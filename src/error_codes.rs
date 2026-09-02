@@ -16,6 +16,18 @@ pub const INPUT_INVALID: &str = "INPUT_INVALID";
 /// The host could not be contacted (network failure or per-target timeout).
 pub const HOST_UNREACHABLE: &str = "HOST_UNREACHABLE";
 
+/// An unexpected controller-side failure that is not evidence of a target
+/// connectivity problem. The detail carries the original bounded error chain.
+pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+
+/// The requested GitHub Release or one of its required platform assets does
+/// not exist.
+pub const RELEASE_NOT_FOUND: &str = "RELEASE_NOT_FOUND";
+
+/// Release metadata, artifact bytes, or attestations could not be fetched.
+/// This is deliberately separate from target-host reachability.
+pub const RELEASE_DOWNLOAD_FAILED: &str = "RELEASE_DOWNLOAD_FAILED";
+
 /// OpenSSH reported an authentication failure for the configured profile.
 pub const SSH_AUTH_FAILED: &str = "SSH_AUTH_FAILED";
 

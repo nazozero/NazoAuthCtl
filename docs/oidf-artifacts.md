@@ -1,13 +1,33 @@
-# Signed OIDF driver and matrix artifacts
+# OIDF driver and matrix artifacts
 
-This contract separates OIDF conformance data from both the NazoAuth server
-Release and the NazoAuthCtl Release. It is not a NazoAuth management API and it
-does not execute the Suite.
+The normal user workflow has no artifact configuration:
+
+```text
+nazoauthctl oidf run
+nazoauthctl oidf run ciba
+nazoauthctl oidf run oidc-core-p001
+```
+
+The first command runs the complete Matrix bundled in the signed NazoAuthCtl
+release against the official OpenID Foundation Suite. The second uses a stable
+group alias; the third selects one exact bundled plan. The other aliases are
+`oidc`, `fapi`, `openid4vci`, `openid4vp`, and `openid4vc`. Unknown selectors
+fail and print the valid aliases, groups, and plans.
+
+NazoAuthCtl automatically creates the temporary `*.oidf.nazoauth.com` tenant,
+fresh test material, managed browser workers, the CIBA callback when selected,
+and a private evidence directory. On the first interactive run it securely
+prompts for the official Suite API token and stores it in the platform
+credential store. Non-interactive jobs may pipe the token with
+`--token-stdin`.
+
+The remaining commands in this document are maintainer-facing artifact
+inspection tools. They do not supply inputs to `oidf run`.
 
 ## Ownership and trust
 
 The artifact publisher owns a signed driver manifest and its matrix payload.
-The controller operator owns a local trust policy. NazoAuth owns protocol keys,
+For the inspection commands, the controller operator owns a local trust policy. NazoAuth owns protocol keys,
 tenant resolution, clients, users, and trust state. The Suite-side driver owns
 test client and wallet private keys. Artifact verification never transfers any
 of those private keys.
@@ -100,10 +120,11 @@ nazoauthctl oidf artifact verify \
 The command reads bounded regular non-symlink files and emits a verified public
 identity only after every check succeeds. `--require` values are the
 capability set supplied by the caller; this command does not discover or grant
-NazoAuth capabilities. `oidf run` separately obtains deployment-bound
-provider actions and resource kinds from authenticated capability negotiation;
-runner capability strings and provider authorization are never treated as the
-same authority. The public verifier revalidates the complete trust-policy schema,
+NazoAuth capabilities. Ordinary `oidf run` instead consumes the Matrix bundled
+with the ctl release and obtains deployment-bound provider actions and resource
+kinds from authenticated capability negotiation. Runner capability strings and
+provider authorization are never treated as the same authority. The public
+verifier revalidates the complete trust-policy schema,
 source, signer identity, public key, and derived key ID even when a library
 caller constructs the policy value directly instead of using the file parser.
 
@@ -209,11 +230,9 @@ a plan JTI but deliberately records `deployment_bound: false`,
 the authenticated negotiation, ordinary resource provider, target/Suite origin
 policy, and deployment-bound crash-safe journal blockers. The `plan` command
 creates no NazoAuth resource, Suite plan, execution journal, or cleanup
-obligation. `oidf run` reopens and re-verifies the exact cached bytes,
-binds the plan to authenticated deployment and ordinary-provider capabilities,
-and only then clears those blockers. Signed budgets are contract ceilings; the
-runner enforces them against selected Suite modules, created clients, and
-elapsed time.
+obligation. It is not an input to ordinary `oidf run`, whose Matrix and driver
+are part of the ctl release. Resource budgets remain contract ceilings enforced
+against selected Suite modules, created clients, and elapsed time.
 
 Schema 5 also binds the delivery contract to
 `nazoauthctl-bounded-plan-runner-v1`, the existing runner whose behavior tests
@@ -233,10 +252,10 @@ canonical request hash, typed result, revision, and manifest transition, and
 proves cleanup back to the enumerated baseline. Suite outcomes and controller
 evidence remain distinct facts; neither is presented as a Suite signature.
 
-Before ordinary Apply, `oidf run` durably stores the exact signed
-`ControlOperation`, canonical request hash, private manifest path, and proxy
-recovery input. Response loss replays that same operation. Cleanup first
-enumerates the run identities, then issues a digest-bound Revoke, persists each
-typed terminal result, restores the proxy, and removes the private manifest only
-through the journal's deletion-intent state machine. No older controller journal
-or control protocol is accepted.
+Before ordinary Apply, `oidf run` durably stores the exact
+`ControlOperation`, canonical request hash, and private manifest path. Response
+loss replays that same operation. Cleanup first enumerates the run identities,
+then issues a digest-bound Revoke, persists each typed terminal result, and
+removes the private manifest only through the journal's deletion-intent state
+machine. mTLS trust is an ordinary tenant resource; ingress forwards the RFC
+9440 client-certificate header and no per-run proxy trust file is installed.

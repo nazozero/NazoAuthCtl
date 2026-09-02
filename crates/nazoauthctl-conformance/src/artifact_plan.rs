@@ -13,7 +13,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::{CachedOidfArtifact, OidfArtifactMatrix, OidfDriverHandler, OidfPlanResourceBudget};
+use crate::{
+    CachedOidfArtifact, OIDF_ARTIFACT_CACHE_SCHEMA_VERSION, OIDF_DRIVER_ENGINE_PROTOCOL,
+    OIDF_DRIVER_SCHEMA_VERSION, OIDF_MATRIX_SCHEMA_VERSION, OidfArtifactMatrix, OidfDriverHandler,
+    OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity, VerifiedOidfArtifact,
+};
+
+const BUNDLED_DRIVER: &[u8] = include_bytes!("../resources/oidf/driver.json");
+const BUNDLED_MATRIX: &[u8] = include_bytes!("../resources/oidf/matrix.json");
+const BUNDLED_SOURCE_REVISION: &str = "77c362f9fc62e5114f3c61e2b4420f864d7112ab";
 
 pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 5;
 
@@ -93,6 +101,181 @@ pub enum OidfPlanError {
     ResourceBound,
     #[error("artifact validity cannot contain the selected resource budget")]
     ArtifactValidity,
+}
+
+/// Resolve the single user-facing selector against the Matrix bundled with
+/// this exact ctl release. An absent selector means the complete Matrix.
+pub fn resolve_bundled_oidf_selection(
+    selector: Option<&str>,
+) -> Result<OidfPlanSelection, OidfPlanError> {
+    let Some(selector) = selector else {
+        return Ok(OidfPlanSelection::default());
+    };
+    let matrix = bundled_oidf_matrix()?;
+    let matching_groups = |predicate: &dyn Fn(&str) -> bool| {
+        matrix
+            .groups
+            .iter()
+            .filter(|group| predicate(&group.id))
+            .map(|group| group.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let groups = match selector {
+        "oidc" => matching_groups(&|id| id == "oidc-core"),
+        "ciba" => matching_groups(&|id| id == "fapi-ciba"),
+        "fapi" => matching_groups(&|id| id.starts_with("fapi-")),
+        "openid4vci" => matching_groups(&|id| id.starts_with("openid4vc-vci")),
+        "openid4vp" => matching_groups(&|id| id.starts_with("openid4vc-vp")),
+        "openid4vc" => matching_groups(&|id| id.starts_with("openid4vc-")),
+        exact if matrix.groups.iter().any(|group| group.id == exact) => vec![exact.to_owned()],
+        exact
+            if matrix
+                .groups
+                .iter()
+                .flat_map(|group| &group.plans)
+                .any(|plan| plan.id == exact) =>
+        {
+            return Ok(OidfPlanSelection {
+                groups: Vec::new(),
+                plans: vec![exact.to_owned()],
+            });
+        }
+        _ => return Err(OidfPlanError::UnknownSelection),
+    };
+    if groups.is_empty() {
+        return Err(OidfPlanError::UnknownSelection);
+    }
+    Ok(OidfPlanSelection {
+        groups,
+        plans: Vec::new(),
+    })
+}
+
+pub fn bundled_oidf_selection_choices() -> Result<Vec<String>, OidfPlanError> {
+    let matrix = bundled_oidf_matrix()?;
+    let mut choices = [
+        "oidc",
+        "ciba",
+        "fapi",
+        "openid4vci",
+        "openid4vp",
+        "openid4vc",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect::<Vec<_>>();
+    choices.extend(matrix.groups.iter().map(|group| group.id.clone()));
+    choices.extend(
+        matrix
+            .groups
+            .iter()
+            .flat_map(|group| &group.plans)
+            .map(|plan| plan.id.clone()),
+    );
+    Ok(choices)
+}
+
+pub fn bundled_oidf_matrix() -> Result<OidfArtifactMatrix, OidfPlanError> {
+    let matrix: OidfArtifactMatrix =
+        serde_json::from_slice(BUNDLED_MATRIX).map_err(|_| OidfPlanError::MalformedMatrix)?;
+    if matrix.schema != OIDF_MATRIX_SCHEMA_VERSION {
+        return Err(OidfPlanError::MalformedMatrix);
+    }
+    Ok(matrix)
+}
+
+/// Compile the immutable Matrix and driver embedded in the ctl binary. Their
+/// content identity remains in evidence, but is no longer operator input.
+pub fn open_bundled_oidf_driver_plan(
+    selection: OidfPlanSelection,
+    now: i64,
+) -> Result<OidfDriverInspectionPlan, OidfPlanError> {
+    let matrix = bundled_oidf_matrix()?;
+    let plan_count = matrix
+        .groups
+        .iter()
+        .map(|group| group.plans.len())
+        .sum::<usize>();
+    let mut budget = OidfPlanResourceBudget {
+        modules: 0,
+        clients: 0,
+        wall_clock_seconds: 0,
+    };
+    for plan in matrix.groups.iter().flat_map(|group| &group.plans) {
+        budget.modules = budget
+            .modules
+            .checked_add(plan.resource_budget.modules)
+            .ok_or(OidfPlanError::ResourceBound)?;
+        budget.clients = budget
+            .clients
+            .checked_add(plan.resource_budget.clients)
+            .ok_or(OidfPlanError::ResourceBound)?;
+        budget.wall_clock_seconds = budget
+            .wall_clock_seconds
+            .checked_add(plan.resource_budget.wall_clock_seconds)
+            .ok_or(OidfPlanError::ResourceBound)?;
+    }
+    let driver: crate::OidfDriverProgram =
+        serde_json::from_slice(BUNDLED_DRIVER).map_err(|_| OidfPlanError::CacheIdentity)?;
+    let driver_sha256 = sha256(BUNDLED_DRIVER);
+    let matrix_sha256 = sha256(BUNDLED_MATRIX);
+    let artifact_digest = sha256([BUNDLED_DRIVER, BUNDLED_MATRIX].concat().as_slice());
+    let artifact = VerifiedOidfArtifact {
+        artifact_id: "nazoauthctl-bundled-oidf-v5.2.2".to_owned(),
+        revision: BUNDLED_SOURCE_REVISION.to_owned(),
+        source: "nazoauthctl-bundled".to_owned(),
+        signer_identity: "nazoauthctl-release".to_owned(),
+        signer_key_id: "nazoauthctl-release".to_owned(),
+        driver_manifest_sha256: artifact_digest,
+        driver_manifest_size: u64::try_from(BUNDLED_DRIVER.len() + BUNDLED_MATRIX.len())
+            .map_err(|_| OidfPlanError::ResourceBound)?,
+        suite: OidfSuiteIdentity {
+            origin: "https://www.certification.openid.net".to_owned(),
+            release: "release-v5.2.2".to_owned(),
+            revision: "321bc5bc53601b9690b54c023c0cbfac0f0230f2".to_owned(),
+            image_digest: "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415"
+                .to_owned(),
+        },
+        engine_protocol: OIDF_DRIVER_ENGINE_PROTOCOL,
+        required_capabilities: vec!["nazoauth.client.create".to_owned()],
+        driver_schema: OIDF_DRIVER_SCHEMA_VERSION,
+        driver_sha256,
+        driver_size: u64::try_from(BUNDLED_DRIVER.len())
+            .map_err(|_| OidfPlanError::ResourceBound)?,
+        driver_handlers: u32::try_from(driver.handlers.len())
+            .map_err(|_| OidfPlanError::ResourceBound)?,
+        matrix_sha256,
+        matrix_size: u64::try_from(BUNDLED_MATRIX.len())
+            .map_err(|_| OidfPlanError::ResourceBound)?,
+        matrix_groups: u32::try_from(matrix.groups.len())
+            .map_err(|_| OidfPlanError::ResourceBound)?,
+        matrix_plans: u32::try_from(plan_count).map_err(|_| OidfPlanError::ResourceBound)?,
+        matrix_modules: budget.modules,
+        matrix_clients: budget.clients,
+        matrix_wall_clock_seconds: budget.wall_clock_seconds,
+        not_before: 0,
+        expires_at: i64::MAX,
+        resource_bounds: OidfResourceBounds {
+            max_plans: u32::try_from(plan_count).map_err(|_| OidfPlanError::ResourceBound)?,
+            max_modules: budget.modules,
+            max_clients: budget.clients,
+            max_wall_clock_seconds: budget.wall_clock_seconds,
+        },
+    };
+    compile_oidf_driver_inspection_plan(
+        CachedOidfArtifact {
+            schema: OIDF_ARTIFACT_CACHE_SCHEMA_VERSION,
+            manifest_url: "nazoauthctl-bundled".to_owned(),
+            opened_at: now,
+            cache_entry: PathBuf::new(),
+            artifact,
+        },
+        BUNDLED_DRIVER,
+        BUNDLED_MATRIX,
+        &BTreeSet::from(["nazoauth.client.create".to_owned()]),
+        selection,
+        now,
+    )
 }
 
 pub(crate) fn compile_oidf_driver_inspection_plan(
@@ -284,6 +467,47 @@ mod tests {
         OidfDriverAutomation, OidfDriverHandler, OidfDriverLane, OidfDriverProgram,
         OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity, VerifiedOidfArtifact,
     };
+
+    #[test]
+    fn bundled_matrix_resolves_public_aliases_and_exact_ids() {
+        assert_eq!(
+            resolve_bundled_oidf_selection(None).unwrap(),
+            OidfPlanSelection::default()
+        );
+        assert_eq!(
+            resolve_bundled_oidf_selection(Some("ciba")).unwrap().groups,
+            ["fapi-ciba"]
+        );
+        assert_eq!(
+            resolve_bundled_oidf_selection(Some("openid4vci"))
+                .unwrap()
+                .groups,
+            ["openid4vc-vci", "openid4vc-vci-haip"]
+        );
+        assert_eq!(
+            resolve_bundled_oidf_selection(Some("oidc-core-p001"))
+                .unwrap()
+                .plans,
+            ["oidc-core-p001"]
+        );
+        assert_eq!(
+            resolve_bundled_oidf_selection(Some("missing")).unwrap_err(),
+            OidfPlanError::UnknownSelection
+        );
+    }
+
+    #[test]
+    fn bundled_matrix_compiles_without_external_artifact_inputs() {
+        let selection = resolve_bundled_oidf_selection(Some("ciba")).unwrap();
+        let plan = open_bundled_oidf_driver_plan(selection, 1_800_000_000).unwrap();
+        assert_eq!(plan.selected_group_count, 1);
+        assert!(!plan.plans.is_empty());
+        assert!(plan.plans.iter().all(|entry| entry.group_id == "fapi-ciba"));
+        assert_eq!(
+            plan.artifact.suite.origin,
+            "https://www.certification.openid.net"
+        );
+    }
 
     #[test]
     fn compiles_exact_selection() {

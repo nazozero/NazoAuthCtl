@@ -88,6 +88,10 @@ fn next_command(code: &str) -> Option<&'static str> {
         error_codes::TARGET_IDENTITY_MISMATCH => {
             "nazoauthctl verify --instance <alias>, then re-check the artifact source"
         }
+        error_codes::INTERNAL_ERROR
+        | error_codes::RELEASE_NOT_FOUND
+        | error_codes::RELEASE_DOWNLOAD_FAILED
+        | crate::target::ARTIFACT_UNVERIFIED => return None,
         _ => return None,
     })
 }

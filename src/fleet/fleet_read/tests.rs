@@ -217,7 +217,7 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
         Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
     let factory: Factory = Arc::new(|record: &HostRecord| {
         let scenario = if record.alias == "server-c" {
-            Scenario::Offline("ssh to 'x' exited 255")
+            Scenario::Offline("HOST_UNREACHABLE: ssh to 'x' exited 255 (Connection refused)")
         } else {
             Scenario::Online
         };
@@ -236,7 +236,7 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
     assert!(outcomes[1].result.is_ok());
     let (code, detail) = outcomes[2].result.as_ref().expect_err("offline").clone();
     assert_eq!(code, error_codes::HOST_UNREACHABLE, "{detail}");
-    assert!(detail.contains("exited 255"), "{detail}");
+    assert!(detail.contains("Connection refused"), "{detail}");
     Ok(())
 }
 
@@ -329,6 +329,10 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
 #[test]
 fn stable_code_maps_transport_tokens() {
     assert_eq!(
+        stable_code("HOST_UNREACHABLE: connection refused"),
+        error_codes::HOST_UNREACHABLE
+    );
+    assert_eq!(
         stable_code("REMOTE_HELPER_MISMATCH: drift"),
         error_codes::REMOTE_HELPER_MISMATCH
     );
@@ -339,6 +343,22 @@ fn stable_code_maps_transport_tokens() {
     assert_eq!(
         stable_code("SUDO_PASSWORD_REQUIRED: sudo refused"),
         error_codes::PRIVILEGE_REQUIRED
+    );
+    assert_eq!(
+        stable_code("unexpected local serialization bug"),
+        error_codes::INTERNAL_ERROR
+    );
+    assert_eq!(
+        stable_code("RELEASE_NOT_FOUND: HTTP 404"),
+        error_codes::RELEASE_NOT_FOUND
+    );
+    assert_eq!(
+        stable_code("RELEASE_DOWNLOAD_FAILED: curl timed out"),
+        error_codes::RELEASE_DOWNLOAD_FAILED
+    );
+    assert_eq!(
+        stable_code("browser operation timed out"),
+        error_codes::INTERNAL_ERROR
     );
 }
 

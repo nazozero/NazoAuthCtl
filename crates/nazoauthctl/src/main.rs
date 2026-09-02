@@ -7,10 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     ArtifactTrustPolicy, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS, OidfPlanSelection,
-    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_driver,
-    read_artifact_matrix, read_compact_manifest, resolve_oidf_artifact, verify_oidf_artifact,
+    bundled_oidf_selection_choices, open_cached_oidf_artifact, open_cached_oidf_driver_plan,
+    read_artifact_driver, read_artifact_matrix, read_compact_manifest,
+    resolve_bundled_oidf_selection, resolve_oidf_artifact, verify_oidf_artifact,
 };
-use zeroize::Zeroizing;
 
 mod ordinary_run;
 
@@ -454,24 +454,11 @@ fn exit_with_error(error: &anyhow::Error) -> ! {
 
 pub(crate) struct RunInvocation {
     pub(crate) instance: Option<String>,
-    pub(crate) trust_policy: PathBuf,
-    pub(crate) artifact_cache: PathBuf,
-    pub(crate) artifact_digest: String,
     pub(crate) tenant_id: String,
-    pub(crate) suite: Option<String>,
-    pub(crate) token: Option<Zeroizing<String>>,
-    pub(crate) token_file: Option<PathBuf>,
     pub(crate) token_stdin: bool,
-    pub(crate) token_fd: Option<u32>,
-    pub(crate) webdriver: Vec<String>,
-    pub(crate) evidence_directory: Option<PathBuf>,
     pub(crate) capture_review_screenshots: bool,
     pub(crate) upload_review_screenshots: bool,
     pub(crate) retain_suite_plans_for_certification: bool,
-    pub(crate) proxy_trust_bundle: Option<PathBuf>,
-    pub(crate) proxy_reload_executable: Option<PathBuf>,
-    pub(crate) ciba_user_approval_callback_url: Option<String>,
-    pub(crate) ciba_user_approval_listen: Option<std::net::SocketAddr>,
     pub(crate) groups: Vec<String>,
     pub(crate) plans: Vec<String>,
     pub(crate) poll_timeout: Duration,
@@ -487,90 +474,23 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         std::process::exit(0);
     }
 
-    let mut trust_policy = None;
-    let mut artifact_cache = None;
-    let mut artifact_digest = None;
-    let mut suite = None;
-    let mut token = None;
-    let mut token_file = None;
     let mut token_stdin = false;
-    let mut token_fd = None;
-    let mut webdriver = Vec::new();
-    let mut evidence_directory = None;
     let mut capture_review_screenshots = false;
     let mut upload_review_screenshots = false;
     let mut retain_suite_plans_for_certification = false;
-    let mut proxy_trust_bundle = None;
-    let mut proxy_reload_executable = None;
-    let mut ciba_user_approval_callback_url = None;
-    let mut ciba_user_approval_listen = None;
-    let mut groups = Vec::new();
-    let mut plans = Vec::new();
+    let mut selector = None;
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
     let mut jobs = DEFAULT_JOBS;
     let mut index = 0usize;
     while index < values.len() {
         let option = values[index].as_str();
         match option {
-            "--trust-policy"
-            | "--artifact-cache"
-            | "--artifact-digest"
-            | "--suite"
-            | "--token"
-            | "--token-file"
-            | "--token-fd"
-            | "--webdriver"
-            | "--evidence-dir"
-            | "--proxy-trust-bundle"
-            | "--proxy-reload-executable"
-            | "--ciba-user-approval-callback-url"
-            | "--ciba-user-approval-listen"
-            | "--group"
-            | "--plan"
-            | "--poll-timeout"
-            | "--jobs" => {
+            "--poll-timeout" | "--jobs" => {
                 let value = values
                     .get(index + 1)
                     .with_context(|| format!("{option} requires a value"))?
                     .clone();
                 match option {
-                    "--trust-policy" => {
-                        set_once(&mut trust_policy, PathBuf::from(value), option)?;
-                    }
-                    "--artifact-cache" => {
-                        set_once(&mut artifact_cache, PathBuf::from(value), option)?;
-                    }
-                    "--artifact-digest" => set_once(&mut artifact_digest, value, option)?,
-                    "--suite" => set_once(&mut suite, value, option)?,
-                    "--token" => set_once(&mut token, Zeroizing::new(value), option)?,
-                    "--token-file" => set_once(&mut token_file, PathBuf::from(value), option)?,
-                    "--token-fd" => {
-                        let value = value
-                            .parse::<u32>()
-                            .context("--token-fd must be an integer")?;
-                        set_once(&mut token_fd, value, option)?;
-                    }
-                    "--webdriver" => webdriver.push(value),
-                    "--evidence-dir" => {
-                        set_once(&mut evidence_directory, PathBuf::from(value), option)?;
-                    }
-                    "--proxy-trust-bundle" => {
-                        set_once(&mut proxy_trust_bundle, PathBuf::from(value), option)?;
-                    }
-                    "--proxy-reload-executable" => {
-                        set_once(&mut proxy_reload_executable, PathBuf::from(value), option)?;
-                    }
-                    "--ciba-user-approval-callback-url" => {
-                        set_once(&mut ciba_user_approval_callback_url, value, option)?;
-                    }
-                    "--ciba-user-approval-listen" => {
-                        let address = value.parse::<std::net::SocketAddr>().context(
-                            "--ciba-user-approval-listen must be an IP address and port",
-                        )?;
-                        set_once(&mut ciba_user_approval_listen, address, option)?;
-                    }
-                    "--group" => groups.push(value),
-                    "--plan" => plans.push(value),
                     "--poll-timeout" => {
                         poll_timeout = Duration::from_secs(
                             value
@@ -615,74 +535,49 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                 upload_review_screenshots = true;
                 index += 1;
             }
-            _ => bail!("unknown oidf run option: {option}"),
+            value if value.starts_with('-') => bail!("unknown oidf run option: {value}"),
+            value => {
+                set_once(&mut selector, value.to_owned(), "OIDF selector")?;
+                index += 1;
+            }
         }
-    }
-    let token_sources = usize::from(token.is_some())
-        + usize::from(token_file.is_some())
-        + usize::from(token_stdin)
-        + usize::from(token_fd.is_some());
-    if token_sources > 1 {
-        bail!("--token, --token-file, --token-stdin, and --token-fd are mutually exclusive");
-    }
-    if proxy_trust_bundle.is_some() != proxy_reload_executable.is_some() {
-        bail!("--proxy-trust-bundle and --proxy-reload-executable must be specified together");
-    }
-    if ciba_user_approval_callback_url.is_some() != ciba_user_approval_listen.is_some() {
-        bail!(
-            "--ciba-user-approval-callback-url and --ciba-user-approval-listen must be specified together"
-        );
-    }
-    if capture_review_screenshots && evidence_directory.is_none() {
-        bail!("--capture-review-screenshots requires --evidence-dir");
     }
     if upload_review_screenshots && !capture_review_screenshots {
         bail!("--upload-review-screenshots requires --capture-review-screenshots");
     }
-    let trust_policy = trust_policy.context("--trust-policy is required")?;
-    let artifact_cache = artifact_cache.context("--artifact-cache is required")?;
-    let artifact_digest = artifact_digest.context("--artifact-digest is required")?;
-    if artifact_digest.len() != 64
-        || !artifact_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        bail!("--artifact-digest must be 64 lowercase hexadecimal characters");
-    }
+    let selection = resolve_bundled_oidf_selection(selector.as_deref()).map_err(|error| {
+        if error == nazoauthctl_conformance::OidfPlanError::UnknownSelection {
+            let choices = bundled_oidf_selection_choices()
+                .map(|choices| choices.join(", "))
+                .unwrap_or_else(|_| {
+                    "oidc, ciba, fapi, openid4vci, openid4vp, openid4vc".to_owned()
+                });
+            anyhow::anyhow!(
+                "unknown OIDF selector `{}`; valid choices: {choices}",
+                selector.as_deref().unwrap_or_default()
+            )
+        } else {
+            anyhow::anyhow!("bundled OIDF Matrix is invalid: {error}")
+        }
+    })?;
     let tenant_id = uuid::Uuid::now_v7().to_string();
-    let distinct_webdrivers = webdriver.iter().collect::<std::collections::BTreeSet<_>>();
     if poll_timeout.is_zero()
         || poll_timeout > Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS)
         || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
-        || (!webdriver.is_empty()
-            && (webdriver.len() != jobs || distinct_webdrivers.len() != webdriver.len()))
     {
         bail!(
-            "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds, jobs must be between 1 and {MAX_PARALLEL_JOBS}, and explicit WebDriver endpoints must be distinct and repeated exactly once per job"
+            "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds and jobs must be between 1 and {MAX_PARALLEL_JOBS}"
         );
     }
     Ok(RunInvocation {
         instance,
-        trust_policy,
-        artifact_cache,
-        artifact_digest,
         tenant_id,
-        suite,
-        token,
-        token_file,
         token_stdin,
-        token_fd,
-        webdriver,
-        evidence_directory,
         capture_review_screenshots,
         upload_review_screenshots,
         retain_suite_plans_for_certification,
-        proxy_trust_bundle,
-        proxy_reload_executable,
-        ciba_user_approval_callback_url,
-        ciba_user_approval_listen,
-        groups,
-        plans,
+        groups: selection.groups,
+        plans: selection.plans,
         poll_timeout,
         jobs,
     })
@@ -716,10 +611,7 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--instance SELECTOR] [--json] oidf run --trust-policy PATH --artifact-cache PATH --artifact-digest SHA256 [options]\n\nRequired:\n  --trust-policy PATH            Signed-artifact trust policy\n  --artifact-cache PATH          Private immutable artifact cache root\n  --artifact-digest SHA256       Exact cached compact-manifest digest (64 lowercase hex)\n\nEach run creates a fresh temporary tenant at <uuid>.oidf.nazoauth.com and generates new client, mTLS, attestation, credential and tenant signing material.\n\nOptions:\n  --suite URL                    OpenID Foundation Suite origin (default: official Suite)\n  --token TOKEN                  API token; visible in argv/shell history\n  --token-file PATH              Read token from a private regular file\n  --token-stdin                  Read token from stdin\n  --token-fd FD                  Read token from an inherited private descriptor\n  --webdriver URL                Dedicated W3C endpoint; repeat exactly once per job\n  --evidence-dir PATH            Commit a unique controller-operation-bound private evidence bundle\n  --capture-review-screenshots   Capture signed review placeholders locally into --evidence-dir\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the official Suite\n  --proxy-trust-bundle PATH      Atomically install this run's public client CAs\n  --proxy-reload-executable PATH Root-owned executable that validates/reloads the proxy\n  --group ID                     Run one signed Matrix group; repeat to select more\n  --plan ID                      Run one signed Matrix plan; repeat to select more\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
-    );
-    println!(
-        "  --ciba-user-approval-callback-url URL  Public HTTPS callback forwarded only to the local Ctl listener\n  --ciba-user-approval-listen ADDR       Loopback IP:port for that callback"
+        "Usage:\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nWithout a selector, the complete bundled OIDF Matrix runs against the official OpenID Foundation Conformance Suite. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant at <uuid>.oidf.nazoauth.com, generates fresh test material, starts its browser workers, and writes evidence below the instance recovery directory.\n\nOptions:\n  --token-stdin                  Read the official Suite API token from stdin instead of the secure credential store\n  --capture-review-screenshots   Capture review evidence into the automatic evidence directory\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the official Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
     );
 }
 
@@ -1034,67 +926,88 @@ mod tests {
     }
 
     #[test]
-    fn run_parses_automatic_review_upload_without_retention() {
-        let parsed = routed_run(&args(&[
-            "nazoauthctl",
-            "--instance",
-            "prod",
-            "oidf",
-            "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--suite",
-            "https://suite.example",
-            "--token-fd",
-            "7",
-            "--group",
-            "oidc",
-            "--plan",
-            "oidc-core-p001",
-            "--jobs",
-            "3",
-            "--evidence-dir",
-            "/x/evidence",
-            "--capture-review-screenshots",
-            "--upload-review-screenshots",
-        ]))
-        .expect("parse")
-        .expect("run");
-        assert_eq!(parsed.instance.as_deref(), Some("prod"));
-        assert_eq!(parsed.trust_policy, PathBuf::from("/x/trust.json"));
-        assert_eq!(parsed.artifact_cache, PathBuf::from("/x/cache"));
-        assert_eq!(parsed.artifact_digest, "a".repeat(64));
+    fn run_without_options_selects_the_complete_bundled_matrix() {
+        let parsed = routed_run(&args(&["nazoauthctl", "oidf", "run"]))
+            .expect("parse")
+            .expect("run");
+        assert!(parsed.groups.is_empty());
+        assert!(parsed.plans.is_empty());
         assert!(uuid::Uuid::parse_str(&parsed.tenant_id).is_ok());
-        assert_eq!(parsed.token_fd, Some(7));
-        assert_eq!(parsed.groups, ["oidc"]);
-        assert!(!parsed.retain_suite_plans_for_certification);
-        assert!(parsed.capture_review_screenshots);
-        assert!(parsed.upload_review_screenshots);
-        assert_eq!(parsed.plans, ["oidc-core-p001"]);
-        assert_eq!(parsed.jobs, 3);
+        assert_eq!(parsed.jobs, DEFAULT_JOBS);
     }
 
     #[test]
-    fn review_screenshot_capture_requires_an_explicit_evidence_directory() {
-        let error = routed_run(&args(&[
+    fn run_accepts_alias_and_exact_plan_selectors() {
+        let ciba = routed_run(&args(&["nazoauthctl", "oidf", "run", "ciba"]))
+            .expect("parse")
+            .expect("run");
+        assert_eq!(ciba.groups, ["fapi-ciba"]);
+        assert!(ciba.plans.is_empty());
+
+        let plan = routed_run(&args(&["nazoauthctl", "oidf", "run", "oidc-core-p001"]))
+            .expect("parse")
+            .expect("run");
+        assert!(plan.groups.is_empty());
+        assert_eq!(plan.plans, ["oidc-core-p001"]);
+    }
+
+    #[test]
+    fn run_rejects_unknown_or_multiple_selectors_without_full_fallback() {
+        let unknown = routed_run(&args(&["nazoauthctl", "oidf", "run", "missing"]))
+            .err()
+            .expect("unknown selector must fail");
+        let message = unknown.to_string();
+        assert!(message.contains("unknown OIDF selector `missing`"));
+        assert!(message.contains("ciba"));
+        assert!(message.contains("oidc-core-p001"));
+
+        let multiple = routed_run(&args(&["nazoauthctl", "oidf", "run", "oidc", "ciba"]))
+            .err()
+            .expect("only one selector is accepted");
+        assert!(
+            multiple
+                .to_string()
+                .contains("OIDF selector may be specified only once")
+        );
+    }
+
+    #[test]
+    fn removed_internal_run_inputs_are_rejected() {
+        for option in [
+            "--trust-policy",
+            "--artifact-cache",
+            "--artifact-digest",
+            "--suite",
+            "--token",
+            "--token-file",
+            "--token-fd",
+            "--webdriver",
+            "--evidence-dir",
+            "--proxy-trust-bundle",
+            "--proxy-reload-executable",
+            "--ciba-user-approval-callback-url",
+            "--ciba-user-approval-listen",
+            "--group",
+            "--plan",
+        ] {
+            let error = routed_run(&args(&["nazoauthctl", "oidf", "run", option, "value"]))
+                .err()
+                .expect("removed internal option must fail");
+            assert!(error.to_string().contains("unknown oidf run option"));
+        }
+    }
+
+    #[test]
+    fn review_screenshot_capture_uses_the_automatic_evidence_directory() {
+        let parsed = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--capture-review-screenshots",
         ]))
-        .err()
-        .expect("capture needs evidence root");
-        assert!(error.to_string().contains("requires --evidence-dir"));
+        .expect("parse")
+        .expect("run");
+        assert!(parsed.capture_review_screenshots);
     }
 
     #[test]
@@ -1103,12 +1016,6 @@ mod tests {
             "nazoauthctl",
             "oidf",
             "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--upload-review-screenshots",
         ]))
         .err()
@@ -1123,19 +1030,7 @@ mod tests {
     #[test]
     fn run_rejects_jobs_outside_the_validated_bound() {
         for jobs in ["0", "5"] {
-            let error = match routed_run(&args(&[
-                "nazoauthctl",
-                "oidf",
-                "run",
-                "--trust-policy",
-                "/x/trust.json",
-                "--artifact-cache",
-                "/x/cache",
-                "--artifact-digest",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "--jobs",
-                jobs,
-            ])) {
+            let error = match routed_run(&args(&["nazoauthctl", "oidf", "run", "--jobs", jobs])) {
                 Err(error) => error,
                 Ok(_) => panic!("jobs outside 1-4 must fail"),
             };
@@ -1149,12 +1044,6 @@ mod tests {
             "nazoauthctl",
             "oidf",
             "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--poll-timeout",
             "86401",
         ])) {
@@ -1169,24 +1058,11 @@ mod tests {
     }
 
     #[test]
-    fn run_requires_exact_ordinary_identity_and_rejects_lease_options() {
-        let missing = routed_run(&args(&["nazoauthctl", "oidf", "run"]));
-        let missing = match missing {
-            Err(error) => error,
-            Ok(_) => panic!("ordinary identity is required"),
-        };
-        assert!(missing.to_string().contains("--trust-policy is required"));
-
+    fn run_rejects_lease_options() {
         let lease = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--lease-ttl",
             "14400",
         ]));
@@ -1200,37 +1076,10 @@ mod tests {
                 .contains("unknown oidf run option: --lease-ttl")
         );
 
-        let uppercase_digest = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        ]));
-        let uppercase_digest = match uppercase_digest {
-            Err(error) => error,
-            Ok(_) => panic!("uppercase artifact digest must fail"),
-        };
-        assert!(
-            uppercase_digest
-                .to_string()
-                .contains("64 lowercase hexadecimal characters")
-        );
-
         let caller_supplied_tenant = routed_run(&args(&[
             "nazoauthctl",
             "oidf",
             "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--tenant-id",
             "00000000-0000-0000-0000-000000000000",
         ]));
@@ -1246,123 +1095,10 @@ mod tests {
     }
 
     #[test]
-    fn proxy_trust_bundle_and_reload_executable_are_atomic_pair() {
-        let missing_reload = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--proxy-trust-bundle",
-            "/run/proxy/client-cas.pem",
-        ]));
-        assert!(missing_reload.is_err());
-
-        let parsed = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--proxy-trust-bundle",
-            "/run/proxy/client-cas.pem",
-            "--proxy-reload-executable",
-            "/usr/local/sbin/reload-nazoauth-proxy",
-        ]))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            parsed.proxy_trust_bundle,
-            Some(PathBuf::from("/run/proxy/client-cas.pem"))
-        );
-        assert_eq!(
-            parsed.proxy_reload_executable,
-            Some(PathBuf::from("/usr/local/sbin/reload-nazoauth-proxy"))
-        );
-    }
-
-    #[test]
-    fn explicit_webdrivers_are_distinct_and_one_per_job() {
-        let one = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--jobs",
-            "2",
-            "--webdriver",
-            "http://127.0.0.1:24444/wd/hub",
-        ]));
-        assert!(one.is_err());
-
-        let duplicate = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--jobs",
-            "2",
-            "--webdriver",
-            "http://127.0.0.1:24444/wd/hub",
-            "--webdriver",
-            "http://127.0.0.1:24444/wd/hub",
-        ]));
-        assert!(duplicate.is_err());
-
-        let distinct = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--trust-policy",
-            "/x/trust.json",
-            "--artifact-cache",
-            "/x/cache",
-            "--artifact-digest",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--jobs",
-            "2",
-            "--webdriver",
-            "http://127.0.0.1:24444/wd/hub",
-            "--webdriver",
-            "http://127.0.0.1:24445/wd/hub",
-        ]))
-        .expect("parse")
-        .expect("run");
-        assert_eq!(distinct.webdriver.len(), 2);
-    }
-
-    #[test]
-    fn token_sources_are_mutually_exclusive() {
-        let result = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--token",
-            "secret",
-            "--token-stdin",
-        ]));
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("must reject"),
-        };
-        assert!(error.to_string().contains("mutually exclusive"));
+    fn token_stdin_remains_available_for_noninteractive_runs() {
+        let parsed = routed_run(&args(&["nazoauthctl", "oidf", "run", "--token-stdin"]))
+            .expect("parse")
+            .expect("run");
+        assert!(parsed.token_stdin);
     }
 }

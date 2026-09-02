@@ -253,6 +253,8 @@ pub(crate) struct PerformedSteps {
     pub(crate) migration_outcome_unknown: bool,
     pub(crate) migration_result: Option<nazo_operator_protocol::ControlResult>,
     pub(crate) verified_rollback_policy: Option<crate::model::ReleaseRollbackPolicy>,
+    pub(crate) runtime_before_update: Option<runtime_backend::RuntimeReplacement>,
+    pub(crate) runtime_before_update_was_running: bool,
 }
 
 /// Production executor backed by the real adapters.
@@ -348,19 +350,29 @@ impl HostLifecycleExecutor {
         let backend = runtime_backend::backend(kind);
         privilege_gate(kind)?;
 
-        // 0. Live identity hook: the running object must serve exactly the
-        // artifact the DeploymentState records, or nothing proceeds.
+        // 0. The live object's deployment ownership is the authority.
+        // Container artifact drift can be reconciled from its immutable live
+        // reference; a systemd executable cannot serve as its own rollback
+        // source, so host drift is rejected before any mutation.
         let observation = live_observation(backend.as_ref(), job.runtime_object)?;
-        require_observation_serves(&observation, job.current_artifact)?;
+        require_observation_owned(&observation, kind, job.deployment_id)?;
+        let live_digest = observation_digest(&observation).ok_or_else(|| {
+            Failure::new(
+                OBJECT_IDENTITY_MISMATCH,
+                "the owned runtime object does not report a digest-bound artifact",
+            )
+        })?;
+        let recorded_current_was_live =
+            require_host_artifact_continuity(kind, &live_digest, job.current_artifact)?;
 
         // 1. Verify + pull the selected official artifact (download-on-target;
         // re-running verify/pull is idempotent for interrupted resumes).
-        // P1-11: the recorded current version is the signed anti-downgrade
-        // floor — a verified-but-older Release is rejected before download.
+        // An explicit version is operator-authoritative. The recorded release
+        // only acts as the downgrade floor when selecting latest implicitly.
         let verified = verify_pinned_artifact_facts(
             job.artifact,
             kind,
-            job.current_version,
+            version_floor_for_update(job.artifact, job.current_version),
             job.runtime_root,
         )?;
         performed.verified_rollback_policy = Some(verified.rollback_policy.clone());
@@ -370,12 +382,12 @@ impl HostLifecycleExecutor {
         // selected digest is already current and no config was staged, the
         // update is complete: do not snapshot, dispatch migration, rotate the
         // rollback generation, or advance the config revision.
-        if job.config.is_none()
-            && job
-                .current_artifact
-                .strip_prefix("sha256:")
-                .is_some_and(|current| current == new_digest)
-        {
+        if update_is_noop(
+            &live_digest,
+            job.current_artifact,
+            &new_digest,
+            job.config.is_some(),
+        ) {
             return Ok(UpdateExecution::Noop {
                 revision: job.expected_revision,
             });
@@ -383,7 +395,7 @@ impl HostLifecycleExecutor {
         // Build and validate the executable replacement before any migration
         // can mutate external state. Activation consumes this exact plan.
         let replacement = runtime_replacement_required(
-            observation_digest(&observation).as_deref(),
+            Some(live_digest.as_str()),
             &new_digest,
             job.config.is_some(),
         )
@@ -397,6 +409,14 @@ impl HostLifecycleExecutor {
             Ok::<_, Failure>(replacement)
         })
         .transpose()?;
+
+        if replacement.is_some() && kind.is_container() {
+            performed.runtime_before_update = Some(exact_replacement_from_observation(
+                &observation,
+                job.runtime_object,
+            )?);
+            performed.runtime_before_update_was_running = observation.running;
+        }
 
         // 2. Snapshot the current config so a failed activation restores the
         // exact bytes (and a later explicit rollback can reuse the snapshot).
@@ -572,13 +592,21 @@ impl HostLifecycleExecutor {
         // 4. Redeploy the runtime object onto the new artifact. Resume-safe:
         // an object already serving the verified digest is left untouched.
         if let Some(replacement) = replacement {
+            if observation.running {
+                backend.stop(job.runtime_object).map_err(|error| {
+                    Failure::new(ACTIVATION_FAILED, sanitize(error.to_string()))
+                })?;
+            }
+            // From this point the old runtime is stopped, or replacement of
+            // an already-stopped object is about to begin. Any failure must
+            // restore the exact observed object.
+            performed.replaced_runtime = true;
             backend
                 .replace(&replacement)
                 .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
             backend
                 .start(job.runtime_object)
                 .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
-            performed.replaced_runtime = true;
         }
 
         // 5. Embedded identity check: the running object must now report the
@@ -599,7 +627,7 @@ impl HostLifecycleExecutor {
         // 7. Commit: previous <- old current, current <- new (+ its release
         // version), optional config CAS advance — replay-safe under this
         // operation id.
-        let state = job.store.apply_update_healthy(
+        let state = job.store.apply_update_healthy_from_live(
             job.deployment_id,
             job.expected_revision,
             super::deployment_state::UpdateCommit {
@@ -609,6 +637,7 @@ impl HostLifecycleExecutor {
                 config: staged_config_change(job.config_reference, job.config),
                 operation_id: job.operation_id.to_owned(),
             },
+            recorded_current_was_live,
         )?;
         Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
@@ -1151,6 +1180,157 @@ mod tests {
     }
 
     #[test]
+    fn noop_uses_live_digest_and_reconciles_stale_recorded_state() {
+        let selected = "a".repeat(64);
+        let other = "b".repeat(64);
+
+        assert!(update_is_noop(
+            &selected,
+            &format!("sha256:{selected}"),
+            &selected,
+            false
+        ));
+        assert!(!update_is_noop(
+            &other,
+            &format!("sha256:{selected}"),
+            &selected,
+            false
+        ));
+        assert!(!update_is_noop(
+            &selected,
+            &format!("sha256:{other}"),
+            &selected,
+            false
+        ));
+    }
+
+    #[test]
+    fn explicit_version_does_not_inherit_the_recorded_version_floor() {
+        let explicit = OfficialArtifactRef {
+            repository: "nazozero/NazoAuth".to_owned(),
+            version: Some("v0.2.8".to_owned()),
+        };
+        let latest = OfficialArtifactRef {
+            repository: "nazozero/NazoAuth".to_owned(),
+            version: None,
+        };
+
+        assert_eq!(version_floor_for_update(&explicit, Some("v0.2.9")), None);
+        assert_eq!(
+            version_floor_for_update(&latest, Some("v0.2.9")),
+            Some("v0.2.9")
+        );
+    }
+
+    fn owned_observation(kind: RuntimeBackendKind) -> runtime_backend::RuntimeObservation {
+        runtime_backend::RuntimeObservation {
+            backend: kind,
+            object_reference: "nazoauth".to_owned(),
+            display_name: "nazoauth".to_owned(),
+            running: true,
+            server_command_verified: true,
+            artifact: runtime_backend::ArtifactReference::Oci {
+                image_reference: "registry.example/nazoauth".to_owned(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+            },
+            local_artifact_id: None,
+            ports: vec!["127.0.0.1:29892->8000/tcp".to_owned()],
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            safe_environment: BTreeMap::from([("DEPLOYMENT_ID".to_owned(), "deploy-a".to_owned())]),
+            labels: BTreeMap::from([(
+                "io.nazoauth.deployment-id".to_owned(),
+                "deploy-a".to_owned(),
+            )]),
+            evidence: Vec::new(),
+            missing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn live_update_authority_is_deployment_ownership_not_recorded_digest() {
+        let container = owned_observation(RuntimeBackendKind::Podman);
+        require_observation_owned(&container, RuntimeBackendKind::Podman, "deploy-a")
+            .expect("matching label and environment own the container");
+
+        let mut missing_label = container.clone();
+        missing_label.labels.clear();
+        assert_eq!(
+            require_observation_owned(&missing_label, RuntimeBackendKind::Podman, "deploy-a")
+                .expect_err("container ownership requires its label")
+                .code,
+            OBJECT_IDENTITY_MISMATCH
+        );
+
+        let mut wrong_environment = container.clone();
+        wrong_environment
+            .safe_environment
+            .insert("DEPLOYMENT_ID".to_owned(), "deploy-b".to_owned());
+        assert_eq!(
+            require_observation_owned(&wrong_environment, RuntimeBackendKind::Podman, "deploy-a")
+                .expect_err("container ownership requires its environment")
+                .code,
+            OBJECT_IDENTITY_MISMATCH
+        );
+
+        let mut host = owned_observation(RuntimeBackendKind::Host);
+        host.labels.clear();
+        host.artifact = runtime_backend::ArtifactReference::HostBinary {
+            path: PathBuf::from("/usr/local/lib/nazoauth"),
+            sha256: "a".repeat(64),
+        };
+        require_observation_owned(&host, RuntimeBackendKind::Host, "deploy-a")
+            .expect("systemd ownership comes from the deployment environment");
+    }
+
+    #[test]
+    fn only_container_updates_may_converge_a_live_artifact_drift() -> Result<(), Failure> {
+        let live = "b".repeat(64);
+        let recorded = format!("sha256:{}", "a".repeat(64));
+
+        assert!(!require_host_artifact_continuity(
+            RuntimeBackendKind::Podman,
+            &live,
+            &recorded
+        )?);
+        let host_error =
+            require_host_artifact_continuity(RuntimeBackendKind::Host, &live, &recorded)
+                .expect_err("a live systemd binary is not a rollback artifact");
+        assert_eq!(host_error.code, OBJECT_IDENTITY_MISMATCH);
+        assert!(require_host_artifact_continuity(
+            RuntimeBackendKind::Host,
+            &live,
+            &format!("sha256:{live}")
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_activation_snapshot_retains_the_exact_live_surface() {
+        let mut observation = owned_observation(RuntimeBackendKind::Podman);
+        observation.safe_environment.insert(
+            "DATABASE_URL_FILE".to_owned(),
+            "/run/secrets/database-runtime-url".to_owned(),
+        );
+        observation.mounts.push(runtime_backend::NeutralMount {
+            source: PathBuf::from("/srv/nazoauth/database-runtime-url"),
+            destination: PathBuf::from("/run/secrets/database-runtime-url"),
+            read_only: true,
+            selinux_relabel: false,
+            ownership: runtime_backend::Responsibility::Managed,
+            scope: runtime_backend::RuntimeResourceScope::Deployment,
+        });
+
+        let replacement = exact_replacement_from_observation(&observation, "nazoauth")
+            .expect("live surface can be captured");
+        assert_eq!(replacement.artifact, observation.artifact);
+        assert_eq!(replacement.local_artifact_id, observation.local_artifact_id);
+        assert_eq!(replacement.mounts, observation.mounts);
+        assert_eq!(replacement.environment, observation.safe_environment);
+        assert_eq!(replacement.labels, observation.labels);
+    }
+
+    #[test]
     fn replacement_rejects_a_non_neutral_port_binding() {
         let artifact = runtime_backend::ArtifactReference::Oci {
             image_reference: "registry.example/nazoauth".to_owned(),
@@ -1222,6 +1402,43 @@ fn runtime_replacement_required(
     has_staged_config || current_digest != Some(selected_digest)
 }
 
+fn update_is_noop(
+    live_digest: &str,
+    recorded_current: &str,
+    selected_digest: &str,
+    has_staged_config: bool,
+) -> bool {
+    !has_staged_config
+        && live_digest == selected_digest
+        && live_digest == recorded_current.trim_start_matches("sha256:")
+}
+
+fn require_host_artifact_continuity(
+    kind: RuntimeBackendKind,
+    live_digest: &str,
+    recorded_current: &str,
+) -> Result<bool, Failure> {
+    let matches = live_digest == recorded_current.trim_start_matches("sha256:");
+    if kind == RuntimeBackendKind::Host && !matches {
+        return Err(Failure::new(
+            OBJECT_IDENTITY_MISMATCH,
+            "the systemd runtime artifact differs from deployment state; refusing an update because the live executable is not a recoverable rollback source",
+        ));
+    }
+    Ok(matches)
+}
+
+fn version_floor_for_update<'a>(
+    artifact: &OfficialArtifactRef,
+    current_version: Option<&'a str>,
+) -> Option<&'a str> {
+    artifact
+        .version
+        .is_none()
+        .then_some(current_version)
+        .flatten()
+}
+
 fn observation_image_reference(
     observation: &runtime_backend::RuntimeObservation,
 ) -> Option<String> {
@@ -1251,6 +1468,43 @@ fn require_observation_serves(
                 sanitize(digest),
                 sanitize(expected.to_owned())
             ),
+        ));
+    }
+    Ok(())
+}
+
+fn require_observation_owned(
+    observation: &runtime_backend::RuntimeObservation,
+    kind: RuntimeBackendKind,
+    deployment_id: &str,
+) -> Result<(), Failure> {
+    if !observation.server_command_verified {
+        return Err(Failure::new(
+            OBJECT_IDENTITY_MISMATCH,
+            "the runtime object is not a verified NazoAuth server",
+        ));
+    }
+    if observation
+        .safe_environment
+        .get("DEPLOYMENT_ID")
+        .map(String::as_str)
+        != Some(deployment_id)
+    {
+        return Err(Failure::new(
+            OBJECT_IDENTITY_MISMATCH,
+            "the runtime object deployment environment does not match this deployment",
+        ));
+    }
+    if kind.is_container()
+        && observation
+            .labels
+            .get("io.nazoauth.deployment-id")
+            .map(String::as_str)
+            != Some(deployment_id)
+    {
+        return Err(Failure::new(
+            OBJECT_IDENTITY_MISMATCH,
+            "the runtime object ownership label does not match this deployment",
         ));
     }
     Ok(())
@@ -1558,6 +1812,26 @@ pub(crate) fn replacement_from_observation(
     })
 }
 
+/// Capture the live runtime surface used to undo a failed activation. Unlike
+/// a forward replacement this retains every observed mount and safe
+/// environment value because failure recovery must restore the object that
+/// was actually running, not reconstruct it from stale deployment state.
+fn exact_replacement_from_observation(
+    observation: &runtime_backend::RuntimeObservation,
+    object: &str,
+) -> Result<runtime_backend::RuntimeReplacement, Failure> {
+    if observation.backend == RuntimeBackendKind::Host {
+        return Err(Failure::new(
+            OBJECT_IDENTITY_MISMATCH,
+            "a live systemd executable path is not a recoverable artifact source",
+        ));
+    }
+    let mut replacement = replacement_from_observation(observation, object, &observation.artifact)?;
+    replacement.mounts = observation.mounts.clone();
+    replacement.environment = observation.safe_environment.clone();
+    Ok(replacement)
+}
+
 fn image_exists_locally(kind: RuntimeBackendKind, image: &str) -> Result<bool, Failure> {
     use crate::process::Process;
     let engine = match kind {
@@ -1761,18 +2035,47 @@ fn rollback_update(job: &UpdateJob<'_>, performed: &PerformedSteps) -> Result<()
             errors.push(error.detail);
         }
     }
-    if (performed.replaced_runtime || performed.wrote_config)
-        && let Err(error) = redeploy_digest(
-            job.runtime_kind,
-            job.runtime_object,
-            job.current_artifact,
-            job.runtime_root,
-        )
-    {
-        errors.push(format!(
-            "restoring the pre-update runtime failed: {}",
-            error.detail
-        ));
+    if performed.replaced_runtime {
+        if job.runtime_kind == RuntimeBackendKind::Host {
+            if let Err(error) = redeploy_digest(
+                job.runtime_kind,
+                job.runtime_object,
+                job.current_artifact,
+                job.runtime_root,
+            ) {
+                errors.push(format!(
+                    "restoring the verified pre-update host artifact failed: {}",
+                    error.detail
+                ));
+            }
+        } else {
+            match &performed.runtime_before_update {
+                Some(replacement) => {
+                    let backend = runtime_backend::backend(job.runtime_kind);
+                    if let Err(error) = backend.replace(replacement) {
+                        errors.push(format!(
+                            "restoring the pre-update runtime failed: {}",
+                            sanitize(error.to_string())
+                        ));
+                    } else if performed.runtime_before_update_was_running {
+                        if let Err(error) = backend.start(job.runtime_object) {
+                            errors.push(format!(
+                                "starting the restored pre-update runtime failed: {}",
+                                sanitize(error.to_string())
+                            ));
+                        }
+                    } else if let Err(error) = backend.stop(job.runtime_object) {
+                        errors.push(format!(
+                            "restoring the stopped pre-update runtime state failed: {}",
+                            sanitize(error.to_string())
+                        ));
+                    }
+                }
+                None => errors.push(
+                    "the exact pre-update runtime was not retained before replacement".to_owned(),
+                ),
+            }
+        }
     }
     rollback_result(errors)
 }

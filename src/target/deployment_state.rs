@@ -975,6 +975,20 @@ impl TargetStateStore {
         expected_revision: u64,
         commit: UpdateCommit,
     ) -> Result<DeploymentState, Failure> {
+        self.apply_update_healthy_from_live(deployment_id, expected_revision, commit, true)
+    }
+
+    /// Commit a verified update using the live runtime as the pre-update
+    /// authority. When the recorded current artifact did not describe that
+    /// runtime, it is not a valid rollback generation and must not enter the
+    /// new lineage.
+    pub(crate) fn apply_update_healthy_from_live(
+        &self,
+        deployment_id: &str,
+        expected_revision: u64,
+        commit: UpdateCommit,
+        recorded_current_was_live: bool,
+    ) -> Result<DeploymentState, Failure> {
         let UpdateCommit {
             artifact: new_current,
             release: new_release,
@@ -1014,12 +1028,19 @@ impl TargetStateStore {
         })?;
         let artifact_changed = state.artifact.current.as_deref() != Some(new_current.as_str());
         if artifact_changed {
-            state.artifact.previous = state.artifact.current.take();
+            if recorded_current_was_live {
+                state.artifact.previous = state.artifact.current.take();
+                // The release version swap mirrors the artifact reference
+                // swap so the envelope facts stay attached to the right
+                // generation.
+                state.previous_release = state.current_release.take();
+                state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
+            } else {
+                state.artifact.previous = None;
+                state.previous_release = None;
+                state.previous_rollback_policy = None;
+            }
             state.artifact.current = Some(new_current);
-            // The release version swap mirrors the artifact reference swap so
-            // the envelope facts stay attached to the right generation.
-            state.previous_release = state.current_release.take();
-            state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
         }
         state.current_release = new_release;
         state.current_rollback_policy = new_rollback_policy;
@@ -1715,6 +1736,48 @@ mod tests {
         );
         assert_eq!(updated.previous_release, Some(previous_release));
         assert_eq!(updated.previous_rollback_policy, Some(previous_policy));
+        Ok(())
+    }
+
+    #[test]
+    fn update_after_live_drift_clears_unverified_rollback_lineage() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-live-drift-update")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        let recorded = format!("sha256:{}", "a".repeat(64));
+        let old_previous = format!("sha256:{}", "b".repeat(64));
+        let verified_live = format!("sha256:{}", "c".repeat(64));
+        let mut params = sample_params("https://auth.example.com", "nazoauth-main");
+        params.artifact = ArtifactRefs {
+            current: Some(recorded),
+            previous: Some(old_previous),
+        };
+        params.current_release = Some(ReleaseVersion::new("v1")?);
+        let mut state = store.bootstrap("deploy-drift", params, "bootstrap")?;
+        state.previous_release = Some(ReleaseVersion::new("v0")?);
+        state.previous_rollback_policy = Some(crate::model::test_release_rollback_policy());
+        let scope = journal::deployment_scope("deploy-drift")?;
+        persist(&scope_path(&store.root, &scope), &state)?;
+
+        let updated = store.apply_update_healthy_from_live(
+            "deploy-drift",
+            1,
+            UpdateCommit {
+                artifact: verified_live.clone(),
+                release: Some(ReleaseVersion::new("v2")?),
+                rollback_policy: crate::model::test_release_rollback_policy(),
+                config: None,
+                operation_id: "converge-live-drift".to_owned(),
+            },
+            false,
+        )?;
+
+        assert_eq!(
+            updated.artifact.current.as_deref(),
+            Some(verified_live.as_str())
+        );
+        assert_eq!(updated.artifact.previous, None);
+        assert_eq!(updated.previous_release, None);
+        assert_eq!(updated.previous_rollback_policy, None);
         Ok(())
     }
 
