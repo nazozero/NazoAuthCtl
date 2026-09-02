@@ -1731,7 +1731,7 @@ fn create_evidence_directory(recovery_directory: &Path, run_id: &str) -> anyhow:
             .context("failed to create the run evidence directory")?;
         nazoauthctl_conformance::validate_private_evidence_directory(&directory)
             .context("automatic evidence directory is not root-owned and private")?;
-        return Ok(directory);
+        Ok(directory)
     }
     #[cfg(not(unix))]
     {
