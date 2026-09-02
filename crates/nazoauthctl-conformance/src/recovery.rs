@@ -39,6 +39,7 @@ pub struct ConformanceProxyRecovery {
 pub struct TenantResourceRecoveryBinding {
     pub deployment_id: String,
     pub tenant_id: String,
+    pub tenant_domain: String,
     pub realm_id: String,
     pub organization_id: String,
     pub run_id: String,
@@ -1006,6 +1007,27 @@ impl ConformanceRecoveryGuard {
         {
             suite.module_ids.push(module_id.to_owned());
         }
+        self.persist()
+    }
+
+    pub fn release_deleted_suite_plan(&mut self, plan_id: &str) -> anyhow::Result<()> {
+        validate_component(plan_id, "Suite plan ID")?;
+        let suite = self
+            .journal
+            .suite
+            .as_mut()
+            .context("deleted Suite plan has no persisted allocation")?;
+        if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
+            bail!("Suite plan cannot be released from unsettled recovery state");
+        }
+        let Some(index) = suite
+            .plan_ids
+            .iter()
+            .position(|existing| existing == plan_id)
+        else {
+            bail!("deleted Suite plan is not owned by this recovery journal");
+        };
+        suite.plan_ids.remove(index);
         self.persist()
     }
 
@@ -2408,7 +2430,17 @@ fn validate_ordinary_binding(
         .map_err(|_| anyhow::anyhow!("tenant-resource realm ID is invalid"))?;
     let organization_id = uuid::Uuid::parse_str(&binding.organization_id)
         .map_err(|_| anyhow::anyhow!("tenant-resource organization ID is invalid"))?;
+    let tenant_domain = match url::Host::parse(&binding.tenant_domain)
+        .map_err(|_| anyhow::anyhow!("tenant-resource tenant domain is invalid"))?
+    {
+        url::Host::Domain(domain) => domain,
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => {
+            bail!("tenant-resource tenant domain must be a DNS name")
+        }
+    };
     if binding.deployment_id != deployment_id
+        || tenant_domain != binding.tenant_domain
+        || !tenant_domain.contains('.')
         || tenant_id.to_string() != binding.tenant_id
         || realm_id.to_string() != binding.realm_id
         || organization_id.to_string() != binding.organization_id
@@ -2571,6 +2603,7 @@ mod tests {
         TenantResourceRecoveryBinding {
             deployment_id: "deployment-1".to_owned(),
             tenant_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+            tenant_domain: "oidf.example.com".to_owned(),
             realm_id: "00000000-0000-0000-0000-000000000001".to_owned(),
             organization_id: "00000000-0000-0000-0000-000000000002".to_owned(),
             run_id: "run-1".to_owned(),

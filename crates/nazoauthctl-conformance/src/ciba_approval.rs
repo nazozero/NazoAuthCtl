@@ -7,20 +7,14 @@
 use crate::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::io::{Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
-use subtle::ConstantTimeEq;
+use std::sync::Arc;
 use thiserror::Error;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-const MAX_CALLBACK_REQUEST_BYTES: usize = 8 * 1024;
-const CALLBACK_IDLE_WAIT: Duration = Duration::from_millis(20);
+const BACKCHANNEL_RESPONSE_SOURCE: &str = "CallBackchannelAuthenticationEndpoint";
+const AUTOMATED_APPROVAL_SOURCE: &str = "CallAutomatedCibaApprovalEndpoint";
 
 pub struct CibaUserApprovalClient {
     issuer: Url,
@@ -74,7 +68,7 @@ impl CibaUserApprovalClient {
     }
 
     /// Authenticate the temporary applicant and submit a normal user decision.
-    /// A fresh session is used per callback so a crash cannot leave a reusable
+    /// A fresh session is used per decision so a crash cannot leave a reusable
     /// browser-equivalent session in the controller process.
     pub fn decide(&self, auth_req_id: &str, approve: bool) -> Result<(), CibaUserApprovalError> {
         if auth_req_id.trim().is_empty() || auth_req_id.len() > 2048 {
@@ -181,6 +175,58 @@ impl CibaUserApprovalClient {
     }
 }
 
+/// Returns only the CIBA request identifiers for which the Suite has reached
+/// its ordinary automated-approval step. A backchannel response alone is not
+/// approval authority because expiry and ignore tests intentionally omit that
+/// step.
+pub fn ciba_approval_requests(raw_log: &Value) -> Result<Vec<String>, CibaUserApprovalError> {
+    let entries = raw_log
+        .as_array()
+        .ok_or(CibaUserApprovalError::MalformedSuiteLog)?;
+    let mut seen = HashSet::new();
+    let mut auth_req_ids = Vec::new();
+    let mut approval_requests = 0usize;
+    for entry in entries {
+        let source = entry.get("src").and_then(Value::as_str);
+        if source == Some(AUTOMATED_APPROVAL_SOURCE) {
+            approval_requests = approval_requests
+                .checked_add(1)
+                .ok_or(CibaUserApprovalError::MalformedSuiteLog)?;
+            continue;
+        }
+        if source != Some(BACKCHANNEL_RESPONSE_SOURCE) {
+            continue;
+        }
+        let response = match entry.get("backchannel_authentication_endpoint_response") {
+            Some(Value::String(response)) => serde_json::from_str::<Value>(response)
+                .map_err(|_| CibaUserApprovalError::MalformedSuiteLog)?,
+            Some(Value::Object(_)) => entry
+                .get("backchannel_authentication_endpoint_response")
+                .cloned()
+                .expect("matched response exists"),
+            Some(_) => return Err(CibaUserApprovalError::MalformedSuiteLog),
+            None => entry.clone(),
+        };
+        let Some(auth_req_id) = response.get("auth_req_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if auth_req_id.is_empty()
+            || auth_req_id.len() > 2048
+            || auth_req_id.chars().any(char::is_control)
+        {
+            return Err(CibaUserApprovalError::MalformedSuiteLog);
+        }
+        if seen.insert(auth_req_id.to_owned()) {
+            auth_req_ids.push(auth_req_id.to_owned());
+        }
+    }
+    if approval_requests > auth_req_ids.len() {
+        return Err(CibaUserApprovalError::MalformedSuiteLog);
+    }
+    auth_req_ids.truncate(approval_requests);
+    Ok(auth_req_ids)
+}
+
 fn cookie_header(
     response: &HttpResponse,
     csrf_token: &str,
@@ -201,329 +247,6 @@ fn cookie_header(
         return Err(CibaUserApprovalError::MissingSessionCookies);
     }
     Ok(values.join("; "))
-}
-
-/// Loopback callback bridge used by an external driver to request a normal
-/// CIBA user decision. The configured public HTTPS origin is terminated and
-/// forwarded by the deployment edge; this listener deliberately accepts only
-/// loopback traffic and never becomes an NazoAuth route.
-pub struct CibaUserApprovalBridge {
-    local_addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    health: Arc<Mutex<Option<CallbackHealth>>>,
-    worker: Option<JoinHandle<()>>,
-}
-
-#[derive(Clone, Copy)]
-enum CallbackHealth {
-    ListenerUnhealthy,
-    ApprovalFailure(CibaApprovalFailureStage),
-}
-
-impl std::fmt::Debug for CibaUserApprovalBridge {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CibaUserApprovalBridge")
-            .field("local_addr", &self.local_addr)
-            .finish_non_exhaustive()
-    }
-}
-
-impl CibaUserApprovalBridge {
-    pub fn start(
-        bind_addr: SocketAddr,
-        callback_path: &str,
-        approval_token: Zeroizing<String>,
-        approver: Arc<CibaUserApprovalClient>,
-    ) -> Result<Self, CibaUserApprovalError> {
-        if !matches!(bind_addr.ip(), IpAddr::V4(address) if address.is_loopback())
-            && !matches!(bind_addr.ip(), IpAddr::V6(address) if address.is_loopback())
-        {
-            return Err(CibaUserApprovalError::CallbackMustBindLoopback);
-        }
-        let callback_path = validate_callback_path(callback_path)?;
-        if approval_token.len() < 32
-            || approval_token.len() > 512
-            || approval_token.chars().any(char::is_control)
-        {
-            return Err(CibaUserApprovalError::InvalidCallbackToken);
-        }
-        let listener = TcpListener::bind(bind_addr).map_err(CibaUserApprovalError::CallbackBind)?;
-        listener
-            .set_nonblocking(true)
-            .map_err(CibaUserApprovalError::CallbackBind)?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(CibaUserApprovalError::CallbackBind)?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let health = Arc::new(Mutex::new(None));
-        let worker_stop = Arc::clone(&stop);
-        let worker_health = Arc::clone(&health);
-        let worker = thread::Builder::new()
-            .name("nazoauthctl-ciba-approval".to_owned())
-            .spawn(move || {
-                run_callback_loop(
-                    listener,
-                    worker_stop,
-                    worker_health,
-                    callback_path,
-                    approval_token,
-                    approver,
-                )
-            })
-            .map_err(CibaUserApprovalError::CallbackSpawn)?;
-        Ok(Self {
-            local_addr,
-            stop,
-            health,
-            worker: Some(worker),
-        })
-    }
-
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    pub fn ensure_healthy(&self) -> Result<(), CibaUserApprovalError> {
-        self.health
-            .lock()
-            .map_err(|_| CibaUserApprovalError::CallbackUnhealthy)?
-            .as_ref()
-            .map_or(Ok(()), |health| match health {
-                CallbackHealth::ListenerUnhealthy => Err(CibaUserApprovalError::CallbackUnhealthy),
-                CallbackHealth::ApprovalFailure(stage) => {
-                    Err(CibaUserApprovalError::CallbackApprovalFailure(*stage))
-                }
-            })
-    }
-}
-
-impl Drop for CibaUserApprovalBridge {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
-fn validate_callback_path(path: &str) -> Result<String, CibaUserApprovalError> {
-    if !path.starts_with('/')
-        || path == "/"
-        || path.len() > 1024
-        || path.contains('?')
-        || path.contains('#')
-        || path.chars().any(char::is_control)
-    {
-        return Err(CibaUserApprovalError::InvalidCallbackPath);
-    }
-    Ok(path.to_owned())
-}
-
-fn run_callback_loop(
-    listener: TcpListener,
-    stop: Arc<AtomicBool>,
-    health: Arc<Mutex<Option<CallbackHealth>>>,
-    callback_path: String,
-    approval_token: Zeroizing<String>,
-    approver: Arc<CibaUserApprovalClient>,
-) {
-    let accepted = Mutex::new(HashSet::new());
-    while !stop.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                if !peer.ip().is_loopback() {
-                    let _ = write_callback_response(stream, 404);
-                    continue;
-                }
-                if let Err(_error) = handle_callback(
-                    stream,
-                    &callback_path,
-                    approval_token.as_bytes(),
-                    &approver,
-                    &accepted,
-                    &health,
-                ) {
-                    // A malformed or disconnected external request is not a
-                    // process failure and must not let an untrusted peer stop
-                    // approvals for the remaining signed run.
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(CALLBACK_IDLE_WAIT);
-            }
-            Err(_) => {
-                *health.lock().expect("callback health lock") =
-                    Some(CallbackHealth::ListenerUnhealthy);
-                return;
-            }
-        }
-    }
-}
-
-fn handle_callback(
-    mut stream: TcpStream,
-    callback_path: &str,
-    approval_token: &[u8],
-    approver: &CibaUserApprovalClient,
-    accepted: &Mutex<HashSet<String>>,
-    health: &Mutex<Option<CallbackHealth>>,
-) -> Result<(), CibaUserApprovalError> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(CibaUserApprovalError::CallbackRead)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(CibaUserApprovalError::CallbackWrite)?;
-    let request = read_callback_request(&mut stream)?;
-    let Some((auth_req_id, approve)) =
-        parse_callback_request(&request, callback_path, approval_token)
-    else {
-        write_callback_response(stream, 404)?;
-        return Ok(());
-    };
-    {
-        let accepted = accepted
-            .lock()
-            .map_err(|_| CibaUserApprovalError::CallbackUnhealthy)?;
-        if accepted.contains(&auth_req_id) {
-            write_callback_response(stream, 404)?;
-            return Ok(());
-        }
-    }
-    match approver.decide(&auth_req_id, approve) {
-        Ok(()) => {
-            accepted
-                .lock()
-                .map_err(|_| CibaUserApprovalError::CallbackUnhealthy)?
-                .insert(auth_req_id);
-            write_callback_response(stream, 204)?;
-        }
-        Err(error) => {
-            health
-                .lock()
-                .map_err(|_| CibaUserApprovalError::CallbackUnhealthy)?
-                .get_or_insert(CallbackHealth::ApprovalFailure(
-                    error.approval_failure_stage(),
-                ));
-            write_callback_response(stream, 404)?;
-        }
-    }
-    Ok(())
-}
-
-fn read_callback_request(stream: &mut TcpStream) -> Result<String, CibaUserApprovalError> {
-    let mut bytes = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    loop {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(CibaUserApprovalError::CallbackRead)?;
-        if read == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(read) > MAX_CALLBACK_REQUEST_BYTES {
-            return Err(CibaUserApprovalError::CallbackRequestTooLarge);
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    std::str::from_utf8(&bytes)
-        .map(str::to_owned)
-        .map_err(|_| CibaUserApprovalError::MalformedCallbackRequest)
-}
-
-fn parse_callback_request(
-    request: &str,
-    callback_path: &str,
-    approval_token: &[u8],
-) -> Option<(String, bool)> {
-    let (line, _) = request.split_once("\r\n")?;
-    let mut fields = line.split_ascii_whitespace();
-    if fields.next()? != "GET" {
-        return None;
-    }
-    let target = fields.next()?;
-    if !matches!(fields.next(), Some("HTTP/1.1" | "HTTP/1.0")) {
-        return None;
-    }
-    if fields.next().is_some() {
-        return None;
-    }
-    let url = Url::parse(&format!("http://localhost{target}")).ok()?;
-    if url.path() != callback_path {
-        return None;
-    }
-    let mut token = None;
-    let mut auth_req_id = None;
-    let mut action = None;
-    for (name, value) in url.query_pairs() {
-        let value = value.into_owned();
-        match name.as_ref() {
-            "approval_token" => {
-                if token.replace(value).is_some() {
-                    return None;
-                }
-            }
-            "auth_req_id" => {
-                if auth_req_id.replace(value).is_some() {
-                    return None;
-                }
-            }
-            "action" => {
-                if action.replace(value).is_some() {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    let token = token?;
-    if token.len() != approval_token.len()
-        || token.as_bytes().ct_eq(approval_token).unwrap_u8() != 1
-    {
-        return None;
-    }
-    let auth_req_id = auth_req_id?;
-    if auth_req_id.is_empty()
-        || auth_req_id.len() > 2048
-        || auth_req_id.chars().any(char::is_control)
-    {
-        return None;
-    }
-    let approve = match action.as_deref() {
-        Some("allow") | Some("approve") => true,
-        Some("deny") => false,
-        _ => return None,
-    };
-    Some((auth_req_id, approve))
-}
-
-fn write_callback_response(
-    mut stream: TcpStream,
-    status: u16,
-) -> Result<(), CibaUserApprovalError> {
-    let reason = match status {
-        204 => "No Content",
-        404 => "Not Found",
-        _ => "Internal Server Error",
-    };
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {status} {reason}\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .map_err(CibaUserApprovalError::CallbackWrite)?;
-    stream
-        .flush()
-        .map_err(CibaUserApprovalError::CallbackWrite)?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(CibaUserApprovalError::CallbackWrite)
 }
 
 #[derive(Debug, Error)]
@@ -552,34 +275,14 @@ pub enum CibaUserApprovalError {
     DecisionRejected(u16),
     #[error("CIBA user approval transport failed: {0}")]
     Transport(TransportError),
-    #[error("CIBA callback must bind a loopback address")]
-    CallbackMustBindLoopback,
-    #[error("CIBA callback path is invalid")]
-    InvalidCallbackPath,
-    #[error("CIBA callback token is invalid")]
-    InvalidCallbackToken,
-    #[error("CIBA callback listener could not bind: {0}")]
-    CallbackBind(std::io::Error),
-    #[error("CIBA callback listener could not start: {0}")]
-    CallbackSpawn(std::io::Error),
-    #[error("CIBA callback listener is unhealthy")]
-    CallbackUnhealthy,
-    #[error("CIBA approval callback failed during {0}")]
-    CallbackApprovalFailure(CibaApprovalFailureStage),
-    #[error("CIBA callback request is malformed")]
-    MalformedCallbackRequest,
-    #[error("CIBA callback request exceeds the size limit")]
-    CallbackRequestTooLarge,
-    #[error("CIBA callback request could not be read: {0}")]
-    CallbackRead(std::io::Error),
-    #[error("CIBA callback response could not be written: {0}")]
-    CallbackWrite(std::io::Error),
+    #[error("OIDF Suite CIBA log is malformed")]
+    MalformedSuiteLog,
 }
 
-/// A non-sensitive CIBA approval phase retained by the callback bridge.
+/// A non-sensitive CIBA approval phase used by orchestration diagnostics.
 ///
-/// The bridge deliberately discards HTTP statuses, response contents, issuer
-/// URLs, callback capabilities, and credentials before reporting this phase.
+/// Diagnostics deliberately discard HTTP statuses, response contents, issuer
+/// URLs, request identifiers, and credentials before reporting this phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CibaApprovalFailureStage {
     Client,
@@ -610,23 +313,13 @@ impl std::fmt::Display for CibaApprovalFailureStage {
 }
 
 impl CibaUserApprovalError {
-    fn approval_failure_stage(&self) -> CibaApprovalFailureStage {
+    pub fn approval_failure_stage(&self) -> CibaApprovalFailureStage {
         match self {
             Self::InvalidIssuer
             | Self::InvalidCredentials
             | Self::InvalidAuthRequestId
             | Self::RequestEncoding
-            | Self::CallbackMustBindLoopback
-            | Self::InvalidCallbackPath
-            | Self::InvalidCallbackToken
-            | Self::CallbackBind(_)
-            | Self::CallbackSpawn(_)
-            | Self::CallbackUnhealthy
-            | Self::CallbackApprovalFailure(_)
-            | Self::MalformedCallbackRequest
-            | Self::CallbackRequestTooLarge
-            | Self::CallbackRead(_)
-            | Self::CallbackWrite(_) => CibaApprovalFailureStage::Client,
+            | Self::MalformedSuiteLog => CibaApprovalFailureStage::Client,
             Self::LoginRejected(_) | Self::MalformedLoginResponse | Self::MfaRequired => {
                 CibaApprovalFailureStage::Login
             }
@@ -669,16 +362,6 @@ mod tests {
                 .expect("responses")
                 .pop_front()
                 .ok_or(TransportError::Network(TransportFailureStage::SendRequest))
-        }
-    }
-
-    struct ErrorTransport;
-
-    impl Transport for ErrorTransport {
-        fn send(&self, _: HttpRequest, _: usize) -> Result<HttpResponse, TransportError> {
-            Err(TransportError::Network(
-                TransportFailureStage::SendConnectOrTls,
-            ))
         }
     }
 
@@ -741,6 +424,35 @@ mod tests {
     }
 
     #[test]
+    fn standard_user_session_rejects_when_the_suite_requests_denial() {
+        let fake = Arc::new(FakeTransport::new(vec![
+            response(
+                200,
+                &[
+                    ("Set-Cookie", "session=opaque; Path=/; HttpOnly"),
+                    ("Set-Cookie", "csrf=csrf-value; Path=/"),
+                ],
+                json!({"csrf_token":"csrf-value","mfa_required":false}),
+            ),
+            response(
+                200,
+                &[],
+                json!({"auth_req_id":"request-1","request":{"client_id":"client-1"}}),
+            ),
+            response(200, &[], json!({"success":true})),
+        ]));
+        client(Arc::clone(&fake))
+            .decide("request-1", false)
+            .expect("normal user denial succeeds");
+        let requests = fake.requests.lock().expect("requests");
+        assert_eq!(
+            serde_json::from_slice::<Value>(requests[2].body().expect("decision body"))
+                .expect("decision JSON"),
+            json!({"decision":"deny","csrf_token":"csrf-value"})
+        );
+    }
+
+    #[test]
     fn mismatched_or_absent_verification_never_posts_a_decision() {
         let fake = Arc::new(FakeTransport::new(vec![
             response(
@@ -788,87 +500,75 @@ mod tests {
     }
 
     #[test]
-    fn callback_parser_is_single_use_shape_and_token_fenced() {
-        let token = b"0123456789abcdef0123456789abcdef";
-        let request = concat!(
-            "GET /ciba/approve?approval_token=0123456789abcdef0123456789abcdef",
-            "&auth_req_id=request-1&action=allow HTTP/1.1\r\nHost: callback.example\r\n\r\n"
-        );
+    fn suite_log_exposes_only_explicit_automated_approval_requests_in_order() {
+        let log = json!([
+            {
+                "src": "UnrelatedCondition",
+                "auth_req_id": "ignored"
+            },
+            {
+                "src": "CallBackchannelAuthenticationEndpoint",
+                "backchannel_authentication_endpoint_response":
+                    "{\"auth_req_id\":\"request-1\",\"expires_in\":120}"
+            },
+            {
+                "src": "CallBackchannelAuthenticationEndpoint",
+                "auth_req_id": "request-1",
+                "result": "SUCCESS"
+            },
+            {
+                "src": "CallAutomatedCibaApprovalEndpoint",
+                "msg": "automation requested"
+            },
+            {
+                "src": "CallBackchannelAuthenticationEndpoint",
+                "auth_req_id": "request-2",
+                "result": "SUCCESS"
+            },
+            {
+                "src": "CallAutomatedCibaApprovalEndpoint",
+                "msg": "automation requested"
+            }
+        ]);
         assert_eq!(
-            parse_callback_request(request, "/ciba/approve", token),
-            Some(("request-1".to_owned(), true))
+            ciba_approval_requests(&log).expect("valid Suite log"),
+            ["request-1", "request-2"]
         );
-        assert!(parse_callback_request(
-            "GET /ciba/approve?approval_token=wrong&auth_req_id=request-1&action=allow HTTP/1.1\r\n\r\n",
-            "/ciba/approve",
-            token,
-        )
-        .is_none());
-        assert!(parse_callback_request(
-            "GET /ciba/approve?approval_token=0123456789abcdef0123456789abcdef&auth_req_id=request-1&action=allow&extra=1 HTTP/1.1\r\n\r\n",
-            "/ciba/approve",
-            token,
-        )
-        .is_none());
     }
 
     #[test]
-    fn callback_keeps_suite_404_but_records_only_static_failure_stage() {
-        let approval_token = "0123456789abcdef0123456789abcdef";
-        let auth_req_id = "private-auth-request";
-        let bridge = CibaUserApprovalBridge::start(
-            "127.0.0.1:0".parse().expect("loopback address"),
-            "/ciba/approve",
-            Zeroizing::new(approval_token.to_owned()),
-            Arc::new(
-                CibaUserApprovalClient::new(
-                    Url::parse("https://issuer.example/").expect("issuer"),
-                    Zeroizing::new("applicant@example.invalid".to_owned()),
-                    Zeroizing::new("correct horse battery staple".to_owned()),
-                    Arc::new(ErrorTransport),
-                )
-                .expect("client"),
-            ),
-        )
-        .expect("callback bridge");
-        let callback_url = format!(
-            "http://{}/ciba/approve?approval_token={approval_token}&auth_req_id={auth_req_id}&action=allow",
-            bridge.local_addr()
+    fn backchannel_response_without_automation_marker_is_not_approved() {
+        let log = json!([{
+            "src": "CallBackchannelAuthenticationEndpoint",
+            "auth_req_id": "must-not-be-approved",
+            "result": "SUCCESS"
+        }]);
+        assert!(
+            ciba_approval_requests(&log)
+                .expect("valid Suite log")
+                .is_empty()
         );
-        let response = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .expect("callback client")
-            .get(callback_url)
-            .send()
-            .expect("callback response");
-        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
 
-        let error = (0..50)
-            .find_map(|_| match bridge.ensure_healthy() {
-                Ok(()) => {
-                    thread::sleep(Duration::from_millis(10));
-                    None
-                }
-                Err(error) => Some(error),
-            })
-            .expect("approval transport failure must be retained");
+    #[test]
+    fn malformed_matching_suite_response_fails_closed() {
+        let log = json!([{
+            "src": "CallBackchannelAuthenticationEndpoint",
+            "backchannel_authentication_endpoint_response": "not-json"
+        }]);
         assert!(matches!(
-            error,
-            CibaUserApprovalError::CallbackApprovalFailure(CibaApprovalFailureStage::Transport(
-                TransportError::Network(TransportFailureStage::SendConnectOrTls)
-            ))
+            ciba_approval_requests(&log),
+            Err(CibaUserApprovalError::MalformedSuiteLog)
         ));
-        let rendered = error.to_string();
-        assert_eq!(
-            rendered,
-            "CIBA approval callback failed during transport-send-connect-or-tls"
-        );
-        for secret in [approval_token, auth_req_id, "correct horse battery staple"] {
-            assert!(!rendered.contains(secret));
-        }
+    }
+
+    #[test]
+    fn approval_marker_without_a_backchannel_request_fails_closed() {
+        let log = json!([{"src": "CallAutomatedCibaApprovalEndpoint"}]);
+        assert!(matches!(
+            ciba_approval_requests(&log),
+            Err(CibaUserApprovalError::MalformedSuiteLog)
+        ));
     }
 
     #[test]

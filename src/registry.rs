@@ -32,7 +32,7 @@ use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::filesystem;
@@ -235,6 +235,12 @@ pub struct InstanceRecord {
     pub host_id: Uuid,
     /// Canonical issuer origin of the instance (https/http URL reference).
     pub issuer: String,
+    /// Operator-owned DNS suffix used for temporary OIDF tenants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidf_tenant_domain: Option<String>,
+    /// Operator-selected OIDF Suite HTTPS origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidf_suite_origin: Option<String>,
     /// Optional controller identity reference (e.g. key id at the server).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_id: Option<String>,
@@ -283,6 +289,8 @@ impl InstanceRecord {
             alias: alias.into(),
             host_id,
             issuer: issuer.into(),
+            oidf_tenant_domain: None,
+            oidf_suite_origin: None,
             controller_id: None,
             controller_key_ref: None,
             backup_before_update: BackupBeforeUpdatePolicy::Off,
@@ -299,6 +307,12 @@ impl InstanceRecord {
         validate_key(&self.deployment_id, "deployment id")?;
         validate_key(&self.alias, "instance alias")?;
         validate_issuer(&self.issuer)?;
+        if let Some(domain) = self.oidf_tenant_domain.as_deref() {
+            validate_oidf_tenant_domain(domain)?;
+        }
+        if let Some(origin) = self.oidf_suite_origin.as_deref() {
+            validate_oidf_suite_origin(origin)?;
+        }
         self.backup_before_update.validate()?;
         if let Some(id) = self.controller_id.as_deref() {
             validate_key(id, "controller id")?;
@@ -319,6 +333,32 @@ impl InstanceRecord {
         self.validate()?;
         Ok(self)
     }
+}
+
+fn validate_oidf_tenant_domain(value: &str) -> anyhow::Result<()> {
+    let domain = match Host::parse(value).context("OIDF tenant domain is not a valid DNS name")? {
+        Host::Domain(domain) => domain,
+        Host::Ipv4(_) | Host::Ipv6(_) => bail!("OIDF tenant domain must be a DNS name"),
+    };
+    if domain != value || !domain.contains('.') {
+        bail!("OIDF tenant domain must be a lowercase DNS suffix such as oidf.example.com");
+    }
+    Ok(())
+}
+
+fn validate_oidf_suite_origin(value: &str) -> anyhow::Result<()> {
+    let parsed = Url::parse(value).context("OIDF Suite origin is not a valid URL")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        bail!("OIDF Suite must be a bare HTTPS origin");
+    }
+    Ok(())
 }
 
 /// Schema discriminator for [`DiscoveryEvidence`] artifacts.
@@ -668,6 +708,26 @@ impl RegistryStore {
         let path = self.instance_path(&renamed.deployment_id);
         write_record(&path, "instance record", &renamed)?;
         Ok(renamed)
+    }
+
+    pub fn set_oidf_configuration(
+        &self,
+        deployment_id: &str,
+        tenant_domain: &str,
+        suite_origin: &str,
+    ) -> anyhow::Result<InstanceRecord> {
+        validate_oidf_tenant_domain(tenant_domain)?;
+        validate_oidf_suite_origin(suite_origin)?;
+        let _lock = self.lock()?;
+        let mut record = self
+            .find_instance_by_deployment_locked(deployment_id)?
+            .with_context(|| format!("unknown deployment id '{deployment_id}'"))?;
+        record.oidf_tenant_domain = Some(tenant_domain.to_owned());
+        record.oidf_suite_origin = Some(suite_origin.trim_end_matches('/').to_owned());
+        record.validate()?;
+        let path = self.instance_path(&record.deployment_id);
+        write_record(&path, "instance record", &record)?;
+        Ok(record)
     }
 
     pub fn instance_by_alias(&self, alias: &str) -> anyhow::Result<Option<InstanceRecord>> {
@@ -1400,6 +1460,55 @@ mod tests {
             )
             .expect_err("duplicate alias");
         assert!(error.to_string().contains("duplicate instance alias"));
+        Ok(())
+    }
+
+    #[test]
+    fn oidf_tenant_domain_is_explicit_instance_configuration() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        register_fixture(&store, &host, "deploy-alpha", "production")?;
+
+        let configured = store.set_oidf_configuration(
+            "deploy-alpha",
+            "oidf.example.com",
+            "https://suite.example",
+        )?;
+        assert_eq!(
+            configured.oidf_tenant_domain.as_deref(),
+            Some("oidf.example.com")
+        );
+        assert_eq!(
+            configured.oidf_suite_origin.as_deref(),
+            Some("https://suite.example")
+        );
+        assert_eq!(
+            store
+                .instance_by_deployment("deploy-alpha")?
+                .expect("instance")
+                .oidf_tenant_domain
+                .as_deref(),
+            Some("oidf.example.com")
+        );
+        assert!(
+            store
+                .set_oidf_configuration(
+                    "deploy-alpha",
+                    "oidf.example.com/path",
+                    "https://suite.example",
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .set_oidf_configuration("deploy-alpha", "127.0.0.1", "https://suite.example",)
+                .is_err()
+        );
+        assert!(
+            store
+                .set_oidf_configuration("deploy-alpha", "oidf.example.com", "http://suite.example",)
+                .is_err()
+        );
         Ok(())
     }
 

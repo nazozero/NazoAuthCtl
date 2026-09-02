@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     CachedOidfArtifact, OIDF_ARTIFACT_CACHE_SCHEMA_VERSION, OIDF_DRIVER_ENGINE_PROTOCOL,
     OIDF_DRIVER_SCHEMA_VERSION, OIDF_MATRIX_SCHEMA_VERSION, OidfArtifactMatrix, OidfDriverHandler,
-    OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity, VerifiedOidfArtifact,
+    OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity, Origin, VerifiedOidfArtifact,
 };
 
 const BUNDLED_DRIVER: &[u8] = include_bytes!("../resources/oidf/driver.json");
@@ -188,6 +188,7 @@ pub fn bundled_oidf_matrix() -> Result<OidfArtifactMatrix, OidfPlanError> {
 /// content identity remains in evidence, but is no longer operator input.
 pub fn open_bundled_oidf_driver_plan(
     selection: OidfPlanSelection,
+    suite_origin: &Origin,
     now: i64,
 ) -> Result<OidfDriverInspectionPlan, OidfPlanError> {
     let matrix = bundled_oidf_matrix()?;
@@ -230,7 +231,7 @@ pub fn open_bundled_oidf_driver_plan(
         driver_manifest_size: u64::try_from(BUNDLED_DRIVER.len() + BUNDLED_MATRIX.len())
             .map_err(|_| OidfPlanError::ResourceBound)?,
         suite: OidfSuiteIdentity {
-            origin: "https://www.certification.openid.net".to_owned(),
+            origin: suite_origin.as_str().to_owned(),
             release: "release-v5.2.2".to_owned(),
             revision: "321bc5bc53601b9690b54c023c0cbfac0f0230f2".to_owned(),
             image_digest: "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415"
@@ -499,14 +500,12 @@ mod tests {
     #[test]
     fn bundled_matrix_compiles_without_external_artifact_inputs() {
         let selection = resolve_bundled_oidf_selection(Some("ciba")).unwrap();
-        let plan = open_bundled_oidf_driver_plan(selection, 1_800_000_000).unwrap();
+        let suite = Origin::parse("https://suite.example").unwrap();
+        let plan = open_bundled_oidf_driver_plan(selection, &suite, 1_800_000_000).unwrap();
         assert_eq!(plan.selected_group_count, 1);
         assert!(!plan.plans.is_empty());
         assert!(plan.plans.iter().all(|entry| entry.group_id == "fapi-ciba"));
-        assert_eq!(
-            plan.artifact.suite.origin,
-            "https://www.certification.openid.net"
-        );
+        assert_eq!(plan.artifact.suite.origin, "https://suite.example");
     }
 
     #[test]

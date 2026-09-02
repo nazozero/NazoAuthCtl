@@ -9,31 +9,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
     ArtifactMaterializationBinding, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
-    BrowserReviewScreenshotCapture, BrowserTargetOrigin, CibaUserApprovalBridge,
-    CibaUserApprovalClient, ClientConfig, ConformanceAutomation, ConformanceBinding,
-    ConformanceRecoveryStore, ConformanceRunConfig, ConformanceRunner, CredentialStore,
-    DescriptorMaterializer, EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
-    EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceRuntimeIdentity,
-    EvidenceSourceIdentity, HttpRequest, HttpTransport, ManagedWebDriver, MatrixSelection,
-    OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
-    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
-    OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
-    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
-    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
-    TenantResourceRecoveryPhase, Transport, TtyRenderer, bundled_oidf_matrix,
-    open_bundled_oidf_driver_plan, recover_suite_resources, write_private_control_evidence_bundle,
-    write_review_screenshot_manifest,
+    BrowserReviewScreenshotCapture, BrowserTargetOrigin, CibaUserApprovalClient, ClientConfig,
+    ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore, ConformanceRunConfig,
+    ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
+    EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
+    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
+    HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane,
+    OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
+    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
+    RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
+    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
+    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
+    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
+    bundled_oidf_matrix, open_bundled_oidf_driver_plan, recover_suite_resources,
+    write_private_control_evidence_bundle, write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -42,12 +39,11 @@ use zeroize::Zeroizing;
 use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
-const OIDF_TENANT_DOMAIN: &str = "oidf.nazoauth.com";
-
 pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
-    let suite_origin = Origin::official();
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
+    let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
+        .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
     let deployment = session.deployment_evidence();
     let recovery_directory = session.recovery_directory()?;
     let recovery_store =
@@ -59,6 +55,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
             groups: invocation.groups.clone(),
             plans: invocation.plans.clone(),
         },
+        &suite_origin,
         now,
     )
     .context("bundled OIDF Matrix cannot be opened")?;
@@ -119,18 +116,16 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
     let evidence_directory = create_evidence_directory(&recovery_directory, &request_jti)?;
-    let ephemeral_tenant = EphemeralTenant::new(&invocation.tenant_id)?;
+    let ephemeral_tenant =
+        EphemeralTenant::new(&invocation.tenant_id, session.oidf_tenant_domain())?;
     let materialization_now = current_unix_time()?;
     if materialization_now > driver_plan.latest_execution_start_at {
         bail!("signed artifact no longer has enough validity remaining for the selected run");
     }
-    let ciba_callback = prepare_ciba_user_approval_callback(
-        &ephemeral_tenant.issuer,
-        driver_plan
-            .plans
-            .iter()
-            .any(|entry| entry.driver_handler.lane == OidfDriverLane::Ciba),
-    )?;
+    let requires_ciba = driver_plan
+        .plans
+        .iter()
+        .any(|entry| entry.driver_handler.lane == OidfDriverLane::Ciba);
     let dynamic_registration_initial_access_token = session
         .dynamic_registration_initial_access_token(&invocation.tenant_id)
         .context("failed to derive the run tenant RFC 7591 initial access token")?;
@@ -146,9 +141,6 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
             dynamic_registration_initial_access_token: Some(
                 dynamic_registration_initial_access_token.as_str(),
             ),
-            ciba_user_approval_callback_url: ciba_callback
-                .as_ref()
-                .map(|value| value.public_url.as_str()),
         },
     )
     .context("failed to prepare ordinary run material from the signed Matrix")?;
@@ -169,6 +161,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     let recovery = match recovery_store.begin_ordinary_run(TenantResourceRecoveryBinding {
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
+        tenant_domain: session.oidf_tenant_domain().to_owned(),
         realm_id: ephemeral_tenant.realm_id.clone(),
         organization_id: ephemeral_tenant.organization_id.clone(),
         run_id: request_jti.clone(),
@@ -195,7 +188,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
             provision_ephemeral_tenant(&session, &ephemeral_tenant, &recovery)
                 .context("failed to provision the run-scoped OIDF tenant")?;
         probe_ephemeral_tenant(&ephemeral_tenant.issuer).context(
-            "the temporary tenant is not publicly reachable; verify wildcard TLS and host routing for *.oidf.nazoauth.com",
+            "the temporary tenant is not publicly reachable; verify wildcard DNS, TLS, and host routing for the configured OIDF tenant domain",
         )?;
         let baseline = session
             .execute_control_operation(
@@ -298,8 +291,8 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     // The OpenID4VP client and runner are being generalized in the adjacent
     // slice. Keep this typed boundary ordinary-only: a lease-shaped adapter is
     // deliberately impossible here.
-    let ciba_bridge =
-        start_ciba_user_approval_bridge(ciba_callback, &ephemeral_tenant.issuer, &run_secrets)?;
+    let ciba_approver =
+        build_ciba_user_approver(requires_ciba, &ephemeral_tenant.issuer, &run_secrets)?;
     let run_result = run_signed_suite(
         ordinary,
         suite_client.clone(),
@@ -313,7 +306,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         plan_resource_budgets,
         selected_resource_budget,
         recovery.clone(),
-        ciba_bridge,
+        ciba_approver,
         &evidence_directory,
     );
 
@@ -409,8 +402,13 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
             recovery.commit_suite_plan_retention()?;
             let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
             eprintln!(
-                "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
-                manifest_path.display()
+                "Suite plans retained for review: suite={} plans={} manifest={}",
+                suite_origin,
+                report
+                    .as_ref()
+                    .map(|report| report.retained_suite_plan_ids.join(","))
+                    .unwrap_or_default(),
+                manifest_path.display(),
             );
             Ok(())
         })() {
@@ -446,8 +444,13 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
                 retention_committed = true;
                 errors.retain(|error| !error.starts_with("suite-retention="));
                 eprintln!(
-                    "Suite plans retained for certification review: review/publish them in the official Suite UI, then use a controlled deletion procedure; manifest={}",
-                    manifest_path.display()
+                    "Suite plans retained for review: suite={} plans={} manifest={}",
+                    suite_origin,
+                    report
+                        .as_ref()
+                        .map(|report| report.retained_suite_plan_ids.join(","))
+                        .unwrap_or_default(),
+                    manifest_path.display(),
                 );
             }
             Err(error) => errors.push(format!("suite-retention-retry={error:#}")),
@@ -570,7 +573,18 @@ fn conformance_run_succeeds(
 
 #[cfg(test)]
 mod acceptance_tests {
-    use super::{conformance_run_succeeds, prepare_ciba_user_approval_callback};
+    use super::{EphemeralTenant, conformance_run_succeeds};
+
+    #[test]
+    fn temporary_tenant_uses_the_instance_owned_domain() {
+        let tenant =
+            EphemeralTenant::new("00000000-0000-0000-0000-000000000001", "oidf.example.com")
+                .expect("temporary tenant");
+        assert_eq!(
+            tenant.issuer,
+            "https://00000000-0000-0000-0000-000000000001.oidf.example.com"
+        );
+    }
 
     #[test]
     fn review_only_run_is_successful() {
@@ -581,34 +595,6 @@ mod acceptance_tests {
     fn failed_or_incomplete_module_fails_the_run() {
         assert!(!conformance_run_succeeds(true, true, 1, 0));
         assert!(!conformance_run_succeeds(true, true, 0, 1));
-    }
-
-    #[test]
-    fn ciba_callback_is_derived_from_the_temporary_tenant() {
-        let callback = prepare_ciba_user_approval_callback(
-            "https://00000000-0000-0000-0000-000000000001.oidf.nazoauth.com",
-            true,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            callback
-                .public_url
-                .starts_with("https://00000000-0000-0000-0000-000000000001.oidf.nazoauth.com/__nazoauthctl/ciba-approval?approval_token=")
-        );
-        assert_eq!(callback.callback_path, "/__nazoauthctl/ciba-approval");
-        assert_eq!(
-            callback.listen_addr,
-            std::net::SocketAddr::from(([127, 0, 0, 1], 19046))
-        );
-        assert!(
-            prepare_ciba_user_approval_callback(
-                "https://00000000-0000-0000-0000-000000000001.oidf.nazoauth.com",
-                false,
-            )
-            .unwrap()
-            .is_none()
-        );
     }
 }
 
@@ -658,16 +644,21 @@ struct EphemeralTenant {
 }
 
 impl EphemeralTenant {
-    fn new(tenant_id: &str) -> anyhow::Result<Self> {
+    fn new(tenant_id: &str, tenant_domain: &str) -> anyhow::Result<Self> {
         let tenant_id = uuid::Uuid::parse_str(tenant_id)
             .context("generated OIDF tenant ID is invalid")?
             .to_string();
         let realm_id = uuid::Uuid::now_v7().to_string();
         let organization_id = uuid::Uuid::now_v7().to_string();
-        Self::from_ids(&tenant_id, &realm_id, &organization_id)
+        Self::from_ids(&tenant_id, &realm_id, &organization_id, tenant_domain)
     }
 
-    fn from_ids(tenant_id: &str, realm_id: &str, organization_id: &str) -> anyhow::Result<Self> {
+    fn from_ids(
+        tenant_id: &str,
+        realm_id: &str,
+        organization_id: &str,
+        tenant_domain: &str,
+    ) -> anyhow::Result<Self> {
         let tenant_id = uuid::Uuid::parse_str(tenant_id)
             .context("OIDF tenant ID is invalid")?
             .to_string();
@@ -680,7 +671,7 @@ impl EphemeralTenant {
         if tenant_id == realm_id || tenant_id == organization_id || realm_id == organization_id {
             bail!("OIDF tenant boundaries must use distinct IDs");
         }
-        let external_host = format!("{tenant_id}.{OIDF_TENANT_DOMAIN}");
+        let external_host = format!("{tenant_id}.{tenant_domain}");
         Ok(Self {
             slug: format!("oidf-{}", tenant_id.replace('-', "")),
             issuer: format!("https://{external_host}"),
@@ -914,14 +905,9 @@ fn run_signed_suite(
     plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
-    ciba_bridge: Option<CibaUserApprovalBridge>,
+    ciba_approver: Option<Arc<CibaUserApprovalClient>>,
     evidence_directory: &Path,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
-    if let Some(bridge) = &ciba_bridge {
-        bridge
-            .ensure_healthy()
-            .context("CIBA user approval callback is unhealthy")?;
-    }
     let binding = ConformanceBinding::openid4vc_trust_policy(
         materialized.trust_policy_resource_id(),
         materialized.trust_policy_digest(),
@@ -989,6 +975,7 @@ fn run_signed_suite(
             review_screenshot_capture: review_screenshot_capture.clone(),
             verifier: Some(verifier),
             issuer: Some(issuer),
+            ciba_approver: ciba_approver.clone(),
         });
     }
     let control = RunControl::default();
@@ -1020,59 +1007,24 @@ fn run_signed_suite(
         let mut renderer = StableRenderer::new(io::stderr().lock());
         runner.run(&mut renderer)
     };
-    if let Some(bridge) = &ciba_bridge {
-        bridge
-            .ensure_healthy()
-            .context("CIBA user approval callback failed")?;
-    }
     Ok(summary.report)
 }
 
-struct CibaUserApprovalCallback {
-    public_url: Zeroizing<String>,
-    callback_path: String,
-    listen_addr: SocketAddr,
-    approval_token: Zeroizing<String>,
-}
-
-fn prepare_ciba_user_approval_callback(
-    target_issuer: &str,
+fn build_ciba_user_approver(
     requires_ciba: bool,
-) -> anyhow::Result<Option<CibaUserApprovalCallback>> {
+    target_issuer: &str,
+    secrets: &RunSecrets,
+) -> anyhow::Result<Option<Arc<CibaUserApprovalClient>>> {
     if !requires_ciba {
         return Ok(None);
     }
-    let mut public_url = Url::parse(target_issuer)
-        .context("temporary tenant issuer is not a valid CIBA callback origin")?;
-    public_url.set_path("/__nazoauthctl/ciba-approval");
-    let callback_path = public_url.path().to_owned();
-    let approval_token = Zeroizing::new(random_urlsafe_token(32));
-    Ok(Some(CibaUserApprovalCallback {
-        public_url: Zeroizing::new(format!(
-            "{public_url}?approval_token={}&auth_req_id={{auth_req_id}}&action={{action}}",
-            approval_token.as_str()
-        )),
-        callback_path,
-        listen_addr: SocketAddr::from(([127, 0, 0, 1], 19046)),
-        approval_token,
-    }))
-}
-
-fn start_ciba_user_approval_bridge(
-    callback: Option<CibaUserApprovalCallback>,
-    target_issuer: &str,
-    secrets: &RunSecrets,
-) -> anyhow::Result<Option<CibaUserApprovalBridge>> {
-    let Some(callback) = callback else {
-        return Ok(None);
-    };
     let issuer = Url::parse(target_issuer)
         .context("deployment target issuer is not a valid CIBA approval URL")?;
     let transport = Arc::new(
         HttpTransport::new(Duration::from_secs(30))
             .context("failed to initialize normal CIBA user-approval transport")?,
     );
-    let approver = Arc::new(
+    Ok(Some(Arc::new(
         CibaUserApprovalClient::new(
             issuer,
             secrets.applicant_email.clone(),
@@ -1080,23 +1032,7 @@ fn start_ciba_user_approval_bridge(
             transport,
         )
         .context("failed to initialize normal CIBA user approval")?,
-    );
-    CibaUserApprovalBridge::start(
-        callback.listen_addr,
-        &callback.callback_path,
-        callback.approval_token,
-        approver,
-    )
-    .map(Some)
-    .context("failed to start CIBA user-approval callback bridge")
-}
-
-fn random_urlsafe_token(bytes: usize) -> String {
-    let mut material = vec![0u8; bytes];
-    for value in &mut material {
-        *value = rand::random();
-    }
-    URL_SAFE_NO_PAD.encode(material)
+    )))
 }
 
 struct DurableSuiteObserver {
@@ -1109,14 +1045,14 @@ impl SuiteResourceObserver for DurableSuiteObserver {
         self.retain_suite_plans_for_certification
     }
 
+    fn retain_failed_suite_plans_for_diagnosis(&self) -> bool {
+        true
+    }
+
     fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
             .and_then(|mut recovery| {
-                recovery.begin_suite_create_with_retention(
-                    origin.as_str(),
-                    intent_id,
-                    self.retain_suite_plans_for_certification,
-                )
+                recovery.begin_suite_create_with_retention(origin.as_str(), intent_id, true)
             })
             .map_err(|error| format!("failed to persist Suite plan create intent: {error:#}"))
     }
@@ -1132,11 +1068,7 @@ impl SuiteResourceObserver for DurableSuiteObserver {
     fn module_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {
         lock_recovery(&self.recovery)
             .and_then(|mut recovery| {
-                recovery.begin_suite_create_with_retention(
-                    origin.as_str(),
-                    intent_id,
-                    self.retain_suite_plans_for_certification,
-                )
+                recovery.begin_suite_create_with_retention(origin.as_str(), intent_id, true)
             })
             .map_err(|error| format!("failed to persist Suite module create intent: {error:#}"))
     }
@@ -1145,6 +1077,12 @@ impl SuiteResourceObserver for DurableSuiteObserver {
         lock_recovery(&self.recovery)
             .and_then(|mut recovery| recovery.record_suite_module(intent_id, module_id))
             .map_err(|error| format!("failed to persist Suite module allocation: {error:#}"))
+    }
+
+    fn plan_deleted(&self, plan_id: &str) -> Result<(), String> {
+        lock_recovery(&self.recovery)
+            .and_then(|mut recovery| recovery.release_deleted_suite_plan(plan_id))
+            .map_err(|error| format!("failed to release deleted Suite plan: {error:#}"))
     }
 }
 
@@ -1228,9 +1166,21 @@ fn suite_retention_manifest(
     review_screenshot_manifest: Option<&nazoauthctl_conformance::ReviewScreenshotManifestReceipt>,
 ) -> anyhow::Result<SuiteRetentionManifest> {
     let binding = recovery.ordinary_binding();
+    let retained_plan_ids = report
+        .retained_suite_plan_ids
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if retained_plan_ids.is_empty() {
+        bail!("retained report has no Suite plan IDs");
+    }
     let plans = report
         .plans
         .iter()
+        .filter(|plan| {
+            plan.suite_plan_id
+                .as_ref()
+                .is_some_and(|plan_id| retained_plan_ids.contains(plan_id))
+        })
         .map(|plan| {
             let suite_plan_id = plan
                 .suite_plan_id
@@ -1245,7 +1195,7 @@ fn suite_retention_manifest(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(SuiteRetentionManifest {
-        schema: if report.review_pending { 2 } else { 1 },
+        schema: 2,
         suite_origin: report.suite_origin.clone(),
         artifact_digest: artifact_digest.to_owned(),
         matrix_sha256: matrix_sha256.to_owned(),
@@ -1262,6 +1212,9 @@ fn suite_retention_manifest(
             .modules
             .iter()
             .filter_map(|module| {
+                if !retained_plan_ids.contains(&module.suite_plan_id) {
+                    return None;
+                }
                 let pending = module.deferred_review_pending.as_ref()?;
                 Some(SuiteRetentionDeferredReview {
                     matrix_plan_id: module.matrix_plan_id.clone(),
@@ -1574,6 +1527,7 @@ fn recover_ephemeral_tenant(
         &recovery.ordinary_binding().tenant_id,
         &recovery.ordinary_binding().realm_id,
         &recovery.ordinary_binding().organization_id,
+        &recovery.ordinary_binding().tenant_domain,
     )?;
     if !recovery.tenant_created() {
         let expected_revision = recovery.ordinary_binding().tenant_create_expected_revision;

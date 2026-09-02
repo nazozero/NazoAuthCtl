@@ -683,6 +683,8 @@ fn instance_show(context: &FleetContext, selector: &InstanceSelector) -> anyhow:
             "transport": host.transport,
         },
         "issuer": record.issuer,
+        "oidf_tenant_domain": record.oidf_tenant_domain,
+        "oidf_suite_origin": record.oidf_suite_origin,
         "controller_id": record.controller_id,
         "controller_key_ref": record.controller_key_ref,
         "observation": record.last_observation.map(|observation| serde_json::json!({

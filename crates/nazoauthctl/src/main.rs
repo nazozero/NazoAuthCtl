@@ -32,6 +32,11 @@ fn main() {
         Invocation::ArtifactOpen(invocation) => execute_artifact_open(invocation),
         Invocation::ArtifactResolve(invocation) => execute_artifact_resolve(invocation),
         Invocation::ArtifactVerify(invocation) => execute_artifact_verify(invocation),
+        Invocation::Configure {
+            instance,
+            tenant_domain,
+            suite_origin,
+        } => execute_configure(instance, tenant_domain, suite_origin),
         Invocation::Run(invocation) => ordinary_run::execute(*invocation).map(|code| {
             std::process::exit(code);
         }),
@@ -41,12 +46,30 @@ fn main() {
     }
 }
 
+fn execute_configure(
+    instance: Option<String>,
+    tenant_domain: String,
+    suite_origin: String,
+) -> anyhow::Result<()> {
+    let (alias, tenant_domain, suite_origin) =
+        nazoauthctl_core::configure_oidf(instance.as_deref(), &tenant_domain, &suite_origin)?;
+    println!(
+        "OIDF configuration for instance '{alias}': tenant domain {tenant_domain}; Suite {suite_origin}"
+    );
+    Ok(())
+}
+
 enum Invocation {
     Core,
     ArtifactPlan(ArtifactPlanInvocation),
     ArtifactOpen(ArtifactOpenInvocation),
     ArtifactResolve(ArtifactResolveInvocation),
     ArtifactVerify(ArtifactVerifyInvocation),
+    Configure {
+        instance: Option<String>,
+        tenant_domain: String,
+        suite_origin: String,
+    },
     Run(Box<RunInvocation>),
 }
 
@@ -78,12 +101,42 @@ fn parse_invocation(args: &[OsString]) -> anyhow::Result<Invocation> {
             "verify" => parse_artifact_verify_options(options).map(Invocation::ArtifactVerify),
             other => bail!("unknown oidf artifact command: {other}"),
         },
+        [command, options @ ..] if command == "configure" => {
+            parse_configure_options(options, globals.instance)
+        }
         [command, options @ ..] if command == "run" => parse_run_options(options, globals.instance)
             .map(Box::new)
             .map(Invocation::Run),
         [command, ..] => bail!("unknown oidf command: {command}"),
         [] => bail!("an oidf command is required"),
     }
+}
+
+fn parse_configure_options(
+    values: &[String],
+    instance: Option<String>,
+) -> anyhow::Result<Invocation> {
+    let mut tenant_domain = None;
+    let mut suite_origin = None;
+    let mut index = 0usize;
+    while index < values.len() {
+        let option = values[index].as_str();
+        let value = values
+            .get(index + 1)
+            .with_context(|| format!("{option} requires a value"))?
+            .clone();
+        match option {
+            "--tenant-domain" => set_once(&mut tenant_domain, value, option)?,
+            "--suite" => set_once(&mut suite_origin, value, option)?,
+            _ => bail!("unknown oidf configure option: {option}"),
+        }
+        index += 2;
+    }
+    Ok(Invocation::Configure {
+        instance,
+        tenant_domain: tenant_domain.context("oidf configure requires --tenant-domain DOMAIN")?,
+        suite_origin: suite_origin.context("oidf configure requires --suite HTTPS_ORIGIN")?,
+    })
 }
 
 struct ArtifactPlanInvocation {
@@ -611,7 +664,7 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nWithout a selector, the complete bundled OIDF Matrix runs against the official OpenID Foundation Conformance Suite. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant at <uuid>.oidf.nazoauth.com, generates fresh test material, starts its browser workers, and writes evidence below the instance recovery directory.\n\nOptions:\n  --token-stdin                  Read the official Suite API token from stdin instead of the secure credential store\n  --capture-review-screenshots   Capture review evidence into the automatic evidence directory\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the official Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+        "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the deployment operator's wildcard DNS suffix and selected Suite origin once. Neither has a built-in domain or fallback. Without a run selector, the complete bundled OIDF Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant at <uuid>.<configured-domain>, generates fresh test material, starts its browser workers, and writes evidence below the instance recovery directory.\n\nOptions:\n  --token-stdin                  Read the Suite API token from stdin instead of the secure credential store\n  --capture-review-screenshots   Capture review evidence into the automatic evidence directory\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the selected Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
     );
 }
 
@@ -626,6 +679,19 @@ mod tests {
     fn routed_run(args: &[OsString]) -> anyhow::Result<Option<RunInvocation>> {
         match parse_invocation(args)? {
             Invocation::Run(invocation) => Ok(Some(*invocation)),
+            _ => Ok(None),
+        }
+    }
+
+    fn routed_configure(
+        args: &[OsString],
+    ) -> anyhow::Result<Option<(Option<String>, String, String)>> {
+        match parse_invocation(args)? {
+            Invocation::Configure {
+                instance,
+                tenant_domain,
+                suite_origin,
+            } => Ok(Some((instance, tenant_domain, suite_origin))),
             _ => Ok(None),
         }
     }
@@ -937,6 +1003,27 @@ mod tests {
     }
 
     #[test]
+    fn configure_binds_one_domain_to_the_selected_instance() {
+        let parsed = routed_configure(&args(&[
+            "nazoauthctl",
+            "--instance",
+            "production",
+            "oidf",
+            "configure",
+            "--tenant-domain",
+            "oidf.example.com",
+            "--suite",
+            "https://suite.example",
+        ]))
+        .expect("parse")
+        .expect("configure");
+        assert_eq!(parsed.0.as_deref(), Some("production"));
+        assert_eq!(parsed.1, "oidf.example.com");
+        assert_eq!(parsed.2, "https://suite.example");
+        assert!(routed_configure(&args(&["nazoauthctl", "oidf", "configure"])).is_err());
+    }
+
+    #[test]
     fn run_accepts_alias_and_exact_plan_selectors() {
         let ciba = routed_run(&args(&["nazoauthctl", "oidf", "run", "ciba"]))
             .expect("parse")
@@ -985,8 +1072,6 @@ mod tests {
             "--evidence-dir",
             "--proxy-trust-bundle",
             "--proxy-reload-executable",
-            "--ciba-user-approval-callback-url",
-            "--ciba-user-approval-listen",
             "--group",
             "--plan",
         ] {

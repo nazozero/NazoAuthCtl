@@ -38,6 +38,8 @@ pub struct ConformanceSession {
     pub target_issuer: String,
     pub evidence: ConformanceDeploymentEvidence,
     pub recovery_dir: PathBuf,
+    oidf_tenant_domain: String,
+    oidf_suite_origin: String,
     secrets_dir: PathBuf,
     registry: RegistryStore,
     target: Box<dyn ExecutionTarget>,
@@ -111,6 +113,18 @@ impl ConformanceSession {
     pub fn open(selector: Option<&str>) -> anyhow::Result<Self> {
         let registry = RegistryStore::open_default()?;
         let record = crate::fleet::resolve_instance(&registry, selector, "conformance")?;
+        let oidf_tenant_domain = record.oidf_tenant_domain.clone().with_context(|| {
+            format!(
+                "OIDF tenant domain is not configured for instance '{}'; run `nazoauthctl --instance {} oidf configure --tenant-domain <domain> --suite <https-origin>` once",
+                record.alias, record.alias
+            )
+        })?;
+        let oidf_suite_origin = record.oidf_suite_origin.clone().with_context(|| {
+            format!(
+                "OIDF Suite origin is not configured for instance '{}'; run `nazoauthctl --instance {} oidf configure --tenant-domain <domain> --suite <https-origin>` once",
+                record.alias, record.alias
+            )
+        })?;
         let host = registry
             .host_by_id(record.host_id)?
             .context("instance references missing host")?;
@@ -178,6 +192,8 @@ impl ConformanceSession {
             target_issuer: inspection.issuer,
             evidence,
             recovery_dir,
+            oidf_tenant_domain,
+            oidf_suite_origin,
             secrets_dir,
             registry,
             target,
@@ -189,6 +205,14 @@ impl ConformanceSession {
 
     pub fn target_issuer(&self) -> &str {
         &self.target_issuer
+    }
+
+    pub fn oidf_tenant_domain(&self) -> &str {
+        &self.oidf_tenant_domain
+    }
+
+    pub fn oidf_suite_origin(&self) -> &str {
+        &self.oidf_suite_origin
     }
 
     pub fn openid4vp_evidence_verifier_inputs(&self) -> &OpenId4VpEvidenceVerifierInputs {
@@ -382,6 +406,22 @@ impl ConformanceSession {
     }
 }
 
+pub fn configure_oidf(
+    selector: Option<&str>,
+    tenant_domain: &str,
+    suite_origin: &str,
+) -> anyhow::Result<(String, String, String)> {
+    let registry = RegistryStore::open_default()?;
+    let record = crate::fleet::resolve_instance(&registry, selector, "OIDF configuration")?;
+    let record =
+        registry.set_oidf_configuration(&record.deployment_id, tenant_domain, suite_origin)?;
+    Ok((
+        record.alias,
+        record.oidf_tenant_domain.unwrap_or_default(),
+        record.oidf_suite_origin.unwrap_or_default(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
@@ -543,6 +583,8 @@ mod tests {
                 },
             },
             recovery_dir: temp.path().join("recovery"),
+            oidf_tenant_domain: "oidf.example.com".to_owned(),
+            oidf_suite_origin: "https://suite.example".to_owned(),
             secrets_dir: temp.path().join("secrets"),
             registry,
             target: Box::new(RecordingTarget {

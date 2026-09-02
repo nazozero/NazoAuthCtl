@@ -3,23 +3,36 @@
 The normal user workflow has no artifact configuration:
 
 ```text
+nazoauthctl oidf configure --tenant-domain oidf.example.com --suite https://suite.example
 nazoauthctl oidf run
 nazoauthctl oidf run ciba
 nazoauthctl oidf run oidc-core-p001
 ```
 
-The first command runs the complete Matrix bundled in the signed NazoAuthCtl
-release against the official OpenID Foundation Suite. The second uses a stable
-group alias; the third selects one exact bundled plan. The other aliases are
+The configuration command stores the operator-owned wildcard DNS suffix and
+the selected Suite origin once for the selected instance. Neither has a
+NazoAuth-owned default. The first run command runs the complete Matrix bundled
+in the signed NazoAuthCtl release. The second uses a stable group
+alias; the third selects one exact bundled plan. The other aliases are
 `oidc`, `fapi`, `openid4vci`, `openid4vp`, and `openid4vc`. Unknown selectors
 fail and print the valid aliases, groups, and plans.
 
-NazoAuthCtl automatically creates the temporary `*.oidf.nazoauth.com` tenant,
-fresh test material, managed browser workers, the CIBA callback when selected,
-and a private evidence directory. On the first interactive run it securely
-prompts for the official Suite API token and stores it in the platform
+NazoAuthCtl automatically creates a temporary tenant below the configured domain,
+fresh test material, managed browser workers, and a private evidence directory.
+For CIBA, ctl reads the authenticated Suite log and completes the requested
+allow or deny action through the same login and CIBA decision endpoints used by
+an ordinary tenant user. NazoAuth exposes no conformance-only route. On the
+first interactive run ctl securely
+prompts for the selected Suite API token and stores it in the platform
 credential store. Non-interactive jobs may pipe the token with
 `--token-stdin`.
+
+Execution stops at the first Suite failure or ctl automation error. Started
+Suite plans are retained and their exact IDs and Suite origin are printed so
+the operator can inspect the same records in the Suite UI; plans that never
+started are deleted. A CIBA test that explicitly requires uploaded visual
+evidence is likewise retained as review pending instead of being reported as
+an automated pass.
 
 The remaining commands in this document are maintainer-facing artifact
 inspection tools. They do not supply inputs to `oidf run`.
@@ -82,7 +95,8 @@ Driver schema 1 is a signed-by-digest JSON payload consumed by engine protocol
 arbitrary network fields. A bounded handler table selects only controller-owned
 operations already covered by the engine: `none`, `browser`, `openid4vci`, or
 `openid4vp`, plus either the normal bounded-parallel lane or the serialized
-`ciba` lane. A CIBA handler must use real browser approval automation. Unknown
+`ciba` lane. A CIBA handler uses the temporary tenant's normal user session and
+decision endpoints. Unknown
 fields, handlers, operations, or engine protocols fail closed, so publishing a
 new plan/handler mapping does not require a controller release while adding a
 new host capability does.

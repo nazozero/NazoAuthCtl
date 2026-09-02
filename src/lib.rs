@@ -24,7 +24,7 @@ pub use cli::{GlobalOptions, parse_global_options};
 pub use conformance::{
     ConformanceControlCompletion, ConformanceControlOutcome, ConformanceDeploymentEvidence,
     ConformanceRuntimeEvidence, ConformanceSession, ControlOperationIdentity,
-    OpenId4VpEvidenceVerifierInputs,
+    OpenId4VpEvidenceVerifierInputs, configure_oidf,
 };
 
 pub fn main_entry() {

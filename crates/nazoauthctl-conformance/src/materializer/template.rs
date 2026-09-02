@@ -575,13 +575,6 @@ fn resolve_reference(
             resolve_suite_test_url(&prepared.suite_base_url, &prepared.request_jti, reference,)?
         )));
     }
-    if name == "target.ciba_user_approval_callback_url" {
-        return prepared
-            .ciba_user_approval_callback_url
-            .as_ref()
-            .map(|value| Value::String(value.to_string()))
-            .ok_or_else(|| MaterializerError::UnknownSecretReference(name.to_owned()));
-    }
     if name == "generated.applicant_email" {
         return Ok(Value::String(prepared.applicant_email.to_string()));
     }

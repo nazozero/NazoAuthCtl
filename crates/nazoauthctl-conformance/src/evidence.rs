@@ -1199,7 +1199,7 @@ mod tests {
 
     #[test]
     fn completion_evidence_is_bound_to_the_dynamic_tenant_issuer() {
-        let tenant_issuer = "https://01a06016-43e0-7cf1-9633-b9c6124823cb.oidf.nazoauth.com";
+        let tenant_issuer = "https://01a06016-43e0-7cf1-9633-b9c6124823cb.oidf.example.com";
         let trigger_path = "/openid4vp/complete/01a06016-71d4-7181-b275-be8f5ade62a0";
         let trigger_url =
             url::Url::parse(&format!("{tenant_issuer}{trigger_path}")).expect("completion URL");

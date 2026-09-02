@@ -433,6 +433,9 @@ fn merge_reports(
         .iter()
         .filter(|module| module.deferred_review_pending.is_some())
         .count();
+    let external_review_pending = modules
+        .iter()
+        .any(|module| !module.terminal && module.outcome == ModuleOutcome::Review);
     let all_modules_settled = all_modules_instantiated
         && terminal_modules
             .checked_add(deferred_review_modules)
@@ -445,24 +448,61 @@ fn merge_reports(
         .suite_resource_observer
         .as_ref()
         .is_some_and(|observer| observer.retain_suite_plans_for_certification());
-    let retention_eligible = retention_requested
+    let outcomes = summarize_module_outcomes(&modules);
+    let certification_retention = retention_requested
         && !worker_panicked
         && errors.is_empty()
         && prepared.all_selected_plan_definitions_enumerated
         && defined_modules > 0
         && all_modules_settled;
-    if !retention_eligible {
+    let diagnostic_retention = runner
+        .config
+        .suite_resource_observer
+        .as_ref()
+        .is_some_and(|observer| observer.retain_failed_suite_plans_for_diagnosis())
+        && (!outcomes.failed_modules.is_empty()
+            || external_review_pending
+            || errors.iter().any(|error| error != "run interrupted"));
+    let retained_suite_plan_ids = if certification_retention {
+        prepared.suite_plan_ids.clone()
+    } else if diagnostic_retention && !worker_panicked {
+        plans
+            .iter()
+            .filter(|plan| plan.created_instances > 0)
+            .filter_map(|plan| plan.suite_plan_id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let cleanup_plan_ids = prepared
+        .suite_plan_ids
+        .iter()
+        .filter(|plan_id| !retained_suite_plan_ids.contains(plan_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if retained_suite_plan_ids.is_empty() {
         let cancellable_module_ids = cancellable_module_ids(&observed_module_ids, &modules);
         cleanup_all(
             &runner.config.client,
             &cancellable_module_ids,
-            &prepared.suite_plan_ids,
+            &cleanup_plan_ids,
+            runner.config.suite_resource_observer.as_ref(),
+            &mut cleanup,
+        );
+    } else {
+        cleanup_all(
+            &runner.config.client,
+            &[],
+            &cleanup_plan_ids,
+            runner.config.suite_resource_observer.as_ref(),
             &mut cleanup,
         );
     }
-    let cleanup_complete = !retention_eligible && !worker_panicked && cleanup.failures.is_empty();
-    let retention_candidate_settled = retention_eligible;
-    let outcomes = summarize_module_outcomes(&modules);
+    let retention_candidate_settled =
+        !retained_suite_plan_ids.is_empty() && cleanup.failures.is_empty();
+    let retention_eligible = retention_candidate_settled;
+    let cleanup_complete =
+        retained_suite_plan_ids.is_empty() && !worker_panicked && cleanup.failures.is_empty();
     let matrix_expectations = summarize_matrix_expectations(&modules);
     let matrix_expectations_satisfied = prepared.matrix_expectations_satisfied
         && prepared.all_selected_plan_definitions_enumerated
@@ -501,7 +541,7 @@ fn merge_reports(
             local_success,
             suite_pass,
             acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
-            review_pending: deferred_review_modules > 0,
+            review_pending: deferred_review_modules > 0 || external_review_pending,
             human_review_required: !outcomes.human_review_modules.is_empty(),
             human_review_modules: outcomes.human_review_modules,
             deferred_review_modules: outcomes.deferred_review_modules,
@@ -509,6 +549,7 @@ fn merge_reports(
             expected_skipped_modules: matrix_expectations.expected_skipped_modules,
             unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
             unknown_declared_skip_modules: prepared.unknown_declared_skip_modules,
+            retained_suite_plan_ids,
             matrix_expectations_satisfied,
             failed_modules: outcomes.failed_modules,
             incomplete_modules: outcomes.incomplete_modules,
