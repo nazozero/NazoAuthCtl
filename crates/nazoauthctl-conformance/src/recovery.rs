@@ -1685,8 +1685,11 @@ fn validate_deferred_review_screenshot_binding(
                 && image.marker == pending.marker
                 && image.obligation_index == pending.obligation_index
                 && image.source
-                    == crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
-                && image.trigger_path == "/ui/verification-result"
+                    == crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver
+                && image
+                    .trigger_path
+                    .strip_prefix("/openid4vp/complete/")
+                    .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
         });
         if !module_matches || !screenshot_matches {
             bail!("deferred review screenshot manifest does not bind the retained module");
@@ -1815,6 +1818,27 @@ fn validate_review_screenshot_manifest_binding(
                                 })
                         })
                     && image.trigger_path == "/ui/verification-result"
+                    && sha256_hex(
+                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
+                    ) == image.trigger_url_sha256
+            }
+            crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver => {
+                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
+                    .is_ok_and(|url| {
+                        url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                    })
+                    && image.verification_receipt.is_none()
+                    && target_issuer
+                        .is_some_and(|target_issuer| target_issuer == image.trigger_origin)
+                    && image
+                        .trigger_path
+                        .strip_prefix("/openid4vp/complete/")
+                        .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
                     && sha256_hex(
                         format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
                     ) == image.trigger_url_sha256

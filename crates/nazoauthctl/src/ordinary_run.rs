@@ -26,9 +26,8 @@ use nazoauthctl_conformance::{
     EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
     HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane,
     OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard, RunControl,
-    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
+    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, ProxyTrustGuard,
+    RunControl, StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
     SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
     SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
     TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
@@ -222,34 +221,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         mtls_trust_anchor_pem: prepared.mtls_trust_anchor_pem(),
     };
 
-    let vp_evidence_verifier = invocation
-        .capture_review_screenshots
-        .then(|| {
-            let inputs = session.openid4vp_evidence_verifier_inputs();
-            if inputs.target_issuer != session.target_issuer()
-                || inputs.deployment_id != deployment.deployment_id
-            {
-                bail!("current runtime evidence identity does not match the selected instance");
-            }
-            let public_key = nazo_operator_protocol::decode_instance_public_key(
-                &inputs.instance_public_key_base64,
-            )
-            .context("current runtime evidence public key is invalid")?;
-            OpenId4VpEvidenceVerifier::new(
-                inputs.deployment_id.clone(),
-                invocation.tenant_id.clone(),
-                inputs.runtime_instance_id.clone(),
-                inputs.instance_key_id.clone(),
-                public_key,
-            )
-            .context("current runtime evidence identity is invalid")
-        })
-        .transpose()?;
-    let vp_evidence_trust_anchor = vp_evidence_verifier
-        .as_ref()
-        .map(|verifier| verifier.recovery_trust_anchor(&ephemeral_tenant.issuer))
-        .transpose()
-        .context("failed to persist the OpenID4VP evidence runtime trust anchor")?;
     let private_manifest_path = recovery_directory.join(format!("material-{request_jti}.json"));
     manifest
         .write_private(&private_manifest_path)
@@ -276,7 +247,7 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         manifest_path: Some(private_manifest_path.clone()),
         material_sha256: Some(manifest.raw_sha256().to_owned()),
         proxy: proxy_recovery,
-        vp_evidence_trust_anchor,
+        vp_evidence_trust_anchor: None,
         resource_identities: manifest.resource_identities().to_vec(),
     }) {
         Ok(recovery) => Arc::new(Mutex::new(recovery)),
@@ -457,7 +428,6 @@ pub(super) fn execute(mut invocation: RunInvocation) -> anyhow::Result<i32> {
         selected_resource_budget,
         recovery.clone(),
         ciba_bridge,
-        vp_evidence_verifier,
     );
 
     let mut recovery = take_recovery(recovery)?;
@@ -1029,7 +999,6 @@ fn run_signed_suite(
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_bridge: Option<CibaUserApprovalBridge>,
-    vp_evidence_verifier: Option<OpenId4VpEvidenceVerifier>,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     if let Some(bridge) = &ciba_bridge {
         bridge
@@ -1077,17 +1046,6 @@ fn run_signed_suite(
             plans: invocation.plans.clone(),
         })
         .context("requested selection is outside the signed artifact Matrix")?;
-    let vp_evidence = invocation
-        .capture_review_screenshots
-        .then(|| {
-            OpenId4VpEvidenceRunContext::new(
-                &review_screenshot_run_jti,
-                invocation.artifact_digest.as_str(),
-                selected.digest.as_str(),
-            )
-        })
-        .transpose()
-        .context("OpenID4VP review evidence binding is invalid")?;
     let mut automation = Vec::with_capacity(invocation.jobs);
     for worker_index in 0..invocation.jobs {
         let browser = build_browser(
@@ -1116,17 +1074,10 @@ fn run_signed_suite(
             Duration::from_secs(30),
             binding.clone(),
         )?;
-        let verifier_client = match &vp_evidence_verifier {
-            Some(evidence_verifier) => {
-                verifier_client.with_evidence_verifier(evidence_verifier.clone())
-            }
-            None => verifier_client,
-        };
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
         automation.push(ConformanceAutomation {
             browser: Some(browser),
             review_screenshot_capture: review_screenshot_capture.clone(),
-            vp_evidence: vp_evidence.clone(),
             verifier: Some(verifier),
             issuer: Some(issuer),
         });

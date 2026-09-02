@@ -844,6 +844,22 @@ fn valid_review_screenshot_trigger(
                 && sha256(format!("{}{}", audit.trigger_origin, audit.trigger_path).as_bytes())
                     == audit.trigger_url_sha256
         }
+        crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver => {
+            audit.verification_receipt.is_none()
+                && audit.trigger_origin == target_issuer
+                && trigger_url.scheme() == "https"
+                && trigger_url.host_str().is_some()
+                && trigger_url
+                    .path()
+                    .strip_prefix("/openid4vp/complete/")
+                    .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+                && trigger_url.query().is_none()
+                && trigger_url.fragment().is_none()
+                && trigger_url.username().is_empty()
+                && trigger_url.password().is_none()
+                && sha256(format!("{}{}", audit.trigger_origin, audit.trigger_path).as_bytes())
+                    == audit.trigger_url_sha256
+        }
     }
 }
 

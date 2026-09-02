@@ -21,6 +21,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::oidf_protocol as nazo_operator_protocol;
@@ -747,6 +748,17 @@ pub trait BrowserAutomation: Send {
     ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
         Err(BrowserError::ReviewScreenshotRequired)
     }
+
+    /// Capture the verifier's ordinary completion page after the protocol
+    /// exchange has completed. This is the same page a browser user sees.
+    fn capture_openid4vp_completion(
+        &mut self,
+        _completion_url: &Url,
+        _capture: &BrowserReviewCaptureContext,
+        _obligation_index: usize,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        Err(BrowserError::ReviewScreenshotRequired)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1015,6 +1027,22 @@ impl BrowserReviewCaptureContext {
         )
     }
 
+    pub(crate) fn write_vp_completion_png(
+        &self,
+        bytes: &[u8],
+        completion_url: &Url,
+        obligation_index: usize,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        self.write_png_with_audit(
+            bytes,
+            completion_url,
+            ReviewScreenshotMarker::Required,
+            obligation_index,
+            BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver,
+            None,
+        )
+    }
+
     fn write_png_with_audit(
         &self,
         bytes: &[u8],
@@ -1042,6 +1070,9 @@ impl BrowserReviewCaptureContext {
                 sha256_hex(trigger_url.as_str().as_bytes())
             }
             BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => sha256_hex(
+                format!("{}{}", redacted_origin(trigger_url), trigger_url.path()).as_bytes(),
+            ),
+            BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver => sha256_hex(
                 format!("{}{}", redacted_origin(trigger_url), trigger_url.path()).as_bytes(),
             ),
         };
@@ -1254,6 +1285,8 @@ pub enum BrowserReviewScreenshotSource {
     SuiteVerificationEvidence,
     #[serde(rename = "nazo-vp-verification-result/live-webdriver")]
     NazoVpVerificationResultLiveWebdriver,
+    #[serde(rename = "nazo-vp-completion/live-webdriver")]
+    NazoVpCompletionLiveWebdriver,
 }
 
 #[derive(Serialize)]
@@ -1838,6 +1871,48 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
             obligation_index,
             &evidence.receipt,
         )
+    }
+
+    fn capture_openid4vp_completion(
+        &mut self,
+        completion_url: &Url,
+        capture: &BrowserReviewCaptureContext,
+        obligation_index: usize,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        if obligation_index >= MAX_REVIEW_SCREENSHOTS_PER_MODULE {
+            return Err(BrowserError::ReviewScreenshotLimit);
+        }
+        capture.reserve_attempt()?;
+        if !self.policy.target_origin.allows(completion_url)
+            || !completion_url.username().is_empty()
+            || completion_url.password().is_some()
+            || completion_url.query().is_some()
+            || completion_url.fragment().is_some()
+            || completion_url
+                .path()
+                .strip_prefix("/openid4vp/complete/")
+                .is_none_or(|value| Uuid::parse_str(value).is_err())
+        {
+            return Err(self.navigation_violation(self.last_url.as_ref(), completion_url));
+        }
+        self.navigate(completion_url)?;
+        let current = self.ensure_current_url()?;
+        if current != *completion_url {
+            return Err(self.navigation_violation(Some(completion_url), &current));
+        }
+        let page = self.driver.page_source()?;
+        if !page.contains("data-testid=\"vp-verification-result\"")
+            || !page.contains("data-status=\"verified\"")
+            || !page.contains("Presentation verified")
+        {
+            return Err(BrowserError::ReviewScreenshotRequired);
+        }
+        let screenshot = self.driver.screenshot_png()?;
+        let current = self.ensure_current_url()?;
+        if current != *completion_url {
+            return Err(self.navigation_violation(Some(completion_url), &current));
+        }
+        capture.write_vp_completion_png(&screenshot, &current, obligation_index)
     }
 
     /// Navigate to the capability-free NazoAuthWeb shell without routing the
@@ -2862,6 +2937,20 @@ impl<D: BrowserDriver> BrowserAutomation for BrowserExecutor<D> {
         BrowserExecutor::capture_openid4vp_verification_result(
             self,
             evidence,
+            capture,
+            obligation_index,
+        )
+    }
+
+    fn capture_openid4vp_completion(
+        &mut self,
+        completion_url: &Url,
+        capture: &BrowserReviewCaptureContext,
+        obligation_index: usize,
+    ) -> Result<BrowserReviewScreenshotReceipt, BrowserError> {
+        BrowserExecutor::capture_openid4vp_completion(
+            self,
+            completion_url,
             capture,
             obligation_index,
         )
