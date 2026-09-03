@@ -2792,6 +2792,14 @@ mod tests {
             uuid::Uuid::now_v7()
         ));
         #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::create_dir(&root).expect("create isolated lock directory");
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("make isolated lock directory private");
+        }
+        #[cfg(unix)]
         let store = ConformanceRecoveryStore::open(&root, "deployment-1").expect("store");
         #[cfg(unix)]
         let acquire = || store.acquire_orchestration_lock();
