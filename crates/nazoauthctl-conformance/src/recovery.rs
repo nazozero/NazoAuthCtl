@@ -2787,10 +2787,13 @@ mod tests {
     }
     #[test]
     fn deployment_oidf_orchestration_lock_is_fail_fast_and_reusable() {
-        let root = std::env::temp_dir().join(format!(
-            "nazoauthctl-oidf-orchestration-lock-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("temporary directory")
+            .join(format!(
+                "nazoauthctl-oidf-orchestration-lock-{}",
+                uuid::Uuid::now_v7()
+            ));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
