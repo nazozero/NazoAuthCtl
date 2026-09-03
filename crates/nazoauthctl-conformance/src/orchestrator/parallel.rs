@@ -146,9 +146,9 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                         };
                         let summary = child
                             .run_prepared(&mut progress, worker_prepared(&work_ref[next_index]));
-                        if completed_plan_stops_dispatch(&summary.report) {
-                            stop_launching.store(true, Ordering::SeqCst);
-                        } else if has_unsettled_suite_resources(&summary.report) {
+                        if completed_plan_stops_dispatch(&summary.report)
+                            || has_unsettled_suite_resources(&summary.report)
+                        {
                             stop_launching.store(true, Ordering::SeqCst);
                         }
                         if sender
