@@ -97,14 +97,20 @@ impl SuiteClient {
         if unauthenticated.status != 401 {
             return Err(SuiteClientError::AuthBoundary);
         }
-        let authenticated = self.request_json(
+        let authenticated = match self.request_json(
             HttpMethod::Get,
             "/api/plan",
             &[("start", "0"), ("length", "1")],
             None,
             true,
             self.config.max_response_bytes,
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(SuiteClientError::MalformedResponse) => {
+                return Err(SuiteClientError::AuthenticationResponseMalformed);
+            }
+            Err(error) => return Err(error),
+        };
         if matches!(authenticated.status, 401 | 403) {
             return Err(SuiteClientError::AuthenticationRejected);
         }
@@ -618,6 +624,8 @@ pub enum SuiteClientError {
     AuthBoundary,
     #[error("Suite rejected the API token")]
     AuthenticationRejected,
+    #[error("Suite returned a malformed API token authentication response")]
+    AuthenticationResponseMalformed,
     #[error("Suite bearer token is required")]
     MissingToken,
     #[error("Suite response is malformed JSON")]
@@ -830,6 +838,7 @@ mod tests {
     struct AuthCapture {
         requests: Mutex<Vec<HttpRequest>>,
         authenticated_status: u16,
+        authenticated_body: Vec<u8>,
     }
 
     impl Transport for AuthCapture {
@@ -844,7 +853,11 @@ mod tests {
                     401
                 },
                 headers: vec![],
-                body: b"{}".to_vec(),
+                body: if authenticated {
+                    self.authenticated_body.clone()
+                } else {
+                    b"{}".to_vec()
+                },
             })
         }
     }
@@ -854,6 +867,7 @@ mod tests {
         let capture = Arc::new(AuthCapture {
             requests: Mutex::new(Vec::new()),
             authenticated_status: 200,
+            authenticated_body: b"{}".to_vec(),
         });
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
@@ -877,6 +891,7 @@ mod tests {
         let capture = Arc::new(AuthCapture {
             requests: Mutex::new(Vec::new()),
             authenticated_status: 401,
+            authenticated_body: b"{}".to_vec(),
         });
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
@@ -889,6 +904,49 @@ mod tests {
         assert!(matches!(
             client.probe_auth(),
             Err(SuiteClientError::AuthenticationRejected)
+        ));
+    }
+
+    #[test]
+    fn malformed_authenticated_response_is_distinct_from_a_broken_suite_origin() {
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("expired-token").expect("token")),
+            Arc::new(AuthCapture {
+                requests: Mutex::new(Vec::new()),
+                authenticated_status: 200,
+                authenticated_body: b"<html>login</html>".to_vec(),
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+
+        assert!(matches!(
+            client.probe_auth(),
+            Err(SuiteClientError::AuthenticationResponseMalformed)
+        ));
+    }
+
+    #[test]
+    fn malformed_unauthenticated_response_remains_a_suite_boundary_failure() {
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("token").expect("token")),
+            Arc::new(Capture {
+                request: Mutex::new(None),
+                response: HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: b"<html>not the Suite API</html>".to_vec(),
+                },
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+
+        assert!(matches!(
+            client.probe_auth(),
+            Err(SuiteClientError::MalformedResponse)
         ));
     }
 

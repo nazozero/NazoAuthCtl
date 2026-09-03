@@ -2835,16 +2835,30 @@ fn authenticate_suite(
                 }
                 return Ok((client, token));
             }
-            Err(SuiteClientError::AuthenticationRejected) if io::stdin().is_terminal() => {
+            Err(
+                error @ (SuiteClientError::AuthenticationRejected
+                | SuiteClientError::AuthenticationResponseMalformed),
+            ) if io::stdin().is_terminal() => {
                 eprintln!(
                     "{}",
-                    match language {
-                        OutputLanguage::Chinese => {
-                            "OIDF Suite 拒绝了当前 Token，请重新输入（Ctrl+C 取消）。"
+                    match (language, error) {
+                        (OutputLanguage::Chinese, SuiteClientError::AuthenticationRejected) =>
+                            "OIDF Suite 拒绝了当前 Token，请重新输入（Ctrl+C 取消）。",
+                        (OutputLanguage::English, SuiteClientError::AuthenticationRejected) =>
+                            "The OIDF Suite rejected the current token. Enter another token (Ctrl+C to cancel).",
+                        (
+                            OutputLanguage::Chinese,
+                            SuiteClientError::AuthenticationResponseMalformed,
+                        ) => {
+                            "OIDF Suite 无法确认当前 Token（认证响应不是 JSON），请重新输入（Ctrl+C 取消）。"
                         }
-                        OutputLanguage::English => {
-                            "The OIDF Suite rejected the current token. Enter another token (Ctrl+C to cancel)."
+                        (
+                            OutputLanguage::English,
+                            SuiteClientError::AuthenticationResponseMalformed,
+                        ) => {
+                            "The OIDF Suite could not validate the current token because its authentication response was not JSON. Enter another token (Ctrl+C to cancel)."
                         }
+                        _ => unreachable!(),
                     }
                 );
                 token = prompt_token(language)?;
