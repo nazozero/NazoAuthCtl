@@ -1,16 +1,16 @@
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
     ArtifactTrustPolicy, BearerToken, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
-    OidfPlanSelection, OutputLanguage, bundled_oidf_selection_choices, open_cached_oidf_artifact,
-    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, resolve_bundled_oidf_selection, resolve_oidf_artifact,
-    verify_oidf_artifact,
+    OidfPlanSelection, OutputLanguage, TerminalTheme, bundled_oidf_selection_choices,
+    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_driver,
+    read_artifact_matrix, read_compact_manifest, resolve_bundled_oidf_selection,
+    resolve_oidf_artifact, verify_oidf_artifact,
 };
 
 mod ordinary_run;
@@ -20,9 +20,10 @@ const DEFAULT_JOBS: usize = 4;
 
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
+    let json_requested = args.iter().any(|value| value == "--json");
     let invocation = match parse_invocation(&args) {
         Ok(invocation) => invocation,
-        Err(error) => exit_with_error(&error),
+        Err(error) => exit_with_error(&error, json_requested),
     };
     let result = match invocation {
         Invocation::Core => {
@@ -43,7 +44,7 @@ fn main() {
         }),
     };
     if let Err(error) = result {
-        exit_with_error(&error);
+        exit_with_error(&error, json_requested);
     }
 }
 
@@ -54,9 +55,38 @@ fn execute_configure(
 ) -> anyhow::Result<()> {
     let (alias, tenant_domain, suite_origin) =
         nazoauthctl_core::configure_oidf(instance.as_deref(), &tenant_domain, &suite_origin)?;
-    println!(
-        "OIDF configuration for instance '{alias}': tenant domain {tenant_domain}; Suite {suite_origin}"
-    );
+    let language = output_language();
+    let theme = TerminalTheme::detect(io::stdout().is_terminal());
+    if theme.is_terminal() {
+        let title = match language {
+            OutputLanguage::Chinese => "OIDF 配置已保存",
+            OutputLanguage::English => "OIDF configuration saved",
+        };
+        let (instance_label, domain_label) = match language {
+            OutputLanguage::Chinese => ("实例", "租户域名"),
+            OutputLanguage::English => ("Instance", "Tenant domain"),
+        };
+        println!("{}  {}", theme.success('✓'), theme.heading(title));
+        println!(
+            "  {} {}",
+            theme.muted(format!("{instance_label:<12}")),
+            theme.strong(alias)
+        );
+        println!(
+            "  {} {}",
+            theme.muted(format!("{domain_label:<12}")),
+            theme.accent(tenant_domain)
+        );
+        println!(
+            "  {} {}",
+            theme.muted(format!("{:<12}", "OIDF Suite")),
+            theme.accent(suite_origin)
+        );
+    } else {
+        println!(
+            "OIDF configuration for instance '{alias}': tenant domain {tenant_domain}; Suite {suite_origin}"
+        );
+    }
     Ok(())
 }
 
@@ -493,16 +523,31 @@ fn print_artifact_verify_help() {
     );
 }
 
-fn exit_with_error(error: &anyhow::Error) -> ! {
+fn exit_with_error(error: &anyhow::Error, json: bool) -> ! {
     let message = format!("{error:#}");
-    let output = serde_json::json!({
-        "schema": 1,
-        "success": false,
-        "error": message,
-    });
-    let _ = serde_json::to_writer_pretty(io::stdout().lock(), &output);
-    let _ = writeln!(io::stdout());
-    let _ = writeln!(io::stderr(), "nazoauthctl failed: {error:#}");
+    if json {
+        let output = serde_json::json!({
+            "schema": 1,
+            "success": false,
+            "error": message,
+        });
+        let _ = serde_json::to_writer_pretty(io::stdout().lock(), &output);
+        let _ = writeln!(io::stdout());
+    } else {
+        let language = output_language();
+        let theme = TerminalTheme::detect(io::stderr().is_terminal());
+        let title = match language {
+            OutputLanguage::Chinese => "命令执行失败",
+            OutputLanguage::English => "Command failed",
+        };
+        let _ = writeln!(
+            io::stderr(),
+            "{}  {}\n\n  {}",
+            theme.error('✗'),
+            theme.strong(title),
+            message
+        );
+    }
     std::process::exit(1)
 }
 
@@ -684,7 +729,21 @@ fn run_help(language: OutputLanguage) -> &'static str {
 }
 
 fn print_run_help() {
-    println!("{}", run_help(output_language()));
+    let theme = TerminalTheme::detect(io::stdout().is_terminal());
+    let help = run_help(output_language());
+    if !theme.is_terminal() {
+        println!("{help}");
+        return;
+    }
+    for line in help.lines() {
+        if !line.starts_with(' ') && (line.ends_with(':') || line.ends_with('：')) {
+            println!("{}", theme.heading(line));
+        } else if line.trim_start().starts_with("nazoauthctl ") {
+            println!("{}", theme.accent(line));
+        } else {
+            println!("{line}");
+        }
+    }
 }
 
 #[cfg(test)]

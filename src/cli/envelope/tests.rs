@@ -10,6 +10,7 @@ fn render(code_line: &str, json_mode: bool) -> String {
         },
         &error,
         json_mode,
+        false,
     )
 }
 
@@ -51,6 +52,19 @@ fn text_envelope_covers_the_stable_codes() {
             "{code} missing from:\n{rendered}"
         );
     }
+}
+
+#[test]
+fn interactive_failure_uses_semantic_colors_without_changing_json() {
+    let error = anyhow::anyhow!("{}: unavailable", crate::error_codes::HOST_UNREACHABLE);
+    let colored = render_failure("update", &EnvelopeContext::default(), &error, false, true);
+    assert!(colored.contains("\x1b[1;31m✗ Command failed\x1b[0m"));
+    assert!(colored.contains("\x1b[31mHOST_UNREACHABLE\x1b[0m"));
+    assert!(colored.contains("\x1b[32mnazoauthctl host check"));
+
+    let json = render_failure("update", &EnvelopeContext::default(), &error, true, true);
+    assert!(!json.contains('\u{1b}'));
+    serde_json::from_str::<serde_json::Value>(&json).expect("valid JSON");
 }
 
 #[test]
@@ -123,12 +137,12 @@ fn side_effect_hints_distinguish_conflict_from_precondition() {
 fn operation_ids_are_lifted_out_of_the_chain() {
     let id = "01970000-0000-7000-8000-000000000001";
     let error = anyhow::anyhow!("the migration outcome is unknown; resume operation {id}");
-    let rendered = render_failure("update", &EnvelopeContext::default(), &error, true);
+    let rendered = render_failure("update", &EnvelopeContext::default(), &error, true, false);
     let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(value["operation_id"], serde_json::json!(id));
 
     let without = anyhow::anyhow!("no identifier here at all");
-    let rendered = render_failure("update", &EnvelopeContext::default(), &without, true);
+    let rendered = render_failure("update", &EnvelopeContext::default(), &without, true, false);
     let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(value["operation_id"], serde_json::Value::Null);
 }
@@ -175,6 +189,7 @@ fn target_install_failure_keeps_remote_code_and_does_not_suggest_host_check() {
         },
         &error,
         true,
+        false,
     );
     let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
 

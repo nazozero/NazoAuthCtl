@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::{env, fmt};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -50,6 +51,97 @@ pub enum OutputLanguage {
     Chinese,
     #[default]
     English,
+}
+
+/// A deliberately small terminal palette shared by the live renderer and the
+/// final human summary. Machine-readable and redirected output always uses
+/// [`TerminalTheme::plain`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalTheme {
+    terminal: bool,
+    color: bool,
+}
+
+impl TerminalTheme {
+    pub fn detect(is_terminal: bool) -> Self {
+        let disabled = env::var_os("NO_COLOR").is_some()
+            || env::var_os("CLICOLOR").is_some_and(|value| value == "0")
+            || env::var("TERM").is_ok_and(|value| value.eq_ignore_ascii_case("dumb"));
+        Self {
+            terminal: is_terminal,
+            color: is_terminal && !disabled,
+        }
+    }
+
+    pub const fn plain() -> Self {
+        Self {
+            terminal: false,
+            color: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn colored() -> Self {
+        Self {
+            terminal: true,
+            color: true,
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        self.terminal
+    }
+
+    pub fn heading(self, value: impl fmt::Display) -> String {
+        self.paint("\x1b[1;96m", value)
+    }
+
+    pub fn strong(self, value: impl fmt::Display) -> String {
+        self.paint("\x1b[1m", value)
+    }
+
+    pub fn accent(self, value: impl fmt::Display) -> String {
+        self.paint("\x1b[36m", value)
+    }
+
+    pub fn success(self, value: impl fmt::Display) -> String {
+        self.paint("\x1b[32m", value)
+    }
+
+    pub fn warning(self, value: impl fmt::Display) -> String {
+        self.paint("\x1b[33m", value)
+    }
+
+    pub fn error(self, value: impl fmt::Display) -> String {
+        self.paint("\x1b[31m", value)
+    }
+
+    pub fn muted(self, value: impl fmt::Display) -> String {
+        self.paint("\x1b[2m", value)
+    }
+
+    pub fn status(self, status: GroupStatus, count: usize, value: impl fmt::Display) -> String {
+        if count == 0 {
+            return self.muted(value);
+        }
+        match status {
+            GroupStatus::Passed => self.success(value),
+            GroupStatus::Review | GroupStatus::Skipped | GroupStatus::Incomplete => {
+                self.warning(value)
+            }
+            GroupStatus::Failed => self.error(value),
+            GroupStatus::Running => self.accent(value),
+            GroupStatus::Remaining => self.muted(value),
+        }
+    }
+
+    fn paint(self, code: &str, value: impl fmt::Display) -> String {
+        if self.color {
+            format!("{code}{value}\x1b[0m")
+        } else {
+            value.to_string()
+        }
+    }
 }
 
 impl OutputLanguage {
@@ -250,6 +342,7 @@ pub struct TtyRenderer<W: Write> {
     language: OutputLanguage,
     snapshot: Option<ProgressSnapshot>,
     activity: Option<ProgressActivity>,
+    theme: TerminalTheme,
 }
 
 impl<W: Write> TtyRenderer<W> {
@@ -258,11 +351,16 @@ impl<W: Write> TtyRenderer<W> {
     }
 
     pub fn localized(writer: W, language: OutputLanguage) -> Self {
+        Self::with_theme(writer, language, TerminalTheme::detect(true))
+    }
+
+    fn with_theme(writer: W, language: OutputLanguage, theme: TerminalTheme) -> Self {
         Self {
             writer,
             language,
             snapshot: None,
             activity: None,
+            theme,
         }
     }
 
@@ -289,13 +387,13 @@ impl<W: Write> TtyRenderer<W> {
         // estimates duration, so no ETA is printed.
         let _ = write!(self.writer, "\x1b[2J\x1b[H");
         let labels = labels(self.language);
-        let _ = writeln!(self.writer, "{}", labels.title);
+        let _ = writeln!(self.writer, "{}", self.theme.heading(labels.title));
         if let Some(activity) = &self.activity {
             let _ = writeln!(
                 self.writer,
-                "{}: {}",
-                labels.status,
-                activity_label(activity, self.language)
+                "{}  {}",
+                self.theme.muted(labels.status),
+                self.theme.accent(activity_label(activity, self.language))
             );
         }
         let Some(snapshot) = self.snapshot.as_ref() else {
@@ -307,70 +405,75 @@ impl<W: Write> TtyRenderer<W> {
         let _ = writeln!(
             self.writer,
             "{}  {}{}  {:>3}%",
-            labels.overall,
-            "█".repeat(filled),
-            "░".repeat(empty),
-            percent(snapshot.completed, snapshot.total)
+            self.theme.strong(labels.overall),
+            self.theme.success("█".repeat(filled)),
+            self.theme.muted("░".repeat(empty)),
+            self.theme
+                .strong(percent(snapshot.completed, snapshot.total))
         );
         let _ = writeln!(
             self.writer,
             "         {} / {}",
-            snapshot.completed, snapshot.total
+            self.theme.strong(snapshot.completed),
+            self.theme.muted(snapshot.total)
         );
         let _ = writeln!(self.writer);
         for group in &snapshot.groups {
             let symbol = match group.status {
-                GroupStatus::Passed => '✓',
-                GroupStatus::Review => '!',
-                GroupStatus::Skipped => '↷',
-                GroupStatus::Failed => '✗',
-                GroupStatus::Incomplete => '…',
-                GroupStatus::Running => '●',
-                GroupStatus::Remaining => '○',
+                GroupStatus::Passed => self.theme.success('✓'),
+                GroupStatus::Review => self.theme.warning('!'),
+                GroupStatus::Skipped => self.theme.warning('↷'),
+                GroupStatus::Failed => self.theme.error('✗'),
+                GroupStatus::Incomplete => self.theme.warning('…'),
+                GroupStatus::Running => self.theme.accent('●'),
+                GroupStatus::Remaining => self.theme.muted('○'),
             };
+            let group_label = self.theme.status(
+                group.status,
+                1,
+                format!("{:<32}", format!("{} · {}", group.profile, group.id)),
+            );
             let _ = writeln!(
                 self.writer,
-                "{} {:<32} {:>4} / {:<4}",
-                symbol,
-                format!("{} · {}", group.profile, group.id),
-                group.completed,
-                group.total
+                "{} {} {:>4} / {:<4}",
+                symbol, group_label, group.completed, group.total
             );
         }
         let _ = writeln!(self.writer);
-        let _ = writeln!(self.writer, "{}:", labels.current);
+        let _ = writeln!(self.writer, "{}", self.theme.strong(labels.current));
         let _ = writeln!(
             self.writer,
             "  {}",
-            current_matrix_label(
+            self.theme.accent(current_matrix_label(
                 snapshot.current_profile.as_deref(),
                 snapshot.current_variant.as_ref()
-            )
+            ))
         );
         let _ = writeln!(
             self.writer,
             "  {}",
-            snapshot.current_test.as_deref().unwrap_or("-")
+            self.theme
+                .strong(snapshot.current_test.as_deref().unwrap_or("-"))
         );
         let _ = writeln!(self.writer);
-        let _ = writeln!(
-            self.writer,
-            "{} {} · {} {} · {} {} · {} {} · {} {} · {} {} · {} {}",
-            labels.passed,
-            snapshot.passed,
-            labels.review,
-            snapshot.reviewed,
-            labels.skipped,
-            snapshot.skipped,
-            labels.failed,
-            snapshot.failed,
-            labels.incomplete,
-            snapshot.incomplete,
-            labels.running,
-            snapshot.running,
-            labels.remaining,
-            snapshot.remaining
-        );
+        let metrics = [
+            (GroupStatus::Passed, snapshot.passed, labels.passed),
+            (GroupStatus::Review, snapshot.reviewed, labels.review),
+            (GroupStatus::Skipped, snapshot.skipped, labels.skipped),
+            (GroupStatus::Failed, snapshot.failed, labels.failed),
+            (
+                GroupStatus::Incomplete,
+                snapshot.incomplete,
+                labels.incomplete,
+            ),
+            (GroupStatus::Running, snapshot.running, labels.running),
+            (GroupStatus::Remaining, snapshot.remaining, labels.remaining),
+        ]
+        .into_iter()
+        .map(|(status, count, label)| self.theme.status(status, count, format!("{label} {count}")))
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let _ = writeln!(self.writer, "{metrics}");
         let _ = self.writer.flush();
     }
 }
@@ -714,7 +817,8 @@ mod tests {
     #[test]
     fn tty_renderer_is_item_based_and_has_no_eta() {
         let mut output = Vec::new();
-        let mut renderer = TtyRenderer::new(&mut output);
+        let mut renderer =
+            TtyRenderer::with_theme(&mut output, OutputLanguage::English, TerminalTheme::plain());
         renderer.update(&ProgressEvent {
             snapshot: ProgressSnapshot {
                 completed: 2,
@@ -760,5 +864,19 @@ mod tests {
         ));
         assert!(text.contains("FAPI 2.0/mode=mTLS"));
         assert!(!text.contains("ETA"));
+    }
+
+    #[test]
+    fn tty_renderer_uses_semantic_colors_when_enabled() {
+        let mut output = Vec::new();
+        let mut renderer = TtyRenderer::with_theme(
+            &mut output,
+            OutputLanguage::English,
+            TerminalTheme::colored(),
+        );
+        renderer.activity(&ProgressActivity::Finished);
+        let text = String::from_utf8(output).expect("utf8");
+        assert!(text.contains("\x1b[1;96mNazoAuth OIDF Conformance\x1b[0m"));
+        assert!(text.contains("\x1b[36mRun finished\x1b[0m"));
     }
 }

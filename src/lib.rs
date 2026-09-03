@@ -28,6 +28,8 @@ pub use conformance::{
 };
 
 pub fn main_entry() {
+    use std::io::IsTerminal as _;
+
     let args = match std::env::args_os()
         .map(|argument| {
             argument
@@ -38,7 +40,14 @@ pub fn main_entry() {
     {
         Ok(args) => args,
         Err(error) => {
-            eprintln!("nazoauthctl: argument parsing failed: {error}");
+            eprintln!(
+                "{}",
+                render_entry_error(
+                    "Argument parsing failed",
+                    error,
+                    terminal_color_enabled(std::io::stderr().is_terminal()),
+                )
+            );
             std::process::exit(2);
         }
     };
@@ -53,7 +62,14 @@ pub fn main_entry() {
             return;
         }
         Err(error) => {
-            eprintln!("nazoauthctl: {error:#}");
+            eprintln!(
+                "{}",
+                render_entry_error(
+                    "Invalid command",
+                    &format!("{error:#}"),
+                    terminal_color_enabled(std::io::stderr().is_terminal()),
+                )
+            );
             std::process::exit(2);
         }
     };
@@ -70,13 +86,33 @@ pub fn main_entry() {
             .downcast_ref::<crate::fleet::fleet_read::PartialFleetFailure>()
             .is_none()
         {
-            let envelope =
-                cli::envelope::render_failure(&action, &envelope_context, &error, json_mode);
+            let envelope = cli::envelope::render_failure(
+                &action,
+                &envelope_context,
+                &error,
+                json_mode,
+                terminal_color_enabled(std::io::stderr().is_terminal()),
+            );
             eprintln!("{envelope}");
         } else {
             eprintln!("nazoauthctl: {error:#}");
         }
         std::process::exit(1);
+    }
+}
+
+fn terminal_color_enabled(is_terminal: bool) -> bool {
+    is_terminal
+        && std::env::var_os("NO_COLOR").is_none()
+        && !std::env::var_os("CLICOLOR").is_some_and(|value| value == "0")
+        && !std::env::var("TERM").is_ok_and(|value| value.eq_ignore_ascii_case("dumb"))
+}
+
+fn render_entry_error(title: &str, detail: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[1;31m✗ {title}\x1b[0m\n\n  {detail}")
+    } else {
+        format!("nazoauthctl: {title}: {detail}")
     }
 }
 
@@ -110,7 +146,24 @@ fn command_action(command: &cli::Command) -> &'static str {
 }
 
 fn print_help(topic: cli::HelpTopic) {
-    println!("{}", help_text(topic));
+    use std::io::IsTerminal as _;
+
+    let help = help_text(topic);
+    if !terminal_color_enabled(std::io::stdout().is_terminal()) {
+        println!("{help}");
+        return;
+    }
+    for (index, line) in help.lines().enumerate() {
+        if index == 0 {
+            println!("\x1b[1;96m{line}\x1b[0m");
+        } else if !line.starts_with(' ') && line.ends_with(':') {
+            println!("\x1b[1;36m{line}\x1b[0m");
+        } else if line.trim_start().starts_with("nazoauthctl ") {
+            println!("\x1b[36m{line}\x1b[0m");
+        } else {
+            println!("{line}");
+        }
+    }
 }
 
 fn help_text(topic: cli::HelpTopic) -> &'static str {
