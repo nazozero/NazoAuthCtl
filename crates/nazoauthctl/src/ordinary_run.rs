@@ -619,24 +619,24 @@ fn conformance_run_succeeds(
 
 #[cfg(test)]
 mod acceptance_tests {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::fs;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt as _;
 
     use nazo_operator_protocol::ControlOperationPayload;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use nazo_operator_protocol::{
         CONTROL_RESULT_SCHEMA, ControlOutcome, ControlResult, ControlResultData,
         TenantResourceIdentity, TenantResourceKind, TenantResourceMapping,
     };
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use nazoauthctl_conformance::{
         ConformanceRecoveryStore, TenantResourceControlOperation, TenantResourceRecoveryBinding,
         TenantResourceRecoveryPhase,
     };
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use super::next_pending_for_run;
     use super::{
         EphemeralTenant, PendingRecoveryCandidate, PendingRecoveryStep, conformance_run_succeeds,
@@ -665,7 +665,7 @@ mod acceptance_tests {
         assert!(!conformance_run_succeeds(true, true, 0, 1));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn recovery_operation(
         result: ControlResultData,
         operation_id: &str,
@@ -687,7 +687,7 @@ mod acceptance_tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn applied_recovery_selects_cleanup_enumerate_as_the_only_next_control_step() {
         let root = std::env::temp_dir().join(format!(
