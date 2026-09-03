@@ -1597,8 +1597,7 @@ fn run_signed_suite<S: ProgressSink>(
             automation,
             suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
                 recovery,
-                retain_suite_plans_for_certification: invocation
-                    .retain_suite_plans_for_certification,
+                retain_suite_plans: !invocation.delete_suite_plans,
             })),
         })?;
         Ok(runner.run(progress).report)
@@ -1659,16 +1658,16 @@ fn build_ciba_user_approver(
 
 struct DurableSuiteObserver {
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
-    retain_suite_plans_for_certification: bool,
+    retain_suite_plans: bool,
 }
 
 impl SuiteResourceObserver for DurableSuiteObserver {
     fn retain_suite_plans_for_certification(&self) -> bool {
-        self.retain_suite_plans_for_certification
+        self.retain_suite_plans
     }
 
     fn retain_failed_suite_plans_for_diagnosis(&self) -> bool {
-        true
+        self.retain_suite_plans
     }
 
     fn plan_create_intent(&self, origin: &Origin, intent_id: &str) -> Result<(), String> {

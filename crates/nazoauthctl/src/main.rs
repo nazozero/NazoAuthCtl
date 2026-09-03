@@ -512,7 +512,7 @@ pub(crate) struct RunInvocation {
     pub(crate) token: Option<BearerToken>,
     pub(crate) token_stdin: bool,
     pub(crate) json: bool,
-    pub(crate) retain_suite_plans_for_certification: bool,
+    pub(crate) delete_suite_plans: bool,
     pub(crate) groups: Vec<String>,
     pub(crate) plans: Vec<String>,
     pub(crate) poll_timeout: Duration,
@@ -531,7 +531,7 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     let mut token = None;
     let mut token_stdin = false;
     let mut json = false;
-    let mut retain_suite_plans_for_certification = false;
+    let mut delete_suite_plans = false;
     let mut selector = None;
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
     let mut jobs = DEFAULT_JOBS;
@@ -582,11 +582,11 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                 json = true;
                 index += 1;
             }
-            "--retain-suite-plans-for-certification" => {
-                if retain_suite_plans_for_certification {
-                    bail!("--retain-suite-plans-for-certification may be specified only once");
+            "--delete-suite-plans" => {
+                if delete_suite_plans {
+                    bail!("--delete-suite-plans may be specified only once");
                 }
-                retain_suite_plans_for_certification = true;
+                delete_suite_plans = true;
                 index += 1;
             }
             value if value.starts_with('-') => bail!("unknown oidf run option: {value}"),
@@ -629,7 +629,7 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         token,
         token_stdin,
         json,
-        retain_suite_plans_for_certification,
+        delete_suite_plans,
         groups: selection.groups,
         plans: selection.plans,
         poll_timeout,
@@ -675,10 +675,10 @@ fn output_language() -> OutputLanguage {
 fn run_help(language: OutputLanguage) -> &'static str {
     match language {
         OutputLanguage::Chinese => {
-            "用法：\n  nazoauthctl [--instance 实例] oidf configure --tenant-domain 域名 --suite HTTPS地址\n  nazoauthctl [--instance 实例] oidf run [分组或计划] [选项]\n\nconfigure 只需设置一次临时租户所用的通配域名后缀和 OIDF Suite 地址。未指定分组或计划时运行完整矩阵。可用别名：oidc、ciba、fapi、openid4vci、openid4vp、openid4vc；也可使用内置分组或计划的完整 ID。\n\n每次运行都会创建新的临时租户、生成新的测试资料，并仅在所选计划需要时启动浏览器任务。\n\n选项：\n  --token TOKEN                  本次运行直接使用 Token，不保存\n  --token-stdin                  从标准输入读取 Token，不保存\n  --json                         输出完整 JSON 报告；默认仅输出简洁摘要\n  --retain-suite-plans-for-certification\n                                  在 Suite 中保留已结束的计划\n  --jobs N                       并行计划数，1-4（默认：4）\n  --poll-timeout 秒数            单个模块等待 Suite 的最长时间（默认：1800）"
+            "用法：\n  nazoauthctl [--instance 实例] oidf configure --tenant-domain 域名 --suite HTTPS地址\n  nazoauthctl [--instance 实例] oidf run [分组或计划] [选项]\n\nconfigure 只需设置一次临时租户所用的通配域名后缀和 OIDF Suite 地址。未指定分组或计划时运行完整矩阵。可用别名：oidc、ciba、fapi、openid4vci、openid4vp、openid4vc；也可使用内置分组或计划的完整 ID。\n\n每次运行都会创建新的临时租户、生成新的测试资料，并仅在所选计划需要时启动浏览器任务。Suite 测试记录默认保留。\n\n选项：\n  --token TOKEN                  本次运行直接使用 Token，不保存\n  --token-stdin                  从标准输入读取 Token，不保存\n  --json                         输出完整 JSON 报告；默认仅输出简洁摘要\n  --delete-suite-plans           运行结束后删除本次创建的 Suite 测试记录\n  --jobs N                       并行计划数，1-4（默认：4）\n  --poll-timeout 秒数            单个模块等待 Suite 的最长时间（默认：1800）"
         }
         OutputLanguage::English => {
-            "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the wildcard tenant-domain suffix and OIDF Suite origin once. Without a selector, the complete bundled Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant and test material, and starts browser workers only when the selected plan needs them.\n\nOptions:\n  --token TOKEN                  Use a token for this run only; do not save it\n  --token-stdin                  Read a token from stdin; do not save it\n  --json                         Print the full JSON report; the default is a concise summary\n  --retain-suite-plans-for-certification\n                                  Retain terminal plans at the Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+            "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the wildcard tenant-domain suffix and OIDF Suite origin once. Without a selector, the complete bundled Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant and test material, and starts browser workers only when the selected plan needs them. Suite test records are retained by default.\n\nOptions:\n  --token TOKEN                  Use a token for this run only; do not save it\n  --token-stdin                  Read a token from stdin; do not save it\n  --json                         Print the full JSON report; the default is a concise summary\n  --delete-suite-plans           Delete Suite test records created by the run when it finishes\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
         }
     }
 }
@@ -1019,6 +1019,34 @@ mod tests {
         assert!(parsed.plans.is_empty());
         assert!(uuid::Uuid::parse_str(&parsed.tenant_id).is_ok());
         assert_eq!(parsed.jobs, DEFAULT_JOBS);
+        assert!(!parsed.delete_suite_plans);
+    }
+
+    #[test]
+    fn suite_plans_are_deleted_only_when_explicitly_requested() {
+        let parsed = routed_run(&args(&[
+            "nazoauthctl",
+            "oidf",
+            "run",
+            "--delete-suite-plans",
+        ]))
+        .expect("parse")
+        .expect("run");
+        assert!(parsed.delete_suite_plans);
+
+        let removed_option = routed_run(&args(&[
+            "nazoauthctl",
+            "oidf",
+            "run",
+            "--retain-suite-plans-for-certification",
+        ]))
+        .err()
+        .expect("removed retention option must fail");
+        assert!(
+            removed_option
+                .to_string()
+                .contains("unknown oidf run option")
+        );
     }
 
     #[test]
