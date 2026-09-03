@@ -621,6 +621,8 @@ fn conformance_run_succeeds(
 mod acceptance_tests {
     #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     use nazo_operator_protocol::ControlOperationPayload;
     #[cfg(unix)]
@@ -693,6 +695,8 @@ mod acceptance_tests {
             uuid::Uuid::now_v7()
         ));
         fs::create_dir(&root).expect("recovery root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("private recovery root");
         let store = ConformanceRecoveryStore::open(&root, "deployment-1").expect("store");
         let resource = TenantResourceIdentity {
             kind: TenantResourceKind::OauthClient,
