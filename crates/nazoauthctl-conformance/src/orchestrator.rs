@@ -434,24 +434,19 @@ impl ConformanceRunner {
                 // the normal interactive driver handle that boundary.
                 return Ok((observed, true));
             }
-            if made_decision || !decided.is_empty() {
-                observed = self.wait_for_state_until(
-                    sink,
-                    &module.test_name,
-                    module_id,
-                    &["RUNNING", "FINISHED", "INTERRUPTED"],
-                    deadline,
-                    started,
-                )?;
-            } else {
+            if !made_decision {
                 emit_waiting_activity(sink, &module.test_name, started, &mut last_wait_report);
-                self.wait_for_runner_refresh(deadline, "CIBA")?;
-                observed = self
-                    .config
-                    .client
-                    .module_info(module_id)
-                    .map_err(|error| safe_error(&error))?;
             }
+            // A single Suite module can request more than one CIBA user
+            // decision while remaining WAITING. Refresh both its state and log
+            // after every decision instead of waiting exclusively for RUNNING,
+            // otherwise the next auth_req_id can never be observed.
+            self.wait_for_runner_refresh(deadline, "CIBA")?;
+            observed = self
+                .config
+                .client
+                .module_info(module_id)
+                .map_err(|error| safe_error(&error))?;
         }
     }
 
@@ -4090,6 +4085,189 @@ mod tests {
             "run interrupted"
         );
         assert!(transport.requests.lock().expect("lock").is_empty());
+    }
+
+    struct RepeatedCibaSuiteTransport {
+        decisions: Arc<AtomicUsize>,
+        refreshes_after_first_decision: AtomicUsize,
+    }
+
+    impl Transport for RepeatedCibaSuiteTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _max_response_bytes: usize,
+        ) -> Result<HttpResponse, TransportError> {
+            let decisions = self.decisions.load(Ordering::SeqCst);
+            let body = match request.url().path() {
+                "/api/log/m" if decisions == 0 => serde_json::json!([
+                    {
+                        "src": "CallBackchannelAuthenticationEndpoint",
+                        "auth_req_id": "request-1"
+                    },
+                    {"src": "CallAutomatedCibaApprovalEndpoint"}
+                ]),
+                "/api/log/m" if self.refreshes_after_first_decision.load(Ordering::SeqCst) < 3 => {
+                    serde_json::json!([
+                        {
+                            "src": "CallBackchannelAuthenticationEndpoint",
+                            "auth_req_id": "request-1"
+                        },
+                        {"src": "CallAutomatedCibaApprovalEndpoint"}
+                    ])
+                }
+                "/api/log/m" => serde_json::json!([
+                    {
+                        "src": "CallBackchannelAuthenticationEndpoint",
+                        "auth_req_id": "request-1"
+                    },
+                    {"src": "CallAutomatedCibaApprovalEndpoint"},
+                    {
+                        "src": "CallBackchannelAuthenticationEndpoint",
+                        "auth_req_id": "request-2"
+                    },
+                    {"src": "CallAutomatedCibaApprovalEndpoint"}
+                ]),
+                "/api/info/m" if decisions >= 2 => {
+                    serde_json::json!({"status":"FINISHED","result":"PASSED"})
+                }
+                "/api/info/m" => {
+                    if decisions == 1 {
+                        self.refreshes_after_first_decision
+                            .fetch_add(1, Ordering::SeqCst);
+                    }
+                    serde_json::json!({"status":"WAITING"})
+                }
+                _ => serde_json::json!({}),
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("json"),
+            })
+        }
+    }
+
+    struct RepeatedCibaApprovalTransport {
+        decisions: Arc<AtomicUsize>,
+        decision_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Transport for RepeatedCibaApprovalTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _max_response_bytes: usize,
+        ) -> Result<HttpResponse, TransportError> {
+            let path = request.url().path();
+            let (headers, body) = if path == "/auth/login" {
+                (
+                    vec![
+                        ("Set-Cookie".to_owned(), "session=opaque; Path=/".to_owned()),
+                        (
+                            "Set-Cookie".to_owned(),
+                            "csrf=csrf-value; Path=/".to_owned(),
+                        ),
+                    ],
+                    serde_json::json!({"csrf_token":"csrf-value","mfa_required":false}),
+                )
+            } else if request.method() == HttpMethod::Get {
+                let auth_req_id = path
+                    .strip_prefix("/auth/ciba/")
+                    .expect("CIBA verification path");
+                (
+                    Vec::new(),
+                    serde_json::json!({"auth_req_id":auth_req_id,"request":{}}),
+                )
+            } else {
+                self.decision_ids.lock().expect("decision IDs lock").push(
+                    path.strip_prefix("/auth/ciba/")
+                        .expect("CIBA decision path")
+                        .to_owned(),
+                );
+                self.decisions.fetch_add(1, Ordering::SeqCst);
+                (Vec::new(), serde_json::json!({"success":true}))
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers,
+                body: serde_json::to_vec(&body).expect("json"),
+            })
+        }
+    }
+
+    #[test]
+    fn ciba_waiting_handles_two_decisions_without_observing_running() {
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let decision_ids = Arc::new(Mutex::new(Vec::new()));
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(RepeatedCibaSuiteTransport {
+                decisions: Arc::clone(&decisions),
+                refreshes_after_first_decision: AtomicUsize::new(0),
+            }),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: SelectedMatrix {
+                document: MatrixDocument {
+                    schema: 1,
+                    name: "matrix".into(),
+                    groups: Vec::new(),
+                },
+                digest: "digest".into(),
+            },
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(5),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+        let approver = Arc::new(
+            CibaUserApprovalClient::new(
+                url::Url::parse("https://tenant.example/").expect("issuer"),
+                zeroize::Zeroizing::new("applicant@example.invalid".to_owned()),
+                zeroize::Zeroizing::new("password".to_owned()),
+                Arc::new(RepeatedCibaApprovalTransport {
+                    decisions: Arc::clone(&decisions),
+                    decision_ids: Arc::clone(&decision_ids),
+                }),
+            )
+            .expect("approver"),
+        );
+        let module = ModuleDefinition {
+            test_name: "fapi-ciba-id1".into(),
+            variant: BTreeMap::new(),
+            raw: serde_json::json!({}),
+        };
+
+        let (observed, needs_interactive_driver) = runner
+            .drive_ciba_waiting_interruptible(
+                &mut (),
+                &approver,
+                &module,
+                "m",
+                serde_json::json!({"status":"WAITING"}),
+            )
+            .expect("both CIBA decisions");
+
+        assert!(is_terminal_state(&observed));
+        assert!(!needs_interactive_driver);
+        assert_eq!(decisions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            decision_ids.lock().expect("decision IDs lock").as_slice(),
+            ["request-1", "request-2"]
+        );
     }
 
     struct PendingTransport;
