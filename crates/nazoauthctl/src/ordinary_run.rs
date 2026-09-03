@@ -73,6 +73,7 @@ fn execute_with_progress<S: ProgressSink>(
     let recovery_directory = session.recovery_directory()?;
     let recovery_store =
         ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
+    let _orchestration_lock = recovery_store.acquire_orchestration_lock()?;
 
     progress.activity(&ProgressActivity::LoadingMatrix);
     let now = current_unix_time()?;
@@ -636,11 +637,14 @@ mod acceptance_tests {
         TenantResourceRecoveryPhase,
     };
 
-    #[cfg(target_os = "linux")]
-    use super::next_pending_for_run;
     use super::{
         EphemeralTenant, PendingRecoveryCandidate, PendingRecoveryStep, conformance_run_succeeds,
         select_unique_pending_candidate,
+    };
+    #[cfg(target_os = "linux")]
+    use super::{
+        completed_lifecycle_candidate, next_pending_for_run, persist_pending_recovery_completion,
+        persisted_candidate_for_pending, pre_suite_requires_resource_cleanup,
     };
 
     #[test]
@@ -688,6 +692,25 @@ mod acceptance_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn failed_recovery_operation(operation_id: &str) -> TenantResourceControlOperation {
+        TenantResourceControlOperation {
+            operation_id: operation_id.to_owned(),
+            request_hash: "b".repeat(64),
+            controller_kid: "c".repeat(43),
+            result: ControlResult {
+                schema: CONTROL_RESULT_SCHEMA,
+                operation_id: operation_id.to_owned(),
+                request_hash: "b".repeat(64),
+                outcome: ControlOutcome::Failed,
+                error: Some(nazo_operator_protocol::ControlErrorCode::ExecutionFailed),
+                accepted_at: 1,
+                completed_at: Some(2),
+                result: None,
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn applied_recovery_selects_cleanup_enumerate_as_the_only_next_control_step() {
         let root = std::env::temp_dir().join(format!(
@@ -720,11 +743,32 @@ mod acceptance_tests {
             })
             .expect("begin recovery");
         recovery.mark_tenant_created().expect("tenant created");
+        assert_eq!(
+            completed_lifecycle_candidate(0, &recovery)
+                .expect("derive completed Create")
+                .expect("completed Create candidate")
+                .step,
+            PendingRecoveryStep::TenantCreate(0)
+        );
         recovery
             .mark_tenant_key_generated()
             .expect("tenant key generated");
+        assert_eq!(
+            completed_lifecycle_candidate(0, &recovery)
+                .expect("derive completed key generation")
+                .expect("completed key generation candidate")
+                .step,
+            PendingRecoveryStep::TenantKeyGenerate(0)
+        );
         recovery.prepare_tenant_reload(1).expect("prepare reload");
         recovery.mark_tenant_reloaded().expect("tenant reloaded");
+        assert_eq!(
+            completed_lifecycle_candidate(0, &recovery)
+                .expect("derive completed Reload")
+                .expect("completed Reload candidate")
+                .step,
+            PendingRecoveryStep::TenantReload(0)
+        );
         recovery
             .record_terminal_completion(
                 TenantResourceRecoveryPhase::BaselineEnumerated,
@@ -756,6 +800,7 @@ mod acceptance_tests {
                 ),
             )
             .expect("apply");
+        assert!(pre_suite_requires_resource_cleanup(&recovery));
 
         let candidate = next_pending_for_run(0, &recovery)
             .expect("derive next step")
@@ -763,6 +808,31 @@ mod acceptance_tests {
         assert_eq!(candidate.step, PendingRecoveryStep::CleanupEnumerate(0));
         assert_eq!(
             candidate.operation,
+            ControlOperationPayload::TenantResourceEnumerate {
+                tenant_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+                selectors: Vec::new(),
+            }
+        );
+        recovery
+            .record_terminal_completion(
+                TenantResourceRecoveryPhase::CleanupEnumerated,
+                recovery_operation(
+                    ControlResultData::TenantResourceEnumerate {
+                        revision: 4,
+                        resources: vec![resource.clone()],
+                        resource_manifest_sha256: "f".repeat(64),
+                    },
+                    "550e8400-e29b-41d4-a716-446655440003",
+                ),
+            )
+            .expect("cleanup enumerate");
+        let persisted =
+            persisted_candidate_for_pending(0, &recovery, "550e8400-e29b-41d4-a716-446655440003")
+                .expect("derive persisted operation")
+                .expect("persisted cleanup enumerate candidate");
+        assert_eq!(persisted.step, PendingRecoveryStep::CleanupEnumerate(0));
+        assert_eq!(
+            persisted.operation,
             ControlOperationPayload::TenantResourceEnumerate {
                 tenant_id: "00000000-0000-0000-0000-000000000000".to_owned(),
                 selectors: Vec::new(),
@@ -782,12 +852,111 @@ mod acceptance_tests {
                 tenant_id: "00000000-0000-0000-0000-000000000000".to_owned(),
             }
         );
-        recovery.mark_tenant_absent(5).expect("tenant absent");
+        recovery.mark_tenant_disabled().expect("tenant disabled");
+        assert_eq!(
+            completed_lifecycle_candidate(0, &recovery)
+                .expect("derive completed Disable")
+                .expect("completed Disable candidate")
+                .step,
+            PendingRecoveryStep::TenantDisable(0)
+        );
+        recovery
+            .prepare_tenant_finalize(5)
+            .expect("prepare finalize");
+        recovery
+            .mark_tenant_cleanup_complete()
+            .expect("tenant finalized");
+        assert_eq!(
+            completed_lifecycle_candidate(0, &recovery)
+                .expect("derive completed Finalize")
+                .expect("completed Finalize candidate")
+                .step,
+            PendingRecoveryStep::TenantFinalize(0)
+        );
+        recovery.mark_tenant_absent(6).expect("tenant absent");
         assert!(
             next_pending_for_run(0, &recovery)
                 .expect("derive absent recovery")
                 .is_none(),
             "an authoritative absence must suppress every tenant operation candidate"
+        );
+        drop(recovery);
+        fs::remove_dir_all(root).expect("remove recovery root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persisted_terminal_failure_rebuilds_the_attempted_resource_operation() {
+        let root = std::env::temp_dir().join(format!(
+            "nazoauthctl-ordinary-failure-recovery-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&root).expect("recovery root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("private recovery root");
+        let store = ConformanceRecoveryStore::open(&root, "deployment-1").expect("store");
+        let mut recovery = store
+            .begin_ordinary_run(TenantResourceRecoveryBinding {
+                deployment_id: "deployment-1".to_owned(),
+                tenant_id: "00000000-0000-0000-0000-000000000010".to_owned(),
+                tenant_domain: "oidf.example.com".to_owned(),
+                realm_id: "00000000-0000-0000-0000-000000000011".to_owned(),
+                organization_id: "00000000-0000-0000-0000-000000000012".to_owned(),
+                run_id: "request-failure-recovery-test".to_owned(),
+                tenant_create_expected_revision: 0,
+                manifest_path: None,
+                material_sha256: None,
+                proxy: None,
+                vp_evidence_trust_anchor: None,
+                resource_identities: vec![TenantResourceIdentity {
+                    kind: TenantResourceKind::OauthClient,
+                    resource_id: "client-failure".to_owned(),
+                    digest: "a".repeat(64),
+                }],
+            })
+            .expect("begin recovery");
+        recovery.mark_tenant_created().expect("tenant created");
+        recovery
+            .mark_tenant_key_generated()
+            .expect("tenant key generated");
+        recovery.prepare_tenant_reload(1).expect("prepare reload");
+        recovery.mark_tenant_reloaded().expect("tenant reloaded");
+        let operation_id = "550e8400-e29b-41d4-a716-446655440010";
+        let failed = failed_recovery_operation(operation_id);
+        persist_pending_recovery_completion(
+            PendingRecoveryStep::BaselineEnumerate(0),
+            &mut recovery,
+            &nazoauthctl_core::ConformanceControlCompletion {
+                identity: nazoauthctl_core::ControlOperationIdentity {
+                    operation_id: failed.operation_id.clone(),
+                    request_hash: failed.request_hash.clone(),
+                    kid: failed.controller_kid.clone(),
+                },
+                result: failed.result.clone(),
+            },
+        )
+        .expect("persist replayed baseline failure before controller journal clear");
+        assert_eq!(
+            recovery
+                .terminal_failure()
+                .expect("replayed failure identity must be durable"),
+            &failed
+        );
+        assert!(
+            !pre_suite_requires_resource_cleanup(&recovery),
+            "a failed pre-Suite operation must delete the temporary tenant directly"
+        );
+
+        let candidate = persisted_candidate_for_pending(0, &recovery, operation_id)
+            .expect("derive persisted failure")
+            .expect("persisted failure candidate");
+        assert_eq!(candidate.step, PendingRecoveryStep::BaselineEnumerate(0));
+        assert_eq!(
+            candidate.operation,
+            ControlOperationPayload::TenantResourceEnumerate {
+                tenant_id: "00000000-0000-0000-0000-000000000010".to_owned(),
+                selectors: Vec::new(),
+            }
         );
         drop(recovery);
         fs::remove_dir_all(root).expect("remove recovery root");
@@ -1153,67 +1322,99 @@ fn run_signed_suite<S: ProgressSink>(
             plans: invocation.plans.clone(),
         })
         .context("requested selection is outside the signed artifact Matrix")?;
-    let mut automation = Vec::with_capacity(invocation.jobs);
-    for index in 0..invocation.jobs {
-        progress.activity(&ProgressActivity::StartingBrowser {
-            current: index + 1,
-            total: invocation.jobs,
-        });
-        let browser = build_browser(target_issuer, suite_origin)?;
-        let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
-            Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
-                OpenId4VciIssuerConfig::new(
-                    target_origin.clone(),
-                    suite_origin.clone(),
-                    applicant_id,
-                    secrets.tx_code.clone(),
-                    secrets.applicant_email.clone(),
-                    secrets.applicant_password.clone(),
-                    Duration::from_secs(30),
-                )?,
-                openid4vci_management_token.clone(),
-                token.clone(),
-            )?));
-        let verifier_client = OpenId4VpVerifierClient::new(
-            target_origin.clone(),
-            suite_origin.clone(),
-            openid4vp_management_token.clone(),
-            Duration::from_secs(30),
-            binding.clone(),
-        )?;
-        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
-        automation.push(ConformanceAutomation {
-            browser: Some(browser),
-            review_screenshot_capture: review_screenshot_capture.clone(),
-            verifier: Some(verifier),
-            issuer: Some(issuer),
-            ciba_approver: ciba_approver.clone(),
-        });
+    let mut managed_browsers = Vec::with_capacity(invocation.jobs);
+    let run_result = (|| -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
+        let mut automation = Vec::with_capacity(invocation.jobs);
+        for index in 0..invocation.jobs {
+            progress.activity(&ProgressActivity::StartingBrowser {
+                current: index + 1,
+                total: invocation.jobs,
+            });
+            let managed_browser = build_browser(target_issuer, suite_origin)?;
+            managed_browsers.push(managed_browser.clone());
+            let browser: Arc<Mutex<dyn BrowserAutomation>> = managed_browser;
+            let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
+                Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
+                    OpenId4VciIssuerConfig::new(
+                        target_origin.clone(),
+                        suite_origin.clone(),
+                        applicant_id,
+                        secrets.tx_code.clone(),
+                        secrets.applicant_email.clone(),
+                        secrets.applicant_password.clone(),
+                        Duration::from_secs(30),
+                    )?,
+                    openid4vci_management_token.clone(),
+                    token.clone(),
+                )?));
+            let verifier_client = OpenId4VpVerifierClient::new(
+                target_origin.clone(),
+                suite_origin.clone(),
+                openid4vp_management_token.clone(),
+                Duration::from_secs(30),
+                binding.clone(),
+            )?;
+            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
+            automation.push(ConformanceAutomation {
+                browser: Some(browser),
+                review_screenshot_capture: review_screenshot_capture.clone(),
+                verifier: Some(verifier),
+                issuer: Some(issuer),
+                ciba_approver: ciba_approver.clone(),
+            });
+        }
+        let control = RunControl::default();
+        let interrupt = control.clone();
+        ctrlc::set_handler(move || interrupt.interrupt())
+            .context("failed to install the conformance interrupt handler")?;
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client: suite_client,
+            matrix: selected,
+            target_origin: Some(target_origin),
+            binding,
+            poll_timeout: invocation.poll_timeout,
+            control,
+            plan_lanes,
+            plan_resource_budgets,
+            selected_resource_budget,
+            jobs: invocation.jobs,
+            upload_review_screenshots: invocation.upload_review_screenshots,
+            automation,
+            suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
+                recovery,
+                retain_suite_plans_for_certification: invocation
+                    .retain_suite_plans_for_certification,
+            })),
+        })?;
+        Ok(runner.run(progress).report)
+    })();
+    let mut browser_cleanup_errors = Vec::new();
+    for (index, browser) in managed_browsers.iter().enumerate() {
+        match browser.lock() {
+            Ok(mut browser) => {
+                if let Err(error) = browser.driver_mut().shutdown() {
+                    browser_cleanup_errors.push(format!("browser {}: {error}", index + 1));
+                }
+            }
+            Err(_) => browser_cleanup_errors.push(format!("browser {}: lock poisoned", index + 1)),
+        }
     }
-    let control = RunControl::default();
-    let interrupt = control.clone();
-    ctrlc::set_handler(move || interrupt.interrupt())
-        .context("failed to install the conformance interrupt handler")?;
-    let runner = ConformanceRunner::new(ConformanceRunConfig {
-        client: suite_client,
-        matrix: selected,
-        target_origin: Some(target_origin),
-        binding,
-        poll_timeout: invocation.poll_timeout,
-        control,
-        plan_lanes,
-        plan_resource_budgets,
-        selected_resource_budget,
-        jobs: invocation.jobs,
-        upload_review_screenshots: invocation.upload_review_screenshots,
-        automation,
-        suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
-            recovery,
-            retain_suite_plans_for_certification: invocation.retain_suite_plans_for_certification,
-        })),
-    })?;
-    let summary = runner.run(progress);
-    Ok(summary.report)
+    let cleanup_result = if browser_cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "failed to stop managed browser infrastructure: {}",
+            browser_cleanup_errors.join("; ")
+        ))
+    };
+    match (run_result, cleanup_result) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "managed browser cleanup also failed: {cleanup_error:#}"
+        ))),
+    }
 }
 
 fn build_ciba_user_approver(
@@ -1332,12 +1533,59 @@ fn cleanup_failed_pre_suite_setup<T>(
     {
         cleanup_errors.push(format!("proxy={error:#}"));
     }
-    let resources_clean = match cleanup_run_resources(session, &mut recovery) {
-        Ok(_) => true,
+    let pending_settled = match session.pending_control_operation() {
+        Ok(Some(_)) => {
+            match resume_pending_conformance_operation(session, std::slice::from_mut(&mut recovery))
+            {
+                Ok(()) => match session.pending_control_operation() {
+                    Ok(None) => true,
+                    Ok(Some(_)) => {
+                        cleanup_errors.push(
+                            "control-journal=pending operation remained after exact recovery"
+                                .to_owned(),
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        cleanup_errors.push(format!("control-journal={error:#}"));
+                        false
+                    }
+                },
+                Err(error) => {
+                    cleanup_errors.push(format!("control-journal={error:#}"));
+                    false
+                }
+            }
+        }
+        Ok(None) => true,
         Err(error) => {
-            cleanup_errors.push(format!("resources={error:#}"));
+            cleanup_errors.push(format!("control-journal={error:#}"));
             false
         }
+    };
+    let resources_clean = if pending_settled {
+        let cleanup = if pre_suite_requires_resource_cleanup(&recovery) {
+            cleanup_run_resources(session, &mut recovery).map(|_| ())
+        } else {
+            tenant_directory_presence(session, &recovery.ordinary_binding().tenant_id).and_then(
+                |(revision, present)| {
+                    if present {
+                        cleanup_ephemeral_tenant(session, &mut recovery)
+                    } else {
+                        recovery.mark_tenant_absent(revision)
+                    }
+                },
+            )
+        };
+        match cleanup {
+            Ok(_) => true,
+            Err(error) => {
+                cleanup_errors.push(format!("resources={error:#}"));
+                false
+            }
+        }
+    } else {
+        false
     };
     if resources_clean
         && recovery.suite_cleanup_complete()
@@ -1354,10 +1602,16 @@ fn cleanup_failed_pre_suite_setup<T>(
     bail!("pre-Suite setup failed: {setup_error:#}; cleanup={cleanup}")
 }
 
+fn pre_suite_requires_resource_cleanup(
+    recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
+) -> bool {
+    recovery.apply_operation().is_some() && recovery.terminal_failure().is_none()
+}
+
 fn build_browser(
     target_issuer: &str,
     suite_origin: &Origin,
-) -> anyhow::Result<Arc<Mutex<dyn BrowserAutomation>>> {
+) -> anyhow::Result<Arc<Mutex<BrowserExecutor<ManagedWebDriver>>>> {
     let target = BrowserTargetOrigin::parse(target_issuer)?;
     let policy = BrowserPolicy::new(target, suite_origin.clone())?;
     let driver = ManagedWebDriver::start_default(Duration::from_secs(30))?;
@@ -1598,7 +1852,7 @@ fn cleanup_ephemeral_tenant(
     let outcome = session.execute_control_operation(
         ControlOperationPayload::TenantDirectoryFinalize {
             expected_revision,
-            tenant_id,
+            tenant_id: tenant_id.clone(),
         },
         None,
         |completion| {
@@ -1608,7 +1862,24 @@ fn cleanup_ephemeral_tenant(
             Ok(())
         },
     )?;
-    successful_control_completion(outcome, "temporary tenant Finalize")?;
+    let completion = successful_control_completion(outcome, "temporary tenant Finalize")?;
+    let ControlResultData::TenantDirectoryMutation {
+        action,
+        tenant_id: finalized_tenant_id,
+        revision,
+        ..
+    } = completion
+        .result
+        .result
+        .as_ref()
+        .context("temporary tenant Finalize omitted its typed result")?
+    else {
+        bail!("temporary tenant Finalize returned the wrong typed result");
+    };
+    if action != "finalize" || finalized_tenant_id != &tenant_id {
+        bail!("temporary tenant Finalize returned another operation");
+    }
+    recovery.mark_tenant_absent(*revision)?;
     Ok(())
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1631,6 +1902,89 @@ struct PendingRecoveryCandidate {
     operation: ControlOperationPayload,
 }
 
+fn pending_recovery_candidate(
+    step: PendingRecoveryStep,
+    recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
+) -> anyhow::Result<PendingRecoveryCandidate> {
+    let binding = recovery.ordinary_binding();
+    let tenant_id = binding.tenant_id.clone();
+    let operation = match step {
+        PendingRecoveryStep::Describe => ControlOperationPayload::TenantDirectoryDescribe,
+        PendingRecoveryStep::TenantCreate(_) => EphemeralTenant::from_ids(
+            &binding.tenant_id,
+            &binding.realm_id,
+            &binding.organization_id,
+            &binding.tenant_domain,
+        )?
+        .create_operation(binding.tenant_create_expected_revision),
+        PendingRecoveryStep::TenantKeyGenerate(_) => {
+            ControlOperationPayload::TenantKeysGenerateLocal {
+                tenant_id,
+                alg: "ES256".to_owned(),
+                purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
+            }
+        }
+        PendingRecoveryStep::TenantReload(_) => ControlOperationPayload::TenantDirectoryReload {
+            expected_revision: recovery
+                .tenant_reload_expected_revision()
+                .context("tenant Reload candidate has no persisted revision")?,
+            tenant_id,
+        },
+        PendingRecoveryStep::BaselineEnumerate(_) | PendingRecoveryStep::CleanupEnumerate(_) => {
+            ControlOperationPayload::TenantResourceEnumerate {
+                tenant_id,
+                selectors: Vec::new(),
+            }
+        }
+        PendingRecoveryStep::Apply(_) => ControlOperationPayload::TenantResourceApply {
+            tenant_id,
+            resources: binding.resource_identities.clone(),
+        },
+        PendingRecoveryStep::CleanupRevoke(_) => {
+            let enumerate = recovery
+                .cleanup_enumerate_operation()
+                .context("cleanup Revoke candidate has no persisted enumeration")?;
+            let ControlResultData::TenantResourceEnumerate { resources, .. } = enumerate
+                .result
+                .result
+                .as_ref()
+                .context("cleanup Enumerate omitted result")?
+            else {
+                bail!("cleanup Enumerate returned the wrong result");
+            };
+            let present = resources
+                .iter()
+                .filter(|candidate| {
+                    binding
+                        .resource_identities
+                        .iter()
+                        .any(|bound| bound == *candidate)
+                })
+                .cloned()
+                .collect();
+            ControlOperationPayload::TenantResourceRevoke {
+                tenant_id,
+                resources: present,
+            }
+        }
+        PendingRecoveryStep::TenantDisable(_) => ControlOperationPayload::TenantDirectoryDisable {
+            expected_revision: recovery
+                .tenant_disable_expected_revision()
+                .context("tenant Disable candidate has no persisted revision")?,
+            tenant_id,
+        },
+        PendingRecoveryStep::TenantFinalize(_) => {
+            ControlOperationPayload::TenantDirectoryFinalize {
+                expected_revision: recovery
+                    .tenant_finalize_expected_revision()
+                    .context("tenant Finalize candidate has no persisted revision")?,
+                tenant_id,
+            }
+        }
+    };
+    Ok(PendingRecoveryCandidate { step, operation })
+}
+
 fn select_unique_pending_candidate(
     mut matching: Vec<PendingRecoveryCandidate>,
 ) -> anyhow::Result<PendingRecoveryCandidate> {
@@ -1649,64 +2003,48 @@ fn next_pending_for_run(
     recovery_index: usize,
     recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> anyhow::Result<Option<PendingRecoveryCandidate>> {
-    let binding = recovery.ordinary_binding().clone();
     if recovery.tenant_absent() {
         return Ok(None);
     }
-    let tenant = EphemeralTenant::from_ids(
-        &binding.tenant_id,
-        &binding.realm_id,
-        &binding.organization_id,
-        &binding.tenant_domain,
-    )?;
     if !recovery.tenant_created() {
-        return Ok(Some(PendingRecoveryCandidate {
-            step: PendingRecoveryStep::TenantCreate(recovery_index),
-            operation: tenant.create_operation(binding.tenant_create_expected_revision),
-        }));
+        return pending_recovery_candidate(
+            PendingRecoveryStep::TenantCreate(recovery_index),
+            recovery,
+        )
+        .map(Some);
     }
     if !recovery.tenant_key_generated() {
-        return Ok(Some(PendingRecoveryCandidate {
-            step: PendingRecoveryStep::TenantKeyGenerate(recovery_index),
-            operation: ControlOperationPayload::TenantKeysGenerateLocal {
-                tenant_id: binding.tenant_id.clone(),
-                alg: "ES256".to_owned(),
-                purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
-            },
-        }));
+        return pending_recovery_candidate(
+            PendingRecoveryStep::TenantKeyGenerate(recovery_index),
+            recovery,
+        )
+        .map(Some);
     }
     if !recovery.tenant_reloaded() {
-        return Ok(recovery
+        return recovery
             .tenant_reload_expected_revision()
-            .map(|expected_revision| PendingRecoveryCandidate {
-                step: PendingRecoveryStep::TenantReload(recovery_index),
-                operation: ControlOperationPayload::TenantDirectoryReload {
-                    expected_revision,
-                    tenant_id: binding.tenant_id.clone(),
-                },
-            }));
+            .map(|_| {
+                pending_recovery_candidate(
+                    PendingRecoveryStep::TenantReload(recovery_index),
+                    recovery,
+                )
+            })
+            .transpose();
     }
-    if !recovery.tenant_disabled()
-        && let Some(expected_revision) = recovery.tenant_disable_expected_revision()
-    {
-        return Ok(Some(PendingRecoveryCandidate {
-            step: PendingRecoveryStep::TenantDisable(recovery_index),
-            operation: ControlOperationPayload::TenantDirectoryDisable {
-                expected_revision,
-                tenant_id: binding.tenant_id.clone(),
-            },
-        }));
+    if !recovery.tenant_disabled() && recovery.tenant_disable_expected_revision().is_some() {
+        return pending_recovery_candidate(
+            PendingRecoveryStep::TenantDisable(recovery_index),
+            recovery,
+        )
+        .map(Some);
     }
-    if !recovery.tenant_cleanup_complete()
-        && let Some(expected_revision) = recovery.tenant_finalize_expected_revision()
+    if !recovery.tenant_cleanup_complete() && recovery.tenant_finalize_expected_revision().is_some()
     {
-        return Ok(Some(PendingRecoveryCandidate {
-            step: PendingRecoveryStep::TenantFinalize(recovery_index),
-            operation: ControlOperationPayload::TenantDirectoryFinalize {
-                expected_revision,
-                tenant_id: binding.tenant_id.clone(),
-            },
-        }));
+        return pending_recovery_candidate(
+            PendingRecoveryStep::TenantFinalize(recovery_index),
+            recovery,
+        )
+        .map(Some);
     }
     if recovery.terminal_failure().is_some()
         || retained_recovery_stops_before_live_apply(recovery.suite_retention_committed())
@@ -1714,62 +2052,151 @@ fn next_pending_for_run(
         return Ok(None);
     }
     if recovery.baseline_enumerate_operation().is_none() {
-        return Ok(Some(PendingRecoveryCandidate {
-            step: PendingRecoveryStep::BaselineEnumerate(recovery_index),
-            operation: ControlOperationPayload::TenantResourceEnumerate {
-                tenant_id: binding.tenant_id.clone(),
-                selectors: Vec::new(),
-            },
-        }));
+        return pending_recovery_candidate(
+            PendingRecoveryStep::BaselineEnumerate(recovery_index),
+            recovery,
+        )
+        .map(Some);
     }
     if recovery.apply_operation().is_none() {
-        return Ok(Some(PendingRecoveryCandidate {
-            step: PendingRecoveryStep::Apply(recovery_index),
-            operation: ControlOperationPayload::TenantResourceApply {
-                tenant_id: binding.tenant_id.clone(),
-                resources: binding.resource_identities.clone(),
-            },
-        }));
+        return pending_recovery_candidate(PendingRecoveryStep::Apply(recovery_index), recovery)
+            .map(Some);
     }
     if recovery.cleanup_enumerate_operation().is_none() {
-        return Ok(Some(PendingRecoveryCandidate {
-            step: PendingRecoveryStep::CleanupEnumerate(recovery_index),
-            operation: ControlOperationPayload::TenantResourceEnumerate {
-                tenant_id: binding.tenant_id.clone(),
-                selectors: Vec::new(),
-            },
-        }));
+        return pending_recovery_candidate(
+            PendingRecoveryStep::CleanupEnumerate(recovery_index),
+            recovery,
+        )
+        .map(Some);
     }
-    if recovery.cleanup_revoke_operation().is_none()
-        && let Some(enumerate) = recovery.cleanup_enumerate_operation()
-    {
-        let ControlResultData::TenantResourceEnumerate { resources, .. } = enumerate
-            .result
-            .result
-            .as_ref()
-            .context("cleanup Enumerate omitted result")?
-        else {
-            bail!("cleanup Enumerate returned the wrong result");
-        };
-        let present = resources
-            .iter()
-            .filter(|candidate| {
-                binding
-                    .resource_identities
-                    .iter()
-                    .any(|bound| bound == *candidate)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !present.is_empty() {
-            return Ok(Some(PendingRecoveryCandidate {
-                step: PendingRecoveryStep::CleanupRevoke(recovery_index),
-                operation: ControlOperationPayload::TenantResourceRevoke {
-                    tenant_id: binding.tenant_id.clone(),
-                    resources: present,
-                },
-            }));
+    if recovery.cleanup_revoke_operation().is_none() {
+        let candidate = pending_recovery_candidate(
+            PendingRecoveryStep::CleanupRevoke(recovery_index),
+            recovery,
+        )?;
+        if matches!(
+            &candidate.operation,
+            ControlOperationPayload::TenantResourceRevoke { resources, .. }
+                if !resources.is_empty()
+        ) {
+            return Ok(Some(candidate));
         }
+    }
+    Ok(None)
+}
+
+fn persisted_candidate_for_pending(
+    recovery_index: usize,
+    recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
+    operation_id: &str,
+) -> anyhow::Result<Option<PendingRecoveryCandidate>> {
+    let step = if recovery
+        .baseline_enumerate_operation()
+        .is_some_and(|operation| operation.operation_id == operation_id)
+    {
+        Some(PendingRecoveryStep::BaselineEnumerate(recovery_index))
+    } else if recovery
+        .apply_operation()
+        .is_some_and(|operation| operation.operation_id == operation_id)
+    {
+        Some(PendingRecoveryStep::Apply(recovery_index))
+    } else if recovery
+        .cleanup_enumerate_operation()
+        .is_some_and(|operation| operation.operation_id == operation_id)
+    {
+        Some(PendingRecoveryStep::CleanupEnumerate(recovery_index))
+    } else if recovery
+        .cleanup_revoke_operation()
+        .is_some_and(|operation| operation.operation_id == operation_id)
+    {
+        Some(PendingRecoveryStep::CleanupRevoke(recovery_index))
+    } else if recovery
+        .terminal_failure()
+        .is_some_and(|operation| operation.operation_id == operation_id)
+    {
+        Some(match recovery.ordinary_phase() {
+            TenantResourceRecoveryPhase::Intent => {
+                PendingRecoveryStep::BaselineEnumerate(recovery_index)
+            }
+            TenantResourceRecoveryPhase::BaselineEnumerated => {
+                PendingRecoveryStep::Apply(recovery_index)
+            }
+            TenantResourceRecoveryPhase::Applied => {
+                PendingRecoveryStep::CleanupEnumerate(recovery_index)
+            }
+            TenantResourceRecoveryPhase::CleanupEnumerated => {
+                PendingRecoveryStep::CleanupRevoke(recovery_index)
+            }
+            TenantResourceRecoveryPhase::CleanupRevoked => {
+                bail!("terminal failure cannot follow completed cleanup Revoke")
+            }
+        })
+    } else {
+        None
+    };
+    step.map(|step| pending_recovery_candidate(step, recovery))
+        .transpose()
+}
+
+fn completed_lifecycle_candidate(
+    recovery_index: usize,
+    recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
+) -> anyhow::Result<Option<PendingRecoveryCandidate>> {
+    if recovery.tenant_absent() {
+        return Ok(None);
+    }
+    if recovery.tenant_cleanup_complete() {
+        return recovery
+            .tenant_finalize_expected_revision()
+            .map(|_| {
+                pending_recovery_candidate(
+                    PendingRecoveryStep::TenantFinalize(recovery_index),
+                    recovery,
+                )
+            })
+            .transpose();
+    }
+    if recovery.tenant_disabled() && recovery.tenant_finalize_expected_revision().is_none() {
+        return recovery
+            .tenant_disable_expected_revision()
+            .map(|_| {
+                pending_recovery_candidate(
+                    PendingRecoveryStep::TenantDisable(recovery_index),
+                    recovery,
+                )
+            })
+            .transpose();
+    }
+    if recovery.ordinary_phase() != TenantResourceRecoveryPhase::Intent
+        || recovery.terminal_failure().is_some()
+        || recovery.tenant_disable_expected_revision().is_some()
+    {
+        return Ok(None);
+    }
+    if recovery.tenant_reloaded() {
+        return recovery
+            .tenant_reload_expected_revision()
+            .map(|_| {
+                pending_recovery_candidate(
+                    PendingRecoveryStep::TenantReload(recovery_index),
+                    recovery,
+                )
+            })
+            .transpose();
+    }
+    if recovery.tenant_key_generated() && recovery.tenant_reload_expected_revision().is_none() {
+        return pending_recovery_candidate(
+            PendingRecoveryStep::TenantKeyGenerate(recovery_index),
+            recovery,
+        )
+        .map(Some);
+    }
+    if recovery.tenant_created() && !recovery.tenant_key_generated() {
+        return pending_recovery_candidate(
+            PendingRecoveryStep::TenantCreate(recovery_index),
+            recovery,
+        )
+        .map(Some);
     }
     Ok(None)
 }
@@ -1780,16 +2207,48 @@ fn resume_pending_candidate<F>(
     operation: ControlOperationPayload,
     change_set: Option<Vec<u8>>,
     persist: F,
-    label: &str,
-) -> anyhow::Result<()>
+) -> anyhow::Result<nazoauthctl_core::ConformanceControlOutcome>
 where
     F: FnOnce(&nazoauthctl_core::ConformanceControlCompletion) -> anyhow::Result<()>,
 {
-    let outcome = session
+    session
         .resume_pending_control_operation(expected, operation, change_set, persist)?
-        .context("the pending ControlOperation changed before recovery dispatch")?;
-    successful_control_completion(outcome, label)?;
-    Ok(())
+        .context("the pending ControlOperation changed before recovery dispatch")
+}
+
+fn persist_pending_recovery_completion(
+    step: PendingRecoveryStep,
+    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
+    completion: &nazoauthctl_core::ConformanceControlCompletion,
+) -> anyhow::Result<()> {
+    if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Failed {
+        let phase = recovery.ordinary_phase();
+        return recovery.record_terminal_completion(phase, control_operation(completion));
+    }
+    match step {
+        PendingRecoveryStep::TenantCreate(_) => recovery.mark_tenant_created(),
+        PendingRecoveryStep::TenantKeyGenerate(_) => recovery.mark_tenant_key_generated(),
+        PendingRecoveryStep::TenantReload(_) => recovery.mark_tenant_reloaded(),
+        PendingRecoveryStep::BaselineEnumerate(_) => recovery.record_terminal_completion(
+            TenantResourceRecoveryPhase::BaselineEnumerated,
+            control_operation(completion),
+        ),
+        PendingRecoveryStep::Apply(_) => recovery.record_terminal_completion(
+            TenantResourceRecoveryPhase::Applied,
+            control_operation(completion),
+        ),
+        PendingRecoveryStep::CleanupEnumerate(_) => recovery.record_terminal_completion(
+            TenantResourceRecoveryPhase::CleanupEnumerated,
+            control_operation(completion),
+        ),
+        PendingRecoveryStep::CleanupRevoke(_) => recovery.record_terminal_completion(
+            TenantResourceRecoveryPhase::CleanupRevoked,
+            control_operation(completion),
+        ),
+        PendingRecoveryStep::TenantDisable(_) => recovery.mark_tenant_disabled(),
+        PendingRecoveryStep::TenantFinalize(_) => recovery.mark_tenant_cleanup_complete(),
+        PendingRecoveryStep::Describe => unreachable!(),
+    }
 }
 
 fn execute_pending_recovery_candidate(
@@ -1800,14 +2259,11 @@ fn execute_pending_recovery_candidate(
 ) -> anyhow::Result<()> {
     let operation = candidate.operation;
     match candidate.step {
-        PendingRecoveryStep::Describe => resume_pending_candidate(
-            session,
-            expected,
-            operation,
-            None,
-            |_| Ok(()),
-            "recovery pending tenant directory Describe",
-        ),
+        PendingRecoveryStep::Describe => {
+            let outcome = resume_pending_candidate(session, expected, operation, None, |_| Ok(()))?;
+            successful_control_completion(outcome, "recovery pending tenant directory Describe")?;
+            Ok(())
+        }
         step => {
             let index = match step {
                 PendingRecoveryStep::TenantCreate(index)
@@ -1825,51 +2281,11 @@ fn execute_pending_recovery_candidate(
             let change_set = matches!(step, PendingRecoveryStep::Apply(_))
                 .then(|| recovery.read_private_material().map(|value| value.to_vec()))
                 .transpose()?;
-            resume_pending_candidate(
-                session,
-                expected,
-                operation,
-                change_set,
-                |completion| {
-                    if completion.result.outcome
-                        != nazo_operator_protocol::ControlOutcome::Succeeded
-                    {
-                        return Ok(());
-                    }
-                    match step {
-                        PendingRecoveryStep::TenantCreate(_) => recovery.mark_tenant_created(),
-                        PendingRecoveryStep::TenantKeyGenerate(_) => {
-                            recovery.mark_tenant_key_generated()
-                        }
-                        PendingRecoveryStep::TenantReload(_) => recovery.mark_tenant_reloaded(),
-                        PendingRecoveryStep::BaselineEnumerate(_) => recovery
-                            .record_terminal_completion(
-                                TenantResourceRecoveryPhase::BaselineEnumerated,
-                                control_operation(completion),
-                            ),
-                        PendingRecoveryStep::Apply(_) => recovery.record_terminal_completion(
-                            TenantResourceRecoveryPhase::Applied,
-                            control_operation(completion),
-                        ),
-                        PendingRecoveryStep::CleanupEnumerate(_) => recovery
-                            .record_terminal_completion(
-                                TenantResourceRecoveryPhase::CleanupEnumerated,
-                                control_operation(completion),
-                            ),
-                        PendingRecoveryStep::CleanupRevoke(_) => recovery
-                            .record_terminal_completion(
-                                TenantResourceRecoveryPhase::CleanupRevoked,
-                                control_operation(completion),
-                            ),
-                        PendingRecoveryStep::TenantDisable(_) => recovery.mark_tenant_disabled(),
-                        PendingRecoveryStep::TenantFinalize(_) => {
-                            recovery.mark_tenant_cleanup_complete()
-                        }
-                        PendingRecoveryStep::Describe => unreachable!(),
-                    }
-                },
-                "recovery pending conformance ControlOperation",
-            )
+            let _ =
+                resume_pending_candidate(session, expected, operation, change_set, |completion| {
+                    persist_pending_recovery_completion(step, recovery, completion)
+                })?;
+            Ok(())
         }
     }
 }
@@ -1886,6 +2302,14 @@ fn resume_pending_conformance_operation(
         operation: ControlOperationPayload::TenantDirectoryDescribe,
     }];
     for (index, recovery) in recoveries.iter().enumerate() {
+        if let Some(candidate) =
+            persisted_candidate_for_pending(index, recovery, &expected.operation_id)?
+        {
+            candidates.push(candidate);
+        }
+        if let Some(candidate) = completed_lifecycle_candidate(index, recovery)? {
+            candidates.push(candidate);
+        }
         if let Some(candidate) = next_pending_for_run(index, recovery)? {
             candidates.push(candidate);
         }
@@ -1918,13 +2342,13 @@ fn recover_pending_runs(
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
             let (directory_revision, tenant_present) =
                 tenant_directory_presence(session, &binding.tenant_id)?;
-            if tenant_present {
-                recover_ephemeral_tenant(session, &mut recovery)?;
-            } else {
-                recovery.mark_tenant_absent(directory_revision)?;
-            }
-            if let Some(failure) = recovery.terminal_failure().cloned() {
-                let tenant_cleanup = cleanup_ephemeral_tenant(session, &mut recovery);
+            let terminal_failure = recovery.terminal_failure().cloned();
+            if let Some(failure) = terminal_failure {
+                let tenant_cleanup = if tenant_present {
+                    cleanup_ephemeral_tenant(session, &mut recovery)
+                } else {
+                    recovery.mark_tenant_absent(directory_revision)
+                };
                 bail!(
                     "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}; tenant_cleanup={}",
                     failure.operation_id,
@@ -1938,6 +2362,11 @@ fn recover_pending_runs(
                         .err()
                         .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}")),
                 );
+            }
+            if tenant_present {
+                recover_ephemeral_tenant(session, &mut recovery)?;
+            } else {
+                recovery.mark_tenant_absent(directory_revision)?;
             }
             if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
                 recovery.publish_committed_suite_retention_manifest()?;

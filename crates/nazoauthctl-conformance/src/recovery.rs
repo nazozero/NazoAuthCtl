@@ -20,6 +20,7 @@ const MAX_RECOVERY_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_PENDING_RUNS: usize = 64;
 const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SUITE_RECOVERY_PLANS: usize = 128;
+const ORCHESTRATION_LOCK_FILE: &str = "oidf-orchestration.lock";
 const MAX_SUITE_RECOVERY_MODULES: usize = 16 * 1024;
 const SUITE_RETENTION_MANIFEST_SCHEMA: u32 = 2;
 const MAX_SUITE_RETENTION_MANIFEST_BYTES: usize = 64 * 1024;
@@ -339,6 +340,18 @@ impl ConformanceRecoveryStore {
         })
     }
 
+    /// Acquire the one deployment-wide OIDF orchestration lease. The stable
+    /// inode remains in the recovery directory; dropping the returned file
+    /// releases only its OS lock so a concurrent process can never bypass the
+    /// lease by racing a lock-file replacement.
+    pub fn acquire_orchestration_lock(&self) -> anyhow::Result<File> {
+        let lock_path = self.root.join(ORCHESTRATION_LOCK_FILE);
+        let lock = crate::secure_file::open_lock_file(&lock_path, true).map_err(|error| {
+            anyhow::anyhow!("failed to open OIDF orchestration lock: {error:?}")
+        })?;
+        acquire_orchestration_file_lock(lock, &self.deployment_id)
+    }
+
     /// Persist ordinary-run intent before the caller performs any remote
     /// control operation. This method performs no network operation and only
     /// returns a lock-held guard after the durable journal write succeeds.
@@ -547,6 +560,16 @@ impl ConformanceRecoveryStore {
             self.root.join(format!("run-{run_id}.json")),
             self.root.join(format!("run-{run_id}.lock")),
         )
+    }
+}
+
+fn acquire_orchestration_file_lock(lock: File, deployment_id: &str) -> anyhow::Result<File> {
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(lock),
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            bail!("another OIDF orchestration is already running for deployment '{deployment_id}'")
+        }
+        Err(error) => Err(error).context("failed to acquire OIDF orchestration lock"),
     }
 }
 
@@ -1438,6 +1461,7 @@ fn validate_tenant_resource_journal(
             || (!suite.cleanup_complete
                 && !suite_inventory_transferred
                 && suite.plan_ids.is_empty()
+                && suite.module_ids.is_empty()
                 && suite.pending_create_intents.is_empty())
             || suite.plan_ids.len() > MAX_SUITE_RECOVERY_PLANS
             || suite.module_ids.len() > MAX_SUITE_RECOVERY_MODULES
@@ -2698,6 +2722,45 @@ mod tests {
     }
 
     #[test]
+    fn active_suite_recovery_may_own_modules_after_its_last_plan_is_deleted() {
+        let journal = TenantResourceRecoveryJournal {
+            schema: TENANT_RESOURCE_RECOVERY_JOURNAL_SCHEMA,
+            kind: TENANT_RESOURCE_RECOVERY_KIND.to_owned(),
+            binding: binding(),
+            phase: TenantResourceRecoveryPhase::Intent,
+            tenant_created: false,
+            tenant_key_generated: false,
+            tenant_reload_expected_revision: None,
+            tenant_reloaded: false,
+            tenant_disable_expected_revision: None,
+            tenant_disabled: false,
+            tenant_finalize_expected_revision: None,
+            tenant_cleanup_complete: false,
+            tenant_absence_revision: None,
+            baseline_enumerate: None,
+            apply: None,
+            cleanup_enumerate: None,
+            cleanup_revoke: None,
+            terminal_failure: None,
+            cleanup_complete: false,
+            manifest_removal_intent: false,
+            manifest_cleanup_complete: false,
+            proxy_cleanup_complete: true,
+            suite: Some(SuiteRecoveryState {
+                origin: "https://www.certification.openid.net".to_owned(),
+                plan_ids: Vec::new(),
+                module_ids: vec!["suite-module-1".to_owned()],
+                pending_create_intents: Vec::new(),
+                cleanup_complete: false,
+            }),
+            suite_retention: SuiteRetentionDisposition::default(),
+        };
+
+        validate_journal(&journal, "deployment-1", "run-1")
+            .expect("module ownership keeps active Suite recovery valid");
+    }
+
+    #[test]
     fn retention_accepts_the_explicit_configured_suite_origin() {
         let binding = binding();
         let matrix_plan_id = "openid4vc-vp-p038".to_owned();
@@ -2721,5 +2784,49 @@ mod tests {
 
         validate_suite_retention_manifest(&manifest, &binding, None)
             .expect("explicit configured Suite origin");
+    }
+    #[test]
+    fn deployment_oidf_orchestration_lock_is_fail_fast_and_reusable() {
+        let root = std::env::temp_dir().join(format!(
+            "nazoauthctl-oidf-orchestration-lock-{}",
+            uuid::Uuid::now_v7()
+        ));
+        #[cfg(unix)]
+        let store = ConformanceRecoveryStore::open(&root, "deployment-1").expect("store");
+        #[cfg(unix)]
+        let acquire = || store.acquire_orchestration_lock();
+
+        // Private secure-file primitives intentionally reject Windows in
+        // production. Keep the cross-platform unit test on the exact fs2
+        // contention classifier while Unix exercises the store-owned path.
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root).expect("create isolated lock directory");
+        #[cfg(not(unix))]
+        let path = root.join(ORCHESTRATION_LOCK_FILE);
+        #[cfg(not(unix))]
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("open stable lock file")
+        };
+        #[cfg(not(unix))]
+        let acquire = || acquire_orchestration_file_lock(open(), "deployment-1");
+
+        let first = acquire().expect("first lock");
+
+        let error = acquire().expect_err("concurrent lock must fail");
+        assert_eq!(
+            error.to_string(),
+            "another OIDF orchestration is already running for deployment 'deployment-1'"
+        );
+
+        drop(first);
+        let second = acquire().expect("lock must be reusable after guard drop");
+        drop(second);
+        std::fs::remove_dir_all(root).expect("remove isolated recovery directory");
     }
 }

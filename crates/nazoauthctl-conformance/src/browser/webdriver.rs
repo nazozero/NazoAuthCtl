@@ -604,15 +604,33 @@ impl ManagedDriverProcess {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Result<(), BrowserError> {
         match self {
             Self::Native(child) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if child
+                    .try_wait()
+                    .map_err(|_| BrowserError::DriverStartFailed)?
+                    .is_none()
+                {
+                    child.kill().map_err(|_| BrowserError::DriverStartFailed)?;
+                    child.wait().map_err(|_| BrowserError::DriverStartFailed)?;
+                }
+                Ok(())
             }
             Self::Container(container) => container.remove(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContainerCleanupAction {
+    Remove,
+    List,
+}
+
+struct ContainerCleanupOutput {
+    success: bool,
+    stdout: Vec<u8>,
 }
 
 struct ManagedSeleniumContainer {
@@ -670,20 +688,62 @@ impl ManagedSeleniumContainer {
             && std::str::from_utf8(&output.stdout).is_ok_and(|value| value.trim() == "true"))
     }
 
-    fn remove(&mut self) {
+    fn remove(&mut self) -> Result<(), BrowserError> {
         if self.removed {
-            return;
+            return Ok(());
         }
-        self.removed = true;
-        let mut command = container_command(&self.runtime);
-        command.args(["rm", "--force", &self.name]);
-        let _ = command_output_with_timeout(&mut command, CONTAINER_COMMAND_TIMEOUT);
+        let runtime = self.runtime.clone();
+        let name = self.name.clone();
+        self.remove_with(|action| {
+            let mut command = container_command(&runtime);
+            match action {
+                ContainerCleanupAction::Remove => {
+                    command.args(["rm", "--force", &name]);
+                }
+                ContainerCleanupAction::List => {
+                    command.args(["ps", "--all", "--format", "{{.Names}}"]);
+                }
+            }
+            command_output_with_timeout(&mut command, CONTAINER_COMMAND_TIMEOUT).map(|output| {
+                ContainerCleanupOutput {
+                    success: output.status.success(),
+                    stdout: output.stdout,
+                }
+            })
+        })
+    }
+
+    fn remove_with<F>(&mut self, mut execute: F) -> Result<(), BrowserError>
+    where
+        F: FnMut(ContainerCleanupAction) -> Result<ContainerCleanupOutput, BrowserError>,
+    {
+        if self.removed {
+            return Ok(());
+        }
+        let removal = execute(ContainerCleanupAction::Remove);
+        if removal.as_ref().is_ok_and(|output| output.success) {
+            self.removed = true;
+            return Ok(());
+        }
+
+        let listed = execute(ContainerCleanupAction::List)?;
+        if !listed.success {
+            return Err(removal.err().unwrap_or(BrowserError::DriverStartFailed));
+        }
+        let names =
+            std::str::from_utf8(&listed.stdout).map_err(|_| BrowserError::DriverStartFailed)?;
+        if names.lines().all(|candidate| candidate.trim() != self.name) {
+            self.removed = true;
+            Ok(())
+        } else {
+            Err(removal.err().unwrap_or(BrowserError::DriverStartFailed))
+        }
     }
 }
 
 impl Drop for ManagedSeleniumContainer {
     fn drop(&mut self) {
-        self.remove();
+        let _ = self.remove();
     }
 }
 
@@ -753,9 +813,16 @@ impl ManagedWebDriver {
 
         let endpoint = WebDriverEndpoint::parse(&format!("http://127.0.0.1:{port}"))?;
         let mut process = ManagedDriverProcess::Native(child);
-        wait_for_webdriver(&endpoint, timeout, &mut process)?;
-        let mut client = WebDriverClient::connect(endpoint, timeout)?;
-        client.start_chrome()?;
+        if let Err(error) = wait_for_webdriver(&endpoint, timeout, &mut process) {
+            return fail_after_started_process(&mut process, error);
+        }
+        let mut client = match WebDriverClient::connect(endpoint, timeout) {
+            Ok(client) => client,
+            Err(error) => return fail_after_started_process(&mut process, error),
+        };
+        if let Err(error) = client.start_chrome() {
+            return fail_after_started_process(&mut process, error);
+        }
         Ok(Self { client, process })
     }
 
@@ -775,6 +842,35 @@ impl ManagedWebDriver {
     pub fn driver_mut(&mut self) -> &mut WebDriverClient {
         &mut self.client
     }
+
+    pub fn shutdown(&mut self) -> Result<(), BrowserError> {
+        let quit = self.client.quit();
+        let stop = self.process.stop();
+        match (quit, stop) {
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
+fn preserve_start_error_after_cleanup<T, F>(
+    error: BrowserError,
+    cleanup: F,
+) -> Result<T, BrowserError>
+where
+    F: FnOnce() -> Result<(), BrowserError>,
+{
+    match cleanup() {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(cleanup_error),
+    }
+}
+
+fn fail_after_started_process<T>(
+    process: &mut ManagedDriverProcess,
+    error: BrowserError,
+) -> Result<T, BrowserError> {
+    preserve_start_error_after_cleanup(error, || process.stop())
 }
 
 #[cfg(unix)]
@@ -856,8 +952,7 @@ impl BrowserDriver for ManagedWebDriver {
 
 impl Drop for ManagedWebDriver {
     fn drop(&mut self) {
-        let _ = self.client.quit();
-        self.process.stop();
+        let _ = self.shutdown();
     }
 }
 
@@ -1666,6 +1761,95 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         );
+    }
+
+    #[test]
+    fn managed_selenium_cleanup_retries_after_failure_and_accepts_confirmed_absence() {
+        let mut container = ManagedSeleniumContainer {
+            runtime: PathBuf::from("unused-test-runtime"),
+            name: "nazoauthctl-oidf-test".to_owned(),
+            removed: false,
+        };
+        let mut actions = Vec::new();
+        let error = container
+            .remove_with(|action| {
+                actions.push(action);
+                Ok(match action {
+                    ContainerCleanupAction::Remove => ContainerCleanupOutput {
+                        success: false,
+                        stdout: Vec::new(),
+                    },
+                    ContainerCleanupAction::List => ContainerCleanupOutput {
+                        success: true,
+                        stdout: b"nazoauthctl-oidf-test\n".to_vec(),
+                    },
+                })
+            })
+            .expect_err("a still-present container must keep cleanup pending");
+        assert_eq!(error, BrowserError::DriverStartFailed);
+        assert!(!container.removed);
+        assert_eq!(
+            actions,
+            [ContainerCleanupAction::Remove, ContainerCleanupAction::List]
+        );
+
+        actions.clear();
+        container
+            .remove_with(|action| {
+                actions.push(action);
+                Ok(ContainerCleanupOutput {
+                    success: matches!(action, ContainerCleanupAction::Remove),
+                    stdout: Vec::new(),
+                })
+            })
+            .expect("a later successful removal must settle cleanup");
+        assert!(container.removed);
+        assert_eq!(actions, [ContainerCleanupAction::Remove]);
+
+        let mut absent = ManagedSeleniumContainer {
+            runtime: PathBuf::from("unused-test-runtime"),
+            name: "nazoauthctl-oidf-absent".to_owned(),
+            removed: false,
+        };
+        absent
+            .remove_with(|action| {
+                Ok(match action {
+                    ContainerCleanupAction::Remove => ContainerCleanupOutput {
+                        success: false,
+                        stdout: Vec::new(),
+                    },
+                    ContainerCleanupAction::List => ContainerCleanupOutput {
+                        success: true,
+                        stdout: b"another-container\n".to_vec(),
+                    },
+                })
+            })
+            .expect("a successful listing can confirm that the container is absent");
+        assert!(absent.removed);
+    }
+
+    #[test]
+    fn native_start_failure_preserves_the_original_error_after_successful_cleanup() {
+        let mut cleanup_called = false;
+        let result: Result<(), BrowserError> =
+            preserve_start_error_after_cleanup(BrowserError::Transport, || {
+                cleanup_called = true;
+                Ok(())
+            });
+        assert!(cleanup_called);
+        assert_eq!(result, Err(BrowserError::Transport));
+    }
+
+    #[test]
+    fn native_start_failure_exposes_cleanup_failure() {
+        let mut cleanup_called = false;
+        let result: Result<(), BrowserError> =
+            preserve_start_error_after_cleanup(BrowserError::Transport, || {
+                cleanup_called = true;
+                Err(BrowserError::DriverStartFailed)
+            });
+        assert!(cleanup_called);
+        assert_eq!(result, Err(BrowserError::DriverStartFailed));
     }
 
     #[test]

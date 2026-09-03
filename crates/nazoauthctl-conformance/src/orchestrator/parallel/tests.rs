@@ -634,6 +634,49 @@ fn failed_outcome_stops_queued_plans_immediately() {
 }
 
 #[test]
+fn completed_plan_failure_detection_excludes_review_and_skipped_outcomes() {
+    let failed =
+        parallel_fixture_with_result(serde_json::json!({}), &["plan-a", "plan-b"], None, "FAILED")
+            .0
+            .run(&mut ())
+            .report;
+    assert!(completed_plan_stops_dispatch(&failed));
+
+    for result in ["REVIEW", "SKIPPED"] {
+        let report = parallel_fixture_with_result(
+            serde_json::json!({}),
+            &["plan-a", "plan-b"],
+            None,
+            result,
+        )
+        .0
+        .run(&mut ())
+        .report;
+        assert!(
+            !completed_plan_stops_dispatch(&report),
+            "{result} must not stop independent plan dispatch as a failure"
+        );
+    }
+}
+
+#[test]
+fn completed_plan_local_error_stops_dispatch_but_shared_interrupt_is_not_a_new_failure() {
+    let mut report =
+        parallel_fixture_with_result(serde_json::json!({}), &["plan-a", "plan-b"], None, "REVIEW")
+            .0
+            .run(&mut ())
+            .report;
+    assert!(!completed_plan_stops_dispatch(&report));
+
+    report.errors.push("module automation failed".to_owned());
+    assert!(completed_plan_stops_dispatch(&report));
+
+    report.errors.clear();
+    report.errors.push("run interrupted".to_owned());
+    assert!(!completed_plan_stops_dispatch(&report));
+}
+
+#[test]
 fn parallel_expected_skips_are_preserved_and_acceptance_is_exact() {
     let (mut runner, _) = parallel_fixture_with_result(
         serde_json::json!({}),
@@ -661,7 +704,7 @@ fn parallel_expected_skips_are_preserved_and_acceptance_is_exact() {
 }
 
 #[test]
-fn ciba_plans_use_one_global_serial_lane() {
+fn independent_ciba_plans_run_in_parallel_within_the_jobs_limit() {
     let (runner, transport) = parallel_fixture_with_lanes(
         serde_json::json!({}),
         &["plan-a", "plan-b"],
@@ -673,7 +716,7 @@ fn ciba_plans_use_one_global_serial_lane() {
     let summary = runner.run(&mut ());
 
     assert!(summary.report.local_success);
-    assert_eq!(transport.maximum_active_waits.load(Ordering::SeqCst), 1);
+    assert!(transport.maximum_active_waits.load(Ordering::SeqCst) >= 2);
     assert_eq!(summary.report.orchestration_integrity.terminal_modules, 2);
     assert!(summary.report.cleanup.failures.is_empty());
 }

@@ -15,7 +15,6 @@ struct PlanWork {
     group: GroupProgress,
     report: PlanReport,
     plan: PlannedPlan,
-    lane: OidfDriverLane,
 }
 
 enum WorkerMessage {
@@ -86,7 +85,6 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
         (0..work.len()).collect::<Vec<_>>(),
     )));
     let stop_launching = Arc::new(AtomicBool::new(false));
-    let ciba_lane = Arc::new(Mutex::new(()));
     let mut snapshots = vec![None::<ProgressSnapshot>; work.len()];
     let mut finished = vec![false; work.len()];
     let mut results = vec![None::<RunSummary>; work.len()];
@@ -99,7 +97,6 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
             let sender = sender.clone();
             let queue = Arc::clone(&queue);
             let stop_launching = Arc::clone(&stop_launching);
-            let ciba_lane = Arc::clone(&ciba_lane);
             scope.spawn(move || {
                 let worker = catch_unwind(AssertUnwindSafe(|| {
                     loop {
@@ -150,14 +147,12 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             stop_launching: Arc::clone(&stop_launching),
                             control: runner.config.control.clone(),
                         };
-                        let _ciba_guard = if work_ref[next_index].lane == OidfDriverLane::Ciba {
-                            Some(ciba_lane.lock().map_err(|_| ()).expect("CIBA lane lock"))
-                        } else {
-                            None
-                        };
                         let summary = child
                             .run_prepared(&mut progress, worker_prepared(&work_ref[next_index]));
-                        if has_unsettled_suite_resources(&summary.report) {
+                        if completed_plan_stops_dispatch(&summary.report) {
+                            stop_launching.store(true, Ordering::SeqCst);
+                            runner.config.control.interrupt();
+                        } else if has_unsettled_suite_resources(&summary.report) {
                             stop_launching.store(true, Ordering::SeqCst);
                         }
                         if sender
@@ -229,21 +224,35 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     )
 }
 
+fn completed_plan_stops_dispatch(report: &ConformanceReport) -> bool {
+    report
+        .modules
+        .iter()
+        .any(|module| module.outcome == ModuleOutcome::Failed)
+        || !report.failed_modules.is_empty()
+        || report.progress.failed > 0
+        || report.progress.failed_groups > 0
+        || report
+            .progress
+            .groups
+            .iter()
+            .any(|group| group.status == GroupStatus::Failed)
+        // A pure interruption is an effect of another worker having already
+        // stopped dispatch, not a second failure source.
+        || report.errors.iter().any(|error| error != "run interrupted")
+}
+
 fn plan_work(prepared: &mut PreparedRun) -> Vec<PlanWork> {
     std::mem::take(&mut prepared.planned)
         .into_iter()
         .enumerate()
-        .map(|(index, plan)| {
-            let lane = plan.lane;
-            PlanWork {
-                index,
-                group_index: plan.group_index,
-                matrix_plan_id: plan.matrix_plan_id.clone(),
-                group: prepared.groups[plan.group_index].clone(),
-                report: prepared.plans[plan.report_index].clone(),
-                plan,
-                lane,
-            }
+        .map(|(index, plan)| PlanWork {
+            index,
+            group_index: plan.group_index,
+            matrix_plan_id: plan.matrix_plan_id.clone(),
+            group: prepared.groups[plan.group_index].clone(),
+            report: prepared.plans[plan.report_index].clone(),
+            plan,
         })
         .collect()
 }

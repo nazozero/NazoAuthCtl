@@ -185,13 +185,16 @@ pub fn ciba_approval_requests(raw_log: &Value) -> Result<Vec<String>, CibaUserAp
         .ok_or(CibaUserApprovalError::MalformedSuiteLog)?;
     let mut seen = HashSet::new();
     let mut auth_req_ids = Vec::new();
-    let mut approval_requests = 0usize;
+    let mut pending_auth_req_id: Option<String> = None;
     for entry in entries {
         let source = entry.get("src").and_then(Value::as_str);
         if source == Some(AUTOMATED_APPROVAL_SOURCE) {
-            approval_requests = approval_requests
-                .checked_add(1)
+            let auth_req_id = pending_auth_req_id
+                .take()
                 .ok_or(CibaUserApprovalError::MalformedSuiteLog)?;
+            if seen.insert(auth_req_id.clone()) {
+                auth_req_ids.push(auth_req_id);
+            }
             continue;
         }
         if source != Some(BACKCHANNEL_RESPONSE_SOURCE) {
@@ -216,14 +219,8 @@ pub fn ciba_approval_requests(raw_log: &Value) -> Result<Vec<String>, CibaUserAp
         {
             return Err(CibaUserApprovalError::MalformedSuiteLog);
         }
-        if seen.insert(auth_req_id.to_owned()) {
-            auth_req_ids.push(auth_req_id.to_owned());
-        }
+        pending_auth_req_id = Some(auth_req_id.to_owned());
     }
-    if approval_requests > auth_req_ids.len() {
-        return Err(CibaUserApprovalError::MalformedSuiteLog);
-    }
-    auth_req_ids.truncate(approval_requests);
     Ok(auth_req_ids)
 }
 
@@ -533,6 +530,30 @@ mod tests {
         assert_eq!(
             ciba_approval_requests(&log).expect("valid Suite log"),
             ["request-1", "request-2"]
+        );
+    }
+
+    #[test]
+    fn approval_marker_uses_the_most_recent_backchannel_request() {
+        let log = json!([
+            {
+                "src": "CallBackchannelAuthenticationEndpoint",
+                "auth_req_id": "stale-request",
+                "result": "SUCCESS"
+            },
+            {
+                "src": "CallBackchannelAuthenticationEndpoint",
+                "auth_req_id": "current-request",
+                "result": "SUCCESS"
+            },
+            {
+                "src": "CallAutomatedCibaApprovalEndpoint",
+                "msg": "automation requested"
+            }
+        ]);
+        assert_eq!(
+            ciba_approval_requests(&log).expect("valid Suite log"),
+            ["current-request"]
         );
     }
 
