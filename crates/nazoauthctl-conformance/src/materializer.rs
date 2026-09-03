@@ -1267,7 +1267,25 @@ impl DescriptorMaterializer {
         // include a VCI plan. The corresponding private keys remain in
         // `PreparedMaterialization` and are consumed only when a finalized
         // VCI/HAIP plan needs them.
-        let attestation = Some(generate_attestation_material(&suite_origin.host())?);
+        let issuing_country = descriptor
+            .openid4vc_credential_datasets
+            .get("org.iso.18013.5.1.mDL")
+            .and_then(|dataset| dataset.get("org.iso.18013.5.1"))
+            .and_then(|namespace| namespace.get("issuing_country"))
+            .and_then(Value::as_str);
+        if descriptor
+            .openid4vc_credential_datasets
+            .contains_key("org.iso.18013.5.1.mDL")
+            && issuing_country.is_none()
+        {
+            return Err(MaterializerError::InvalidField(
+                "openid4vc_credential_datasets.org.iso.18013.5.1.mDL.issuing_country",
+            ));
+        }
+        let attestation = Some(generate_attestation_material(
+            suite_origin.as_str(),
+            issuing_country,
+        )?);
         let mut clients = BTreeMap::new();
         for (logical_client_id, policy) in policies {
             let registration = registrations
@@ -1743,6 +1761,7 @@ fn descriptor_requires_pre_authorized_vci(descriptor: &MatrixDescriptor) -> bool
 mod tests {
     use std::sync::OnceLock;
 
+    use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
     use base64::{
         Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
     };
@@ -1750,7 +1769,7 @@ mod tests {
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
         KeyUsagePurpose,
     };
-    use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
+    use x509_parser::{extensions::ParsedExtension, parse_x509_certificate, pem::parse_x509_pem};
 
     use super::*;
     use crate::materializer::crypto::generate_mtls;
@@ -2748,7 +2767,7 @@ mod tests {
         (format!("{leaf}{root}"), root)
     }
 
-    fn assert_vp_credential_signer(config: &Value, suite_host: &str) {
+    fn assert_vp_credential_signer(config: &Value, suite_origin: &str) {
         let credential = config["credential"]
             .as_object()
             .expect("credential configuration");
@@ -2777,22 +2796,41 @@ mod tests {
             .extended_key_usage()
             .expect("credential EKU")
             .expect("credential EKU present");
+        assert!(eku.critical, "document signer EKU must be critical");
         assert!(
             eku.value
                 .other
                 .iter()
                 .any(|oid| oid.to_id_string() == "1.0.18013.5.1.2")
         );
-        let san = leaf
-            .subject_alternative_name()
-            .expect("credential SAN")
-            .expect("credential SAN present");
         assert!(
-            san.value
-                .general_names
-                .iter()
-                .any(|name| matches!(name, GeneralName::DNSName(value) if *value == suite_host))
+            leaf.subject()
+                .iter_country()
+                .next()
+                .and_then(|value| value.as_str().ok())
+                .is_some_and(|value| value == "UT")
         );
+        for oid in ["2.5.29.14", "2.5.29.18", "2.5.29.31", "2.5.29.35"] {
+            assert!(
+                leaf.extensions()
+                    .iter()
+                    .any(|extension| extension.oid.to_id_string() == oid),
+                "document signer extension {oid}"
+            );
+        }
+        assert!(leaf.extensions().iter().any(|extension| {
+            matches!(
+                extension.parsed_extension(),
+                ParsedExtension::IssuerAlternativeName(names)
+                    if names.general_names.iter().any(|name| {
+                        matches!(name, x509_parser::extensions::GeneralName::URI(value) if *value == suite_origin)
+                    })
+            )
+        }));
+        assert!(leaf.extensions().iter().any(|extension| matches!(
+            extension.parsed_extension(),
+            ParsedExtension::CRLDistributionPoints(_)
+        )));
 
         let run_anchor = credential["trust_anchor_pem"]
             .as_str()
@@ -2801,6 +2839,72 @@ mod tests {
         let (_, root_pem) =
             x509_parser::pem::parse_x509_pem(run_anchor.as_bytes()).expect("run root PEM");
         let (_, root) = parse_x509_certificate(&root_pem.contents).expect("run root certificate");
+        assert_eq!(root.subject(), root.issuer());
+        assert!(
+            root.subject()
+                .iter_country()
+                .next()
+                .and_then(|value| value.as_str().ok())
+                .is_some_and(|value| value == "UT")
+        );
+        let constraints = root
+            .basic_constraints()
+            .expect("IACA basic constraints")
+            .expect("IACA basic constraints present");
+        assert!(constraints.critical);
+        assert!(constraints.value.ca);
+        assert_eq!(constraints.value.path_len_constraint, Some(0));
+        for oid in ["2.5.29.14", "2.5.29.18", "2.5.29.31"] {
+            assert!(
+                root.extensions()
+                    .iter()
+                    .any(|extension| extension.oid.to_id_string() == oid),
+                "IACA extension {oid}"
+            );
+        }
+        let root_ski = root
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(identifier) => Some(identifier.0),
+                _ => None,
+            })
+            .expect("IACA subject key identifier");
+        let leaf_ski = leaf
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(identifier) => Some(identifier.0),
+                _ => None,
+            })
+            .expect("document signer subject key identifier");
+        let leaf_aki = leaf
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::AuthorityKeyIdentifier(identifier) => {
+                    identifier.key_identifier.as_ref().map(|value| value.0)
+                }
+                _ => None,
+            })
+            .expect("document signer authority key identifier");
+        assert_eq!(
+            root_ski,
+            digest(
+                &SHA1_FOR_LEGACY_USE_ONLY,
+                root.public_key().subject_public_key.data.as_ref(),
+            )
+            .as_ref()
+        );
+        assert_eq!(
+            leaf_ski,
+            digest(
+                &SHA1_FOR_LEGACY_USE_ONLY,
+                leaf.public_key().subject_public_key.data.as_ref(),
+            )
+            .as_ref()
+        );
+        assert_eq!(leaf_aki, root_ski);
         leaf.verify_signature(Some(root.public_key()))
             .expect("credential leaf must chain to the run root");
     }
@@ -2966,10 +3070,10 @@ mod tests {
 
     #[test]
     fn vci_materialization_binds_issuer_and_declared_variant() {
-        let first_attestation =
-            generate_attestation_material("suite.example").expect("first attestation");
-        let second_attestation =
-            generate_attestation_material("suite.example").expect("second attestation");
+        let first_attestation = generate_attestation_material("https://suite.example", Some("UT"))
+            .expect("first attestation");
+        let second_attestation = generate_attestation_material("https://suite.example", Some("UT"))
+            .expect("second attestation");
         assert_ne!(
             first_attestation.key_attestation_private_jwks.as_str(),
             second_attestation.key_attestation_private_jwks.as_str(),
@@ -3307,7 +3411,8 @@ mod tests {
             "client": {"client_id": "issuer.example"}
         });
         let variant = BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]);
-        let attestation = generate_attestation_material("suite.example").expect("attestation");
+        let attestation = generate_attestation_material("https://suite.example", Some("UT"))
+            .expect("attestation");
         let materialized = materialize_vp_config(
             "oid4vp-1final-verifier-haip-test-plan",
             &variant,
@@ -3321,7 +3426,7 @@ mod tests {
             materialized["client"]["request_object_trust_anchor_pem"],
             test_trust_anchor()
         );
-        assert_vp_credential_signer(&materialized, "suite.example");
+        assert_vp_credential_signer(&materialized, "https://suite.example");
         assert_eq!(
             materialize_vp_config(
                 "oid4vp-1final-verifier-haip-test-plan",

@@ -1,5 +1,6 @@
 use super::MaterializerError;
 use aws_lc_rs::{
+    digest::{SHA1_FOR_LEGACY_USE_ONLY, digest},
     encoding::AsDer,
     rsa::{KeyPair as RsaKeyPair, KeySize as RsaKeySize},
 };
@@ -12,12 +13,13 @@ use pkcs1::RsaPrivateKey as Pkcs1RsaPrivateKey;
 use pkcs8::PrivateKeyInfoRef;
 use rand::{TryRng as _, rngs::SysRng};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, CertifiedIssuer, CrlDistributionPoint, CustomExtension,
+    DnType, DnValue, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
+    string::PrintableString,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{fmt::Write as _, net::IpAddr};
+use std::fmt::Write as _;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -129,16 +131,29 @@ pub(super) fn random_tx_code() -> String {
 /// the Suite can validate x5c chains without deployment secrets.  No generated
 /// private value is returned in the onboarding bundle.
 pub(super) fn generate_attestation_material(
-    suite_host: &str,
+    suite_origin: &str,
+    issuing_country: Option<&str>,
 ) -> Result<GeneratedAttestationMaterial, MaterializerError> {
     let now = OffsetDateTime::now_utc();
+    let ca_key = p256::ecdsa::SigningKey::generate();
     let mut ca_params =
         CertificateParams::new(Vec::<String>::new()).map_err(|_| MaterializerError::Crypto)?;
     ca_params.not_before = now - TimeDuration::days(1);
     ca_params.not_after = now + TimeDuration::days(2);
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_key = p256::ecdsa::SigningKey::generate();
+    if let Some(issuing_country) = issuing_country {
+        configure_mdoc_identity(
+            &mut ca_params,
+            &ca_key,
+            issuing_country,
+            "NazoAuth conformance IACA",
+        )?;
+        ca_params
+            .custom_extensions
+            .push(issuer_alternative_name(suite_origin));
+        ca_params.crl_distribution_points = vec![mdoc_crl_distribution_point(suite_origin)];
+    }
     let ca_key_der = Zeroizing::new(ec_pkcs8_der(&ca_key));
     let ca_key_pair =
         KeyPair::try_from(ca_key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
@@ -150,7 +165,8 @@ pub(super) fn generate_attestation_material(
         generate_attestation_leaf(&ca, "NazoAuth client attestation")?;
     let (key_attestation_private_jwks, key_attestation_public_jwks) =
         generate_attestation_leaf(&ca, "NazoAuth key attestation")?;
-    let credential_signing_private_jwk = generate_credential_signing_leaf(&ca, suite_host)?;
+    let credential_signing_private_jwk =
+        generate_credential_signing_leaf(&ca, suite_origin, issuing_country)?;
     Ok(GeneratedAttestationMaterial {
         trust_anchor_pem,
         attester_private_jwks,
@@ -221,7 +237,8 @@ fn generate_attestation_leaf<'a>(
 /// contract. It never enters the onboarding bundle.
 fn generate_credential_signing_leaf<'a>(
     ca: &CertifiedIssuer<'a, KeyPair>,
-    suite_host: &str,
+    suite_origin: &str,
+    issuing_country: Option<&str>,
 ) -> Result<Zeroizing<String>, MaterializerError> {
     let signing_key = p256::ecdsa::SigningKey::generate();
     let key_der = Zeroizing::new(ec_pkcs8_der(&signing_key));
@@ -232,21 +249,34 @@ fn generate_credential_signing_leaf<'a>(
     params.not_before = now - TimeDuration::days(1);
     params.not_after = now + TimeDuration::days(2);
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::Other(vec![1, 0, 18013, 5, 1, 2])];
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "NazoAuth credential".to_owned());
-    let canonical_host = suite_host.trim_matches(['[', ']']);
-    let san = match canonical_host.parse::<IpAddr>() {
-        Ok(address) => SanType::IpAddress(address),
-        Err(_) => SanType::DnsName(
-            canonical_host
-                .to_owned()
-                .try_into()
-                .map_err(|_| MaterializerError::Crypto)?,
-        ),
-    };
-    params.subject_alt_names = vec![san];
+    if let Some(issuing_country) = issuing_country {
+        configure_mdoc_identity(
+            &mut params,
+            &signing_key,
+            issuing_country,
+            "NazoAuth conformance document signer",
+        )?;
+        params.use_authority_key_identifier_extension = true;
+        params.crl_distribution_points = vec![mdoc_crl_distribution_point(suite_origin)];
+        params
+            .custom_extensions
+            .push(subject_key_identifier(&signing_key));
+        params
+            .custom_extensions
+            .push(issuer_alternative_name(suite_origin));
+        let mut document_signer_eku = CustomExtension::from_oid_content(
+            &[2, 5, 29, 37],
+            der_sequence(&[der_tlv(0x06, &[0x28, 0x81, 0x8c, 0x5d, 0x05, 0x01, 0x02])]),
+        );
+        document_signer_eku.set_criticality(true);
+        params.custom_extensions.push(document_signer_eku);
+    } else {
+        params.extended_key_usages =
+            vec![ExtendedKeyUsagePurpose::Other(vec![1, 0, 18013, 5, 1, 2])];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "NazoAuth credential".to_owned());
+    }
     let certificate = params
         .signed_by(&key_pair, ca)
         .map_err(|_| MaterializerError::Crypto)?;
@@ -269,6 +299,55 @@ fn generate_credential_signing_leaf<'a>(
     serde_json::to_string(&private)
         .map(Zeroizing::new)
         .map_err(|_| MaterializerError::Encoding)
+}
+
+fn configure_mdoc_identity(
+    params: &mut CertificateParams,
+    signing_key: &SigningKey,
+    issuing_country: &str,
+    common_name: &str,
+) -> Result<(), MaterializerError> {
+    let country =
+        PrintableString::try_from(issuing_country).map_err(|_| MaterializerError::Crypto)?;
+    params
+        .distinguished_name
+        .push(DnType::CountryName, DnValue::PrintableString(country));
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name.to_owned());
+    params.key_identifier_method =
+        KeyIdMethod::PreSpecified(mdoc_subject_key_identifier(signing_key));
+    Ok(())
+}
+
+fn mdoc_subject_key_identifier(signing_key: &SigningKey) -> Vec<u8> {
+    let point = signing_key.verifying_key().to_sec1_point(false);
+    digest(&SHA1_FOR_LEGACY_USE_ONLY, point.as_bytes())
+        .as_ref()
+        .to_vec()
+}
+
+fn subject_key_identifier(signing_key: &SigningKey) -> CustomExtension {
+    CustomExtension::from_oid_content(
+        &[2, 5, 29, 14],
+        der_tlv(0x04, &mdoc_subject_key_identifier(signing_key)),
+    )
+}
+
+fn issuer_alternative_name(suite_origin: &str) -> CustomExtension {
+    CustomExtension::from_oid_content(
+        &[2, 5, 29, 18],
+        der_sequence(&[der_tlv(0x86, suite_origin.as_bytes())]),
+    )
+}
+
+fn mdoc_crl_distribution_point(suite_origin: &str) -> CrlDistributionPoint {
+    CrlDistributionPoint {
+        uris: vec![format!(
+            "{}/nazoauthctl-mdoc.crl",
+            suite_origin.trim_end_matches('/')
+        )],
+    }
 }
 
 fn ec_pkcs8_der(signing_key: &p256::ecdsa::SigningKey) -> Vec<u8> {

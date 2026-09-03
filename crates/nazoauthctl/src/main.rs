@@ -509,8 +509,6 @@ pub(crate) struct RunInvocation {
     pub(crate) instance: Option<String>,
     pub(crate) tenant_id: String,
     pub(crate) token_stdin: bool,
-    pub(crate) capture_review_screenshots: bool,
-    pub(crate) upload_review_screenshots: bool,
     pub(crate) retain_suite_plans_for_certification: bool,
     pub(crate) groups: Vec<String>,
     pub(crate) plans: Vec<String>,
@@ -528,8 +526,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     }
 
     let mut token_stdin = false;
-    let mut capture_review_screenshots = false;
-    let mut upload_review_screenshots = false;
     let mut retain_suite_plans_for_certification = false;
     let mut selector = None;
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
@@ -574,29 +570,12 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                 retain_suite_plans_for_certification = true;
                 index += 1;
             }
-            "--capture-review-screenshots" => {
-                if capture_review_screenshots {
-                    bail!("--capture-review-screenshots may be specified only once");
-                }
-                capture_review_screenshots = true;
-                index += 1;
-            }
-            "--upload-review-screenshots" => {
-                if upload_review_screenshots {
-                    bail!("--upload-review-screenshots may be specified only once");
-                }
-                upload_review_screenshots = true;
-                index += 1;
-            }
             value if value.starts_with('-') => bail!("unknown oidf run option: {value}"),
             value => {
                 set_once(&mut selector, value.to_owned(), "OIDF selector")?;
                 index += 1;
             }
         }
-    }
-    if upload_review_screenshots && !capture_review_screenshots {
-        bail!("--upload-review-screenshots requires --capture-review-screenshots");
     }
     let selection = resolve_bundled_oidf_selection(selector.as_deref()).map_err(|error| {
         if error == nazoauthctl_conformance::OidfPlanError::UnknownSelection {
@@ -626,8 +605,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         instance,
         tenant_id,
         token_stdin,
-        capture_review_screenshots,
-        upload_review_screenshots,
         retain_suite_plans_for_certification,
         groups: selection.groups,
         plans: selection.plans,
@@ -664,7 +641,7 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
 
 fn print_run_help() {
     println!(
-        "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the deployment operator's wildcard DNS suffix and selected Suite origin once. Neither has a built-in domain or fallback. Without a run selector, the complete bundled OIDF Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant at <uuid>.<configured-domain>, generates fresh test material, starts its browser workers, and writes evidence below the instance recovery directory.\n\nOptions:\n  --token-stdin                  Read the Suite API token from stdin instead of the secure credential store\n  --capture-review-screenshots   Capture review evidence into the automatic evidence directory\n  --upload-review-screenshots    Upload each captured PNG to its exact Suite placeholder and wait for REVIEW\n  --retain-suite-plans-for-certification\n                               Retain terminal plans, or an audited deferred OIDF review boundary, at the selected Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+        "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the deployment operator's wildcard DNS suffix and selected Suite origin once. Neither has a built-in domain or fallback. Without a run selector, the complete bundled OIDF Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant at <uuid>.<configured-domain>, generates fresh test material, starts browser workers only when the selected plan needs them, automatically supplies required review screenshots, and writes evidence below the instance recovery directory.\n\nOptions:\n  --token-stdin                  Read the Suite API token from stdin instead of the secure credential store\n  --retain-suite-plans-for-certification\n                               Retain terminal plans at the selected Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
     );
 }
 
@@ -1083,33 +1060,16 @@ mod tests {
     }
 
     #[test]
-    fn review_screenshot_capture_uses_the_automatic_evidence_directory() {
-        let parsed = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
+    fn review_screenshot_flags_are_not_part_of_the_user_interface() {
+        for option in [
             "--capture-review-screenshots",
-        ]))
-        .expect("parse")
-        .expect("run");
-        assert!(parsed.capture_review_screenshots);
-    }
-
-    #[test]
-    fn review_screenshot_upload_requires_capture() {
-        let error = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
             "--upload-review-screenshots",
-        ]))
-        .err()
-        .expect("upload needs capture");
-        assert!(
-            error
-                .to_string()
-                .contains("requires --capture-review-screenshots")
-        );
+        ] {
+            let error = routed_run(&args(&["nazoauthctl", "oidf", "run", option]))
+                .err()
+                .expect("legacy review option must be rejected");
+            assert!(error.to_string().contains("unknown oidf run option"));
+        }
     }
 
     #[test]

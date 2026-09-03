@@ -10,7 +10,10 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
@@ -22,16 +25,16 @@ use nazoauthctl_conformance::{
     ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
     EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
     EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
-    HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverLane,
-    OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage,
-    ProgressActivity, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
-    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
-    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
-    TenantResourceRecoveryPhase, Transport, TtyRenderer, bundled_oidf_matrix,
-    open_bundled_oidf_driver_plan, recover_suite_resources, write_private_control_evidence_bundle,
-    write_review_screenshot_manifest,
+    HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverAutomation,
+    OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient,
+    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    Origin, OutputLanguage, ProgressActivity, ProgressSink, ProxyTrustGuard, RunControl,
+    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
+    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
+    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
+    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
+    bundled_oidf_matrix, open_bundled_oidf_driver_plan, recover_suite_resources,
+    write_private_control_evidence_bundle, write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -47,15 +50,29 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
             .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
             .as_deref(),
     );
+    let control = RunControl::default();
+    let user_interrupted = Arc::new(AtomicBool::new(false));
+    let interrupt_notice = match language {
+        OutputLanguage::Chinese => "收到 Ctrl+C，正在终止测试并清理临时资源……",
+        OutputLanguage::English => {
+            "Ctrl+C received; stopping the test and cleaning up temporary resources..."
+        }
+    };
     if io::stderr().is_terminal() {
         execute_with_progress(
             invocation,
             &mut TtyRenderer::localized(io::stderr(), language),
+            control,
+            user_interrupted,
+            interrupt_notice,
         )
     } else {
         execute_with_progress(
             invocation,
             &mut StableRenderer::localized(io::stderr(), language),
+            control,
+            user_interrupted,
+            interrupt_notice,
         )
     }
 }
@@ -63,6 +80,9 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
 fn execute_with_progress<S: ProgressSink>(
     invocation: RunInvocation,
     progress: &mut S,
+    control: RunControl,
+    user_interrupted: Arc<AtomicBool>,
+    interrupt_notice: &'static str,
 ) -> anyhow::Result<i32> {
     progress.activity(&ProgressActivity::OpeningDeployment);
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
@@ -86,6 +106,16 @@ fn execute_with_progress<S: ProgressSink>(
         now,
     )
     .context("bundled OIDF Matrix cannot be opened")?;
+    let requires_browser = driver_plan
+        .plans
+        .iter()
+        .any(|plan| !matches!(plan.driver_handler.automation, OidfDriverAutomation::None));
+    let captures_review_screenshots = driver_plan.plans.iter().any(|plan| {
+        matches!(
+            plan.driver_handler.automation,
+            OidfDriverAutomation::Openid4vp { .. }
+        )
+    });
     let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
 
     progress.activity(&ProgressActivity::AuthenticatingSuite);
@@ -351,20 +381,29 @@ fn execute_with_progress<S: ProgressSink>(
         recovery.clone(),
         ciba_approver,
         &evidence_directory,
+        requires_browser,
+        captures_review_screenshots,
+        control,
+        Arc::clone(&user_interrupted),
+        interrupt_notice,
         progress,
     );
 
     progress.activity(&ProgressActivity::CleaningUp);
     let mut recovery = take_recovery(recovery)?;
-    let mut retention_eligible = run_result
-        .as_ref()
-        .is_ok_and(|report| report.orchestration_integrity.retention_eligible);
-    let mut errors = Vec::new();
-    // This root-private, module-bound manifest is the manual upload list for
-    // NazoAuthWeb VP result captures. It performs no Suite upload and is
-    // produced even when retention was not requested; only a later retention
-    // transition binds its digest into the Suite journal.
-    let review_screenshot_manifest = if invocation.capture_review_screenshots {
+    let user_cancelled = user_interrupted.load(Ordering::SeqCst);
+    let mut retention_eligible = !user_cancelled
+        && run_result
+            .as_ref()
+            .is_ok_and(|report| report.orchestration_integrity.retention_eligible);
+    let mut errors = if user_cancelled {
+        vec!["run=interrupted by Ctrl+C".to_owned()]
+    } else {
+        Vec::new()
+    };
+    // The runner has already uploaded required NazoAuthWeb VP result captures;
+    // this root-private manifest preserves their exact local evidence.
+    let review_screenshot_manifest = if captures_review_screenshots && !user_cancelled {
         match run_result.as_ref() {
             Ok(report) => match write_review_screenshot_manifest(
                 report,
@@ -380,11 +419,7 @@ fn execute_with_progress<S: ProgressSink>(
                     None
                 }
             },
-            Err(_) => {
-                retention_eligible = false;
-                errors.push("review-screenshot-manifest=identity".to_owned());
-                None
-            }
+            Err(_) => None,
         }
     } else {
         None
@@ -418,9 +453,17 @@ fn execute_with_progress<S: ProgressSink>(
     }
     let cleanup = cleanup_run_resources(&session, &mut recovery);
     let mut report = match run_result {
-        Ok(report) => Some(report),
+        Ok(mut report) => {
+            if user_cancelled {
+                report.errors.clear();
+                report.retained_suite_plan_ids.clear();
+            }
+            Some(report)
+        }
         Err(error) => {
-            errors.push(format!("run={error:#}"));
+            if !user_cancelled {
+                errors.push(format!("run={error:#}"));
+            }
             None
         }
     };
@@ -606,7 +649,13 @@ fn execute_with_progress<S: ProgressSink>(
     serde_json::to_writer_pretty(io::stdout().lock(), &output)
         .context("failed to write the structured ordinary conformance report")?;
     writeln!(io::stdout()).context("failed to finish the structured conformance report")?;
-    Ok(if success { 0 } else { 1 })
+    Ok(if user_interrupted.load(Ordering::SeqCst) {
+        130
+    } else if success {
+        0
+    } else {
+        1
+    })
 }
 
 fn conformance_run_succeeds(
@@ -1283,6 +1332,11 @@ fn run_signed_suite<S: ProgressSink>(
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_approver: Option<Arc<CibaUserApprovalClient>>,
     evidence_directory: &Path,
+    requires_browser: bool,
+    captures_review_screenshots: bool,
+    control: RunControl,
+    user_interrupted: Arc<AtomicBool>,
+    interrupt_notice: &'static str,
     progress: &mut S,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
     let binding = ConformanceBinding::openid4vc_trust_policy(
@@ -1303,8 +1357,7 @@ fn run_signed_suite<S: ProgressSink>(
         .ordinary_binding()
         .run_id
         .clone();
-    let review_screenshot_capture = invocation
-        .capture_review_screenshots
+    let review_screenshot_capture = captures_review_screenshots
         .then(|| {
             BrowserReviewScreenshotCapture::new(
                 evidence_directory.to_path_buf(),
@@ -1322,17 +1375,35 @@ fn run_signed_suite<S: ProgressSink>(
             plans: invocation.plans.clone(),
         })
         .context("requested selection is outside the signed artifact Matrix")?;
+    let interrupt = control.clone();
+    ctrlc::set_handler(move || {
+        if !user_interrupted.swap(true, Ordering::SeqCst) {
+            eprintln!("{interrupt_notice}");
+        }
+        interrupt.interrupt();
+    })
+    .context("failed to install the conformance interrupt handler")?;
     let mut managed_browsers = Vec::with_capacity(invocation.jobs);
     let run_result = (|| -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
+        if control.is_interrupted() {
+            bail!("run interrupted");
+        }
         let mut automation = Vec::with_capacity(invocation.jobs);
         for index in 0..invocation.jobs {
-            progress.activity(&ProgressActivity::StartingBrowser {
-                current: index + 1,
-                total: invocation.jobs,
-            });
-            let managed_browser = build_browser(target_issuer, suite_origin)?;
-            managed_browsers.push(managed_browser.clone());
-            let browser: Arc<Mutex<dyn BrowserAutomation>> = managed_browser;
+            if control.is_interrupted() {
+                bail!("run interrupted");
+            }
+            let browser: Option<Arc<Mutex<dyn BrowserAutomation>>> = if requires_browser {
+                progress.activity(&ProgressActivity::StartingBrowser {
+                    current: index + 1,
+                    total: invocation.jobs,
+                });
+                let managed_browser = build_browser(target_issuer, suite_origin)?;
+                managed_browsers.push(managed_browser.clone());
+                Some(managed_browser)
+            } else {
+                None
+            };
             let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
                 Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
                     OpenId4VciIssuerConfig::new(
@@ -1356,29 +1427,25 @@ fn run_signed_suite<S: ProgressSink>(
             )?;
             let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
             automation.push(ConformanceAutomation {
-                browser: Some(browser),
+                browser,
                 review_screenshot_capture: review_screenshot_capture.clone(),
                 verifier: Some(verifier),
                 issuer: Some(issuer),
                 ciba_approver: ciba_approver.clone(),
             });
         }
-        let control = RunControl::default();
-        let interrupt = control.clone();
-        ctrlc::set_handler(move || interrupt.interrupt())
-            .context("failed to install the conformance interrupt handler")?;
         let runner = ConformanceRunner::new(ConformanceRunConfig {
             client: suite_client,
             matrix: selected,
             target_origin: Some(target_origin),
             binding,
             poll_timeout: invocation.poll_timeout,
-            control,
+            control: control.clone(),
             plan_lanes,
             plan_resource_budgets,
             selected_resource_budget,
             jobs: invocation.jobs,
-            upload_review_screenshots: invocation.upload_review_screenshots,
+            upload_review_screenshots: captures_review_screenshots,
             automation,
             suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
                 recovery,
