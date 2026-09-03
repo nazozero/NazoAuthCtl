@@ -194,6 +194,38 @@ pub fn prepare_control_operation(
     Ok(prepared)
 }
 
+/// Rebuild the currently journaled operation only when `input` is its exact
+/// canonical content. Unlike [`prepare_control_operation`], an empty or
+/// different journal never mints a new operation id.
+pub fn prepare_pending_control_operation(
+    registry: &RegistryStore,
+    keys: &ControllerKeyStore,
+    journal: &OperationJournal,
+    expected: &OperationJournalEntry,
+    instance_selector: &str,
+    input: ControlOperationInput,
+) -> anyhow::Result<Option<PreparedOperation>> {
+    let record = resolve_instance(registry, instance_selector)?;
+    let Some(entry) = journal.load()? else {
+        return Ok(None);
+    };
+    if !entry.has_same_identity(expected) {
+        bail!(
+            "the operation journal changed while operation '{}' was being recovered",
+            expected.operation_id
+        );
+    }
+    let signed =
+        build_signed_control_operation_with_id(keys, &record, input, Some(&entry.operation_id))?;
+    if signed.request_hash != entry.request_hash || signed.kid != entry.kid {
+        return Ok(None);
+    }
+    Ok(Some(PreparedOperation {
+        signed,
+        kind: AttemptKind::Resumed,
+    }))
+}
+
 fn clone_input(input: &ControlOperationInput) -> ControlOperationInput {
     ControlOperationInput {
         operation: input.operation.clone(),
@@ -364,20 +396,26 @@ pub fn settle_journal(
     verdict: &DispatchVerdict,
     persist_terminal: impl FnOnce(&ControlResult) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    let expected = prepared.journal_entry();
     match verdict {
-        DispatchVerdict::DefinitivelyRejected { .. } => journal.clear(),
+        DispatchVerdict::DefinitivelyRejected { code }
+            if code == crate::error_codes::OPERATION_ID_CONFLICT =>
+        {
+            Ok(())
+        }
+        DispatchVerdict::DefinitivelyRejected { .. } => journal.clear_if_matches(&expected),
         DispatchVerdict::OutcomeUnknown => Ok(()),
-        DispatchVerdict::InProgressAccepted => journal.mark_accepted(&prepared.signed.operation_id),
+        DispatchVerdict::InProgressAccepted => journal.mark_accepted_if_matches(&expected),
         DispatchVerdict::Terminal(result) => {
             validate_result_binding(prepared, result)?;
-            journal.mark_accepted(&prepared.signed.operation_id)?;
+            journal.mark_accepted_if_matches(&expected)?;
             persist_terminal(result).with_context(|| {
                 format!(
                     "failed to persist terminal result for operation '{}'",
                     prepared.signed.operation_id
                 )
             })?;
-            journal.clear()
+            journal.clear_if_matches(&expected)
         }
     }
 }
@@ -1008,6 +1046,74 @@ mod tests {
             journal.load()?.unwrap().operation_id,
             first.signed.operation_id
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resume_only_requires_the_exact_existing_operation() -> anyhow::Result<()> {
+        let f = fixture()?;
+        f.keys.get_or_create_active("deploy-alpha")?;
+        let journal = f.journal()?;
+        let absent = OperationJournalEntry::new(
+            uuid::Uuid::now_v7().to_string(),
+            "ab".repeat(32),
+            f.keys
+                .get_or_create_active("deploy-alpha")?
+                .kid()
+                .to_owned(),
+        );
+
+        assert!(
+            prepare_pending_control_operation(
+                &f.registry,
+                &f.keys,
+                &journal,
+                &absent,
+                "production",
+                input("rev-1"),
+            )?
+            .is_none()
+        );
+        assert!(journal.load()?.is_none());
+
+        let first = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        let expected = journal.load()?.context("journaled operation")?;
+        assert!(
+            prepare_pending_control_operation(
+                &f.registry,
+                &f.keys,
+                &journal,
+                &expected,
+                "production",
+                input("rev-2"),
+            )?
+            .is_none()
+        );
+        assert_eq!(
+            journal.load()?.unwrap().operation_id,
+            first.signed.operation_id
+        );
+
+        let resumed = prepare_pending_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            &expected,
+            "production",
+            input("rev-1"),
+        )?
+        .context("exact pending operation must be recoverable")?;
+        assert_eq!(resumed.kind, AttemptKind::Resumed);
+        assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+        assert_eq!(resumed.signed.request_hash, first.signed.request_hash);
+        assert_eq!(resumed.signed.kid, first.signed.kid);
+        assert_eq!(resumed.signed.compact_jws, first.signed.compact_jws);
         Ok(())
     }
 

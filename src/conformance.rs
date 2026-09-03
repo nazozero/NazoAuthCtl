@@ -5,8 +5,9 @@ use nazo_operator_protocol::{ControlOperationPayload, ControlOutcome, ControlRes
 
 use crate::{
     controller_identity::{
-        OperationJournal, operation::ControlOperationInput, prepare_control_operation,
-        store::ControllerKeyStore, validate_control_change_set, validate_control_result_binding,
+        OperationJournal, PreparedOperation, operation::ControlOperationInput,
+        prepare_control_operation, prepare_pending_control_operation, store::ControllerKeyStore,
+        validate_control_change_set, validate_control_result_binding,
     },
     filesystem::ensure_private_directory,
     registry::RegistryStore,
@@ -243,6 +244,67 @@ impl ConformanceSession {
         Ok(self.recovery_dir.clone())
     }
 
+    pub fn pending_control_operation(
+        &self,
+    ) -> anyhow::Result<Option<crate::controller_identity::OperationJournalEntry>> {
+        let journal =
+            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
+        journal.load()
+    }
+
+    pub fn pending_control_operation_matches(
+        &self,
+        expected: &crate::controller_identity::OperationJournalEntry,
+        operation: ControlOperationPayload,
+    ) -> anyhow::Result<bool> {
+        let journal =
+            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
+        Ok(prepare_pending_control_operation(
+            &self.registry,
+            &self.controller_keys,
+            &journal,
+            expected,
+            &self.deployment_id,
+            ControlOperationInput {
+                operation,
+                config_revision: self.config_revision.clone(),
+            },
+        )?
+        .is_some())
+    }
+
+    pub fn resume_pending_control_operation<F>(
+        &self,
+        expected: &crate::controller_identity::OperationJournalEntry,
+        operation: ControlOperationPayload,
+        change_set: Option<Vec<u8>>,
+        persist: F,
+    ) -> anyhow::Result<Option<ConformanceControlOutcome>>
+    where
+        F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
+    {
+        validate_control_change_set(&operation, change_set.as_deref())?;
+        let expected_operation = operation.clone();
+        let journal =
+            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
+        let Some(prepared) = prepare_pending_control_operation(
+            &self.registry,
+            &self.controller_keys,
+            &journal,
+            expected,
+            &self.deployment_id,
+            ControlOperationInput {
+                operation,
+                config_revision: self.config_revision.clone(),
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        self.complete_control_operation(&journal, prepared, expected_operation, change_set, persist)
+            .map(Some)
+    }
+
     /// Execute the one current ControlOperation path. Apply requires exactly
     /// one bounded material blob; every other operation rejects one. A durable
     /// result is passed to `persist` before the ctl journal is cleared. If the
@@ -272,6 +334,21 @@ impl ConformanceSession {
                 config_revision: self.config_revision.clone(),
             },
         )?;
+        self.complete_control_operation(&journal, prepared, expected_operation, change_set, persist)
+    }
+
+    fn complete_control_operation<F>(
+        &self,
+        journal: &OperationJournal,
+        prepared: PreparedOperation,
+        expected_operation: ControlOperationPayload,
+        change_set: Option<Vec<u8>>,
+        persist: F,
+    ) -> anyhow::Result<ConformanceControlOutcome>
+    where
+        F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
+    {
+        let expected_journal = prepared.journal_entry();
         let secret_material = change_set
             .map(SecretMaterial::try_new)
             .transpose()
@@ -287,10 +364,16 @@ impl ConformanceSession {
             );
         }
         if !receipt.accepted {
-            journal.clear()?;
-            bail!("the target definitively rejected the ControlOperation before acceptance");
+            let rejection = receipt
+                .rejection_code
+                .as_deref()
+                .unwrap_or("unspecified rejection");
+            if rejection != crate::error_codes::OPERATION_ID_CONFLICT {
+                journal.clear_if_matches(&expected_journal)?;
+            }
+            bail!("the target rejected the ControlOperation before acceptance: {rejection}");
         }
-        journal.mark_accepted(&prepared.signed.operation_id)?;
+        journal.mark_accepted_if_matches(&expected_journal)?;
         let result = receipt.result.context(
             "the target accepted the ControlOperation without returning its durable result",
         )?;
@@ -318,7 +401,7 @@ impl ConformanceSession {
             }
         };
         persist(&completion)?;
-        journal.clear()?;
+        journal.clear_if_matches(&expected_journal)?;
         Ok(outcome)
     }
 
@@ -446,6 +529,8 @@ mod tests {
 
     struct RecordingTarget {
         requests: Rc<RefCell<Vec<RecordedRequest>>>,
+        accepted: Rc<RefCell<bool>>,
+        rejection_code: Rc<RefCell<Option<String>>>,
         outcome: Rc<RefCell<ControlOutcome>>,
         result_data: Rc<RefCell<Option<nazo_operator_protocol::ControlResultData>>>,
     }
@@ -484,16 +569,16 @@ mod tests {
             let operation: nazo_operator_protocol::ControlOperation =
                 serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
             let outcome = *self.outcome.borrow();
+            let accepted = *self.accepted.borrow();
+            let request_hash = nazo_operator_protocol::control_operation_request_hash(&operation)?;
             Ok(ControlOperationReceipt {
                 operation_id: request.operation_id.clone(),
-                accepted: true,
-                rejection_code: None,
-                result: Some(ControlResult {
+                accepted,
+                rejection_code: self.rejection_code.borrow().clone(),
+                result: accepted.then(|| ControlResult {
                     schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                     operation_id: request.operation_id.clone(),
-                    request_hash: nazo_operator_protocol::control_operation_request_hash(
-                        &operation,
-                    )?,
+                    request_hash,
                     outcome,
                     error: (outcome == ControlOutcome::Failed)
                         .then_some(nazo_operator_protocol::ControlErrorCode::ExecutionFailed),
@@ -569,6 +654,8 @@ mod tests {
         let controller_keys = ControllerKeyStore::open(temp.path().join("controller-keys"))?;
         controller_keys.get_or_create_active(deployment_id)?;
         let requests = Rc::new(RefCell::new(Vec::new()));
+        let accepted = Rc::new(RefCell::new(true));
+        let rejection_code = Rc::new(RefCell::new(None));
         let target_outcome = Rc::new(RefCell::new(ControlOutcome::Succeeded));
         let result_data = Rc::new(RefCell::new(None));
         let session = ConformanceSession {
@@ -589,6 +676,8 @@ mod tests {
             registry,
             target: Box::new(RecordingTarget {
                 requests: requests.clone(),
+                accepted: accepted.clone(),
+                rejection_code: rejection_code.clone(),
                 outcome: target_outcome.clone(),
                 result_data: result_data.clone(),
             }),
@@ -608,6 +697,61 @@ mod tests {
                 .controller_keys
                 .instance_dir(&session.deployment_id)?,
         )?;
+        let pending = prepare_control_operation(
+            &session.registry,
+            &session.controller_keys,
+            &journal,
+            &session.deployment_id,
+            ControlOperationInput {
+                operation: ControlOperationPayload::KeysValidate,
+                config_revision: session.config_revision.clone(),
+            },
+        )?;
+        let expected = journal.load()?.context("journaled operation")?;
+        assert!(
+            session
+                .resume_pending_control_operation(
+                    &expected,
+                    ControlOperationPayload::MigrateApply,
+                    None,
+                    |_| Ok(()),
+                )?
+                .is_none(),
+            "different content must not replace the pending operation"
+        );
+        assert!(
+            requests.borrow().is_empty(),
+            "a non-matching recovery candidate must not reach the target"
+        );
+        assert_eq!(
+            journal.load()?.context("journal must remain")?.operation_id,
+            pending.signed.operation_id
+        );
+        assert!(
+            session
+                .resume_pending_control_operation(
+                    &expected,
+                    ControlOperationPayload::KeysValidate,
+                    None,
+                    |_| {
+                        assert!(
+                            journal.load()?.is_some(),
+                            "the recovery result must be persisted before journal clear"
+                        );
+                        Ok(())
+                    },
+                )?
+                .is_some(),
+            "the exact operation must resume"
+        );
+        assert_eq!(requests.borrow().len(), 1);
+        assert_eq!(
+            requests.borrow()[0].operation_id,
+            pending.signed.operation_id
+        );
+        assert_eq!(requests.borrow()[0].compact_jws, pending.signed.compact_jws);
+        assert!(journal.load()?.is_none());
+        requests.borrow_mut().clear();
         assert!(
             session
                 .execute_control_operation(
@@ -707,6 +851,20 @@ mod tests {
         assert!(
             journal.load()?.is_none(),
             "persisted durable failure clears the dispatch journal"
+        );
+
+        *accepted.borrow_mut() = false;
+        *rejection_code.borrow_mut() = Some(crate::error_codes::OPERATION_ID_CONFLICT.to_owned());
+        let error = session
+            .execute_control_operation(ControlOperationPayload::KeysValidate, None, |_| Ok(()))
+            .expect_err("operation identity conflict must fail");
+        assert!(
+            format!("{error:#}").contains(crate::error_codes::OPERATION_ID_CONFLICT),
+            "{error:#}"
+        );
+        assert!(
+            journal.load()?.is_some(),
+            "an identity conflict cannot prove the original operation was unaccepted"
         );
         Ok(())
     }

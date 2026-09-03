@@ -66,8 +66,8 @@ pub mod store;
 
 pub use dispatch::{
     AttemptKind, DispatchVerdict, PreparedOperation, classify_control_receipt, dispatch_via_target,
-    prepare_control_operation, settle_journal, validate_control_change_set,
-    validate_control_result_binding,
+    prepare_control_operation, prepare_pending_control_operation, settle_journal,
+    validate_control_change_set, validate_control_result_binding,
 };
 pub use journal::{JournalState, OperationJournal, OperationJournalEntry};
 pub use operation::{

@@ -111,6 +111,12 @@ impl OperationJournalEntry {
             state: JournalState::Dispatched,
         }
     }
+
+    pub fn has_same_identity(&self, other: &Self) -> bool {
+        self.operation_id == other.operation_id
+            && self.request_hash == other.request_hash
+            && self.kid == other.kid
+    }
 }
 
 /// Handle to one instance's operation journal.
@@ -262,6 +268,52 @@ impl OperationJournal {
             .with_context(|| format!("failed to persist {}", self.path.display()))
     }
 
+    /// Transition only the exact operation observed by the caller. State and
+    /// timestamp are intentionally excluded: a concurrent retry may already
+    /// have moved the same operation from dispatched to accepted.
+    pub fn mark_accepted_if_matches(&self, expected: &OperationJournalEntry) -> anyhow::Result<()> {
+        let _lock = InstanceJournalLock::acquire(
+            self.path
+                .parent()
+                .context("journal path has no parent directory")?,
+        )?;
+        let Some(mut entry) = self.load()? else {
+            bail!("the expected journaled operation is no longer present");
+        };
+        if !entry.has_same_identity(expected) {
+            bail!(
+                "the operation journal changed while operation '{}' was settling",
+                expected.operation_id
+            );
+        }
+        entry.state = JournalState::Accepted;
+        let bytes = serde_json::to_vec_pretty(&entry)
+            .context("failed to serialize the operation journal entry")?;
+        filesystem::atomic_write(&self.path, &bytes, 0o600)
+            .with_context(|| format!("failed to persist {}", self.path.display()))
+    }
+
+    /// Remove only the exact operation observed by the caller. This prevents
+    /// a late completion from deleting a newer single-slot journal entry.
+    pub fn clear_if_matches(&self, expected: &OperationJournalEntry) -> anyhow::Result<()> {
+        let _lock = InstanceJournalLock::acquire(
+            self.path
+                .parent()
+                .context("journal path has no parent directory")?,
+        )?;
+        let Some(entry) = self.load()? else {
+            bail!("the expected journaled operation is no longer present");
+        };
+        if !entry.has_same_identity(expected) {
+            bail!(
+                "the operation journal changed while operation '{}' was settling",
+                expected.operation_id
+            );
+        }
+        filesystem::remove_file_durable(&self.path)
+            .with_context(|| format!("failed to clear {}", self.path.display()))
+    }
+
     /// Remove the entry after a definitive unaccepted rejection so the next
     /// attempt mints a fresh operation id. Absence is already fine.
     pub fn clear(&self) -> anyhow::Result<()> {
@@ -344,6 +396,24 @@ mod tests {
         journal.clear()?;
         assert!(journal.load()?.is_none());
         journal.clear()?;
+        Ok(())
+    }
+
+    #[test]
+    fn compare_and_clear_never_removes_a_newer_operation() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let journal = journal(&f)?;
+        let first = sample_entry("01900000-0000-7000-8000-000000000010");
+        let second = sample_entry("01900000-0000-7000-8000-000000000011");
+        journal.record_dispatched(&first)?;
+        journal.clear()?;
+        journal.record_dispatched(&second)?;
+
+        assert!(journal.clear_if_matches(&first).is_err());
+        assert!(journal.mark_accepted_if_matches(&first).is_err());
+        assert_eq!(journal.load()?.context("newer entry")?, second);
+        journal.clear_if_matches(&second)?;
+        assert!(journal.load()?.is_none());
         Ok(())
     }
 
