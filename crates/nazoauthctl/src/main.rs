@@ -6,10 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use nazoauthctl_conformance::{
-    ArtifactTrustPolicy, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS, OidfPlanSelection,
-    bundled_oidf_selection_choices, open_cached_oidf_artifact, open_cached_oidf_driver_plan,
-    read_artifact_driver, read_artifact_matrix, read_compact_manifest,
-    resolve_bundled_oidf_selection, resolve_oidf_artifact, verify_oidf_artifact,
+    ArtifactTrustPolicy, BearerToken, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
+    OidfPlanSelection, OutputLanguage, bundled_oidf_selection_choices, open_cached_oidf_artifact,
+    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
+    read_compact_manifest, resolve_bundled_oidf_selection, resolve_oidf_artifact,
+    verify_oidf_artifact,
 };
 
 mod ordinary_run;
@@ -508,7 +509,9 @@ fn exit_with_error(error: &anyhow::Error) -> ! {
 pub(crate) struct RunInvocation {
     pub(crate) instance: Option<String>,
     pub(crate) tenant_id: String,
+    pub(crate) token: Option<BearerToken>,
     pub(crate) token_stdin: bool,
+    pub(crate) json: bool,
     pub(crate) retain_suite_plans_for_certification: bool,
     pub(crate) groups: Vec<String>,
     pub(crate) plans: Vec<String>,
@@ -525,7 +528,9 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         std::process::exit(0);
     }
 
+    let mut token = None;
     let mut token_stdin = false;
+    let mut json = false;
     let mut retain_suite_plans_for_certification = false;
     let mut selector = None;
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
@@ -534,7 +539,7 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     while index < values.len() {
         let option = values[index].as_str();
         match option {
-            "--poll-timeout" | "--jobs" => {
+            "--poll-timeout" | "--jobs" | "--token" => {
                 let value = values
                     .get(index + 1)
                     .with_context(|| format!("{option} requires a value"))?
@@ -552,6 +557,13 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                             .parse::<usize>()
                             .context("--jobs must be an integer")?;
                     }
+                    "--token" => {
+                        set_once(
+                            &mut token,
+                            BearerToken::new(value).context("--token is invalid")?,
+                            "--token",
+                        )?;
+                    }
                     _ => unreachable!(),
                 }
                 index += 2;
@@ -561,6 +573,13 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                     bail!("--token-stdin may be specified only once");
                 }
                 token_stdin = true;
+                index += 1;
+            }
+            "--json" => {
+                if json {
+                    bail!("--json may be specified only once");
+                }
+                json = true;
                 index += 1;
             }
             "--retain-suite-plans-for-certification" => {
@@ -593,6 +612,9 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         }
     })?;
     let tenant_id = uuid::Uuid::now_v7().to_string();
+    if token.is_some() && token_stdin {
+        bail!("--token and --token-stdin cannot be used together");
+    }
     if poll_timeout.is_zero()
         || poll_timeout > Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS)
         || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
@@ -604,7 +626,9 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     Ok(RunInvocation {
         instance,
         tenant_id,
+        token,
         token_stdin,
+        json,
         retain_suite_plans_for_certification,
         groups: selection.groups,
         plans: selection.plans,
@@ -639,10 +663,28 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
     Ok(())
 }
 
+fn output_language() -> OutputLanguage {
+    OutputLanguage::from_locale(
+        ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .into_iter()
+            .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
+            .as_deref(),
+    )
+}
+
+fn run_help(language: OutputLanguage) -> &'static str {
+    match language {
+        OutputLanguage::Chinese => {
+            "用法：\n  nazoauthctl [--instance 实例] oidf configure --tenant-domain 域名 --suite HTTPS地址\n  nazoauthctl [--instance 实例] oidf run [分组或计划] [选项]\n\nconfigure 只需设置一次临时租户所用的通配域名后缀和 OIDF Suite 地址。未指定分组或计划时运行完整矩阵。可用别名：oidc、ciba、fapi、openid4vci、openid4vp、openid4vc；也可使用内置分组或计划的完整 ID。\n\n每次运行都会创建新的临时租户、生成新的测试资料，并仅在所选计划需要时启动浏览器任务。\n\n选项：\n  --token TOKEN                  本次运行直接使用 Token，不保存\n  --token-stdin                  从标准输入读取 Token，不保存\n  --json                         输出完整 JSON 报告；默认仅输出简洁摘要\n  --retain-suite-plans-for-certification\n                                  在 Suite 中保留已结束的计划\n  --jobs N                       并行计划数，1-4（默认：4）\n  --poll-timeout 秒数            单个模块等待 Suite 的最长时间（默认：1800）"
+        }
+        OutputLanguage::English => {
+            "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the wildcard tenant-domain suffix and OIDF Suite origin once. Without a selector, the complete bundled Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant and test material, and starts browser workers only when the selected plan needs them.\n\nOptions:\n  --token TOKEN                  Use a token for this run only; do not save it\n  --token-stdin                  Read a token from stdin; do not save it\n  --json                         Print the full JSON report; the default is a concise summary\n  --retain-suite-plans-for-certification\n                                  Retain terminal plans at the Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+        }
+    }
+}
+
 fn print_run_help() {
-    println!(
-        "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the deployment operator's wildcard DNS suffix and selected Suite origin once. Neither has a built-in domain or fallback. Without a run selector, the complete bundled OIDF Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant at <uuid>.<configured-domain>, generates fresh test material, starts browser workers only when the selected plan needs them, automatically supplies required review screenshots, and writes evidence below the instance recovery directory.\n\nOptions:\n  --token-stdin                  Read the Suite API token from stdin instead of the secure credential store\n  --retain-suite-plans-for-certification\n                               Retain terminal plans at the selected Suite\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
-    );
+    println!("{}", run_help(output_language()));
 }
 
 #[cfg(test)]
@@ -1042,7 +1084,6 @@ mod tests {
             "--artifact-cache",
             "--artifact-digest",
             "--suite",
-            "--token",
             "--token-file",
             "--token-fd",
             "--webdriver",
@@ -1145,5 +1186,65 @@ mod tests {
             .expect("parse")
             .expect("run");
         assert!(parsed.token_stdin);
+    }
+
+    #[test]
+    fn direct_token_is_transient_and_redacted() {
+        let parsed = routed_run(&args(&[
+            "nazoauthctl",
+            "oidf",
+            "run",
+            "--token",
+            "temporary-secret",
+        ]))
+        .expect("parse")
+        .expect("run");
+
+        assert!(parsed.token.is_some());
+        assert_eq!(
+            format!("{:?}", parsed.token.as_ref().expect("token")),
+            "BearerToken(REDACTED)"
+        );
+        assert!(!parsed.token_stdin);
+    }
+
+    #[test]
+    fn direct_token_and_stdin_are_mutually_exclusive() {
+        let error = routed_run(&args(&[
+            "nazoauthctl",
+            "oidf",
+            "run",
+            "--token",
+            "temporary-secret",
+            "--token-stdin",
+        ]))
+        .err()
+        .expect("ambiguous token source must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--token and --token-stdin cannot be used together")
+        );
+    }
+
+    #[test]
+    fn json_output_is_explicit() {
+        let default = routed_run(&args(&["nazoauthctl", "oidf", "run"]))
+            .expect("parse")
+            .expect("run");
+        let json = routed_run(&args(&["nazoauthctl", "oidf", "run", "--json"]))
+            .expect("parse")
+            .expect("run");
+
+        assert!(!default.json);
+        assert!(json.json);
+    }
+
+    #[test]
+    fn run_help_is_localized() {
+        assert!(run_help(OutputLanguage::Chinese).contains("用法："));
+        assert!(run_help(OutputLanguage::Chinese).contains("本次运行直接使用 Token，不保存"));
+        assert!(run_help(OutputLanguage::English).contains("Usage:"));
     }
 }

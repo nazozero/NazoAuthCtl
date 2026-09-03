@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal as _, Read as _, Write as _};
+use std::io::{self, IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -25,16 +25,17 @@ use nazoauthctl_conformance::{
     ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
     EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
     EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
-    HttpTransport, ManagedWebDriver, MatrixSelection, OidfArtifactMatrix, OidfDriverAutomation,
-    OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient,
-    OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient,
-    Origin, OutputLanguage, ProgressActivity, ProgressSink, ProxyTrustGuard, RunControl,
-    StableRenderer, SuiteClient, SuiteResourceObserver, SuiteRetentionDeferredReview,
-    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
-    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, TtyRenderer,
-    bundled_oidf_matrix, open_bundled_oidf_driver_plan, recover_suite_resources,
-    write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    HttpTransport, ManagedWebDriver, MatrixSelection, ModuleOutcome, OidfArtifactMatrix,
+    OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity, ProgressSink,
+    ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, SuiteClientError,
+    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
+    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
+    TenantResourceRecoveryPhase, Transport, TtyRenderer, bundled_oidf_matrix,
+    open_bundled_oidf_driver_plan, recover_suite_resources, write_private_control_evidence_bundle,
+    write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -44,12 +45,7 @@ use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
-    let language = OutputLanguage::from_locale(
-        ["LC_ALL", "LC_MESSAGES", "LANG"]
-            .into_iter()
-            .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
-            .as_deref(),
-    );
+    let language = super::output_language();
     let control = RunControl::default();
     let user_interrupted = Arc::new(AtomicBool::new(false));
     let interrupt_notice = match language {
@@ -62,6 +58,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         execute_with_progress(
             invocation,
             &mut TtyRenderer::localized(io::stderr(), language),
+            language,
             control,
             user_interrupted,
             interrupt_notice,
@@ -70,6 +67,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         execute_with_progress(
             invocation,
             &mut StableRenderer::localized(io::stderr(), language),
+            language,
             control,
             user_interrupted,
             interrupt_notice,
@@ -80,6 +78,7 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
 fn execute_with_progress<S: ProgressSink>(
     invocation: RunInvocation,
     progress: &mut S,
+    language: OutputLanguage,
     control: RunControl,
     user_interrupted: Arc<AtomicBool>,
     interrupt_notice: &'static str,
@@ -119,29 +118,16 @@ fn execute_with_progress<S: ProgressSink>(
     let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
 
     progress.activity(&ProgressActivity::AuthenticatingSuite);
-    let (token, prompted) = resolve_token(&invocation, &suite_origin)?;
-    let suite_client =
-        SuiteClient::new(suite_origin.clone(), token.clone(), ClientConfig::default())
-            .context("failed to initialize the Suite client")?;
-    suite_client
-        .probe_auth()
-        .context("Suite API token authentication failed")?;
-    if prompted {
-        CredentialStore::new(credential_root()?)?.save(&suite_origin, &token)?;
-    }
+    let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language)?;
     progress.activity(&ProgressActivity::RecoveringPreviousRun);
     let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
     if !recovered_retention.is_empty() {
-        serde_json::to_writer_pretty(
+        write_recovered_retention_output(
             io::stdout().lock(),
-            &RecoveredRetentionOutput {
-                schema: 1,
-                recovered: true,
-                retention: recovered_retention,
-            },
-        )
-        .context("failed to write recovered retention report")?;
-        writeln!(io::stdout()).context("failed to finish recovered retention report")?;
+            &recovered_retention,
+            language,
+            invocation.json,
+        )?;
         progress.activity(&ProgressActivity::Finished);
         return Ok(0);
     }
@@ -646,9 +632,7 @@ fn execute_with_progress<S: ProgressSink>(
         deployment: deployment_report,
     };
     progress.activity(&ProgressActivity::Finished);
-    serde_json::to_writer_pretty(io::stdout().lock(), &output)
-        .context("failed to write the structured ordinary conformance report")?;
-    writeln!(io::stdout()).context("failed to finish the structured conformance report")?;
+    write_final_output(io::stdout().lock(), &output, language, invocation.json)?;
     Ok(if user_interrupted.load(Ordering::SeqCst) {
         130
     } else if success {
@@ -687,8 +671,9 @@ mod acceptance_tests {
     };
 
     use super::{
-        EphemeralTenant, PendingRecoveryCandidate, PendingRecoveryStep, conformance_run_succeeds,
-        select_unique_pending_candidate,
+        DeploymentReport, EphemeralTenant, FinalOutput, PendingRecoveryCandidate,
+        PendingRecoveryStep, conformance_run_succeeds, select_unique_pending_candidate,
+        write_final_output,
     };
     #[cfg(target_os = "linux")]
     use super::{
@@ -716,6 +701,53 @@ mod acceptance_tests {
     fn failed_or_incomplete_module_fails_the_run() {
         assert!(!conformance_run_succeeds(true, true, 1, 0));
         assert!(!conformance_run_succeeds(true, true, 0, 1));
+    }
+
+    #[test]
+    fn concise_output_is_the_default_human_interface() {
+        let output = FinalOutput {
+            schema: 3,
+            success: false,
+            errors: vec!["test failure".to_owned()],
+            report: None,
+            retention: None,
+            evidence: None,
+            deployment: DeploymentReport {
+                deployment_id: "deployment".to_owned(),
+                tenant_id: "tenant".to_owned(),
+                target_issuer: "https://tenant.example".to_owned(),
+                artifact_digest: "digest".to_owned(),
+                artifact_revision: "revision".to_owned(),
+                matrix_sha256: "matrix".to_owned(),
+                selected_groups: 1,
+                selected_plans: 1,
+                apply_operation_id: "operation".to_owned(),
+                apply_request_hash: "request".to_owned(),
+                apply_controller_kid: "kid".to_owned(),
+                apply_revision: 1,
+                resource_manifest_sha256: "manifest".to_owned(),
+                trust_policy_resource_id: "policy".to_owned(),
+                trust_policy_digest: "policy-digest".to_owned(),
+                applicant_id: "applicant".to_owned(),
+                client_count: 1,
+                cleanup_complete: true,
+            },
+        };
+        let mut text = Vec::new();
+
+        write_final_output(
+            &mut text,
+            &output,
+            nazoauthctl_conformance::OutputLanguage::Chinese,
+            false,
+        )
+        .expect("summary");
+        let text = String::from_utf8(text).expect("UTF-8");
+
+        assert!(text.contains("OIDF 结果：未通过"));
+        assert!(text.contains("错误：test failure"));
+        assert!(!text.contains('{'));
+        assert!(!text.contains("artifact_digest"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1282,10 +1314,126 @@ struct FinalOutput {
 }
 
 #[derive(Serialize)]
-struct RecoveredRetentionOutput {
+struct RecoveredRetentionOutput<'a> {
     schema: u32,
     recovered: bool,
-    retention: Vec<SuiteRetentionManifestReceipt>,
+    retention: &'a [SuiteRetentionManifestReceipt],
+}
+
+fn write_recovered_retention_output<W: io::Write>(
+    mut writer: W,
+    retention: &[SuiteRetentionManifestReceipt],
+    language: OutputLanguage,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        serde_json::to_writer_pretty(
+            &mut writer,
+            &RecoveredRetentionOutput {
+                schema: 1,
+                recovered: true,
+                retention,
+            },
+        )
+        .context("failed to write recovered retention report")?;
+    } else {
+        match language {
+            OutputLanguage::Chinese => {
+                write!(
+                    writer,
+                    "已恢复上次运行保留的 {} 个 Suite 计划。",
+                    retention.len()
+                )?;
+            }
+            OutputLanguage::English => {
+                write!(
+                    writer,
+                    "Recovered {} retained Suite plan(s) from the previous run.",
+                    retention.len()
+                )?;
+            }
+        }
+    }
+    writeln!(writer).context("failed to finish recovered retention output")
+}
+
+fn write_final_output<W: io::Write>(
+    mut writer: W,
+    output: &FinalOutput,
+    language: OutputLanguage,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut writer, output)
+            .context("failed to write the structured ordinary conformance report")?;
+        return writeln!(writer).context("failed to finish the structured conformance report");
+    }
+
+    let status = match (language, output.success) {
+        (OutputLanguage::Chinese, true) => "OIDF 结果：通过",
+        (OutputLanguage::Chinese, false) => "OIDF 结果：未通过",
+        (OutputLanguage::English, true) => "OIDF result: passed",
+        (OutputLanguage::English, false) => "OIDF result: not passed",
+    };
+    writeln!(writer, "{status}")?;
+
+    if let Some(report) = &output.report {
+        let mut passed = 0usize;
+        let mut review = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        let mut incomplete = 0usize;
+        for module in &report.modules {
+            if module.human_review_required {
+                review += 1;
+                continue;
+            }
+            match module.outcome {
+                ModuleOutcome::Passed => passed += 1,
+                ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending => review += 1,
+                ModuleOutcome::Skipped => skipped += 1,
+                ModuleOutcome::Failed => failed += 1,
+                ModuleOutcome::Incomplete => incomplete += 1,
+            }
+        }
+        match language {
+            OutputLanguage::Chinese => writeln!(
+                writer,
+                "模块：通过 {passed} · 复核 {review} · 跳过 {skipped} · 失败 {failed} · 未完成 {incomplete}"
+            )?,
+            OutputLanguage::English => writeln!(
+                writer,
+                "Modules: passed {passed} · review {review} · skipped {skipped} · failed {failed} · incomplete {incomplete}"
+            )?,
+        }
+    }
+    if let Some(evidence) = &output.evidence {
+        match language {
+            OutputLanguage::Chinese => {
+                writeln!(writer, "证据：{}", evidence.directory.display())?;
+            }
+            OutputLanguage::English => {
+                writeln!(writer, "Evidence: {}", evidence.directory.display())?;
+            }
+        }
+    }
+    if output.retention.is_some() {
+        writeln!(
+            writer,
+            "{}",
+            match language {
+                OutputLanguage::Chinese => "Suite 计划已按要求保留。",
+                OutputLanguage::English => "Suite plans were retained as requested.",
+            }
+        )?;
+    }
+    for error in &output.errors {
+        match language {
+            OutputLanguage::Chinese => writeln!(writer, "错误：{error}")?,
+            OutputLanguage::English => writeln!(writer, "Error: {error}")?,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2628,7 +2776,11 @@ fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool 
 fn resolve_token(
     invocation: &RunInvocation,
     origin: &Origin,
+    language: OutputLanguage,
 ) -> anyhow::Result<(BearerToken, bool)> {
+    if let Some(token) = &invocation.token {
+        return Ok((token.clone(), false));
+    }
     if invocation.token_stdin {
         let mut bytes = Zeroizing::new(Vec::new());
         io::stdin()
@@ -2646,11 +2798,63 @@ fn resolve_token(
         return Ok((token, false));
     }
     if !io::stdin().is_terminal() {
-        bail!("no official Suite API token is stored; pipe it with --token-stdin once");
+        bail!(match language {
+            OutputLanguage::Chinese => {
+                "未保存 OIDF Suite API Token；请使用 --token TOKEN 或 --token-stdin 提供"
+            }
+            OutputLanguage::English => {
+                "no OIDF Suite API token is stored; provide one with --token TOKEN or --token-stdin"
+            }
+        });
     }
-    let value = rpassword::prompt_password("OpenID Foundation Conformance Suite API Token:")?;
-    let token = BearerToken::new(value)?;
-    Ok((token, true))
+    Ok((prompt_token(language)?, true))
+}
+
+fn prompt_token(language: OutputLanguage) -> anyhow::Result<BearerToken> {
+    let prompt = match language {
+        OutputLanguage::Chinese => "OIDF Suite API Token：",
+        OutputLanguage::English => "OIDF Suite API Token: ",
+    };
+    BearerToken::new(rpassword::prompt_password(prompt)?).map_err(Into::into)
+}
+
+fn authenticate_suite(
+    invocation: &RunInvocation,
+    origin: &Origin,
+    language: OutputLanguage,
+) -> anyhow::Result<(SuiteClient, BearerToken)> {
+    let transient_token = invocation.token.is_some() || invocation.token_stdin;
+    let (mut token, mut prompted) = resolve_token(invocation, origin, language)?;
+    loop {
+        let client = SuiteClient::new(origin.clone(), token.clone(), ClientConfig::default())
+            .context("failed to initialize the Suite client")?;
+        match client.probe_auth() {
+            Ok(_) => {
+                if prompted && !transient_token {
+                    CredentialStore::new(credential_root()?)?.save(origin, &token)?;
+                }
+                return Ok((client, token));
+            }
+            Err(SuiteClientError::AuthenticationRejected) if io::stdin().is_terminal() => {
+                eprintln!(
+                    "{}",
+                    match language {
+                        OutputLanguage::Chinese => {
+                            "OIDF Suite 拒绝了当前 Token，请重新输入（Ctrl+C 取消）。"
+                        }
+                        OutputLanguage::English => {
+                            "The OIDF Suite rejected the current token. Enter another token (Ctrl+C to cancel)."
+                        }
+                    }
+                );
+                token = prompt_token(language)?;
+                prompted = true;
+            }
+            Err(error) => {
+                return Err(error).context("Suite API token authentication failed");
+            }
+        }
+    }
 }
 
 fn credential_root() -> anyhow::Result<PathBuf> {

@@ -105,6 +105,9 @@ impl SuiteClient {
             true,
             self.config.max_response_bytes,
         )?;
+        if matches!(authenticated.status, 401 | 403) {
+            return Err(SuiteClientError::AuthenticationRejected);
+        }
         if authenticated.status != 200 || !authenticated.body.is_object() {
             return Err(SuiteClientError::AuthBoundary);
         }
@@ -613,6 +616,8 @@ pub enum SuiteClientError {
     HttpStatus(u16),
     #[error("Suite authentication boundary failed")]
     AuthBoundary,
+    #[error("Suite rejected the API token")]
+    AuthenticationRejected,
     #[error("Suite bearer token is required")]
     MissingToken,
     #[error("Suite response is malformed JSON")]
@@ -824,6 +829,7 @@ mod tests {
 
     struct AuthCapture {
         requests: Mutex<Vec<HttpRequest>>,
+        authenticated_status: u16,
     }
 
     impl Transport for AuthCapture {
@@ -832,7 +838,11 @@ mod tests {
             let authenticated = !requests.is_empty();
             requests.push(request);
             Ok(HttpResponse {
-                status: if authenticated { 200 } else { 401 },
+                status: if authenticated {
+                    self.authenticated_status
+                } else {
+                    401
+                },
                 headers: vec![],
                 body: b"{}".to_vec(),
             })
@@ -843,6 +853,7 @@ mod tests {
     fn bearer_never_enters_url_or_error() {
         let capture = Arc::new(AuthCapture {
             requests: Mutex::new(Vec::new()),
+            authenticated_status: 200,
         });
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
@@ -859,6 +870,26 @@ mod tests {
             Some("Bearer secret-token")
         );
         assert!(!authenticated.url().as_str().contains("secret-token"));
+    }
+
+    #[test]
+    fn rejected_token_is_distinct_from_a_broken_auth_boundary() {
+        let capture = Arc::new(AuthCapture {
+            requests: Mutex::new(Vec::new()),
+            authenticated_status: 401,
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("expired-token").expect("token")),
+            capture,
+            ClientConfig::default(),
+        )
+        .expect("client");
+
+        assert!(matches!(
+            client.probe_auth(),
+            Err(SuiteClientError::AuthenticationRejected)
+        ));
     }
 
     struct ReviewUploadCapture {
