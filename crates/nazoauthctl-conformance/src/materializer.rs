@@ -2827,6 +2827,17 @@ mod tests {
                     })
             )
         }));
+        assert!(leaf.extensions().iter().any(|extension| {
+            matches!(
+                extension.parsed_extension(),
+                ParsedExtension::SubjectAlternativeName(names)
+                    if names.general_names.iter().any(|name| {
+                        matches!(name, x509_parser::extensions::GeneralName::URI(value) if *value == suite_origin)
+                    }) && names.general_names.iter().any(|name| {
+                        matches!(name, x509_parser::extensions::GeneralName::DNSName(value) if *value == "suite.example")
+                    })
+            )
+        }));
         assert!(leaf.extensions().iter().any(|extension| matches!(
             extension.parsed_extension(),
             ParsedExtension::CRLDistributionPoints(_)
@@ -2905,6 +2916,38 @@ mod tests {
             .as_ref()
         );
         assert_eq!(leaf_aki, root_ski);
+        leaf.verify_signature(Some(root.public_key()))
+            .expect("credential leaf must chain to the run root");
+    }
+
+    fn assert_sd_jwt_vp_credential_signer(
+        attestation: &GeneratedAttestationMaterial,
+        suite_origin: &str,
+    ) {
+        let signing_jwk: Value = serde_json::from_str(&attestation.credential_signing_private_jwk)
+            .expect("credential signing JWK");
+        let leaf_der = STANDARD
+            .decode(signing_jwk["x5c"][0].as_str().expect("credential leaf x5c"))
+            .expect("credential leaf base64");
+        let (remaining, leaf) = parse_x509_certificate(&leaf_der).expect("credential leaf");
+        assert!(remaining.is_empty());
+        assert!(leaf.extended_key_usage().expect("credential EKU").is_none());
+        assert!(leaf.extensions().iter().any(|extension| {
+            matches!(
+                extension.parsed_extension(),
+                ParsedExtension::SubjectAlternativeName(names)
+                    if names.general_names.iter().any(|name| {
+                        matches!(name, x509_parser::extensions::GeneralName::URI(value) if *value == suite_origin)
+                    }) && names.general_names.iter().any(|name| {
+                        matches!(name, x509_parser::extensions::GeneralName::DNSName(value) if *value == "suite.example")
+                    })
+            )
+        }));
+
+        let (_, root_pem) =
+            x509_parser::pem::parse_x509_pem(attestation.trust_anchor_pem.as_bytes())
+                .expect("run root PEM");
+        let (_, root) = parse_x509_certificate(&root_pem.contents).expect("run root certificate");
         leaf.verify_signature(Some(root.public_key()))
             .expect("credential leaf must chain to the run root");
     }
@@ -3475,6 +3518,13 @@ mod tests {
             .unwrap_err(),
             MaterializerError::InvalidField("credential.signing_jwk")
         );
+    }
+
+    #[test]
+    fn sd_jwt_vp_credential_signer_is_bound_to_the_suite_issuer() {
+        let attestation = generate_attestation_material("https://suite.example", None)
+            .expect("SD-JWT attestation");
+        assert_sd_jwt_vp_credential_signer(&attestation, "https://suite.example");
     }
 
     fn ciba_descriptor() -> MatrixDescriptor {

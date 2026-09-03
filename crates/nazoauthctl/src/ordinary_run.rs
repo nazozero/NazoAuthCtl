@@ -403,7 +403,7 @@ fn execute_with_progress<S: ProgressSink>(
     };
     // The runner has already uploaded required NazoAuthWeb VP result captures;
     // this root-private manifest preserves their exact local evidence.
-    let review_screenshot_manifest = if captures_review_screenshots && !user_cancelled {
+    let review_screenshot_manifest = if captures_review_screenshots && retention_eligible {
         match run_result.as_ref() {
             Ok(report) => match write_review_screenshot_manifest(
                 report,

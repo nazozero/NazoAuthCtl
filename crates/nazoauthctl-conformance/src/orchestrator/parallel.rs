@@ -35,7 +35,6 @@ struct ChannelSink {
     index: usize,
     sender: mpsc::Sender<WorkerMessage>,
     stop_launching: Arc<AtomicBool>,
-    control: RunControl,
 }
 
 impl ProgressSink for ChannelSink {
@@ -51,7 +50,6 @@ impl ProgressSink for ChannelSink {
             .any(|group| group.status == GroupStatus::Failed)
         {
             self.stop_launching.store(true, Ordering::SeqCst);
-            self.control.interrupt();
         }
         let _ = self.sender.send(WorkerMessage::Progress {
             index: self.index,
@@ -145,13 +143,11 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             index: next_index,
                             sender: sender.clone(),
                             stop_launching: Arc::clone(&stop_launching),
-                            control: runner.config.control.clone(),
                         };
                         let summary = child
                             .run_prepared(&mut progress, worker_prepared(&work_ref[next_index]));
                         if completed_plan_stops_dispatch(&summary.report) {
                             stop_launching.store(true, Ordering::SeqCst);
-                            runner.config.control.interrupt();
                         } else if has_unsettled_suite_resources(&summary.report) {
                             stop_launching.store(true, Ordering::SeqCst);
                         }

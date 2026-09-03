@@ -21,6 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 pub(super) const MTLS_CLIENT_SAN_DNS: &str = "nazoauthctl-client";
@@ -249,6 +250,9 @@ fn generate_credential_signing_leaf<'a>(
     params.not_before = now - TimeDuration::days(1);
     params.not_after = now + TimeDuration::days(2);
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params
+        .custom_extensions
+        .push(subject_alternative_name(suite_origin)?);
     if let Some(issuing_country) = issuing_country {
         configure_mdoc_identity(
             &mut params,
@@ -271,8 +275,6 @@ fn generate_credential_signing_leaf<'a>(
         document_signer_eku.set_criticality(true);
         params.custom_extensions.push(document_signer_eku);
     } else {
-        params.extended_key_usages =
-            vec![ExtendedKeyUsagePurpose::Other(vec![1, 0, 18013, 5, 1, 2])];
         params
             .distinguished_name
             .push(DnType::CommonName, "NazoAuth credential".to_owned());
@@ -339,6 +341,22 @@ fn issuer_alternative_name(suite_origin: &str) -> CustomExtension {
         &[2, 5, 29, 18],
         der_sequence(&[der_tlv(0x86, suite_origin.as_bytes())]),
     )
+}
+
+fn subject_alternative_name(suite_origin: &str) -> Result<CustomExtension, MaterializerError> {
+    let suite_host = Url::parse(suite_origin)
+        .map_err(|_| MaterializerError::Crypto)?
+        .host_str()
+        .ok_or(MaterializerError::Crypto)?
+        .as_bytes()
+        .to_vec();
+    Ok(CustomExtension::from_oid_content(
+        &[2, 5, 29, 17],
+        der_sequence(&[
+            der_tlv(0x82, &suite_host),
+            der_tlv(0x86, suite_origin.as_bytes()),
+        ]),
+    ))
 }
 
 fn mdoc_crl_distribution_point(suite_origin: &str) -> CrlDistributionPoint {
