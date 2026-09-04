@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use cliclack::{
-    MultiProgress, ProgressBar, log, multi_progress, note, outro, password, progress_bar, spinner,
+    MultiProgress, ProgressBar, input, log, multi_progress, note, outro, progress_bar, spinner,
 };
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
@@ -160,7 +160,10 @@ impl CliclackRenderer {
                 GroupStatus::Passed => {
                     let _ = log::success(message);
                 }
-                GroupStatus::Review | GroupStatus::Skipped | GroupStatus::Incomplete => {
+                GroupStatus::Review
+                | GroupStatus::Warning
+                | GroupStatus::Skipped
+                | GroupStatus::Incomplete => {
                     let _ = log::warning(message);
                 }
                 GroupStatus::Failed => {
@@ -255,35 +258,38 @@ fn overall_progress_message(
     snapshot: &nazoauthctl_conformance::ProgressSnapshot,
     language: OutputLanguage,
 ) -> String {
-    let (passed, review, skipped, failed, incomplete, running, remaining, current) = match language
-    {
-        OutputLanguage::Chinese => (
-            "通过",
-            "待复核",
-            "跳过",
-            "失败",
-            "未完成",
-            "运行中",
-            "剩余",
-            "当前",
-        ),
-        OutputLanguage::English => (
-            "passed",
-            "review",
-            "skipped",
-            "failed",
-            "incomplete",
-            "running",
-            "remaining",
-            "current",
-        ),
-    };
+    let (passed, review, warning, skipped, failed, incomplete, running, remaining, current) =
+        match language {
+            OutputLanguage::Chinese => (
+                "通过",
+                "待复核",
+                "警告",
+                "跳过",
+                "失败",
+                "未完成",
+                "运行中",
+                "剩余",
+                "当前",
+            ),
+            OutputLanguage::English => (
+                "passed",
+                "review",
+                "warning",
+                "skipped",
+                "failed",
+                "incomplete",
+                "running",
+                "remaining",
+                "current",
+            ),
+        };
     format!(
-        "{}/{} · {passed} {} · {review} {} · {skipped} {} · {failed} {} · {incomplete} {} · {running} {} · {remaining} {}\n{current}: {}/{}",
+        "{}/{} · {passed} {} · {review} {} · {warning} {} · {skipped} {} · {failed} {} · {incomplete} {} · {running} {} · {remaining} {}\n{current}: {}/{}",
         snapshot.completed,
         snapshot.total,
         snapshot.passed,
         snapshot.reviewed,
+        snapshot.warnings,
         snapshot.skipped,
         snapshot.failed,
         snapshot.incomplete,
@@ -301,6 +307,7 @@ fn group_status_label(status: GroupStatus, language: OutputLanguage) -> &'static
     match (language, status) {
         (OutputLanguage::Chinese, GroupStatus::Passed) => "通过",
         (OutputLanguage::Chinese, GroupStatus::Review) => "待复核",
+        (OutputLanguage::Chinese, GroupStatus::Warning) => "警告",
         (OutputLanguage::Chinese, GroupStatus::Skipped) => "跳过",
         (OutputLanguage::Chinese, GroupStatus::Failed) => "失败",
         (OutputLanguage::Chinese, GroupStatus::Incomplete) => "未完成",
@@ -308,6 +315,7 @@ fn group_status_label(status: GroupStatus, language: OutputLanguage) -> &'static
         (OutputLanguage::Chinese, GroupStatus::Remaining) => "剩余",
         (OutputLanguage::English, GroupStatus::Passed) => "passed",
         (OutputLanguage::English, GroupStatus::Review) => "review",
+        (OutputLanguage::English, GroupStatus::Warning) => "warning",
         (OutputLanguage::English, GroupStatus::Skipped) => "skipped",
         (OutputLanguage::English, GroupStatus::Failed) => "failed",
         (OutputLanguage::English, GroupStatus::Incomplete) => "incomplete",
@@ -339,6 +347,7 @@ mod renderer_tests {
                     status,
                     passed: group_total.saturating_sub(1 + failed),
                     reviewed: usize::from(matches!(status, GroupStatus::Review)),
+                    warnings: usize::from(matches!(status, GroupStatus::Warning)),
                     skipped: usize::from(matches!(status, GroupStatus::Skipped)),
                     failed,
                     incomplete: usize::from(matches!(status, GroupStatus::Incomplete)),
@@ -347,6 +356,7 @@ mod renderer_tests {
                 }],
                 passed_groups: usize::from(matches!(status, GroupStatus::Passed)),
                 review_groups: usize::from(matches!(status, GroupStatus::Review)),
+                warning_groups: usize::from(matches!(status, GroupStatus::Warning)),
                 skipped_groups: usize::from(matches!(status, GroupStatus::Skipped)),
                 failed_groups: usize::from(matches!(status, GroupStatus::Failed)),
                 incomplete_groups: usize::from(matches!(status, GroupStatus::Incomplete)),
@@ -354,6 +364,7 @@ mod renderer_tests {
                 remaining_groups: 0,
                 passed: group_total.saturating_sub(1 + failed),
                 reviewed: usize::from(matches!(status, GroupStatus::Review)),
+                warnings: usize::from(matches!(status, GroupStatus::Warning)),
                 skipped: usize::from(matches!(status, GroupStatus::Skipped)),
                 failed,
                 incomplete: usize::from(matches!(status, GroupStatus::Incomplete)),
@@ -418,11 +429,27 @@ mod renderer_tests {
         renderer.error();
         assert!(renderer.finished);
     }
+
+    #[test]
+    fn renderer_exposes_warning_as_a_distinct_terminal_status() {
+        let mut renderer = CliclackRenderer::new(OutputLanguage::English);
+        let warning = snapshot(2, 2, GroupStatus::Warning, 0);
+        let summary = overall_progress_message(&warning.snapshot, OutputLanguage::English);
+        assert!(summary.contains("warning 1"));
+        assert!(!summary.contains("review 1"));
+        assert_eq!(
+            group_status_label(GroupStatus::Warning, OutputLanguage::English),
+            "warning"
+        );
+        renderer.update(&warning);
+        renderer.finish();
+        assert!(renderer.finished);
+    }
 }
 
 pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     let language = super::output_language();
-    let control = RunControl::default();
+    let control = RunControl::with_fail_fast(invocation.fail_fast);
     let user_interrupted = Arc::new(AtomicBool::new(false));
     let interrupt_notice = match language {
         OutputLanguage::Chinese => "收到 Ctrl+C，正在终止测试并清理临时资源……",
@@ -481,6 +508,7 @@ fn execute_with_progress<S: ProgressSink>(
         OidfPlanSelection {
             groups: invocation.groups.clone(),
             plans: invocation.plans.clone(),
+            excluded_plans: invocation.excluded_plans.clone(),
         },
         &suite_origin,
         now,
@@ -1715,6 +1743,7 @@ struct FinalOutput {
 struct ModuleCounts {
     passed: usize,
     review: usize,
+    warning: usize,
     skipped: usize,
     failed: usize,
     incomplete: usize,
@@ -1723,19 +1752,148 @@ struct ModuleCounts {
 fn module_counts(report: &nazoauthctl_conformance::ConformanceReport) -> ModuleCounts {
     let mut counts = ModuleCounts::default();
     for module in &report.modules {
-        if module.human_review_required {
-            counts.review += 1;
-            continue;
-        }
         match module.outcome {
             ModuleOutcome::Passed => counts.passed += 1,
             ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending => counts.review += 1,
+            ModuleOutcome::Warning => counts.warning += 1,
             ModuleOutcome::Skipped => counts.skipped += 1,
             ModuleOutcome::Failed => counts.failed += 1,
             ModuleOutcome::Incomplete => counts.incomplete += 1,
         }
     }
     counts
+}
+
+fn execution_boundary(
+    report: &nazoauthctl_conformance::ConformanceReport,
+    language: OutputLanguage,
+) -> Option<String> {
+    let integrity = &report.orchestration_integrity;
+    let running = integrity
+        .created_instances
+        .saturating_sub(integrity.terminal_modules);
+    let unstarted = integrity
+        .defined_modules
+        .saturating_sub(integrity.created_instances);
+    let reason = report
+        .errors
+        .iter()
+        .find(|error| error.as_str() != "run interrupted")
+        .or_else(|| report.errors.first());
+    if running == 0 && unstarted == 0 {
+        return reason.map(|reason| match language {
+            OutputLanguage::Chinese => format!("停止或失败原因：{reason}"),
+            OutputLanguage::English => format!("Stop or failure reason: {reason}"),
+        });
+    }
+    let status = match language {
+        OutputLanguage::Chinese => format!(
+            "执行未收敛：已报告终态 {}/{} · 停止时未取得 Suite 终态 {} · 未启动 {}",
+            integrity.terminal_modules, integrity.defined_modules, running, unstarted
+        ),
+        OutputLanguage::English => format!(
+            "Execution unsettled: terminal reports {}/{} · no Suite terminal state when stopped {} · not started {}",
+            integrity.terminal_modules, integrity.defined_modules, running, unstarted
+        ),
+    };
+    Some(match (language, reason) {
+        (OutputLanguage::Chinese, Some(reason)) => format!("{status}\n停止原因：{reason}"),
+        (OutputLanguage::English, Some(reason)) => format!("{status}\nStop reason: {reason}"),
+        (_, None) => status,
+    })
+}
+
+fn write_execution_boundary<W: io::Write>(
+    writer: &mut W,
+    report: &nazoauthctl_conformance::ConformanceReport,
+    language: OutputLanguage,
+) -> anyhow::Result<()> {
+    if let Some(boundary) = execution_boundary(report, language) {
+        writeln!(writer, "{boundary}")?;
+    }
+    Ok(())
+}
+
+fn warning_module_message(
+    warning: &nazoauthctl_conformance::WarningModule,
+    language: OutputLanguage,
+) -> String {
+    let mut reasons = Vec::new();
+    if warning.official_result.as_deref() == Some("WARNING") {
+        reasons.push(match language {
+            OutputLanguage::Chinese => "Suite 结果为 WARNING".to_owned(),
+            OutputLanguage::English => "Suite result is WARNING".to_owned(),
+        });
+    }
+    if !warning.condition_results.is_empty() {
+        let conditions = warning
+            .warning_conditions
+            .iter()
+            .map(|condition| format!("{}×{}", condition.source, condition.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        reasons.push(match language {
+            OutputLanguage::Chinese => format!(
+                "Suite 条件日志：{} · {} 条",
+                conditions, warning.condition_count
+            ),
+            OutputLanguage::English => format!(
+                "Suite condition log: {} ({} entry/entries)",
+                conditions, warning.condition_count
+            ),
+        });
+    }
+    let status = warning.official_status.as_deref().unwrap_or("-");
+    let result = warning.official_result.as_deref().unwrap_or("-");
+    let separator = match language {
+        OutputLanguage::Chinese => "；",
+        OutputLanguage::English => "; ",
+    };
+    let reason = if reasons.is_empty() {
+        match language {
+            OutputLanguage::Chinese => "Suite 报告了警告".to_owned(),
+            OutputLanguage::English => "Suite reported a warning".to_owned(),
+        }
+    } else {
+        reasons.join(separator)
+    };
+    match language {
+        OutputLanguage::Chinese => format!(
+            "警告 · {} · 状态={} · 结果={} · {}",
+            warning.module, status, result, reason
+        ),
+        OutputLanguage::English => format!(
+            "warning · {} · status={} · result={} · {}",
+            warning.module, status, result, reason
+        ),
+    }
+}
+
+fn warning_condition_count(report: &nazoauthctl_conformance::ConformanceReport) -> usize {
+    report
+        .warning_modules
+        .iter()
+        .map(|warning| warning.condition_count)
+        .sum()
+}
+
+fn write_warning_modules<W: io::Write>(
+    writer: &mut W,
+    report: &nazoauthctl_conformance::ConformanceReport,
+    language: OutputLanguage,
+) -> anyhow::Result<()> {
+    if report.warning_modules.is_empty() {
+        return Ok(());
+    }
+    let title = match language {
+        OutputLanguage::Chinese => "警告模块（Suite 条件 WARNING 条目）：",
+        OutputLanguage::English => "Warning modules (Suite WARNING condition entries):",
+    };
+    writeln!(writer, "{title} {}", warning_condition_count(report))?;
+    for warning in &report.warning_modules {
+        writeln!(writer, "{}", warning_module_message(warning, language))?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1805,6 +1963,27 @@ fn write_terminal_recovered_retention_output(
     .context("failed to render recovered retention output")
 }
 
+fn run_policy_lines(
+    report: &nazoauthctl_conformance::ConformanceReport,
+    language: OutputLanguage,
+) -> Vec<String> {
+    let mode = match (language, report.fail_fast) {
+        (OutputLanguage::Chinese, false) => "执行模式：失败后继续收集结果",
+        (OutputLanguage::Chinese, true) => "执行模式：遇错即停（--fail-fast）",
+        (OutputLanguage::English, false) => "Run mode: continue after test failures",
+        (OutputLanguage::English, true) => "Run mode: stop on first error (--fail-fast)",
+    };
+    let mut lines = vec![mode.to_owned()];
+    if !report.excluded_plans.is_empty() {
+        let label = match language {
+            OutputLanguage::Chinese => "明确排除的计划（未执行）",
+            OutputLanguage::English => "Explicitly excluded plans (not executed)",
+        };
+        lines.push(format!("{label}: {}", report.excluded_plans.join(", ")));
+    }
+    lines
+}
+
 fn write_final_output<W: io::Write>(
     mut writer: W,
     output: &FinalOutput,
@@ -1826,19 +2005,34 @@ fn write_final_output<W: io::Write>(
     writeln!(writer, "{status}")?;
 
     if let Some(report) = &output.report {
+        for line in run_policy_lines(report, language) {
+            writeln!(writer, "{line}")?;
+        }
         let counts = module_counts(report);
         match language {
             OutputLanguage::Chinese => writeln!(
                 writer,
-                "模块：通过 {} · 复核 {} · 跳过 {} · 失败 {} · 未完成 {}",
-                counts.passed, counts.review, counts.skipped, counts.failed, counts.incomplete
+                "模块：通过 {} · 复核 {} · 警告 {} · 跳过 {} · 失败 {} · 未完成 {}",
+                counts.passed,
+                counts.review,
+                counts.warning,
+                counts.skipped,
+                counts.failed,
+                counts.incomplete
             )?,
             OutputLanguage::English => writeln!(
                 writer,
-                "Modules: passed {} · review {} · skipped {} · failed {} · incomplete {}",
-                counts.passed, counts.review, counts.skipped, counts.failed, counts.incomplete
+                "Modules: passed {} · review {} · warning {} · skipped {} · failed {} · incomplete {}",
+                counts.passed,
+                counts.review,
+                counts.warning,
+                counts.skipped,
+                counts.failed,
+                counts.incomplete
             )?,
         }
+        write_execution_boundary(&mut writer, report, language)?;
+        write_warning_modules(&mut writer, report, language)?;
     }
     if let Some(evidence) = &output.evidence {
         match language {
@@ -1898,14 +2092,23 @@ fn write_terminal_final_output(
     let mut details = vec![format!("{result_label}: {outcome}")];
 
     if let Some(report) = &output.report {
+        details.extend(run_policy_lines(report, language));
         let counts = module_counts(report);
         let labels = match language {
-            OutputLanguage::Chinese => ["通过", "待复核", "跳过", "失败", "未完成"],
-            OutputLanguage::English => ["passed", "review", "skipped", "failed", "incomplete"],
+            OutputLanguage::Chinese => ["通过", "待复核", "警告", "跳过", "失败", "未完成"],
+            OutputLanguage::English => [
+                "passed",
+                "review",
+                "warning",
+                "skipped",
+                "failed",
+                "incomplete",
+            ],
         };
         let summary = [
             counts.passed,
             counts.review,
+            counts.warning,
             counts.skipped,
             counts.failed,
             counts.incomplete,
@@ -1916,6 +2119,27 @@ fn write_terminal_final_output(
         .collect::<Vec<_>>()
         .join(" · ");
         details.push(format!("{modules_label}: {summary}"));
+        if let Some(boundary) = execution_boundary(report, language) {
+            details.push(boundary);
+        }
+        if !report.warning_modules.is_empty() {
+            let label = match language {
+                OutputLanguage::Chinese => "警告模块",
+                OutputLanguage::English => "Warning modules",
+            };
+            details.push(match language {
+                OutputLanguage::Chinese => format!(
+                    "{label}: {} · Suite 条件 WARNING {} 条",
+                    report.warning_modules.len(),
+                    warning_condition_count(report)
+                ),
+                OutputLanguage::English => format!(
+                    "{label}: {} · Suite WARNING conditions {}",
+                    report.warning_modules.len(),
+                    warning_condition_count(report)
+                ),
+            });
+        }
     }
     if let Some(evidence) = &output.evidence {
         details.push(format!(
@@ -1933,6 +2157,12 @@ fn write_terminal_final_output(
     note(title, details.join("\n")).context("failed to render conformance summary")?;
     for error in &output.errors {
         log::error(error).context("failed to render conformance error")?;
+    }
+    if let Some(report) = &output.report {
+        for warning in &report.warning_modules {
+            log::warning(warning_module_message(warning, language))
+                .context("failed to render conformance warning")?;
+        }
     }
     if output.success {
         outro(outcome).context("failed to render successful conformance completion")
@@ -2105,7 +2335,10 @@ fn run_signed_suite<S: ProgressSink>(
                 retain_suite_plans: !invocation.delete_suite_plans,
             })),
         })?;
-        Ok(runner.run(progress).report)
+        let mut report = runner.run(progress).report;
+        report.excluded_plans = invocation.excluded_plans.clone();
+        report.fail_fast = invocation.fail_fast;
+        Ok(report)
     })();
     let mut browser_cleanup_errors = Vec::new();
     for (index, browser) in managed_browsers.iter().enumerate() {
@@ -3332,8 +3565,8 @@ fn prompt_token(language: OutputLanguage) -> anyhow::Result<BearerToken> {
         OutputLanguage::English => "OIDF Suite API Token: ",
     };
     BearerToken::new(
-        password(prompt)
-            .interact()
+        input(prompt)
+            .interact::<String>()
             .context("OIDF Suite token input was cancelled or failed")?,
     )
     .map_err(Into::into)

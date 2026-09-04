@@ -32,6 +32,9 @@ pub struct OidfPlanSelection {
     pub groups: Vec<String>,
     #[serde(default)]
     pub plans: Vec<String>,
+    /// Explicit operator omissions. These are never inferred defaults.
+    #[serde(default)]
+    pub excluded_plans: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -138,6 +141,7 @@ pub fn resolve_bundled_oidf_selection(
             return Ok(OidfPlanSelection {
                 groups: Vec::new(),
                 plans: vec![exact.to_owned()],
+                excluded_plans: Vec::new(),
             });
         }
         _ => return Err(OidfPlanError::UnknownSelection),
@@ -148,6 +152,7 @@ pub fn resolve_bundled_oidf_selection(
     Ok(OidfPlanSelection {
         groups,
         plans: Vec::new(),
+        excluded_plans: Vec::new(),
     })
 }
 
@@ -173,6 +178,29 @@ pub fn bundled_oidf_selection_choices() -> Result<Vec<String>, OidfPlanError> {
             .map(|plan| plan.id.clone()),
     );
     Ok(choices)
+}
+
+pub fn resolve_bundled_oidf_plan_id(reference: &str) -> Result<String, OidfPlanError> {
+    let matrix = bundled_oidf_matrix()?;
+    let matches = matrix
+        .groups
+        .iter()
+        .flat_map(|group| group.plans.iter())
+        .filter(|plan| {
+            plan.id == reference
+                || plan
+                    .id
+                    .rsplit('-')
+                    .next()
+                    .is_some_and(|segment| segment == reference)
+        })
+        .map(|plan| plan.id.clone())
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Ok(matches.into_iter().next().expect("one match"))
+    } else {
+        Err(OidfPlanError::UnknownSelection)
+    }
 }
 
 pub fn bundled_oidf_matrix() -> Result<OidfArtifactMatrix, OidfPlanError> {
@@ -315,6 +343,7 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     }
     let groups = selection_set(&selection.groups)?;
     let plans = selection_set(&selection.plans)?;
+    let excluded_plans = selection_set(&selection.excluded_plans)?;
     if groups
         .iter()
         .any(|wanted| !matrix.groups.iter().any(|group| &group.id == wanted))
@@ -325,6 +354,27 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
                 .flat_map(|group| &group.plans)
                 .any(|plan| &plan.id == wanted)
         })
+        || excluded_plans.iter().any(|wanted| {
+            !matrix
+                .groups
+                .iter()
+                .flat_map(|group| &group.plans)
+                .any(|plan| &plan.id == wanted)
+        })
+    {
+        return Err(OidfPlanError::UnknownSelection);
+    }
+    let selected_before_exclusions = matrix
+        .groups
+        .iter()
+        .filter(|group| groups.is_empty() || groups.contains(&group.id))
+        .flat_map(|group| group.plans.iter())
+        .filter(|plan| plans.is_empty() || plans.contains(&plan.id))
+        .map(|plan| plan.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if excluded_plans
+        .iter()
+        .any(|plan| !selected_before_exclusions.contains(plan.as_str()))
     {
         return Err(OidfPlanError::UnknownSelection);
     }
@@ -342,6 +392,9 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
         }
         for plan in group.plans {
             if !plans.is_empty() && !plans.contains(&plan.id) {
+                continue;
+            }
+            if excluded_plans.contains(&plan.id) {
                 continue;
             }
             selected_resource_budget.modules = selected_resource_budget
@@ -518,6 +571,7 @@ mod tests {
             OidfPlanSelection {
                 groups: vec!["oidc".to_owned()],
                 plans: vec!["p002".to_owned()],
+                excluded_plans: Vec::new(),
             },
             1_800_000_000,
         )
@@ -588,6 +642,18 @@ mod tests {
     }
 
     #[test]
+    fn exclusion_reference_requires_exact_id_or_final_plan_segment() {
+        assert_eq!(
+            resolve_bundled_oidf_plan_id("p040").expect("p040 suffix"),
+            "openid4vc-vp-p040"
+        );
+        assert_eq!(
+            resolve_bundled_oidf_plan_id("040"),
+            Err(OidfPlanError::UnknownSelection)
+        );
+    }
+
+    #[test]
     fn rejects_unknown_duplicate_and_conflicting_selection() {
         let matrix = matrix_bytes();
         let compile = |selection| {
@@ -603,6 +669,7 @@ mod tests {
             compile(OidfPlanSelection {
                 groups: vec!["missing".to_owned()],
                 plans: Vec::new(),
+                excluded_plans: Vec::new(),
             })
             .unwrap_err(),
             OidfPlanError::UnknownSelection
@@ -611,6 +678,7 @@ mod tests {
             compile(OidfPlanSelection {
                 groups: vec!["oidc".to_owned(), "oidc".to_owned()],
                 plans: Vec::new(),
+                excluded_plans: Vec::new(),
             })
             .unwrap_err(),
             OidfPlanError::InvalidSelection
@@ -619,9 +687,28 @@ mod tests {
             compile(OidfPlanSelection {
                 groups: vec!["oidc".to_owned()],
                 plans: vec!["p003".to_owned()],
+                excluded_plans: Vec::new(),
             })
             .unwrap_err(),
             OidfPlanError::EmptySelection
+        );
+        assert_eq!(
+            compile(OidfPlanSelection {
+                groups: vec!["oidc".to_owned()],
+                plans: Vec::new(),
+                excluded_plans: vec!["p001".to_owned(), "p002".to_owned()],
+            })
+            .unwrap_err(),
+            OidfPlanError::EmptySelection
+        );
+        assert_eq!(
+            compile(OidfPlanSelection {
+                groups: vec!["oidc".to_owned()],
+                plans: vec!["p001".to_owned()],
+                excluded_plans: vec!["p002".to_owned()],
+            })
+            .unwrap_err(),
+            OidfPlanError::UnknownSelection
         );
     }
 
@@ -695,6 +782,7 @@ mod tests {
                 OidfPlanSelection {
                     groups: Vec::new(),
                     plans: vec!["p001".to_owned()],
+                    excluded_plans: Vec::new(),
                 },
                 1_800_000_900,
             )

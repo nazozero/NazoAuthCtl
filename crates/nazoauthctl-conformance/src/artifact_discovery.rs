@@ -1033,6 +1033,7 @@ mod tests {
             OidfPlanSelection {
                 groups: vec!["oidc".to_owned()],
                 plans: vec!["p001".to_owned()],
+                excluded_plans: Vec::new(),
             },
             NOW + 1,
         )

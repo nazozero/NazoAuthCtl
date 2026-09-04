@@ -10,8 +10,8 @@ use nazoauthctl_conformance::{
     ArtifactTrustPolicy, BearerToken, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
     OidfPlanSelection, OutputLanguage, bundled_oidf_selection_choices, open_cached_oidf_artifact,
     open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, resolve_bundled_oidf_selection, resolve_oidf_artifact,
-    verify_oidf_artifact,
+    read_compact_manifest, resolve_bundled_oidf_plan_id, resolve_bundled_oidf_selection,
+    resolve_oidf_artifact, verify_oidf_artifact,
 };
 
 mod ordinary_run;
@@ -213,7 +213,11 @@ fn parse_artifact_plan_options(values: &[String]) -> anyhow::Result<ArtifactPlan
         cache_directory: cache_directory.context("--cache-dir is required")?,
         manifest_digest: manifest_digest.context("--digest is required")?,
         capabilities,
-        selection: OidfPlanSelection { groups, plans },
+        selection: OidfPlanSelection {
+            groups,
+            plans,
+            excluded_plans: Vec::new(),
+        },
     })
 }
 
@@ -549,8 +553,10 @@ pub(crate) struct RunInvocation {
     pub(crate) delete_suite_plans: bool,
     pub(crate) groups: Vec<String>,
     pub(crate) plans: Vec<String>,
+    pub(crate) excluded_plans: Vec<String>,
     pub(crate) poll_timeout: Duration,
     pub(crate) jobs: usize,
+    pub(crate) fail_fast: bool,
 }
 
 fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Result<RunInvocation> {
@@ -567,6 +573,8 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     let mut json = false;
     let mut delete_suite_plans = false;
     let mut selector = None;
+    let mut excluded_plans = Vec::new();
+    let mut fail_fast = false;
     let mut poll_timeout = Duration::from_secs(DEFAULT_POLL_TIMEOUT_SECONDS);
     let mut jobs = DEFAULT_JOBS;
     let mut index = 0usize;
@@ -623,6 +631,21 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                 delete_suite_plans = true;
                 index += 1;
             }
+            "--fail-fast" => {
+                if fail_fast {
+                    bail!("--fail-fast may be specified only once");
+                }
+                fail_fast = true;
+                index += 1;
+            }
+            "--exclude-plan" => {
+                let value = values
+                    .get(index + 1)
+                    .with_context(|| format!("{option} requires a value"))?
+                    .clone();
+                push_unique_vec(&mut excluded_plans, value, option)?;
+                index += 2;
+            }
             value if value.starts_with('-') => bail!("unknown oidf run option: {value}"),
             value => {
                 set_once(&mut selector, value.to_owned(), "OIDF selector")?;
@@ -630,7 +653,7 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
             }
         }
     }
-    let selection = resolve_bundled_oidf_selection(selector.as_deref()).map_err(|error| {
+    let mut selection = resolve_bundled_oidf_selection(selector.as_deref()).map_err(|error| {
         if error == nazoauthctl_conformance::OidfPlanError::UnknownSelection {
             let choices = bundled_oidf_selection_choices()
                 .map(|choices| choices.join(", "))
@@ -645,6 +668,14 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
             anyhow::anyhow!("bundled OIDF Matrix is invalid: {error}")
         }
     })?;
+    selection.excluded_plans = excluded_plans
+        .iter()
+        .map(|reference| {
+            resolve_bundled_oidf_plan_id(reference).map_err(|_| {
+                anyhow::anyhow!("unknown or ambiguous excluded OIDF plan `{reference}`")
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let tenant_id = uuid::Uuid::now_v7().to_string();
     if token.is_some() && token_stdin {
         bail!("--token and --token-stdin cannot be used together");
@@ -666,8 +697,10 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         delete_suite_plans,
         groups: selection.groups,
         plans: selection.plans,
+        excluded_plans: selection.excluded_plans,
         poll_timeout,
         jobs,
+        fail_fast,
     })
 }
 
@@ -709,10 +742,10 @@ fn output_language() -> OutputLanguage {
 fn run_help(language: OutputLanguage) -> &'static str {
     match language {
         OutputLanguage::Chinese => {
-            "用法：\n  nazoauthctl [--instance 实例] oidf configure --tenant-domain 域名 --suite HTTPS地址\n  nazoauthctl [--instance 实例] oidf run [分组或计划] [选项]\n\nconfigure 只需设置一次临时租户所用的通配域名后缀和 OIDF Suite 地址。未指定分组或计划时运行完整矩阵。可用别名：oidc、ciba、fapi、openid4vci、openid4vp、openid4vc；也可使用内置分组或计划的完整 ID。\n\n每次运行都会创建新的临时租户、生成新的测试资料，并仅在所选计划需要时启动浏览器任务。Suite 测试记录默认保留。\n\n选项：\n  --token TOKEN                  本次运行直接使用 Token，不保存\n  --token-stdin                  从标准输入读取 Token，不保存\n  --json                         输出完整 JSON 报告；默认仅输出简洁摘要\n  --delete-suite-plans           运行结束后删除本次创建的 Suite 测试记录\n  --jobs N                       并行计划数，1-4（默认：4）\n  --poll-timeout 秒数            单个模块等待 Suite 的最长时间（默认：1800）"
+            "用法：\n  nazoauthctl [--instance 实例] oidf configure --tenant-domain 域名 --suite HTTPS地址\n  nazoauthctl [--instance 实例] oidf run [分组或计划] [选项]\n\nconfigure 只需设置一次临时租户所用的通配域名后缀和 OIDF Suite 地址。未指定分组或计划时运行完整矩阵。可用别名：oidc、ciba、fapi、openid4vci、openid4vp、openid4vc；也可使用内置分组或计划的完整 ID。\n\n每次运行都会创建新的临时租户、生成新的测试资料，并仅在所选计划需要时启动浏览器任务。Suite 测试记录默认保留。\n\n选项：\n  --token TOKEN                  本次运行直接使用 Token，不保存\n  --token-stdin                  从标准输入读取 Token，不保存\n  --json                         输出完整 JSON 报告；默认仅输出简洁摘要\n  --delete-suite-plans           运行结束后删除本次创建的 Suite 测试记录\n  --exclude-plan ID              明确排除计划，接受完整 ID 或 p040 形式，可重复指定\n  --fail-fast                    首个错误后停止后续测试（默认继续收集）\n  --jobs N                       并行计划数，1-4（默认：4）\n  --poll-timeout 秒数            单个模块等待 Suite 的最长时间（默认：1800）"
         }
         OutputLanguage::English => {
-            "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the wildcard tenant-domain suffix and OIDF Suite origin once. Without a selector, the complete bundled Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant and test material, and starts browser workers only when the selected plan needs them. Suite test records are retained by default.\n\nOptions:\n  --token TOKEN                  Use a token for this run only; do not save it\n  --token-stdin                  Read a token from stdin; do not save it\n  --json                         Print the full JSON report; the default is a concise summary\n  --delete-suite-plans           Delete Suite test records created by the run when it finishes\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+            "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the wildcard tenant-domain suffix and OIDF Suite origin once. Without a selector, the complete bundled Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant and test material, and starts browser workers only when the selected plan needs them. Suite test records are retained by default.\n\nOptions:\n  --token TOKEN                  Use a token for this run only; do not save it\n  --token-stdin                  Read a token from stdin; do not save it\n  --json                         Print the full JSON report; the default is a concise summary\n  --delete-suite-plans           Delete Suite test records created by the run when it finishes\n  --exclude-plan ID              Explicitly exclude a full plan ID or p040 suffix; repeatable\n  --fail-fast                    Stop after the first error (default: continue collecting)\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
         }
     }
 }
@@ -1132,6 +1165,29 @@ mod tests {
             .expect("run");
         assert!(plan.groups.is_empty());
         assert_eq!(plan.plans, ["oidc-core-p001"]);
+    }
+
+    #[test]
+    fn run_excludes_unique_plan_suffix_and_enables_fail_fast_only_explicitly() {
+        let parsed = routed_run(&args(&[
+            "nazoauthctl",
+            "oidf",
+            "run",
+            "openid4vc",
+            "--exclude-plan",
+            "p040",
+            "--fail-fast",
+        ]))
+        .expect("parse")
+        .expect("run");
+        assert_eq!(parsed.excluded_plans, ["openid4vc-vp-p040"]);
+        assert!(parsed.fail_fast);
+
+        let default = routed_run(&args(&["nazoauthctl", "oidf", "run"]))
+            .expect("parse")
+            .expect("run");
+        assert!(default.excluded_plans.is_empty());
+        assert!(!default.fail_fast);
     }
 
     #[test]

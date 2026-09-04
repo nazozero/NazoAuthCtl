@@ -67,6 +67,15 @@ pub struct ModuleReport {
     pub blocking_log_results: Vec<String>,
     /// Non-blocking WARNING condition results found in the raw Suite log.
     pub advisory_log_results: Vec<String>,
+    /// Exact number of non-blocking WARNING condition entries. The result
+    /// categories above are deduplicated, while this count preserves how many
+    /// warnings the Suite emitted.
+    #[serde(default)]
+    pub advisory_log_count: usize,
+    /// Public-safe names and counts of Suite WARNING conditions. Raw messages
+    /// remain private evidence because they can contain request material.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub advisory_conditions: Vec<WarningCondition>,
     /// Locally captured, root-private screenshots requested by a signed
     /// browser placeholder command. They are evidence references only; image
     /// bytes, browser URLs, and page content never enter this report.
@@ -122,12 +131,14 @@ fn is_false(value: &bool) -> bool {
 pub enum ModuleOutcome {
     Passed,
     Review,
+    Warning,
     DeferredReviewPending,
     Skipped,
     Failed,
     Incomplete,
 }
 
+#[derive(Clone)]
 pub(crate) struct ModuleReportContext {
     pub matrix_plan_id: String,
     pub suite_plan_id: String,
@@ -178,6 +189,9 @@ pub struct OrchestrationIntegrity {
 #[derive(Clone, Serialize)]
 pub struct ConformanceReport {
     pub schema: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_plans: Vec<String>,
+    pub fail_fast: bool,
     pub matrix_digest: String,
     pub suite_origin: String,
     pub auth_probe: Option<AuthProbe>,
@@ -206,6 +220,9 @@ pub struct ConformanceReport {
     pub human_review_required: bool,
     /// Variant-qualified module identities requiring human review.
     pub human_review_modules: Vec<String>,
+    /// Warnings reported by the Suite. This is separate from `REVIEW`: a
+    /// module can have both an official review result and warning conditions.
+    pub warning_modules: Vec<WarningModule>,
     /// Variant-qualified modules at the deferred Suite review boundary. These
     /// are settled locally but never terminal/passed Suite outcomes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -260,10 +277,14 @@ impl ModuleReport {
             .map(ToOwned::to_owned);
         let mut blocking_log_results = BTreeSet::new();
         let mut advisory_log_results = BTreeSet::new();
+        let mut advisory_log_count = 0;
+        let mut advisory_conditions = BTreeMap::new();
         collect_condition_log_results(
             &raw_log,
             &mut blocking_log_results,
             &mut advisory_log_results,
+            &mut advisory_log_count,
+            &mut advisory_conditions,
         );
         let blocking_log_results = blocking_log_results.into_iter().collect::<Vec<_>>();
         let advisory_log_results = advisory_log_results.into_iter().collect::<Vec<_>>();
@@ -275,14 +296,15 @@ impl ModuleReport {
             } else {
                 match official_result.as_deref() {
                     Some("PASSED") if advisory_log_results.is_empty() => ModuleOutcome::Passed,
-                    Some("PASSED" | "REVIEW" | "WARNING") => ModuleOutcome::Review,
+                    Some("REVIEW") => ModuleOutcome::Review,
+                    Some("WARNING") | Some("PASSED") => ModuleOutcome::Warning,
                     Some("SKIPPED") => ModuleOutcome::Skipped,
                     _ => ModuleOutcome::Failed,
                 }
             };
         let human_review_required = matches!(
             outcome,
-            ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending
+            ModuleOutcome::Review | ModuleOutcome::Warning | ModuleOutcome::DeferredReviewPending
         ) || (outcome == ModuleOutcome::Skipped
             && !advisory_log_results.is_empty());
         Self {
@@ -300,6 +322,11 @@ impl ModuleReport {
             human_review_required,
             blocking_log_results,
             advisory_log_results,
+            advisory_log_count,
+            advisory_conditions: advisory_conditions
+                .into_iter()
+                .map(|(source, count)| WarningCondition { source, count })
+                .collect(),
             review_screenshots: Vec::new(),
             review_screenshots_required: 0,
             review_screenshots_required_captured: 0,
@@ -325,6 +352,12 @@ impl ModuleReport {
     }
 }
 
+impl ModuleReport {
+    pub fn has_warning(&self) -> bool {
+        self.official_result.as_deref() == Some("WARNING") || !self.advisory_log_results.is_empty()
+    }
+}
+
 impl Drop for ModuleReport {
     fn drop(&mut self) {
         crate::matrix::zeroize_json_value(&mut self.raw_info);
@@ -336,10 +369,34 @@ pub(crate) struct ModuleOutcomeSummary {
     pub all_passed: bool,
     pub acceptance_pass: bool,
     pub human_review_modules: Vec<String>,
+    pub warning_modules: Vec<WarningModule>,
     pub deferred_review_modules: Vec<String>,
     pub skipped_modules: Vec<String>,
     pub failed_modules: Vec<String>,
     pub incomplete_modules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct WarningModule {
+    pub module: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_result: Option<String>,
+    /// Public condition categories only; raw Suite log content remains in
+    /// root-private evidence.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub condition_results: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub condition_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warning_conditions: Vec<WarningCondition>,
+}
+
+#[derive(Clone, Debug, Serialize, Eq, PartialEq)]
+pub struct WarningCondition {
+    pub source: String,
+    pub count: usize,
 }
 
 pub(crate) struct MatrixExpectationSummary {
@@ -352,6 +409,7 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
         all_passed: !modules.is_empty(),
         acceptance_pass: !modules.is_empty(),
         human_review_modules: Vec::new(),
+        warning_modules: Vec::new(),
         deferred_review_modules: Vec::new(),
         skipped_modules: Vec::new(),
         failed_modules: Vec::new(),
@@ -362,9 +420,23 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
         if module.human_review_required {
             summary.human_review_modules.push(identity.clone());
         }
+        if module.has_warning() {
+            summary.warning_modules.push(WarningModule {
+                module: identity.clone(),
+                official_status: module.official_status.clone(),
+                official_result: module.official_result.clone(),
+                condition_results: module.advisory_log_results.clone(),
+                condition_count: module.advisory_log_count,
+                warning_conditions: module.advisory_conditions.clone(),
+            });
+        }
         match module.outcome {
             ModuleOutcome::Passed => {}
             ModuleOutcome::Review => {
+                summary.all_passed = false;
+                summary.acceptance_pass = false;
+            }
+            ModuleOutcome::Warning => {
                 summary.all_passed = false;
                 summary.acceptance_pass = false;
             }
@@ -432,11 +504,19 @@ fn collect_condition_log_results(
     value: &Value,
     blocking: &mut BTreeSet<String>,
     advisory: &mut BTreeSet<String>,
+    advisory_count: &mut usize,
+    advisory_conditions: &mut BTreeMap<String, usize>,
 ) {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_condition_log_results(value, blocking, advisory);
+                collect_condition_log_results(
+                    value,
+                    blocking,
+                    advisory,
+                    advisory_count,
+                    advisory_conditions,
+                );
             }
         }
         Value::Object(values) => {
@@ -447,15 +527,36 @@ fn collect_condition_log_results(
                     }
                     "WARNING" => {
                         advisory.insert(result.to_owned());
+                        *advisory_count += 1;
+                        *advisory_conditions
+                            .entry(public_warning_condition_source(values))
+                            .or_insert(0) += 1;
                     }
                     _ => {}
                 }
             }
             for value in values.values() {
-                collect_condition_log_results(value, blocking, advisory);
+                collect_condition_log_results(
+                    value,
+                    blocking,
+                    advisory,
+                    advisory_count,
+                    advisory_conditions,
+                );
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn public_warning_condition_source(values: &Map<String, Value>) -> String {
+    let Some(source) = values.get("src").and_then(Value::as_str) else {
+        return "WARNING".to_owned();
+    };
+    if source.len() <= 128 && !source.bytes().any(|byte| byte.is_ascii_control()) {
+        source.to_owned()
+    } else {
+        "<invalid warning source>".to_owned()
     }
 }
 
@@ -584,22 +685,27 @@ mod tests {
             ["p/review", "p/skipped-warning"]
         );
         assert_eq!(summary.skipped_modules, ["p/skipped", "p/skipped-warning"]);
+        assert_eq!(summary.warning_modules.len(), 1);
+        assert_eq!(summary.warning_modules[0].module, "p/skipped-warning");
+        assert_eq!(summary.warning_modules[0].condition_count, 1);
         assert_eq!(summary.failed_modules, ["p/failed"]);
         assert_eq!(summary.incomplete_modules, ["p/incomplete"]);
         assert!(!summary.acceptance_pass);
     }
 
     #[test]
-    fn passed_with_warning_is_review_and_empty_run_is_not_a_suite_pass() {
+    fn passed_with_warning_is_warning_and_empty_run_is_not_a_suite_pass() {
         let warning = module(
             "warning",
             true,
             "FINISHED",
             "PASSED",
-            serde_json::json!([{"result":"WARNING"}]),
+            serde_json::json!([{"result":"WARNING", "src":"ValidateCertificate"}]),
         );
-        assert_eq!(warning.outcome, ModuleOutcome::Review);
+        assert_eq!(warning.outcome, ModuleOutcome::Warning);
         assert!(warning.human_review_required);
+        assert_eq!(warning.advisory_log_count, 1);
+        assert_eq!(warning.advisory_conditions[0].source, "ValidateCertificate");
         assert!(!summarize_module_outcomes(&[]).all_passed);
         assert!(
             summarize_module_outcomes(&[module(
@@ -610,6 +716,33 @@ mod tests {
                 serde_json::json!([]),
             )])
             .all_passed
+        );
+    }
+
+    #[test]
+    fn review_with_warning_preserves_review_and_records_every_warning_entry() {
+        let review = module(
+            "review-warning",
+            true,
+            "FINISHED",
+            "REVIEW",
+            serde_json::json!([
+                {"result":"WARNING", "src":"ValidateA"},
+                {"nested":{"result":"WARNING", "src":"ValidateA"}}
+            ]),
+        );
+        assert_eq!(review.outcome, ModuleOutcome::Review);
+        assert_eq!(review.advisory_log_count, 2);
+        let summary = summarize_module_outcomes(&[review]);
+        assert_eq!(summary.human_review_modules, ["p/review-warning"]);
+        assert_eq!(summary.warning_modules.len(), 1);
+        assert_eq!(summary.warning_modules[0].condition_count, 2);
+        assert_eq!(
+            summary.warning_modules[0].warning_conditions,
+            [WarningCondition {
+                source: "ValidateA".to_owned(),
+                count: 2
+            }]
         );
     }
 
