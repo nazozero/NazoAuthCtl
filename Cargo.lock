@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-conformance"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-core"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-runtime"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "atomic-write-file",
