@@ -99,7 +99,7 @@ pub use orchestrator::{
 pub use origin::{Origin, OriginError};
 pub use progress::{
     GroupProgress, GroupStatus, OutputLanguage, ProgressActivity, ProgressEvent, ProgressSink,
-    ProgressSnapshot, StableRenderer, TtyRenderer, redacted_variant,
+    ProgressSnapshot, StableRenderer, TerminalTheme, TtyRenderer, redacted_variant,
 };
 pub use proxy_trust::ProxyTrustGuard;
 pub use recovery::{

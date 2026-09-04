@@ -24,16 +24,16 @@ use nazoauthctl_conformance::{
     ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore, ConformanceRunConfig,
     ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
     EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
-    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, HttpRequest,
-    HttpTransport, ManagedWebDriver, MatrixSelection, ModuleOutcome, OidfArtifactMatrix,
-    OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
-    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
-    OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity, ProgressSink,
-    ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, SuiteClientError,
+    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, GroupStatus,
+    HttpRequest, HttpTransport, ManagedWebDriver, MatrixSelection, ModuleOutcome,
+    OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
+    OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
+    ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, SuiteClientError,
     SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
     SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
     TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
-    TenantResourceRecoveryPhase, Transport, TtyRenderer, bundled_oidf_matrix,
+    TenantResourceRecoveryPhase, TerminalTheme, Transport, TtyRenderer, bundled_oidf_matrix,
     open_bundled_oidf_driver_plan, recover_suite_resources, write_private_control_evidence_bundle,
     write_review_screenshot_manifest,
 };
@@ -122,11 +122,13 @@ fn execute_with_progress<S: ProgressSink>(
     progress.activity(&ProgressActivity::RecoveringPreviousRun);
     let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
     if !recovered_retention.is_empty() {
+        let theme = TerminalTheme::detect(io::stdout().is_terminal() && !invocation.json);
         write_recovered_retention_output(
             io::stdout().lock(),
             &recovered_retention,
             language,
             invocation.json,
+            theme,
         )?;
         progress.activity(&ProgressActivity::Finished);
         return Ok(0);
@@ -632,7 +634,14 @@ fn execute_with_progress<S: ProgressSink>(
         deployment: deployment_report,
     };
     progress.activity(&ProgressActivity::Finished);
-    write_final_output(io::stdout().lock(), &output, language, invocation.json)?;
+    let theme = TerminalTheme::detect(io::stdout().is_terminal() && !invocation.json);
+    write_final_output(
+        io::stdout().lock(),
+        &output,
+        language,
+        invocation.json,
+        theme,
+    )?;
     Ok(if user_interrupted.load(Ordering::SeqCst) {
         130
     } else if success {
@@ -740,6 +749,7 @@ mod acceptance_tests {
             &output,
             nazoauthctl_conformance::OutputLanguage::Chinese,
             false,
+            nazoauthctl_conformance::TerminalTheme::plain(),
         )
         .expect("summary");
         let text = String::from_utf8(text).expect("UTF-8");
@@ -748,6 +758,21 @@ mod acceptance_tests {
         assert!(text.contains("错误：test failure"));
         assert!(!text.contains('{'));
         assert!(!text.contains("artifact_digest"));
+
+        let mut terminal_text = Vec::new();
+        write_final_output(
+            &mut terminal_text,
+            &output,
+            nazoauthctl_conformance::OutputLanguage::Chinese,
+            false,
+            nazoauthctl_conformance::TerminalTheme::detect(true),
+        )
+        .expect("terminal summary");
+        let terminal_text = String::from_utf8(terminal_text).expect("UTF-8");
+        assert!(terminal_text.contains("╭─"));
+        assert!(terminal_text.contains("NazoAuth OIDF 一致性测试"));
+        assert!(terminal_text.contains("✗ 未通过"));
+        assert!(terminal_text.contains("test failure"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1325,6 +1350,7 @@ fn write_recovered_retention_output<W: io::Write>(
     retention: &[SuiteRetentionManifestReceipt],
     language: OutputLanguage,
     json: bool,
+    theme: TerminalTheme,
 ) -> anyhow::Result<()> {
     if json {
         serde_json::to_writer_pretty(
@@ -1336,6 +1362,17 @@ fn write_recovered_retention_output<W: io::Write>(
             },
         )
         .context("failed to write recovered retention report")?;
+    } else if theme.is_terminal() {
+        let message = match language {
+            OutputLanguage::Chinese => {
+                format!("已恢复上次运行保留的 {} 个 Suite 计划", retention.len())
+            }
+            OutputLanguage::English => format!(
+                "Recovered {} retained Suite plan(s) from the previous run",
+                retention.len()
+            ),
+        };
+        write!(writer, "{}  {}", theme.success('✓'), theme.strong(message))?;
     } else {
         match language {
             OutputLanguage::Chinese => {
@@ -1362,11 +1399,16 @@ fn write_final_output<W: io::Write>(
     output: &FinalOutput,
     language: OutputLanguage,
     json: bool,
+    theme: TerminalTheme,
 ) -> anyhow::Result<()> {
     if json {
         serde_json::to_writer_pretty(&mut writer, output)
             .context("failed to write the structured ordinary conformance report")?;
         return writeln!(writer).context("failed to finish the structured conformance report");
+    }
+
+    if theme.is_terminal() {
+        return write_terminal_final_output(&mut writer, output, language, theme);
     }
 
     let status = match (language, output.success) {
@@ -1433,6 +1475,110 @@ fn write_final_output<W: io::Write>(
             OutputLanguage::English => writeln!(writer, "Error: {error}")?,
         }
     }
+    Ok(())
+}
+
+fn write_terminal_final_output<W: io::Write>(
+    writer: &mut W,
+    output: &FinalOutput,
+    language: OutputLanguage,
+    theme: TerminalTheme,
+) -> anyhow::Result<()> {
+    let (title, result_label, modules_label, evidence_label, records_label) = match language {
+        OutputLanguage::Chinese => (
+            "NazoAuth OIDF 一致性测试",
+            "结果",
+            "模块",
+            "证据",
+            "Suite 记录",
+        ),
+        OutputLanguage::English => (
+            "NazoAuth OIDF Conformance",
+            "Result",
+            "Modules",
+            "Evidence",
+            "Suite records",
+        ),
+    };
+    writeln!(writer, "╭─ {}", theme.heading(title))?;
+    writeln!(writer, "│")?;
+    let outcome = match (language, output.success) {
+        (OutputLanguage::Chinese, true) => theme.success("✓ 通过"),
+        (OutputLanguage::Chinese, false) => theme.error("✗ 未通过"),
+        (OutputLanguage::English, true) => theme.success("✓ Passed"),
+        (OutputLanguage::English, false) => theme.error("✗ Not passed"),
+    };
+    writeln!(
+        writer,
+        "│  {} {outcome}",
+        theme.muted(format!("{result_label:<10}"))
+    )?;
+
+    if let Some(report) = &output.report {
+        let mut passed = 0usize;
+        let mut review = 0usize;
+        let mut skipped = 0usize;
+        let mut failed = 0usize;
+        let mut incomplete = 0usize;
+        for module in &report.modules {
+            if module.human_review_required {
+                review += 1;
+                continue;
+            }
+            match module.outcome {
+                ModuleOutcome::Passed => passed += 1,
+                ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending => review += 1,
+                ModuleOutcome::Skipped => skipped += 1,
+                ModuleOutcome::Failed => failed += 1,
+                ModuleOutcome::Incomplete => incomplete += 1,
+            }
+        }
+        let labels = match language {
+            OutputLanguage::Chinese => ["通过", "待复核", "跳过", "失败", "未完成"],
+            OutputLanguage::English => ["passed", "review", "skipped", "failed", "incomplete"],
+        };
+        let summary = [
+            (GroupStatus::Passed, passed),
+            (GroupStatus::Review, review),
+            (GroupStatus::Skipped, skipped),
+            (GroupStatus::Failed, failed),
+            (GroupStatus::Incomplete, incomplete),
+        ]
+        .into_iter()
+        .zip(labels)
+        .map(|((status, count), label)| theme.status(status, count, format!("{count} {label}")))
+        .collect::<Vec<_>>()
+        .join(" · ");
+        writeln!(
+            writer,
+            "│  {} {summary}",
+            theme.muted(format!("{modules_label:<10}"))
+        )?;
+    }
+    if let Some(evidence) = &output.evidence {
+        writeln!(
+            writer,
+            "│  {} {}",
+            theme.muted(format!("{evidence_label:<10}")),
+            theme.accent(evidence.directory.display())
+        )?;
+    }
+    if output.retention.is_some() {
+        let retained = match language {
+            OutputLanguage::Chinese => "已保留，可在 OIDF Suite 中查看",
+            OutputLanguage::English => "Retained and available in the OIDF Suite",
+        };
+        writeln!(
+            writer,
+            "│  {} {}",
+            theme.muted(format!("{records_label:<10}")),
+            theme.success(retained)
+        )?;
+    }
+    for error in &output.errors {
+        writeln!(writer, "│  {}  {error}", theme.error('✗'))?;
+    }
+    writeln!(writer, "╰─")?;
     Ok(())
 }
 
