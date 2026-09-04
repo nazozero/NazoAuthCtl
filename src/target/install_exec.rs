@@ -67,6 +67,7 @@ pub const SECRET_PURPOSES: &[&str] = &[
     "database-lifecycle-url",
     "valkey-url",
     "mfa-totp-key",
+    "signing-key-encryption-key",
     "client-secret-pepper",
     "dynamic-registration-token",
     "openid4vc-data-encryption-key",
@@ -77,6 +78,22 @@ pub const SECRET_PURPOSES: &[&str] = &[
 /// Hard cap for the rendered config content riding inside one HostOperation
 /// (the whole operation must stay under `MAX_HOST_OPERATION_BYTES`).
 pub const MAX_CONFIG_CONTENT_BYTES: usize = 32 * 1024;
+
+pub(crate) fn validate_signing_key_encryption_key(bytes: &[u8]) -> anyhow::Result<()> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let encoded = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("signing-key-encryption-key must be UTF-8 base64url"))?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded.trim()).map_err(|_| {
+        anyhow::anyhow!(
+            "signing-key-encryption-key must be unpadded base64url encoding of 32 bytes"
+        )
+    })?;
+    anyhow::ensure!(
+        decoded.len() == 32,
+        "signing-key-encryption-key must decode to 32 bytes"
+    );
+    Ok(())
+}
 
 // Container-internal contract frozen with NazoAuth's configuration loader:
 // the server loads `.env.yaml` (or `NAZOAUTH_SERVER_CONFIG_FILE`) at startup,
@@ -337,15 +354,13 @@ impl InstallOrder {
                 "install requires distinct runtime/lifecycle roles for one PostgreSQL database",
             ));
         }
-        if let Some(import) = &self.current_data_import
-            && (!safe_absolute_install_path(&import.source_data_root)
-                || !safe_absolute_install_path(&import.source_mfa_key_file)
-                || import.source_data_root == self.data_root
-                || Path::new(&import.source_mfa_key_file).starts_with(&self.data_root))
-        {
+        if self.current_data_import.is_some() {
             return Err(super::wire::MessageRejection::new(
                 super::wire::RejectionCode::OperationMalformed,
-                "current data import requires distinct bounded absolute target paths",
+                "legacy current-data import is refused for database-backed signing keys; migrate \
+                 the existing deployment with `nazoauth keys-import --tenant <tenant-uuid> --from \
+                 <legacy-jwk-keys-directory>` using the same deployment wrapping key, then use \
+                 managed update; do not rerun clean install with a new root",
             ));
         }
         if self.secrets.len() != SECRET_PURPOSES.len() {
@@ -380,6 +395,21 @@ impl InstallOrder {
                     super::wire::RejectionCode::OperationMalformed,
                     "every secret except the target-minted MFA key must carry material",
                 ));
+            }
+            if secret.purpose == "signing-key-encryption-key" {
+                validate_signing_key_encryption_key(
+                    secret
+                        .value
+                        .as_ref()
+                        .expect("supplied material was checked")
+                        .as_bytes(),
+                )
+                .map_err(|error| {
+                    super::wire::MessageRejection::new(
+                        super::wire::RejectionCode::OperationMalformed,
+                        error.to_string(),
+                    )
+                })?;
             }
             seen.push(secret.purpose.clone());
         }
@@ -1013,7 +1043,8 @@ impl HostInstallExecutor {
                         })?;
                     }
                 }
-                "client-secret-pepper"
+                "signing-key-encryption-key"
+                | "client-secret-pepper"
                 | "dynamic-registration-token"
                 | "openid4vc-data-encryption-key"
                 | "openid4vci-management-token"
@@ -1271,6 +1302,7 @@ fn start_container_runtime(
     for secret in &job.order.secrets {
         let key = match secret.purpose.as_str() {
             "mfa-totp-key" => "MFA_TOTP_ENCRYPTION_KEY_FILE",
+            "signing-key-encryption-key" => "SIGNING_KEY_ENCRYPTION_KEY_FILE",
             "database-runtime-url" | "database-lifecycle-url" | "valkey-url" => continue,
             "client-secret-pepper" => "CLIENT_SECRET_PEPPER_FILE",
             "dynamic-registration-token" => "DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE",

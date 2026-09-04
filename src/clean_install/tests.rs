@@ -38,6 +38,107 @@ fn helper_runtime_announcement_is_a_closed_three_value_contract() {
     );
 }
 
+#[test]
+fn clean_install_injects_a_deployment_signing_key_root() -> anyhow::Result<()> {
+    let mut request = LocalFixture::new(None)?.request(None);
+    let hello = test_hello(vec!["docker".to_owned()]);
+    let prepared = prepare_install_operation(&mut request, &hello)?;
+    let order = install_order(&prepared.operation);
+    let wrapping = order
+        .secrets
+        .iter()
+        .find(|secret| secret.purpose == "signing-key-encryption-key")
+        .expect("database signing keys need an explicitly provisioned deployment root");
+    let encoded = wrapping
+        .value
+        .as_ref()
+        .expect("controller supplies the root")
+        .as_bytes();
+    assert_eq!(URL_SAFE_NO_PAD.decode(encoded)?.len(), 32);
+    assert!(
+        order
+            .config_content
+            .contains("SIGNING_KEY_ENCRYPTION_KEY_FILE:")
+    );
+    assert!(
+        order
+            .config_content
+            .contains("SIGNING_KEY_ENCRYPTION_KEY_ID:")
+    );
+    assert!(!order.config_content.contains(std::str::from_utf8(encoded)?));
+    assert_ne!(
+        encoded,
+        order
+            .secrets
+            .iter()
+            .find(|secret| secret.purpose == "client-secret-pepper")
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap()
+            .as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn signing_key_root_survives_install_retry_and_is_deployment_scoped() -> anyhow::Result<()> {
+    let root = PrivateTempDir::new("signing-key-install-root")?;
+    let first = load_or_create_deployment_security_roots(root.path(), "deployment-a")?;
+    let restarted = load_or_create_deployment_security_roots(root.path(), "deployment-a")?;
+    let other = load_or_create_deployment_security_roots(root.path(), "deployment-b")?;
+    assert_eq!(
+        first.signing_key_encryption_key,
+        restarted.signing_key_encryption_key
+    );
+    assert_ne!(
+        first.signing_key_encryption_key,
+        other.signing_key_encryption_key
+    );
+    assert_eq!(
+        URL_SAFE_NO_PAD
+            .decode(&first.signing_key_encryption_key)?
+            .len(),
+        32
+    );
+    Ok(())
+}
+
+#[test]
+fn damaged_persisted_signing_root_is_rejected_before_install() -> anyhow::Result<()> {
+    let root = PrivateTempDir::new("damaged-signing-root")?;
+    let _ = load_or_create_deployment_security_roots(root.path(), "deployment-a")?;
+    let path = root
+        .path()
+        .join("secrets/deployment-a/signing-key-encryption-key");
+    filesystem::atomic_write(&path, b"invalid+root", 0o600)?;
+    let error = load_or_create_deployment_security_roots(root.path(), "deployment-a")
+        .err()
+        .expect("damaged persisted wrapping key must be rejected");
+    assert!(error.to_string().contains("base64url"));
+    assert_eq!(std::fs::read(path)?, b"invalid+root");
+    Ok(())
+}
+
+#[test]
+fn install_admission_rejects_malformed_signing_root() -> anyhow::Result<()> {
+    let mut request = LocalFixture::new(None)?.request(None);
+    let prepared = prepare_install_operation(&mut request, &test_hello(vec!["docker".to_owned()]))?;
+    let mut order: InstallOrder =
+        serde_json::from_slice(&serde_json::to_vec(install_order(&prepared.operation))?)?;
+    let root = order
+        .secrets
+        .iter_mut()
+        .find(|secret| secret.purpose == "signing-key-encryption-key")
+        .unwrap();
+    root.value = Some(SecretMaterial::try_new(b"malformed-root".to_vec())?);
+    let error = order
+        .validate()
+        .expect_err("invalid wrapping root must fail at admission");
+    assert!(error.detail.contains("base64url"));
+    Ok(())
+}
+
 /// Valid 64-char lowercase-hex subject digest shared by executor, stub, and
 /// assertions.
 fn digest() -> String {
@@ -599,7 +700,7 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
 }
 
 #[test]
-fn current_data_import_uses_the_same_admin_provisioning_flow() -> anyhow::Result<()> {
+fn current_data_import_is_rejected_before_target_execution() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(None)?;
     let hello = test_hello(vec!["podman".to_owned()]);
     let mut order_request = fixture.imported_request(Some("production"));
@@ -607,32 +708,31 @@ fn current_data_import_uses_the_same_admin_provisioning_flow() -> anyhow::Result
     let order = install_order(&prepared.operation);
     assert!(order.current_data_import.is_some());
 
-    let report = run_clean_install(
+    let rejection = order
+        .validate()
+        .expect_err("legacy data import must not reach a database-backed install");
+    assert_eq!(
+        rejection.code,
+        crate::target::wire::RejectionCode::OperationMalformed
+    );
+    assert!(rejection.detail.contains("nazoauth keys-import"));
+    assert!(rejection.detail.contains("same deployment wrapping key"));
+    assert!(rejection.detail.contains("managed update"));
+
+    let error = run_clean_install(
         &fixture.context,
         fixture.imported_request(Some("production")),
-    )?;
+    )
+    .expect_err("clean install must refuse before creating a target instance");
     assert!(
-        report.contains("admin create --instance production"),
-        "{report}"
+        error.to_string().contains("nazoauth keys-import"),
+        "{error:#}"
     );
-    assert!(report.contains("then enroll MFA"), "{report}");
     assert!(
-        report.contains("nazoauthctl bind --instance production"),
-        "{report}"
+        fixture.executor.steps.lock().unwrap().is_empty(),
+        "target install executor must not run"
     );
-    let record = fixture
-        .context
-        .registry
-        .instance_by_alias("production")?
-        .expect("imported instance registered");
-    assert!(
-        fixture
-            .state_root
-            .join("deployments")
-            .join(record.deployment_id)
-            .join("state.json")
-            .is_file()
-    );
+    assert!(fixture.context.registry.list_instances()?.is_empty());
     Ok(())
 }
 
@@ -965,6 +1065,7 @@ fn linux_target_paths_are_posix_even_when_constructed_on_windows() -> anyhow::Re
             .contains("ENABLE_DIRECTORY_OPENID4VP_VERIFIER: \"true\"")
     );
     for file_setting in [
+        "SIGNING_KEY_ENCRYPTION_KEY_FILE",
         "CLIENT_SECRET_PEPPER_FILE",
         "DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE",
         "OPENID4VC_DATA_ENCRYPTION_KEY_FILE",
@@ -984,6 +1085,7 @@ fn linux_target_paths_are_posix_even_when_constructed_on_windows() -> anyhow::Re
             "database-lifecycle-url",
             "valkey-url",
             "mfa-totp-key",
+            "signing-key-encryption-key",
             "client-secret-pepper",
             "dynamic-registration-token",
             "openid4vc-data-encryption-key",

@@ -325,6 +325,8 @@ struct RuntimeSeedConfig {
     database_url: String,
     valkey_url: String,
     mfa_totp_key_file: String,
+    signing_key_encryption_key_file: String,
+    signing_key_encryption_key_id: String,
     client_secret_pepper_file: String,
     dynamic_registration_token_file: String,
     openid4vc_data_encryption_key_file: String,
@@ -334,6 +336,7 @@ struct RuntimeSeedConfig {
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct DeploymentSecurityRoots {
+    signing_key_encryption_key: Vec<u8>,
     client_secret_pepper: Vec<u8>,
     dynamic_registration_token: Vec<u8>,
     openid4vc_data_encryption_key: Vec<u8>,
@@ -350,6 +353,7 @@ impl DeploymentSecurityRoots {
                 .into_bytes()
         };
         Self {
+            signing_key_encryption_key: token(),
             client_secret_pepper: token(),
             dynamic_registration_token: token(),
             openid4vc_data_encryption_key: token(),
@@ -380,7 +384,10 @@ fn load_or_create_deployment_security_roots(
             Err(error) => Err(error).with_context(|| format!("failed to inspect {name}")),
         }
     };
+    let signing_key_encryption_key = value("signing-key-encryption-key")?;
+    crate::target::install_exec::validate_signing_key_encryption_key(&signing_key_encryption_key)?;
     Ok(DeploymentSecurityRoots {
+        signing_key_encryption_key,
         client_secret_pepper: value("client-secret-pepper")?,
         dynamic_registration_token: value("dynamic-registration-token")?,
         openid4vc_data_encryption_key: value("openid4vc-data-encryption-key")?,
@@ -424,6 +431,8 @@ fn render_config_yaml(
          DATABASE_URL: \"{}\"\n\
          VALKEY_URL: \"{}\"\n\
          MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n\
+         SIGNING_KEY_ENCRYPTION_KEY_FILE: \"{}\"\n\
+         SIGNING_KEY_ENCRYPTION_KEY_ID: \"{}\"\n\
          CLIENT_SECRET_PEPPER_FILE: \"{}\"\n\
          DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE: \"{}\"\n\
          OPENID4VC_DATA_ENCRYPTION_KEY_FILE: \"{}\"\n\
@@ -434,6 +443,8 @@ fn render_config_yaml(
         runtime.database_url,
         runtime.valkey_url,
         runtime.mfa_totp_key_file,
+        runtime.signing_key_encryption_key_file,
+        runtime.signing_key_encryption_key_id,
         runtime.client_secret_pepper_file,
         runtime.dynamic_registration_token_file,
         runtime.openid4vc_data_encryption_key_file,
@@ -501,6 +512,12 @@ fn build_install_order(
         target_os.join(&paths.secrets_dir, &["database-lifecycle-url"])?;
     let valkey_url_file = target_os.join(&paths.secrets_dir, &["valkey-url"])?;
     let mfa_totp_key_file = target_os.join(&paths.secrets_dir, &["mfa-totp-key"])?;
+    let signing_key_encryption_key_file =
+        target_os.join(&paths.secrets_dir, &["signing-key-encryption-key"])?;
+    let signing_key_encryption_key_id = format!(
+        "deployment-{}",
+        &hex_digest(&security_roots.signing_key_encryption_key)[..16]
+    );
     let client_secret_pepper_file =
         target_os.join(&paths.secrets_dir, &["client-secret-pepper"])?;
     let dynamic_registration_token_file =
@@ -545,6 +562,11 @@ fn build_install_order(
             database_url: database_runtime_url.clone(),
             valkey_url: valkey_url.clone(),
             mfa_totp_key_file: config_path(target_os, &mfa_totp_key_file),
+            signing_key_encryption_key_file: config_path(
+                target_os,
+                &signing_key_encryption_key_file,
+            ),
+            signing_key_encryption_key_id: signing_key_encryption_key_id.clone(),
             client_secret_pepper_file: config_path(target_os, &client_secret_pepper_file),
             dynamic_registration_token_file: config_path(
                 target_os,
@@ -574,6 +596,11 @@ fn build_install_order(
                 "{}/mfa-totp-key",
                 crate::target::install_exec::CONTAINER_SECRETS_DIR
             ),
+            signing_key_encryption_key_file: format!(
+                "{}/signing-key-encryption-key",
+                crate::target::install_exec::CONTAINER_SECRETS_DIR
+            ),
+            signing_key_encryption_key_id,
             client_secret_pepper_file: format!(
                 "{}/client-secret-pepper",
                 crate::target::install_exec::CONTAINER_SECRETS_DIR
@@ -649,6 +676,13 @@ fn build_install_order(
                 purpose: "mfa-totp-key".to_owned(),
                 path: mfa_totp_key_file,
                 value: None,
+            },
+            PlannedSecret {
+                purpose: "signing-key-encryption-key".to_owned(),
+                path: signing_key_encryption_key_file,
+                value: Some(SecretMaterial::try_new(
+                    security_roots.signing_key_encryption_key.clone(),
+                )?),
             },
             PlannedSecret {
                 purpose: "client-secret-pepper".to_owned(),
