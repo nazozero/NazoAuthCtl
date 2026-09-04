@@ -37,6 +37,7 @@ anyhow = "1.0.103"
 base64 = "0.23.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+cliclack = "=0.5.6"
 ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
 http = "1.5.0"
@@ -52,7 +53,6 @@ nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
 rand = "0.10.1"
 qrcode = { version = "0.14.1", default-features = false }
 rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-rpassword = "7.4.0"
 rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 semver = "1.0.27"

@@ -124,7 +124,6 @@ pub(crate) fn render_failure(
     context: &EnvelopeContext,
     error: &anyhow::Error,
     json_mode: bool,
-    color: bool,
 ) -> String {
     let rendered = format!("{error:#}");
     let code = crate::fleet::fleet_read::stable_code(&rendered);
@@ -169,27 +168,11 @@ pub(crate) fn render_failure(
     if let Some(next) = next {
         pairs.push(("next_command", next.to_owned()));
     }
-    let details = pairs
+    pairs
         .into_iter()
-        .map(|(label, value)| {
-            if !color {
-                return format!("{label}:{:<15}{value}", "");
-            }
-            let value = match label {
-                "code" => format!("\x1b[31m{value}\x1b[0m"),
-                "next_command" => format!("\x1b[32m{value}\x1b[0m"),
-                _ => value,
-            };
-            let label = format!("\x1b[36m{label}\x1b[0m");
-            format!("{label}:{:<15}{value}", "")
-        })
+        .map(|(label, value)| format!("{label}:{:<15}{value}", ""))
         .collect::<Vec<_>>()
-        .join("\n");
-    if color {
-        format!("\x1b[1;31m✗ Command failed\x1b[0m\n\n{details}")
-    } else {
-        details
-    }
+        .join("\n")
 }
 
 #[cfg(test)]

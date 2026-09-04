@@ -17,6 +17,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
+use cliclack::{
+    MultiProgress, ProgressBar, log, multi_progress, note, outro, password, progress_bar, spinner,
+};
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
     ArtifactMaterializationBinding, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
@@ -24,18 +27,18 @@ use nazoauthctl_conformance::{
     ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore, ConformanceRunConfig,
     ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
     EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
-    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, GroupStatus,
-    HttpRequest, HttpTransport, ManagedWebDriver, MatrixSelection, ModuleOutcome,
+    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, GroupProgress,
+    GroupStatus, HttpRequest, HttpTransport, ManagedWebDriver, MatrixSelection, ModuleOutcome,
     OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
     OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
     OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
-    ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient, SuiteClientError,
-    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    ProgressEvent, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
+    SuiteClientError, SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
     SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
     TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
-    TenantResourceRecoveryPhase, TerminalTheme, Transport, TtyRenderer, bundled_oidf_matrix,
-    open_bundled_oidf_driver_plan, recover_suite_resources, write_private_control_evidence_bundle,
-    write_review_screenshot_manifest,
+    TenantResourceRecoveryPhase, Transport, activity_label, bundled_oidf_matrix,
+    current_matrix_label, open_bundled_oidf_driver_plan, recover_suite_resources,
+    write_private_control_evidence_bundle, write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -44,6 +47,379 @@ use zeroize::Zeroizing;
 use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
+
+struct CliclackRenderer {
+    language: OutputLanguage,
+    phase: Option<ProgressBar>,
+    live: Option<LiveProgress>,
+    terminal_failure: bool,
+    groups: Vec<GroupProgress>,
+    finished: bool,
+}
+
+struct LiveProgress {
+    multi: MultiProgress,
+    overall: ProgressBar,
+    activity: ProgressBar,
+    groups: BTreeMap<(String, String), ProgressBar>,
+}
+
+impl CliclackRenderer {
+    fn new(language: OutputLanguage) -> Self {
+        Self {
+            language,
+            phase: None,
+            live: None,
+            terminal_failure: false,
+            groups: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(live) = &self.live {
+            Self::clear_live(live);
+            live.activity.set_message(match self.language {
+                OutputLanguage::Chinese => "测试计划已结束",
+                OutputLanguage::English => "Test plan finished",
+            });
+            if self.terminal_failure {
+                live.multi.error(match self.language {
+                    OutputLanguage::Chinese => "测试计划已结束，存在失败或未完成模块",
+                    OutputLanguage::English => {
+                        "Test plan finished with failed or incomplete modules"
+                    }
+                });
+            } else {
+                live.multi.stop();
+            }
+            self.log_group_results();
+        } else if let Some(phase) = self.phase.take() {
+            phase.stop(activity_label(&ProgressActivity::Finished, self.language));
+        }
+    }
+
+    fn error(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(live) = &self.live {
+            Self::clear_live(live);
+            live.activity.set_message(match self.language {
+                OutputLanguage::Chinese => "测试计划因错误停止",
+                OutputLanguage::English => "Test plan stopped because of an error",
+            });
+            live.multi.error(match self.language {
+                OutputLanguage::Chinese => "测试计划因错误停止",
+                OutputLanguage::English => "Test plan stopped because of an error",
+            });
+            self.log_group_results();
+        } else if let Some(phase) = self.phase.take() {
+            phase.error(match self.language {
+                OutputLanguage::Chinese => "测试计划因错误停止",
+                OutputLanguage::English => "Test plan stopped because of an error",
+            });
+        }
+    }
+
+    fn start_phase(&mut self, activity: &ProgressActivity) {
+        let phase = spinner();
+        phase.start(activity_label(activity, self.language));
+        self.phase = Some(phase);
+    }
+
+    fn clear_phase(&mut self) {
+        if let Some(phase) = self.phase.take() {
+            phase.clear();
+        }
+    }
+
+    fn clear_live(live: &LiveProgress) {
+        live.overall.clear();
+        for bar in live.groups.values() {
+            bar.clear();
+        }
+    }
+
+    fn log_group_results(&self) {
+        for group in &self.groups {
+            let message = format!(
+                "{} · {} · {} · {}/{}",
+                group_status_label(group.status, self.language),
+                group.profile,
+                group.id,
+                group.completed,
+                group.total
+            );
+            match group.status {
+                GroupStatus::Passed => {
+                    let _ = log::success(message);
+                }
+                GroupStatus::Review | GroupStatus::Skipped | GroupStatus::Incomplete => {
+                    let _ = log::warning(message);
+                }
+                GroupStatus::Failed => {
+                    let _ = log::error(message);
+                }
+                GroupStatus::Running | GroupStatus::Remaining => {
+                    let _ = log::info(message);
+                }
+            }
+        }
+    }
+}
+
+impl ProgressSink for CliclackRenderer {
+    fn update(&mut self, event: &ProgressEvent) {
+        if self.live.is_none() {
+            self.clear_phase();
+            let _ = log::success(match self.language {
+                OutputLanguage::Chinese => "已准备好运行 OIDF 测试计划",
+                OutputLanguage::English => "OIDF test plan is ready",
+            });
+            let title = match self.language {
+                OutputLanguage::Chinese => "NazoAuth OIDF 一致性测试",
+                OutputLanguage::English => "NazoAuth OIDF Conformance",
+            };
+            let multi = multi_progress(title);
+            let overall = multi.add(progress_bar(event.snapshot.total as u64));
+            overall.start(match self.language {
+                OutputLanguage::Chinese => "总进度",
+                OutputLanguage::English => "Overall progress",
+            });
+            let activity = multi.add(spinner());
+            activity.start(activity_label(
+                &ProgressActivity::LoadingMatrix,
+                self.language,
+            ));
+            let groups = BTreeMap::new();
+            self.live = Some(LiveProgress {
+                multi,
+                overall,
+                activity,
+                groups,
+            });
+        }
+        let live = self.live.as_mut().expect("live progress initialized");
+        self.terminal_failure = event.snapshot.failed > 0 || event.snapshot.incomplete > 0;
+        self.groups = event.snapshot.groups.clone();
+        live.overall.set_length(event.snapshot.total as u64);
+        live.overall.set_position(event.snapshot.completed as u64);
+        live.overall
+            .set_message(overall_progress_message(&event.snapshot, self.language));
+        for group in &event.snapshot.groups {
+            let key = (group.profile.clone(), group.id.clone());
+            let bar = live.groups.entry(key).or_insert_with(|| {
+                let bar = live.multi.insert(
+                    live.multi.length().saturating_sub(1),
+                    progress_bar(group.total as u64),
+                );
+                bar.start(format!("{} · {}", group.profile, group.id));
+                bar
+            });
+            bar.set_length(group.total as u64);
+            bar.set_position(group.completed as u64);
+            bar.set_message(format!(
+                "{} · {} · {} · {}/{}",
+                group_status_label(group.status, self.language),
+                group.profile,
+                group.id,
+                group.completed,
+                group.total
+            ));
+        }
+    }
+
+    fn activity(&mut self, activity: &ProgressActivity) {
+        if matches!(activity, ProgressActivity::Finished) {
+            self.finish();
+        } else if matches!(activity, ProgressActivity::PromptingSuiteToken) {
+            self.clear_phase();
+        } else if let Some(live) = &self.live {
+            live.activity
+                .set_message(activity_label(activity, self.language));
+        } else if let Some(phase) = &self.phase {
+            phase.set_message(activity_label(activity, self.language));
+        } else {
+            self.start_phase(activity);
+        }
+    }
+}
+
+fn overall_progress_message(
+    snapshot: &nazoauthctl_conformance::ProgressSnapshot,
+    language: OutputLanguage,
+) -> String {
+    let (passed, review, skipped, failed, incomplete, running, remaining, current) = match language
+    {
+        OutputLanguage::Chinese => (
+            "通过",
+            "待复核",
+            "跳过",
+            "失败",
+            "未完成",
+            "运行中",
+            "剩余",
+            "当前",
+        ),
+        OutputLanguage::English => (
+            "passed",
+            "review",
+            "skipped",
+            "failed",
+            "incomplete",
+            "running",
+            "remaining",
+            "current",
+        ),
+    };
+    format!(
+        "{}/{} · {passed} {} · {review} {} · {skipped} {} · {failed} {} · {incomplete} {} · {running} {} · {remaining} {}\n{current}: {}/{}",
+        snapshot.completed,
+        snapshot.total,
+        snapshot.passed,
+        snapshot.reviewed,
+        snapshot.skipped,
+        snapshot.failed,
+        snapshot.incomplete,
+        snapshot.running,
+        snapshot.remaining,
+        current_matrix_label(
+            snapshot.current_profile.as_deref(),
+            snapshot.current_variant.as_ref()
+        ),
+        snapshot.current_test.as_deref().unwrap_or("-")
+    )
+}
+
+fn group_status_label(status: GroupStatus, language: OutputLanguage) -> &'static str {
+    match (language, status) {
+        (OutputLanguage::Chinese, GroupStatus::Passed) => "通过",
+        (OutputLanguage::Chinese, GroupStatus::Review) => "待复核",
+        (OutputLanguage::Chinese, GroupStatus::Skipped) => "跳过",
+        (OutputLanguage::Chinese, GroupStatus::Failed) => "失败",
+        (OutputLanguage::Chinese, GroupStatus::Incomplete) => "未完成",
+        (OutputLanguage::Chinese, GroupStatus::Running) => "运行中",
+        (OutputLanguage::Chinese, GroupStatus::Remaining) => "剩余",
+        (OutputLanguage::English, GroupStatus::Passed) => "passed",
+        (OutputLanguage::English, GroupStatus::Review) => "review",
+        (OutputLanguage::English, GroupStatus::Skipped) => "skipped",
+        (OutputLanguage::English, GroupStatus::Failed) => "failed",
+        (OutputLanguage::English, GroupStatus::Incomplete) => "incomplete",
+        (OutputLanguage::English, GroupStatus::Running) => "running",
+        (OutputLanguage::English, GroupStatus::Remaining) => "remaining",
+    }
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    use super::*;
+    use nazoauthctl_conformance::{GroupProgress, ProgressSnapshot};
+
+    fn snapshot(
+        total: usize,
+        group_total: usize,
+        status: GroupStatus,
+        failed: usize,
+    ) -> ProgressEvent {
+        ProgressEvent {
+            snapshot: ProgressSnapshot {
+                completed: group_total.saturating_sub(1),
+                total,
+                groups: vec![GroupProgress {
+                    id: "fapi".to_owned(),
+                    profile: "FAPI 2.0".to_owned(),
+                    completed: group_total.saturating_sub(1),
+                    total: group_total,
+                    status,
+                    passed: group_total.saturating_sub(1 + failed),
+                    reviewed: usize::from(matches!(status, GroupStatus::Review)),
+                    skipped: usize::from(matches!(status, GroupStatus::Skipped)),
+                    failed,
+                    incomplete: usize::from(matches!(status, GroupStatus::Incomplete)),
+                    running: usize::from(matches!(status, GroupStatus::Running)),
+                    remaining: 0,
+                }],
+                passed_groups: usize::from(matches!(status, GroupStatus::Passed)),
+                review_groups: usize::from(matches!(status, GroupStatus::Review)),
+                skipped_groups: usize::from(matches!(status, GroupStatus::Skipped)),
+                failed_groups: usize::from(matches!(status, GroupStatus::Failed)),
+                incomplete_groups: usize::from(matches!(status, GroupStatus::Incomplete)),
+                running_groups: usize::from(matches!(status, GroupStatus::Running)),
+                remaining_groups: 0,
+                passed: group_total.saturating_sub(1 + failed),
+                reviewed: usize::from(matches!(status, GroupStatus::Review)),
+                skipped: usize::from(matches!(status, GroupStatus::Skipped)),
+                failed,
+                incomplete: usize::from(matches!(status, GroupStatus::Incomplete)),
+                running: usize::from(matches!(status, GroupStatus::Running)),
+                remaining: 0,
+                current_profile: Some("FAPI 2.0".to_owned()),
+                current_variant: None,
+                current_test: Some("fapi-test".to_owned()),
+            },
+        }
+    }
+
+    #[test]
+    fn renderer_tracks_authoritative_total_growth_and_failure_boundary() {
+        let mut renderer = CliclackRenderer::new(OutputLanguage::English);
+        let review_snapshot = snapshot(3, 3, GroupStatus::Review, 0);
+        let summary = overall_progress_message(&review_snapshot.snapshot, OutputLanguage::English);
+        assert!(summary.contains("review 1"));
+        assert!(summary.contains("current: FAPI 2.0/fapi-test"));
+        renderer.update(&review_snapshot);
+        let live = renderer.live.as_ref().expect("live renderer");
+        assert_eq!(live.overall.length(), Some(3));
+        assert_eq!(live.groups.len(), 1);
+        assert_eq!(
+            live.groups
+                .get(&("FAPI 2.0".to_owned(), "fapi".to_owned()))
+                .expect("group progress")
+                .length(),
+            Some(3)
+        );
+        assert!(!renderer.terminal_failure);
+        assert_eq!(
+            group_status_label(GroupStatus::Review, OutputLanguage::English),
+            "review"
+        );
+
+        renderer.update(&snapshot(5, 5, GroupStatus::Failed, 1));
+        let live = renderer.live.as_ref().expect("live renderer");
+        assert_eq!(live.overall.length(), Some(5));
+        assert_eq!(
+            live.groups
+                .get(&("FAPI 2.0".to_owned(), "fapi".to_owned()))
+                .expect("resized group progress")
+                .length(),
+            Some(5)
+        );
+        assert!(renderer.terminal_failure);
+        assert_eq!(
+            group_status_label(GroupStatus::Failed, OutputLanguage::Chinese),
+            "失败"
+        );
+
+        renderer.finish();
+        assert!(renderer.finished);
+    }
+
+    #[test]
+    fn renderer_error_terminates_an_early_phase_once() {
+        let mut renderer = CliclackRenderer::new(OutputLanguage::English);
+        renderer.activity(&ProgressActivity::OpeningDeployment);
+        renderer.error();
+        renderer.error();
+        assert!(renderer.finished);
+    }
+}
+
 pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
     let language = super::output_language();
     let control = RunControl::default();
@@ -55,14 +431,19 @@ pub(super) fn execute(invocation: RunInvocation) -> anyhow::Result<i32> {
         }
     };
     if io::stderr().is_terminal() {
-        execute_with_progress(
+        let mut renderer = CliclackRenderer::new(language);
+        let result = execute_with_progress(
             invocation,
-            &mut TtyRenderer::localized(io::stderr(), language),
+            &mut renderer,
             language,
             control,
             user_interrupted,
             interrupt_notice,
-        )
+        );
+        if result.is_err() {
+            renderer.error();
+        }
+        result
     } else {
         execute_with_progress(
             invocation,
@@ -118,19 +499,28 @@ fn execute_with_progress<S: ProgressSink>(
     let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
 
     progress.activity(&ProgressActivity::AuthenticatingSuite);
-    let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language)?;
+    let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language, progress)?;
     progress.activity(&ProgressActivity::RecoveringPreviousRun);
     let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
     if !recovered_retention.is_empty() {
-        let theme = TerminalTheme::detect(io::stdout().is_terminal() && !invocation.json);
-        write_recovered_retention_output(
-            io::stdout().lock(),
-            &recovered_retention,
-            language,
-            invocation.json,
-            theme,
-        )?;
         progress.activity(&ProgressActivity::Finished);
+        if invocation.json {
+            write_recovered_retention_output(
+                io::stdout().lock(),
+                &recovered_retention,
+                language,
+                true,
+            )?;
+        } else if io::stdout().is_terminal() && io::stderr().is_terminal() {
+            write_terminal_recovered_retention_output(&recovered_retention, language)?;
+        } else {
+            write_recovered_retention_output(
+                io::stdout().lock(),
+                &recovered_retention,
+                language,
+                false,
+            )?;
+        }
         return Ok(0);
     }
     let matrix: OidfArtifactMatrix =
@@ -634,14 +1024,13 @@ fn execute_with_progress<S: ProgressSink>(
         deployment: deployment_report,
     };
     progress.activity(&ProgressActivity::Finished);
-    let theme = TerminalTheme::detect(io::stdout().is_terminal() && !invocation.json);
-    write_final_output(
-        io::stdout().lock(),
-        &output,
-        language,
-        invocation.json,
-        theme,
-    )?;
+    if invocation.json {
+        write_final_output(io::stdout().lock(), &output, language, true)?;
+    } else if io::stdout().is_terminal() && io::stderr().is_terminal() {
+        write_terminal_final_output(&output, language)?;
+    } else {
+        write_final_output(io::stdout().lock(), &output, language, false)?;
+    }
     Ok(if user_interrupted.load(Ordering::SeqCst) {
         130
     } else if success {
@@ -749,7 +1138,6 @@ mod acceptance_tests {
             &output,
             nazoauthctl_conformance::OutputLanguage::Chinese,
             false,
-            nazoauthctl_conformance::TerminalTheme::plain(),
         )
         .expect("summary");
         let text = String::from_utf8(text).expect("UTF-8");
@@ -758,21 +1146,6 @@ mod acceptance_tests {
         assert!(text.contains("错误：test failure"));
         assert!(!text.contains('{'));
         assert!(!text.contains("artifact_digest"));
-
-        let mut terminal_text = Vec::new();
-        write_final_output(
-            &mut terminal_text,
-            &output,
-            nazoauthctl_conformance::OutputLanguage::Chinese,
-            false,
-            nazoauthctl_conformance::TerminalTheme::detect(true),
-        )
-        .expect("terminal summary");
-        let terminal_text = String::from_utf8(terminal_text).expect("UTF-8");
-        assert!(terminal_text.contains("╭─"));
-        assert!(terminal_text.contains("NazoAuth OIDF 一致性测试"));
-        assert!(terminal_text.contains("✗ 未通过"));
-        assert!(terminal_text.contains("test failure"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1338,6 +1711,33 @@ struct FinalOutput {
     deployment: DeploymentReport,
 }
 
+#[derive(Default)]
+struct ModuleCounts {
+    passed: usize,
+    review: usize,
+    skipped: usize,
+    failed: usize,
+    incomplete: usize,
+}
+
+fn module_counts(report: &nazoauthctl_conformance::ConformanceReport) -> ModuleCounts {
+    let mut counts = ModuleCounts::default();
+    for module in &report.modules {
+        if module.human_review_required {
+            counts.review += 1;
+            continue;
+        }
+        match module.outcome {
+            ModuleOutcome::Passed => counts.passed += 1,
+            ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending => counts.review += 1,
+            ModuleOutcome::Skipped => counts.skipped += 1,
+            ModuleOutcome::Failed => counts.failed += 1,
+            ModuleOutcome::Incomplete => counts.incomplete += 1,
+        }
+    }
+    counts
+}
+
 #[derive(Serialize)]
 struct RecoveredRetentionOutput<'a> {
     schema: u32,
@@ -1350,7 +1750,6 @@ fn write_recovered_retention_output<W: io::Write>(
     retention: &[SuiteRetentionManifestReceipt],
     language: OutputLanguage,
     json: bool,
-    theme: TerminalTheme,
 ) -> anyhow::Result<()> {
     if json {
         serde_json::to_writer_pretty(
@@ -1362,17 +1761,6 @@ fn write_recovered_retention_output<W: io::Write>(
             },
         )
         .context("failed to write recovered retention report")?;
-    } else if theme.is_terminal() {
-        let message = match language {
-            OutputLanguage::Chinese => {
-                format!("已恢复上次运行保留的 {} 个 Suite 计划", retention.len())
-            }
-            OutputLanguage::English => format!(
-                "Recovered {} retained Suite plan(s) from the previous run",
-                retention.len()
-            ),
-        };
-        write!(writer, "{}  {}", theme.success('✓'), theme.strong(message))?;
     } else {
         match language {
             OutputLanguage::Chinese => {
@@ -1394,21 +1782,39 @@ fn write_recovered_retention_output<W: io::Write>(
     writeln!(writer).context("failed to finish recovered retention output")
 }
 
+fn write_terminal_recovered_retention_output(
+    retention: &[SuiteRetentionManifestReceipt],
+    language: OutputLanguage,
+) -> anyhow::Result<()> {
+    let message = match language {
+        OutputLanguage::Chinese => {
+            format!("已恢复上次运行保留的 {} 个 Suite 计划", retention.len())
+        }
+        OutputLanguage::English => format!(
+            "Recovered {} retained Suite plan(s) from the previous run",
+            retention.len()
+        ),
+    };
+    note(
+        match language {
+            OutputLanguage::Chinese => "Suite 记录",
+            OutputLanguage::English => "Suite records",
+        },
+        message,
+    )
+    .context("failed to render recovered retention output")
+}
+
 fn write_final_output<W: io::Write>(
     mut writer: W,
     output: &FinalOutput,
     language: OutputLanguage,
     json: bool,
-    theme: TerminalTheme,
 ) -> anyhow::Result<()> {
     if json {
         serde_json::to_writer_pretty(&mut writer, output)
             .context("failed to write the structured ordinary conformance report")?;
         return writeln!(writer).context("failed to finish the structured conformance report");
-    }
-
-    if theme.is_terminal() {
-        return write_terminal_final_output(&mut writer, output, language, theme);
     }
 
     let status = match (language, output.success) {
@@ -1420,32 +1826,17 @@ fn write_final_output<W: io::Write>(
     writeln!(writer, "{status}")?;
 
     if let Some(report) = &output.report {
-        let mut passed = 0usize;
-        let mut review = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = 0usize;
-        let mut incomplete = 0usize;
-        for module in &report.modules {
-            if module.human_review_required {
-                review += 1;
-                continue;
-            }
-            match module.outcome {
-                ModuleOutcome::Passed => passed += 1,
-                ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending => review += 1,
-                ModuleOutcome::Skipped => skipped += 1,
-                ModuleOutcome::Failed => failed += 1,
-                ModuleOutcome::Incomplete => incomplete += 1,
-            }
-        }
+        let counts = module_counts(report);
         match language {
             OutputLanguage::Chinese => writeln!(
                 writer,
-                "模块：通过 {passed} · 复核 {review} · 跳过 {skipped} · 失败 {failed} · 未完成 {incomplete}"
+                "模块：通过 {} · 复核 {} · 跳过 {} · 失败 {} · 未完成 {}",
+                counts.passed, counts.review, counts.skipped, counts.failed, counts.incomplete
             )?,
             OutputLanguage::English => writeln!(
                 writer,
-                "Modules: passed {passed} · review {review} · skipped {skipped} · failed {failed} · incomplete {incomplete}"
+                "Modules: passed {} · review {} · skipped {} · failed {} · incomplete {}",
+                counts.passed, counts.review, counts.skipped, counts.failed, counts.incomplete
             )?,
         }
     }
@@ -1478,11 +1869,9 @@ fn write_final_output<W: io::Write>(
     Ok(())
 }
 
-fn write_terminal_final_output<W: io::Write>(
-    writer: &mut W,
+fn write_terminal_final_output(
     output: &FinalOutput,
     language: OutputLanguage,
-    theme: TerminalTheme,
 ) -> anyhow::Result<()> {
     let (title, result_label, modules_label, evidence_label, records_label) = match language {
         OutputLanguage::Chinese => (
@@ -1500,86 +1889,56 @@ fn write_terminal_final_output<W: io::Write>(
             "Suite records",
         ),
     };
-    writeln!(writer, "╭─ {}", theme.heading(title))?;
-    writeln!(writer, "│")?;
     let outcome = match (language, output.success) {
-        (OutputLanguage::Chinese, true) => theme.success("✓ 通过"),
-        (OutputLanguage::Chinese, false) => theme.error("✗ 未通过"),
-        (OutputLanguage::English, true) => theme.success("✓ Passed"),
-        (OutputLanguage::English, false) => theme.error("✗ Not passed"),
+        (OutputLanguage::Chinese, true) => "通过",
+        (OutputLanguage::Chinese, false) => "未通过",
+        (OutputLanguage::English, true) => "Passed",
+        (OutputLanguage::English, false) => "Not passed",
     };
-    writeln!(
-        writer,
-        "│  {} {outcome}",
-        theme.muted(format!("{result_label:<10}"))
-    )?;
+    let mut details = vec![format!("{result_label}: {outcome}")];
 
     if let Some(report) = &output.report {
-        let mut passed = 0usize;
-        let mut review = 0usize;
-        let mut skipped = 0usize;
-        let mut failed = 0usize;
-        let mut incomplete = 0usize;
-        for module in &report.modules {
-            if module.human_review_required {
-                review += 1;
-                continue;
-            }
-            match module.outcome {
-                ModuleOutcome::Passed => passed += 1,
-                ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending => review += 1,
-                ModuleOutcome::Skipped => skipped += 1,
-                ModuleOutcome::Failed => failed += 1,
-                ModuleOutcome::Incomplete => incomplete += 1,
-            }
-        }
+        let counts = module_counts(report);
         let labels = match language {
             OutputLanguage::Chinese => ["通过", "待复核", "跳过", "失败", "未完成"],
             OutputLanguage::English => ["passed", "review", "skipped", "failed", "incomplete"],
         };
         let summary = [
-            (GroupStatus::Passed, passed),
-            (GroupStatus::Review, review),
-            (GroupStatus::Skipped, skipped),
-            (GroupStatus::Failed, failed),
-            (GroupStatus::Incomplete, incomplete),
+            counts.passed,
+            counts.review,
+            counts.skipped,
+            counts.failed,
+            counts.incomplete,
         ]
         .into_iter()
         .zip(labels)
-        .map(|((status, count), label)| theme.status(status, count, format!("{count} {label}")))
+        .map(|(count, label)| format!("{count} {label}"))
         .collect::<Vec<_>>()
         .join(" · ");
-        writeln!(
-            writer,
-            "│  {} {summary}",
-            theme.muted(format!("{modules_label:<10}"))
-        )?;
+        details.push(format!("{modules_label}: {summary}"));
     }
     if let Some(evidence) = &output.evidence {
-        writeln!(
-            writer,
-            "│  {} {}",
-            theme.muted(format!("{evidence_label:<10}")),
-            theme.accent(evidence.directory.display())
-        )?;
+        details.push(format!(
+            "{evidence_label}: {}",
+            evidence.directory.display()
+        ));
     }
     if output.retention.is_some() {
         let retained = match language {
             OutputLanguage::Chinese => "已保留，可在 OIDF Suite 中查看",
             OutputLanguage::English => "Retained and available in the OIDF Suite",
         };
-        writeln!(
-            writer,
-            "│  {} {}",
-            theme.muted(format!("{records_label:<10}")),
-            theme.success(retained)
-        )?;
+        details.push(format!("{records_label}: {retained}"));
     }
+    note(title, details.join("\n")).context("failed to render conformance summary")?;
     for error in &output.errors {
-        writeln!(writer, "│  {}  {error}", theme.error('✗'))?;
+        log::error(error).context("failed to render conformance error")?;
     }
-    writeln!(writer, "╰─")?;
-    Ok(())
+    if output.success {
+        outro(outcome).context("failed to render successful conformance completion")
+    } else {
+        cliclack::outro_cancel(outcome).context("failed to render failed conformance completion")
+    }
 }
 
 #[derive(Serialize)]
@@ -2918,10 +3277,11 @@ fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool 
     retention_committed
 }
 
-fn resolve_token(
+fn resolve_token<S: ProgressSink>(
     invocation: &RunInvocation,
     origin: &Origin,
     language: OutputLanguage,
+    progress: &mut S,
 ) -> anyhow::Result<(BearerToken, bool)> {
     if let Some(token) = &invocation.token {
         return Ok((token.clone(), false));
@@ -2952,24 +3312,41 @@ fn resolve_token(
             }
         });
     }
+    progress.activity(&ProgressActivity::PromptingSuiteToken);
     Ok((prompt_token(language)?, true))
 }
 
 fn prompt_token(language: OutputLanguage) -> anyhow::Result<BearerToken> {
+    if !io::stderr().is_terminal() {
+        bail!(match language {
+            OutputLanguage::Chinese => {
+                "无法交互式输入 OIDF Suite Token；请使用 --token TOKEN 或 --token-stdin 提供"
+            }
+            OutputLanguage::English => {
+                "cannot interactively enter an OIDF Suite token without a terminal; provide one with --token TOKEN or --token-stdin"
+            }
+        });
+    }
     let prompt = match language {
         OutputLanguage::Chinese => "OIDF Suite API Token：",
         OutputLanguage::English => "OIDF Suite API Token: ",
     };
-    BearerToken::new(rpassword::prompt_password(prompt)?).map_err(Into::into)
+    BearerToken::new(
+        password(prompt)
+            .interact()
+            .context("OIDF Suite token input was cancelled or failed")?,
+    )
+    .map_err(Into::into)
 }
 
-fn authenticate_suite(
+fn authenticate_suite<S: ProgressSink>(
     invocation: &RunInvocation,
     origin: &Origin,
     language: OutputLanguage,
+    progress: &mut S,
 ) -> anyhow::Result<(SuiteClient, BearerToken)> {
     let transient_token = invocation.token.is_some() || invocation.token_stdin;
-    let (mut token, mut prompted) = resolve_token(invocation, origin, language)?;
+    let (mut token, mut prompted) = resolve_token(invocation, origin, language, progress)?;
     loop {
         let client = SuiteClient::new(origin.clone(), token.clone(), ClientConfig::default())
             .context("failed to initialize the Suite client")?;
@@ -2984,6 +3361,7 @@ fn authenticate_suite(
                 error @ (SuiteClientError::AuthenticationRejected
                 | SuiteClientError::AuthenticationResponseMalformed),
             ) if io::stdin().is_terminal() => {
+                progress.activity(&ProgressActivity::PromptingSuiteToken);
                 eprintln!(
                     "{}",
                     match (language, error) {

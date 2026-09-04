@@ -40,14 +40,7 @@ pub fn main_entry() {
     {
         Ok(args) => args,
         Err(error) => {
-            eprintln!(
-                "{}",
-                render_entry_error(
-                    "Argument parsing failed",
-                    error,
-                    terminal_color_enabled(std::io::stderr().is_terminal()),
-                )
-            );
+            print_entry_error("Argument parsing failed", error);
             std::process::exit(2);
         }
     };
@@ -62,14 +55,7 @@ pub fn main_entry() {
             return;
         }
         Err(error) => {
-            eprintln!(
-                "{}",
-                render_entry_error(
-                    "Invalid command",
-                    &format!("{error:#}"),
-                    terminal_color_enabled(std::io::stderr().is_terminal()),
-                )
-            );
+            print_entry_error("Invalid command", &format!("{error:#}"));
             std::process::exit(2);
         }
     };
@@ -86,14 +72,13 @@ pub fn main_entry() {
             .downcast_ref::<crate::fleet::fleet_read::PartialFleetFailure>()
             .is_none()
         {
-            let envelope = cli::envelope::render_failure(
-                &action,
-                &envelope_context,
-                &error,
-                json_mode,
-                terminal_color_enabled(std::io::stderr().is_terminal()),
-            );
-            eprintln!("{envelope}");
+            let envelope =
+                cli::envelope::render_failure(&action, &envelope_context, &error, json_mode);
+            if !json_mode && std::io::stderr().is_terminal() {
+                let _ = cliclack::log::error(format!("Command failed\n\n{envelope}"));
+            } else {
+                eprintln!("{envelope}");
+            }
         } else {
             eprintln!("nazoauthctl: {error:#}");
         }
@@ -101,18 +86,13 @@ pub fn main_entry() {
     }
 }
 
-fn terminal_color_enabled(is_terminal: bool) -> bool {
-    is_terminal
-        && std::env::var_os("NO_COLOR").is_none()
-        && !std::env::var_os("CLICOLOR").is_some_and(|value| value == "0")
-        && !std::env::var("TERM").is_ok_and(|value| value.eq_ignore_ascii_case("dumb"))
-}
+fn print_entry_error(title: &str, detail: &str) {
+    use std::io::IsTerminal as _;
 
-fn render_entry_error(title: &str, detail: &str, color: bool) -> String {
-    if color {
-        format!("\x1b[1;31m✗ {title}\x1b[0m\n\n  {detail}")
+    if std::io::stderr().is_terminal() {
+        let _ = cliclack::log::error(format!("{title}\n\n{detail}"));
     } else {
-        format!("nazoauthctl: {title}: {detail}")
+        eprintln!("nazoauthctl: {title}: {detail}");
     }
 }
 
@@ -149,20 +129,10 @@ fn print_help(topic: cli::HelpTopic) {
     use std::io::IsTerminal as _;
 
     let help = help_text(topic);
-    if !terminal_color_enabled(std::io::stdout().is_terminal()) {
+    if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+        let _ = cliclack::note("NazoAuthCtl", help);
+    } else {
         println!("{help}");
-        return;
-    }
-    for (index, line) in help.lines().enumerate() {
-        if index == 0 {
-            println!("\x1b[1;96m{line}\x1b[0m");
-        } else if !line.starts_with(' ') && line.ends_with(':') {
-            println!("\x1b[1;36m{line}\x1b[0m");
-        } else if line.trim_start().starts_with("nazoauthctl ") {
-            println!("\x1b[36m{line}\x1b[0m");
-        } else {
-            println!("{line}");
-        }
     }
 }
 

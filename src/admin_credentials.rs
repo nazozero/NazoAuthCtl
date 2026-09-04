@@ -5,7 +5,7 @@
 //! or an owner-only file. They never enter argv, environment variables, logs,
 //! or persistent ctl state.
 
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{IsTerminal as _, Read as _};
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
@@ -75,18 +75,18 @@ fn parse_credentials(bytes: &[u8], source: &str) -> anyhow::Result<AdminCredenti
 }
 
 fn read_interactive(command: &str) -> anyhow::Result<AdminCredentials> {
-    if !std::io::stdin().is_terminal() {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         bail!(
             "{command} needs an interactive terminal or an explicit credentials input; passwords are never accepted on argv"
         );
     }
-    eprint!("Administrator email: ");
-    std::io::stderr().flush()?;
-    let mut email = String::new();
-    std::io::stdin()
-        .read_line(&mut email)
+    let email: String = cliclack::input("Administrator email")
+        .required(false)
+        .interact()
         .context("failed to read administrator email")?;
-    let password = rpassword::prompt_password("Administrator password: ")
+    let password = cliclack::password("Administrator password")
+        .allow_empty()
+        .interact()
         .context("failed to read administrator password")?;
     Ok(AdminCredentials {
         email: email.trim().to_owned(),

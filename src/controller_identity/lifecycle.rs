@@ -928,8 +928,10 @@ fn obtain_approval_token(flag: Option<&str>, action: &str) -> anyhow::Result<Str
     use std::io::IsTerminal as _;
     if std::io::stdin().is_terminal() {
         let prompt = format!("Paste the {action} approval token (input hidden): ");
-        let token =
-            rpassword::prompt_password(prompt).context("failed to read the approval token")?;
+        let token = cliclack::password(prompt)
+            .allow_empty()
+            .interact()
+            .context("failed to read the approval token")?;
         let trimmed = token.trim().to_owned();
         if !token_length_ok(&trimmed) {
             bail!("the pasted approval token has an unexpected length");
@@ -995,7 +997,10 @@ fn make_authenticated_api(
 
 fn prompt_mfa_code(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
     let code = zeroize::Zeroizing::new(
-        rpassword::prompt_password(prompt).context("failed to read administrator MFA code")?,
+        cliclack::password(prompt)
+            .allow_empty()
+            .interact()
+            .context("failed to read administrator MFA code")?,
     );
     let trimmed = code.trim();
     if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
@@ -1280,9 +1285,10 @@ fn read_recovery_secret(path: Option<&std::path::Path>) -> anyhow::Result<String
     }
     use std::io::IsTerminal as _;
     if std::io::stdin().is_terminal() {
-        let secret =
-            rpassword::prompt_password("Paste the offline Recovery Secret (input hidden): ")
-                .context("failed to read the recovery secret")?;
+        let secret = cliclack::password("Paste the offline Recovery Secret (input hidden)")
+            .allow_empty()
+            .interact()
+            .context("failed to read the recovery secret")?;
         Ok(secret.trim().to_owned())
     } else {
         eprintln!("Paste the offline Recovery Secret on one line:");

@@ -272,11 +272,9 @@ impl ReplacementSecretDelivery for InteractiveSecretDelivery {
                  non-interactive environments"
             );
         }
-        print!("type STORED after the secret is saved offline: ");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        std::io::stdin()
-            .read_line(&mut line)
+        let line: String = cliclack::input("Type STORED after the secret is saved offline")
+            .required(false)
+            .interact()
             .context("failed to read the delivery acknowledgement")?;
         if line.trim() != "STORED" {
             bail!(

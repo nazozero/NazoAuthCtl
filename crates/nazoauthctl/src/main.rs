@@ -5,12 +5,13 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
+use cliclack::{intro, log, note, outro};
 use nazoauthctl_conformance::{
     ArtifactTrustPolicy, BearerToken, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
-    OidfPlanSelection, OutputLanguage, TerminalTheme, bundled_oidf_selection_choices,
-    open_cached_oidf_artifact, open_cached_oidf_driver_plan, read_artifact_driver,
-    read_artifact_matrix, read_compact_manifest, resolve_bundled_oidf_selection,
-    resolve_oidf_artifact, verify_oidf_artifact,
+    OidfPlanSelection, OutputLanguage, bundled_oidf_selection_choices, open_cached_oidf_artifact,
+    open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
+    read_compact_manifest, resolve_bundled_oidf_selection, resolve_oidf_artifact,
+    verify_oidf_artifact,
 };
 
 mod ordinary_run;
@@ -56,8 +57,7 @@ fn execute_configure(
     let (alias, tenant_domain, suite_origin) =
         nazoauthctl_core::configure_oidf(instance.as_deref(), &tenant_domain, &suite_origin)?;
     let language = output_language();
-    let theme = TerminalTheme::detect(io::stdout().is_terminal());
-    if theme.is_terminal() {
+    if io::stdout().is_terminal() && io::stderr().is_terminal() {
         let title = match language {
             OutputLanguage::Chinese => "OIDF 配置已保存",
             OutputLanguage::English => "OIDF configuration saved",
@@ -66,22 +66,14 @@ fn execute_configure(
             OutputLanguage::Chinese => ("实例", "租户域名"),
             OutputLanguage::English => ("Instance", "Tenant domain"),
         };
-        println!("{}  {}", theme.success('✓'), theme.heading(title));
-        println!(
-            "  {} {}",
-            theme.muted(format!("{instance_label:<12}")),
-            theme.strong(alias)
-        );
-        println!(
-            "  {} {}",
-            theme.muted(format!("{domain_label:<12}")),
-            theme.accent(tenant_domain)
-        );
-        println!(
-            "  {} {}",
-            theme.muted(format!("{:<12}", "OIDF Suite")),
-            theme.accent(suite_origin)
-        );
+        intro("NazoAuth OIDF")?;
+        note(
+            title,
+            format!(
+                "{instance_label}: {alias}\n{domain_label}: {tenant_domain}\nOIDF Suite: {suite_origin}"
+            ),
+        )?;
+        outro(title)?;
     } else {
         println!(
             "OIDF configuration for instance '{alias}': tenant domain {tenant_domain}; Suite {suite_origin}"
@@ -535,18 +527,15 @@ fn exit_with_error(error: &anyhow::Error, json: bool) -> ! {
         let _ = writeln!(io::stdout());
     } else {
         let language = output_language();
-        let theme = TerminalTheme::detect(io::stderr().is_terminal());
         let title = match language {
             OutputLanguage::Chinese => "命令执行失败",
             OutputLanguage::English => "Command failed",
         };
-        let _ = writeln!(
-            io::stderr(),
-            "{}  {}\n\n  {}",
-            theme.error('✗'),
-            theme.strong(title),
-            message
-        );
+        if io::stderr().is_terminal() {
+            let _ = log::error(format!("{title}\n\n{message}"));
+        } else {
+            let _ = writeln!(io::stderr(), "{title}\n\n{message}");
+        }
     }
     std::process::exit(1)
 }
@@ -729,20 +718,21 @@ fn run_help(language: OutputLanguage) -> &'static str {
 }
 
 fn print_run_help() {
-    let theme = TerminalTheme::detect(io::stdout().is_terminal());
-    let help = run_help(output_language());
-    if !theme.is_terminal() {
+    let language = output_language();
+    let help = run_help(language);
+    if io::stdout().is_terminal() && io::stderr().is_terminal() {
+        let title = match language {
+            OutputLanguage::Chinese => "NazoAuth OIDF 使用说明",
+            OutputLanguage::English => "NazoAuth OIDF guide",
+        };
+        let _ = intro("NazoAuth OIDF");
+        let _ = note(title, help);
+        let _ = outro(match language {
+            OutputLanguage::Chinese => "准备就绪",
+            OutputLanguage::English => "Ready",
+        });
+    } else {
         println!("{help}");
-        return;
-    }
-    for line in help.lines() {
-        if !line.starts_with(' ') && (line.ends_with(':') || line.ends_with('：')) {
-            println!("{}", theme.heading(line));
-        } else if line.trim_start().starts_with("nazoauthctl ") {
-            println!("{}", theme.accent(line));
-        } else {
-            println!("{line}");
-        }
     }
 }
 

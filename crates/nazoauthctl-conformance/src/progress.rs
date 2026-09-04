@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::{env, fmt};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,97 +52,6 @@ pub enum OutputLanguage {
     English,
 }
 
-/// A deliberately small terminal palette shared by the live renderer and the
-/// final human summary. Machine-readable and redirected output always uses
-/// [`TerminalTheme::plain`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TerminalTheme {
-    terminal: bool,
-    color: bool,
-}
-
-impl TerminalTheme {
-    pub fn detect(is_terminal: bool) -> Self {
-        let disabled = env::var_os("NO_COLOR").is_some()
-            || env::var_os("CLICOLOR").is_some_and(|value| value == "0")
-            || env::var("TERM").is_ok_and(|value| value.eq_ignore_ascii_case("dumb"));
-        Self {
-            terminal: is_terminal,
-            color: is_terminal && !disabled,
-        }
-    }
-
-    pub const fn plain() -> Self {
-        Self {
-            terminal: false,
-            color: false,
-        }
-    }
-
-    #[cfg(test)]
-    const fn colored() -> Self {
-        Self {
-            terminal: true,
-            color: true,
-        }
-    }
-
-    pub const fn is_terminal(self) -> bool {
-        self.terminal
-    }
-
-    pub fn heading(self, value: impl fmt::Display) -> String {
-        self.paint("\x1b[1;96m", value)
-    }
-
-    pub fn strong(self, value: impl fmt::Display) -> String {
-        self.paint("\x1b[1m", value)
-    }
-
-    pub fn accent(self, value: impl fmt::Display) -> String {
-        self.paint("\x1b[36m", value)
-    }
-
-    pub fn success(self, value: impl fmt::Display) -> String {
-        self.paint("\x1b[32m", value)
-    }
-
-    pub fn warning(self, value: impl fmt::Display) -> String {
-        self.paint("\x1b[33m", value)
-    }
-
-    pub fn error(self, value: impl fmt::Display) -> String {
-        self.paint("\x1b[31m", value)
-    }
-
-    pub fn muted(self, value: impl fmt::Display) -> String {
-        self.paint("\x1b[2m", value)
-    }
-
-    pub fn status(self, status: GroupStatus, count: usize, value: impl fmt::Display) -> String {
-        if count == 0 {
-            return self.muted(value);
-        }
-        match status {
-            GroupStatus::Passed => self.success(value),
-            GroupStatus::Review | GroupStatus::Skipped | GroupStatus::Incomplete => {
-                self.warning(value)
-            }
-            GroupStatus::Failed => self.error(value),
-            GroupStatus::Running => self.accent(value),
-            GroupStatus::Remaining => self.muted(value),
-        }
-    }
-
-    fn paint(self, code: &str, value: impl fmt::Display) -> String {
-        if self.color {
-            format!("{code}{value}\x1b[0m")
-        } else {
-            value.to_string()
-        }
-    }
-}
-
 impl OutputLanguage {
     pub fn from_locale(locale: Option<&str>) -> Self {
         let language = locale
@@ -164,6 +72,7 @@ pub enum ProgressActivity {
     OpeningDeployment,
     LoadingMatrix,
     AuthenticatingSuite,
+    PromptingSuiteToken,
     RecoveringPreviousRun,
     PreparingTenant {
         issuer: String,
@@ -337,151 +246,9 @@ impl<W: Write> ProgressSink for StableRenderer<W> {
     }
 }
 
-pub struct TtyRenderer<W: Write> {
-    writer: W,
-    language: OutputLanguage,
-    snapshot: Option<ProgressSnapshot>,
-    activity: Option<ProgressActivity>,
-    theme: TerminalTheme,
-}
-
-impl<W: Write> TtyRenderer<W> {
-    pub fn new(writer: W) -> Self {
-        Self::localized(writer, OutputLanguage::English)
-    }
-
-    pub fn localized(writer: W, language: OutputLanguage) -> Self {
-        Self::with_theme(writer, language, TerminalTheme::detect(true))
-    }
-
-    fn with_theme(writer: W, language: OutputLanguage, theme: TerminalTheme) -> Self {
-        Self {
-            writer,
-            language,
-            snapshot: None,
-            activity: None,
-            theme,
-        }
-    }
-
-    pub fn into_inner(self) -> W {
-        self.writer
-    }
-}
-
-impl<W: Write> ProgressSink for TtyRenderer<W> {
-    fn update(&mut self, event: &ProgressEvent) {
-        self.snapshot = Some(event.snapshot.clone());
-        self.render();
-    }
-
-    fn activity(&mut self, activity: &ProgressActivity) {
-        self.activity = Some(activity.clone());
-        self.render();
-    }
-}
-
-impl<W: Write> TtyRenderer<W> {
-    fn render(&mut self) {
-        // Clear the previous compact frame. Progress is item based and never
-        // estimates duration, so no ETA is printed.
-        let _ = write!(self.writer, "\x1b[2J\x1b[H");
-        let labels = labels(self.language);
-        let _ = writeln!(self.writer, "{}", self.theme.heading(labels.title));
-        if let Some(activity) = &self.activity {
-            let _ = writeln!(
-                self.writer,
-                "{}  {}",
-                self.theme.muted(labels.status),
-                self.theme.accent(activity_label(activity, self.language))
-            );
-        }
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            let _ = self.writer.flush();
-            return;
-        };
-        let _ = writeln!(self.writer);
-        let (filled, empty) = bar(snapshot.completed, snapshot.total, 20);
-        let _ = writeln!(
-            self.writer,
-            "{}  {}{}  {:>3}%",
-            self.theme.strong(labels.overall),
-            self.theme.success("█".repeat(filled)),
-            self.theme.muted("░".repeat(empty)),
-            self.theme
-                .strong(percent(snapshot.completed, snapshot.total))
-        );
-        let _ = writeln!(
-            self.writer,
-            "         {} / {}",
-            self.theme.strong(snapshot.completed),
-            self.theme.muted(snapshot.total)
-        );
-        let _ = writeln!(self.writer);
-        for group in &snapshot.groups {
-            let symbol = match group.status {
-                GroupStatus::Passed => self.theme.success('✓'),
-                GroupStatus::Review => self.theme.warning('!'),
-                GroupStatus::Skipped => self.theme.warning('↷'),
-                GroupStatus::Failed => self.theme.error('✗'),
-                GroupStatus::Incomplete => self.theme.warning('…'),
-                GroupStatus::Running => self.theme.accent('●'),
-                GroupStatus::Remaining => self.theme.muted('○'),
-            };
-            let group_label = self.theme.status(
-                group.status,
-                1,
-                format!("{:<32}", format!("{} · {}", group.profile, group.id)),
-            );
-            let _ = writeln!(
-                self.writer,
-                "{} {} {:>4} / {:<4}",
-                symbol, group_label, group.completed, group.total
-            );
-        }
-        let _ = writeln!(self.writer);
-        let _ = writeln!(self.writer, "{}", self.theme.strong(labels.current));
-        let _ = writeln!(
-            self.writer,
-            "  {}",
-            self.theme.accent(current_matrix_label(
-                snapshot.current_profile.as_deref(),
-                snapshot.current_variant.as_ref()
-            ))
-        );
-        let _ = writeln!(
-            self.writer,
-            "  {}",
-            self.theme
-                .strong(snapshot.current_test.as_deref().unwrap_or("-"))
-        );
-        let _ = writeln!(self.writer);
-        let metrics = [
-            (GroupStatus::Passed, snapshot.passed, labels.passed),
-            (GroupStatus::Review, snapshot.reviewed, labels.review),
-            (GroupStatus::Skipped, snapshot.skipped, labels.skipped),
-            (GroupStatus::Failed, snapshot.failed, labels.failed),
-            (
-                GroupStatus::Incomplete,
-                snapshot.incomplete,
-                labels.incomplete,
-            ),
-            (GroupStatus::Running, snapshot.running, labels.running),
-            (GroupStatus::Remaining, snapshot.remaining, labels.remaining),
-        ]
-        .into_iter()
-        .map(|(status, count, label)| self.theme.status(status, count, format!("{label} {count}")))
-        .collect::<Vec<_>>()
-        .join(" · ");
-        let _ = writeln!(self.writer, "{metrics}");
-        let _ = self.writer.flush();
-    }
-}
-
 struct Labels {
     title: &'static str,
     status: &'static str,
-    overall: &'static str,
     current: &'static str,
     passed: &'static str,
     review: &'static str,
@@ -497,7 +264,6 @@ fn labels(language: OutputLanguage) -> Labels {
         OutputLanguage::Chinese => Labels {
             title: "NazoAuth OIDF 一致性测试",
             status: "状态",
-            overall: "总进度",
             current: "当前",
             passed: "通过",
             review: "待复核",
@@ -510,7 +276,6 @@ fn labels(language: OutputLanguage) -> Labels {
         OutputLanguage::English => Labels {
             title: "NazoAuth OIDF Conformance",
             status: "Status",
-            overall: "Overall",
             current: "Current",
             passed: "Passed",
             review: "Review",
@@ -523,7 +288,7 @@ fn labels(language: OutputLanguage) -> Labels {
     }
 }
 
-fn activity_label(activity: &ProgressActivity, language: OutputLanguage) -> String {
+pub fn activity_label(activity: &ProgressActivity, language: OutputLanguage) -> String {
     match (language, activity) {
         (OutputLanguage::Chinese, ProgressActivity::OpeningDeployment) => {
             "正在读取实例配置".to_owned()
@@ -542,6 +307,12 @@ fn activity_label(activity: &ProgressActivity, language: OutputLanguage) -> Stri
         }
         (OutputLanguage::English, ProgressActivity::AuthenticatingSuite) => {
             "Connecting to and authenticating with OIDF Suite".to_owned()
+        }
+        (OutputLanguage::Chinese, ProgressActivity::PromptingSuiteToken) => {
+            "等待安全输入 OIDF Suite Token".to_owned()
+        }
+        (OutputLanguage::English, ProgressActivity::PromptingSuiteToken) => {
+            "Waiting for a securely entered OIDF Suite token".to_owned()
         }
         (OutputLanguage::Chinese, ProgressActivity::RecoveringPreviousRun) => {
             "正在检查并恢复上次未完成的运行".to_owned()
@@ -662,7 +433,7 @@ fn current_label(snapshot: &ProgressSnapshot, language: OutputLanguage) -> Strin
     )
 }
 
-fn current_matrix_label(
+pub fn current_matrix_label(
     profile: Option<&str>,
     variant: Option<&BTreeMap<String, String>>,
 ) -> String {
@@ -688,15 +459,6 @@ fn percent(completed: usize, total: usize) -> usize {
         .saturating_mul(100)
         .checked_div(total)
         .unwrap_or(0)
-}
-
-fn bar(completed: usize, total: usize, width: usize) -> (usize, usize) {
-    let filled = completed
-        .saturating_mul(width)
-        .checked_div(total)
-        .unwrap_or(0)
-        .min(width);
-    (filled, width - filled)
 }
 
 #[cfg(test)]
@@ -812,71 +574,5 @@ mod tests {
         let text = String::from_utf8(output).expect("utf8");
         assert!(text.contains("oidc/mode=plain/test"));
         assert!(!text.contains("config"));
-    }
-
-    #[test]
-    fn tty_renderer_is_item_based_and_has_no_eta() {
-        let mut output = Vec::new();
-        let mut renderer =
-            TtyRenderer::with_theme(&mut output, OutputLanguage::English, TerminalTheme::plain());
-        renderer.update(&ProgressEvent {
-            snapshot: ProgressSnapshot {
-                completed: 2,
-                total: 3,
-                groups: vec![GroupProgress {
-                    id: "fapi".to_owned(),
-                    profile: "FAPI 2.0".to_owned(),
-                    completed: 2,
-                    total: 3,
-                    status: GroupStatus::Running,
-                    passed: 2,
-                    reviewed: 0,
-                    skipped: 0,
-                    failed: 0,
-                    incomplete: 0,
-                    running: 1,
-                    remaining: 0,
-                }],
-                passed_groups: 0,
-                review_groups: 0,
-                skipped_groups: 0,
-                failed_groups: 0,
-                incomplete_groups: 0,
-                running_groups: 1,
-                remaining_groups: 0,
-                passed: 2,
-                reviewed: 0,
-                skipped: 0,
-                failed: 0,
-                incomplete: 0,
-                running: 1,
-                remaining: 0,
-                current_profile: Some("FAPI 2.0".to_owned()),
-                current_variant: Some(BTreeMap::from([("mode".to_owned(), "mTLS".to_owned())])),
-                current_test: Some("fapi-test".to_owned()),
-            },
-        });
-        let text = String::from_utf8(output).expect("utf8");
-        assert!(text.contains("NazoAuth OIDF Conformance"));
-        assert!(text.contains("Overall"));
-        assert!(text.contains(
-            "Passed 2 · Review 0 · Skipped 0 · Failed 0 · Incomplete 0 · Running 1 · Remaining 0"
-        ));
-        assert!(text.contains("FAPI 2.0/mode=mTLS"));
-        assert!(!text.contains("ETA"));
-    }
-
-    #[test]
-    fn tty_renderer_uses_semantic_colors_when_enabled() {
-        let mut output = Vec::new();
-        let mut renderer = TtyRenderer::with_theme(
-            &mut output,
-            OutputLanguage::English,
-            TerminalTheme::colored(),
-        );
-        renderer.activity(&ProgressActivity::Finished);
-        let text = String::from_utf8(output).expect("utf8");
-        assert!(text.contains("\x1b[1;96mNazoAuth OIDF Conformance\x1b[0m"));
-        assert!(text.contains("\x1b[36mRun finished\x1b[0m"));
     }
 }
