@@ -40,11 +40,10 @@ administrator through the deployment root, bind a Controller Key, operate.
 `install` commits as soon as the target reports local health - public DNS/TLS verification (`verify`) and backup setup are separate
 next steps, never hidden gates.
 
-For a clean install from stopped current-format material already on the target,
-append both `--import-data-root /absolute/target/data` and
-`--import-mfa-key-file /absolute/target/mfa-key`. They are an inseparable pair;
-the import allowlist excludes controller state, DeploymentState, bootstrap
-state, and UI cache.
+For database-backed deployments, clean install does not import a legacy `keys/`
+directory or current data. Follow [shared signing-key migration and recovery](docs/shared-signing-keys.md)
+for the server's explicit offline key import, the same deployment wrapping key,
+and the required backup and root-mount checks before a managed update.
 
 ## Commands
 

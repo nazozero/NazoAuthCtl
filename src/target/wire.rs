@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 9;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 10;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -2071,6 +2071,7 @@ mod tests {
                 ("database-lifecycle-url", true),
                 ("valkey-url", true),
                 ("mfa-totp-key", false),
+                ("signing-key-encryption-key", true),
                 ("client-secret-pepper", true),
                 ("dynamic-registration-token", true),
                 ("openid4vc-data-encryption-key", true),
@@ -2082,7 +2083,14 @@ mod tests {
                 |(purpose, supplied)| super::super::install_exec::PlannedSecret {
                     purpose: purpose.to_owned(),
                     path: format!("/var/lib/nazoauth/secrets/{purpose}"),
-                    value: supplied.then(|| SecretMaterial::try_new(b"secret".to_vec()).unwrap()),
+                    value: supplied.then(|| {
+                        let value = if purpose == "signing-key-encryption-key" {
+                            b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".as_slice()
+                        } else {
+                            b"secret".as_slice()
+                        };
+                        SecretMaterial::try_new(value.to_vec()).unwrap()
+                    }),
                 },
             )
             .collect(),

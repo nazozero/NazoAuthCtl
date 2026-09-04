@@ -1201,6 +1201,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1274,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1293,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-conformance"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1327,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-core"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1359,12 +1365,13 @@ dependencies = [
  "urlencoding",
  "uuid",
  "x509-parser",
+ "yaml_serde",
  "zeroize",
 ]
 
 [[package]]
 name = "nazoauthctl-runtime"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -1939,6 +1946,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-file"
@@ -2901,6 +2914,19 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

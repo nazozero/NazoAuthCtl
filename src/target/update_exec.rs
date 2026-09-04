@@ -87,6 +87,52 @@ pub(crate) fn validate_backup_precondition(
     )
 }
 
+fn require_shared_signing_key_root(
+    secrets_root: &str,
+    config: &str,
+    kind: RuntimeBackendKind,
+    mounts: &[runtime_backend::NeutralMount],
+) -> Result<(), Failure> {
+    let refusal = || {
+        Failure::new(
+            "SIGNING_KEY_MIGRATION_REQUIRED",
+            "provision the deployment signing-key root, import existing keys, and configure its runtime access before updating; no runtime or database change was made",
+        )
+    };
+    let configured = super::backup_exec::parse_signing_key_encryption_config(config)
+        .map_err(|_| refusal())?
+        .ok_or_else(refusal)?;
+    let configured_files = [
+        Some(("signing-key-encryption-key", configured.file.as_str())),
+        configured
+            .previous_file
+            .as_deref()
+            .map(|file| ("signing-key-previous-encryption-key", file)),
+    ];
+    for (name, file) in configured_files.into_iter().flatten() {
+        let root = Path::new(secrets_root).join(name);
+        let runtime_path = if kind.is_container() {
+            Path::new(CONTAINER_SECRETS_DIR).join(name)
+        } else {
+            root.clone()
+        };
+        if Path::new(file) != runtime_path {
+            return Err(refusal());
+        }
+        let bytes =
+            filesystem::read_secure_secret_file(&root, name, 4096).map_err(|_| refusal())?;
+        super::install_exec::validate_signing_key_encryption_key(&bytes).map_err(|_| refusal())?;
+        if kind.is_container()
+            && !mounts
+                .iter()
+                .any(|mount| mount.source == root && mount.destination == runtime_path)
+        {
+            return Err(refusal());
+        }
+    }
+    Ok(())
+}
+
 fn validate_loaded_backup_projection(
     expected_manifest_sha256: &str,
     expected_restore_tested_at: DateTime<Utc>,
@@ -392,6 +438,28 @@ impl HostLifecycleExecutor {
                 revision: job.expected_revision,
             });
         }
+        let config_bytes = match job.config {
+            Some(config) => zeroize::Zeroizing::new(config.content.as_bytes().to_vec()),
+            None => filesystem::read_secure_regular_file(
+                Path::new(job.config_reference),
+                "deployment configuration",
+                false,
+                super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+            )
+            .map_err(|error| {
+                Failure::new(
+                    super::install_exec::CONFIG_INVALID,
+                    sanitize(error.to_string()),
+                )
+            })?,
+        };
+        let config_text = std::str::from_utf8(&config_bytes).map_err(|_| {
+            Failure::new(
+                super::install_exec::CONFIG_INVALID,
+                "deployment configuration must be UTF-8",
+            )
+        })?;
+        require_shared_signing_key_root(job.secrets_root, config_text, kind, &observation.mounts)?;
         // Build and validate the executable replacement before any migration
         // can mutate external state. Activation consumes this exact plan.
         let replacement = runtime_replacement_required(
@@ -484,9 +552,10 @@ impl HostLifecycleExecutor {
                         .parent()
                         .is_some_and(|parent| parent == Path::new(CONTAINER_SECRETS_DIR))
                         && mount.destination.file_name().is_some_and(|name| {
-                            super::install_exec::SECRET_PURPOSES
-                                .iter()
-                                .any(|purpose| name == *purpose)
+                            name == "signing-key-previous-encryption-key"
+                                || super::install_exec::SECRET_PURPOSES
+                                    .iter()
+                                    .any(|purpose| name == *purpose)
                         })
                 })
                 .cloned()
@@ -949,6 +1018,73 @@ mod tests {
         assert_eq!(
             lifecycle_database_url(temp.path().to_str().unwrap()).map_err(anyhow::Error::from)?,
             "postgresql://nazo_lifecycle:secret@db.internal/oauth"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn update_requires_an_existing_shared_signing_root_before_mutation() -> anyhow::Result<()> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let temp = crate::filesystem::PrivateTempDir::new("update-signing-root")?;
+        let directory = temp.path().to_str().unwrap();
+        let path = temp.path().join("signing-key-encryption-key");
+        let config = serde_json::json!({
+            "SIGNING_KEY_ENCRYPTION_KEY_FILE": path,
+            "SIGNING_KEY_ENCRYPTION_KEY_ID": "test",
+        })
+        .to_string();
+        let refusal =
+            require_shared_signing_key_root(directory, &config, RuntimeBackendKind::Host, &[])
+                .expect_err("old deployment requires explicit key migration");
+        assert_eq!(refusal.code, "SIGNING_KEY_MIGRATION_REQUIRED");
+        assert!(!path.exists());
+        filesystem::atomic_write(&path, URL_SAFE_NO_PAD.encode([42_u8; 32]).as_bytes(), 0o600)?;
+        require_shared_signing_key_root(directory, &config, RuntimeBackendKind::Host, &[])?;
+        let previous_path = temp.path().join("signing-key-previous-encryption-key");
+        let mut rolling: serde_json::Value = serde_json::from_str(&config)?;
+        rolling["SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_FILE"] = serde_json::json!(previous_path);
+        rolling["SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID"] = serde_json::json!("previous");
+        assert!(
+            require_shared_signing_key_root(
+                directory,
+                &rolling.to_string(),
+                RuntimeBackendKind::Host,
+                &[]
+            )
+            .is_err()
+        );
+        filesystem::atomic_write(
+            &previous_path,
+            URL_SAFE_NO_PAD.encode([43_u8; 32]).as_bytes(),
+            0o600,
+        )?;
+        require_shared_signing_key_root(
+            directory,
+            &rolling.to_string(),
+            RuntimeBackendKind::Host,
+            &[],
+        )?;
+        assert!(
+            require_shared_signing_key_root(directory, "{}", RuntimeBackendKind::Host, &[])
+                .is_err()
+        );
+        let container_config = serde_json::json!({
+            "SIGNING_KEY_ENCRYPTION_KEY_FILE": format!("{CONTAINER_SECRETS_DIR}/signing-key-encryption-key"),
+            "SIGNING_KEY_ENCRYPTION_KEY_ID": "test",
+        }).to_string();
+        assert!(
+            require_shared_signing_key_root(
+                directory,
+                &container_config,
+                RuntimeBackendKind::Docker,
+                &[]
+            )
+            .is_err()
+        );
+        filesystem::atomic_write(&path, b"invalid", 0o600)?;
+        assert!(
+            require_shared_signing_key_root(directory, &config, RuntimeBackendKind::Host, &[])
+                .is_err()
         );
         Ok(())
     }

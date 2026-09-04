@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read as _, Seek as _, SeekFrom, Write as _},
+    io::{Cursor, Read as _, Seek as _, SeekFrom, Write as _},
     net::TcpListener,
     path::{Component, Path, PathBuf},
     process::{Command, Output},
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tar::{Builder as TarBuilder, EntryType, Header as TarHeader};
 use url::Url;
 use uuid::Uuid;
+use yaml_serde::Value as YamlValue;
 
 use super::{
     backup::{self, RestoreTestEnvironment, RestoreTestReceipt, SnapshotFile, SnapshotManifest},
@@ -46,6 +47,17 @@ pub const RESTORE_TEST_FAILED: &str = "RESTORE_TEST_FAILED";
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_KEY_BYTES: u64 = 16 * 1024;
 const MAX_VALKEY_CLEANUP_OUTPUT: usize = 1024 * 1024;
+const SIGNING_KEY_ENCRYPTION_KEY_SECRET: &str = "signing-key-encryption-key";
+const SIGNING_KEY_ENCRYPTION_KEY_SETTING: &str = "SIGNING_KEY_ENCRYPTION_KEY_FILE";
+const SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING: &str = "SIGNING_KEY_ENCRYPTION_KEY_ID";
+const SIGNING_KEY_ENCRYPTION_KEY_ARCHIVE_PATH: &str = "app-secrets/signing-key-encryption-key";
+const SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET: &str = "signing-key-previous-encryption-key";
+const SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING: &str =
+    "SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_FILE";
+const SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING: &str =
+    "SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID";
+const SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ARCHIVE_PATH: &str =
+    "app-secrets/signing-key-previous-encryption-key";
 const DATABASE_SENTINEL_SQL: &str = "SELECT concat_ws('|',
     'controller_recovery_roots=' || (SELECT COUNT(*) FROM controller_recovery_roots),
     'controller_registry_slots=' || (SELECT COUNT(*) FROM controller_registry_slots),
@@ -58,6 +70,93 @@ const DATABASE_SENTINEL_SQL: &str = "SELECT concat_ws('|',
     'users=' || (SELECT COUNT(*) FROM users))";
 const SNAPSHOT_SENTINEL_FILE: &str = "snapshot-sentinel";
 const IMMUTABLE_MANIFEST_FILE: &str = "snapshot-manifest.json";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SigningKeyEncryptionConfig {
+    pub(super) file: String,
+    pub(super) id: String,
+    pub(super) previous_file: Option<String>,
+    pub(super) previous_id: Option<String>,
+}
+
+/// Parse the server's two-key signing-root configuration as YAML.  Callers
+/// apply the path comparison for their own host/container context.
+pub(super) fn parse_signing_key_encryption_config(
+    config: &str,
+) -> anyhow::Result<Option<SigningKeyEncryptionConfig>> {
+    let value: YamlValue = yaml_serde::from_reader(Cursor::new(config.as_bytes()))
+        .context("deployment configuration is not valid YAML")?;
+    let YamlValue::Mapping(entries) = value else {
+        bail!("deployment configuration must be a top-level key/value mapping");
+    };
+    let file = yaml_mapping_scalar(&entries, SIGNING_KEY_ENCRYPTION_KEY_SETTING)?;
+    let id = yaml_mapping_scalar(&entries, SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING)?;
+    let previous_file = yaml_mapping_scalar(&entries, SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING)?;
+    let previous_id =
+        yaml_mapping_scalar(&entries, SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING)?;
+    let current = signing_key_pair(
+        file,
+        id,
+        SIGNING_KEY_ENCRYPTION_KEY_SETTING,
+        SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING,
+    )?;
+    let previous = signing_key_pair(
+        previous_file,
+        previous_id,
+        SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING,
+        SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING,
+    )?;
+    let Some((file, id)) = current else {
+        ensure!(
+            previous.is_none(),
+            "{SIGNING_KEY_ENCRYPTION_KEY_SETTING} and {SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING} are required when a previous signing key is configured"
+        );
+        return Ok(None);
+    };
+    let (previous_file, previous_id) =
+        previous.map_or((None, None), |(file, id)| (Some(file), Some(id)));
+    Ok(Some(SigningKeyEncryptionConfig {
+        file,
+        id,
+        previous_file,
+        previous_id,
+    }))
+}
+
+fn signing_key_pair(
+    file: Option<String>,
+    id: Option<String>,
+    file_setting: &str,
+    id_setting: &str,
+) -> anyhow::Result<Option<(String, String)>> {
+    match (file, id) {
+        (None, None) => Ok(None),
+        (Some(file), Some(id)) => {
+            ensure!(!file.is_empty(), "{file_setting} must not be empty");
+            ensure!(!id.is_empty(), "{id_setting} must not be empty");
+            Ok(Some((file, id)))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("{file_setting} and {id_setting} must be configured together")
+        }
+    }
+}
+
+fn yaml_mapping_scalar(
+    entries: &yaml_serde::Mapping,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some((_, value)) = entries.iter().find(|(key, _)| key.as_str() == Some(name)) else {
+        return Ok(None);
+    };
+    let value = match value {
+        YamlValue::String(value) => value.clone(),
+        YamlValue::Bool(value) => value.to_string(),
+        YamlValue::Number(value) => value.to_string(),
+        _ => bail!("server configuration key {name} must be a scalar"),
+    };
+    Ok(Some(value.trim().to_owned()))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -772,6 +871,38 @@ pub(crate) fn recover(
     let extracted_data = extracted.join("app-data");
     let extracted_secrets = extracted.join("app-secrets");
     let extracted_config = extracted.join("config.yaml");
+    let target_secrets =
+        managed_directory_locator(state, "app-secrets").map_err(restore_failure)?;
+    let current_signing_key_path = expected_signing_key_path(
+        state.runtime.kind,
+        &target_secrets,
+        SIGNING_KEY_ENCRYPTION_KEY_SECRET,
+    );
+    let expected_previous_signing_key_path = expected_signing_key_path(
+        state.runtime.kind,
+        &target_secrets,
+        SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET,
+    );
+    let restored_signing_key_config = validate_recovery_secret_contract(
+        &extracted_config,
+        &extracted_secrets,
+        &manifest.archive_files,
+        &current_signing_key_path,
+        &expected_previous_signing_key_path,
+    )
+    .map_err(restore_failure)?;
+    if state.runtime.kind.is_container()
+        && restored_signing_key_config.previous_file.is_some()
+        && !live
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == expected_previous_signing_key_path)
+    {
+        return Err(Failure::new(
+            RESTORE_TEST_FAILED,
+            "recovery snapshot configures a previous signing-key root but the stopped runtime has no canonical previous-key mount; recovery refused before path switch",
+        ));
+    }
     if crate::filesystem::sha256(&extracted_secrets.join("mfa-totp-key"))
         .map_err(restore_failure)?
         != manifest.mfa_key_sha256
@@ -878,8 +1009,6 @@ pub(crate) fn recover(
             .map_err(restore_failure)?;
 
     let target_data = managed_directory_locator(state, "app-data").map_err(restore_failure)?;
-    let target_secrets =
-        managed_directory_locator(state, "app-secrets").map_err(restore_failure)?;
     let target_config = PathBuf::from(&state.config.reference);
     let staged_data =
         sibling_operation_path(&target_data, operation, "data-stage").map_err(restore_failure)?;
@@ -1402,6 +1531,23 @@ fn run_restore_rehearsal(
     let data = restore_root.join("app-data");
     let secrets = restore_root.join("app-secrets");
     let config = restore_root.join("config.yaml");
+    let current_signing_key_path = expected_signing_key_path(
+        state.runtime.kind,
+        &secrets,
+        SIGNING_KEY_ENCRYPTION_KEY_SECRET,
+    );
+    let expected_previous_signing_key_path = expected_signing_key_path(
+        state.runtime.kind,
+        &secrets,
+        SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET,
+    );
+    let _ = validate_recovery_secret_contract(
+        &config,
+        &secrets,
+        &manifest.archive_files,
+        &current_signing_key_path,
+        &expected_previous_signing_key_path,
+    )?;
     ensure!(
         crate::filesystem::sha256(&secrets.join("mfa-totp-key"))? == manifest.mfa_key_sha256,
         "restored MFA key does not match the snapshot"
@@ -1513,6 +1659,16 @@ fn run_restore_migration(
     secrets: &Path,
     runtime_role: &str,
 ) -> anyhow::Result<()> {
+    let config_bytes = crate::filesystem::read_secure_regular_file(
+        config,
+        "restore deployment configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )?;
+    let config_text = std::str::from_utf8(&config_bytes)
+        .context("restore deployment configuration is not UTF-8")?;
+    let signing_key_config = parse_signing_key_encryption_config(config_text)
+        .context("restore deployment configuration has invalid signing-root settings")?;
     let lifecycle_url_path = secrets.join("database-lifecycle-url");
     let lifecycle_url = crate::filesystem::read_secure_regular_file(
         &lifecycle_url_path,
@@ -1558,6 +1714,20 @@ fn run_restore_migration(
                 scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
             }),
     );
+    if signing_key_config
+        .as_ref()
+        .is_some_and(|config| config.previous_file.is_some())
+    {
+        mounts.push(NeutralMount {
+            source: secrets.join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET),
+            destination: Path::new(CONTAINER_SECRETS_DIR)
+                .join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET),
+            read_only: true,
+            selinux_relabel: false,
+            ownership: Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        });
+    }
     let task = runtime_backend::OneShotTask {
         artifact: artifact.clone(),
         command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
@@ -1622,6 +1792,87 @@ fn secure_regular_path(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn expected_signing_key_path(
+    kind: RuntimeBackendKind,
+    secrets: &Path,
+    secret_name: &str,
+) -> PathBuf {
+    if kind.is_container() {
+        Path::new(CONTAINER_SECRETS_DIR).join(secret_name)
+    } else {
+        secrets.join(secret_name)
+    }
+}
+
+fn validate_recovery_secret_contract(
+    config: &Path,
+    secrets: &Path,
+    archive_files: &[SnapshotFile],
+    expected_path: &Path,
+    expected_previous_path: &Path,
+) -> anyhow::Result<SigningKeyEncryptionConfig> {
+    let bytes = crate::filesystem::read_secure_regular_file(
+        config,
+        "deployment configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )?;
+    let config = std::str::from_utf8(&bytes).context("deployment configuration is not UTF-8")?;
+    let configured_signing_key = parse_signing_key_encryption_config(config)
+        .context("recovery refused before path switch: invalid signing-root configuration")?;
+    let archived_signing_key = archive_files
+        .iter()
+        .any(|file| file.path == SIGNING_KEY_ENCRYPTION_KEY_ARCHIVE_PATH);
+    let Some(configured_signing_key) = configured_signing_key else {
+        bail!(
+            "recovery snapshot does not declare {SIGNING_KEY_ENCRYPTION_KEY_SETTING}; recovery refused before path switch"
+        );
+    };
+    ensure!(
+        Path::new(&configured_signing_key.file) == expected_path,
+        "recovery snapshot {SIGNING_KEY_ENCRYPTION_KEY_SETTING} does not match the canonical runtime path; recovery refused before path switch"
+    );
+    ensure!(
+        archived_signing_key,
+        "recovery snapshot declares {SIGNING_KEY_ENCRYPTION_KEY_SETTING} but omits {SIGNING_KEY_ENCRYPTION_KEY_SECRET}; recovery refused before path switch"
+    );
+    let key = crate::filesystem::read_secure_regular_file(
+        &secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET),
+        "restored signing-key encryption root",
+        false,
+        4 * 1024,
+    )
+    .context("recovery refused before path switch: cannot read signing-key encryption root")?;
+    super::install_exec::validate_signing_key_encryption_key(&key)
+        .context("recovery refused before path switch: invalid signing-key encryption root")?;
+    if let Some(previous_file) = configured_signing_key.previous_file.as_deref() {
+        ensure!(
+            Path::new(previous_file) == expected_previous_path,
+            "recovery snapshot {SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING} does not match the canonical runtime path; recovery refused before path switch"
+        );
+        let archived_previous_signing_key = archive_files
+            .iter()
+            .any(|file| file.path == SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ARCHIVE_PATH);
+        ensure!(
+            archived_previous_signing_key,
+            "recovery snapshot declares {SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING} but omits {SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET}; recovery refused before path switch"
+        );
+        let previous_key = crate::filesystem::read_secure_regular_file(
+            &secrets.join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET),
+            "restored previous signing-key encryption root",
+            false,
+            4 * 1024,
+        )
+        .context(
+            "recovery refused before path switch: cannot read previous signing-key encryption root",
+        )?;
+        super::install_exec::validate_signing_key_encryption_key(&previous_key).context(
+            "recovery refused before path switch: invalid previous signing-key encryption root",
+        )?;
+    }
+    Ok(configured_signing_key)
+}
+
 fn snapshot_file(path: &Path, root: &Path) -> anyhow::Result<SnapshotFile> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink()
@@ -1679,6 +1930,40 @@ fn create_deployment_archive(
     config: &Path,
     sentinel: &[u8],
 ) -> anyhow::Result<Vec<SnapshotFile>> {
+    let config_bytes = crate::filesystem::read_secure_regular_file(
+        config,
+        "deployment configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )?;
+    let config_text =
+        std::str::from_utf8(&config_bytes).context("deployment configuration is not UTF-8")?;
+    let signing_key_config = parse_signing_key_encryption_config(config_text)?;
+    let signing_key_path = secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET);
+    let previous_signing_key_configured = signing_key_config
+        .as_ref()
+        .is_some_and(|config| config.previous_file.is_some());
+    let previous_signing_key_path = secrets.join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET);
+    let signing_key_present = match fs::symlink_metadata(&signing_key_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("failed to inspect signing-key encryption root"),
+    };
+    let previous_signing_key_present = match fs::symlink_metadata(&previous_signing_key_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).context("failed to inspect previous signing-key encryption root");
+        }
+    };
+    ensure!(
+        signing_key_config.is_none() || signing_key_present,
+        "configured {SIGNING_KEY_ENCRYPTION_KEY_SETTING} is missing"
+    );
+    ensure!(
+        !previous_signing_key_configured || previous_signing_key_present,
+        "configured {SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING} is missing"
+    );
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1688,10 +1973,21 @@ fn create_deployment_archive(
     append_tree(&mut archive, data, Path::new("app-data"), &mut files)?;
     append_directory(&mut archive, Path::new("app-secrets"))?;
     for name in crate::target::install_exec::SECRET_PURPOSES {
+        if *name == SIGNING_KEY_ENCRYPTION_KEY_SECRET && !signing_key_present {
+            continue;
+        }
         append_regular(
             &mut archive,
             &secrets.join(name),
             &Path::new("app-secrets").join(name),
+            &mut files,
+        )?;
+    }
+    if previous_signing_key_configured {
+        append_regular(
+            &mut archive,
+            &previous_signing_key_path,
+            Path::new(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ARCHIVE_PATH),
             &mut files,
         )?;
     }
@@ -2214,11 +2510,27 @@ fn start_candidate(
         live.running && live.artifact == manifest.runtime_artifact,
         "source runtime artifact changed after snapshot"
     );
+    let config_bytes = crate::filesystem::read_secure_regular_file(
+        config,
+        "restore deployment configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )?;
+    let config_text = std::str::from_utf8(&config_bytes)
+        .context("restore deployment configuration is not UTF-8")?;
+    let signing_key_config = parse_signing_key_encryption_config(config_text)
+        .context("restore deployment configuration has invalid signing-root settings")?;
+    let previous_signing_key_configured = signing_key_config
+        .as_ref()
+        .is_some_and(|config| config.previous_file.is_some());
     let mut mounts = live.mounts.clone();
     replace_mount(&mut mounts, CONTAINER_DATA_DIR, data, false)?;
     // The runtime mounts each allowlisted secret file individually, never the
     // directory; repoint every one into the restored secrets directory.
     let mut secret_mounts = 0;
+    let previous_secret_destination =
+        Path::new(CONTAINER_SECRETS_DIR).join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET);
+    let mut previous_secret_mount = false;
     for mount in mounts.iter_mut() {
         let relative = match mount
             .destination
@@ -2232,6 +2544,18 @@ fn start_candidate(
             .context("secret mount destination has no file name")?;
         mount.source = secrets.join(name);
         mount.read_only = true;
+        secret_mounts += 1;
+        previous_secret_mount |= mount.destination == previous_secret_destination;
+    }
+    if previous_signing_key_configured && !previous_secret_mount {
+        mounts.push(NeutralMount {
+            source: secrets.join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET),
+            destination: previous_secret_destination,
+            read_only: true,
+            selinux_relabel: false,
+            ownership: Responsibility::Managed,
+            scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
+        });
         secret_mounts += 1;
     }
     ensure!(
@@ -2669,6 +2993,7 @@ fn restore_failure(error: anyhow::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     #[test]
     fn recovery_config_replaces_runtime_database_and_state_epoch() -> anyhow::Result<()> {
@@ -2873,9 +3198,19 @@ mod tests {
         for name in crate::target::install_exec::SECRET_PURPOSES {
             fs::write(secrets.join(name), name.as_bytes())?;
         }
+        let previous_root = URL_SAFE_NO_PAD.encode([8_u8; 32]);
+        fs::write(
+            secrets.join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET),
+            previous_root.as_bytes(),
+        )?;
         fs::write(secrets.join("unknown-legacy-secret"), b"excluded")?;
         let config = temp.path().join("config.yaml");
-        fs::write(&config, b"BIND: 0.0.0.0:8000")?;
+        fs::write(
+            &config,
+            format!(
+                "BIND: 0.0.0.0:8000\n{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: \"/run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\"\nSIGNING_KEY_ENCRYPTION_KEY_ID: \"deployment-test\"\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING}: \"/run/secrets/{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET}\"\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING}: \"deployment-test-previous\"\n"
+            ),
+        )?;
         let archive = temp.path().join("deployment.tar");
         let files = create_deployment_archive(&archive, &data, &secrets, &config, b"sentinel")?;
         let restored = temp.path().join("restored");
@@ -2887,6 +3222,14 @@ mod tests {
                 name.as_bytes()
             );
         }
+        assert_eq!(
+            fs::read(
+                restored
+                    .join("app-secrets")
+                    .join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET)
+            )?,
+            previous_root.as_bytes()
+        );
         assert!(!restored.join("app-secrets/unknown-legacy-secret").exists());
         fs::write(restored.join("extra"), b"not in manifest")?;
         let second = temp.path().join("second");
@@ -2898,6 +3241,280 @@ mod tests {
         assert_ne!(found.len(), files.len());
         Ok(())
     }
+
+    #[test]
+    fn configured_previous_wrapping_key_must_be_present_before_archive_creation()
+    -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-missing-previous")?;
+        let data = temp.path().join("data");
+        let secrets = temp.path().join("secrets");
+        fs::create_dir_all(data.join("instance"))?;
+        fs::create_dir_all(&secrets)?;
+        for &name in crate::target::install_exec::SECRET_PURPOSES {
+            fs::write(secrets.join(name), name.as_bytes())?;
+        }
+        let config = temp.path().join("config.yaml");
+        fs::write(
+            &config,
+            format!(
+                "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: current\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING}: previous\n"
+            ),
+        )?;
+        let archive = temp.path().join("deployment.tar");
+
+        let error = create_deployment_archive(&archive, &data, &secrets, &config, b"sentinel")
+            .expect_err("archive creation accepted a configured missing previous root");
+
+        assert!(
+            error
+                .to_string()
+                .contains(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING)
+        );
+        assert!(!archive.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn old_install_snapshot_archives_existing_secrets_without_new_wrapping_key()
+    -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-old-install")?;
+        let data = temp.path().join("data");
+        let secrets = temp.path().join("secrets");
+        fs::create_dir_all(data.join("instance"))?;
+        fs::create_dir_all(&secrets)?;
+        fs::write(data.join("instance/identity.pub"), b"identity")?;
+        for &name in crate::target::install_exec::SECRET_PURPOSES {
+            if name != SIGNING_KEY_ENCRYPTION_KEY_SECRET {
+                fs::write(secrets.join(name), name.as_bytes())?;
+            }
+        }
+        let config = temp.path().join("config.yaml");
+        fs::write(&config, b"BIND: 0.0.0.0:8000\n")?;
+        let archive = temp.path().join("deployment.tar");
+
+        let files = create_deployment_archive(&archive, &data, &secrets, &config, b"sentinel")?;
+
+        assert!(!files.iter().any(|file| {
+            file.path == format!("app-secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}")
+        }));
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == "app-secrets/mfa-totp-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_old_snapshot_before_path_switch() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-old-recovery")?;
+        let config = temp.path().join("config.yaml");
+        fs::write(&config, b"BIND: 0.0.0.0:8000\n")?;
+        let paths_switching = temp.path().join("paths-switching");
+
+        let error = validate_recovery_secret_contract(
+            &config,
+            &temp.path().join("secrets"),
+            &[],
+            Path::new("/run/secrets/signing-key-encryption-key"),
+            Path::new("/run/secrets/signing-key-previous-encryption-key"),
+        )
+        .expect_err("old snapshot without the wrapping-key contract was accepted");
+
+        assert!(
+            error
+                .to_string()
+                .contains("recovery refused before path switch")
+        );
+        assert!(!paths_switching.exists());
+        assert_eq!(fs::read(&config)?, b"BIND: 0.0.0.0:8000\n");
+        Ok(())
+    }
+
+    #[test]
+    fn configured_wrapping_key_must_be_present_in_snapshot_archive() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-new-recovery")?;
+        let config = temp.path().join("config.yaml");
+        fs::write(
+            &config,
+            format!(
+                "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: \"/run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\"\nSIGNING_KEY_ENCRYPTION_KEY_ID: \"deployment-test\"\n"
+            ),
+        )?;
+        let archive_files = Vec::new();
+
+        let error = validate_recovery_secret_contract(
+            &config,
+            &temp.path().join("secrets"),
+            &archive_files,
+            Path::new("/run/secrets/signing-key-encryption-key"),
+            Path::new("/run/secrets/signing-key-previous-encryption-key"),
+        )
+        .expect_err("configured wrapping key missing from archive was accepted");
+
+        assert!(
+            error
+                .to_string()
+                .contains("omits signing-key-encryption-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_noncanonical_wrapping_key_path_before_path_switch() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-wrong-key-path")?;
+        let config = temp.path().join("config.yaml");
+        let secrets = temp.path().join("secrets");
+        fs::create_dir(&secrets)?;
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        fs::write(
+            secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET),
+            key.as_bytes(),
+        )?;
+        fs::write(
+            &config,
+            format!(
+                "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/other-key\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: deployment-test\n"
+            ),
+        )?;
+        let archive_files = vec![SnapshotFile {
+            path: SIGNING_KEY_ENCRYPTION_KEY_ARCHIVE_PATH.to_owned(),
+            size: key.len() as u64,
+            sha256: backup::hex_digest(key.as_bytes()),
+        }];
+
+        let error = validate_recovery_secret_contract(
+            &config,
+            &secrets,
+            &archive_files,
+            Path::new("/run/secrets/signing-key-encryption-key"),
+            Path::new("/run/secrets/signing-key-previous-encryption-key"),
+        )
+        .expect_err("noncanonical configured wrapping-key path was accepted");
+
+        assert!(error.to_string().contains("canonical runtime path"));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_malformed_wrapping_key_before_path_switch() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-invalid-key")?;
+        let config = temp.path().join("config.yaml");
+        let secrets = temp.path().join("secrets");
+        fs::create_dir(&secrets)?;
+        let key = b"invalid";
+        fs::write(secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET), key)?;
+        fs::write(
+            &config,
+            format!(
+                "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: deployment-test\n"
+            ),
+        )?;
+        let archive_files = vec![SnapshotFile {
+            path: SIGNING_KEY_ENCRYPTION_KEY_ARCHIVE_PATH.to_owned(),
+            size: key.len() as u64,
+            sha256: backup::hex_digest(key),
+        }];
+
+        let error = validate_recovery_secret_contract(
+            &config,
+            &secrets,
+            &archive_files,
+            Path::new("/run/secrets/signing-key-encryption-key"),
+            Path::new("/run/secrets/signing-key-previous-encryption-key"),
+        )
+        .expect_err("malformed wrapping-key material was accepted");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid signing-key encryption root")
+        );
+        assert!(error.to_string().contains("before path switch"));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_missing_previous_wrapping_key_before_path_switch() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-missing-previous-recovery")?;
+        let config = temp.path().join("config.yaml");
+        let secrets = temp.path().join("secrets");
+        fs::create_dir(&secrets)?;
+        let current_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        fs::write(
+            secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET),
+            current_key.as_bytes(),
+        )?;
+        fs::write(
+            &config,
+            format!(
+                "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: current\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING}: previous\n"
+            ),
+        )?;
+        let archive_files = vec![SnapshotFile {
+            path: SIGNING_KEY_ENCRYPTION_KEY_ARCHIVE_PATH.to_owned(),
+            size: current_key.len() as u64,
+            sha256: backup::hex_digest(current_key.as_bytes()),
+        }];
+
+        let error = validate_recovery_secret_contract(
+            &config,
+            &secrets,
+            &archive_files,
+            Path::new("/run/secrets/signing-key-encryption-key"),
+            Path::new("/run/secrets/signing-key-previous-encryption-key"),
+        )
+        .expect_err("recovery accepted a configured missing previous root");
+
+        assert!(
+            error
+                .to_string()
+                .contains("omits signing-key-previous-encryption-key")
+        );
+        assert!(error.to_string().contains("before path switch"));
+        Ok(())
+    }
+
+    #[test]
+    fn signing_root_config_requires_file_and_id() -> anyhow::Result<()> {
+        let parsed = parse_signing_key_encryption_config(
+            "SIGNING_KEY_ENCRYPTION_KEY_FILE: /run/secrets/signing-key-encryption-key\n\
+             SIGNING_KEY_ENCRYPTION_KEY_ID: deployment-test\n",
+        )?
+        .expect("complete signing-root configuration was ignored");
+        assert_eq!(parsed.file, "/run/secrets/signing-key-encryption-key");
+        assert_eq!(parsed.id, "deployment-test");
+        assert_eq!(parsed.previous_file.as_deref(), None);
+        assert_eq!(parsed.previous_id.as_deref(), None);
+        let parsed = parse_signing_key_encryption_config(
+            "SIGNING_KEY_ENCRYPTION_KEY_FILE: /run/secrets/signing-key-encryption-key\n\
+             SIGNING_KEY_ENCRYPTION_KEY_ID: deployment-test\n\
+             SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_FILE: /run/secrets/signing-key-previous-encryption-key\n\
+             SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID: previous\n",
+        )?
+        .expect("complete previous signing-root configuration was ignored");
+        assert_eq!(
+            parsed.previous_file.as_deref(),
+            Some("/run/secrets/signing-key-previous-encryption-key")
+        );
+        assert_eq!(parsed.previous_id.as_deref(), Some("previous"));
+        assert!(
+            parse_signing_key_encryption_config(
+                "SIGNING_KEY_ENCRYPTION_KEY_FILE: /run/secrets/signing-key-encryption-key\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_signing_key_encryption_config(
+                "SIGNING_KEY_ENCRYPTION_KEY_FILE: /run/secrets/signing-key-encryption-key\n\
+                 SIGNING_KEY_ENCRYPTION_KEY_ID: deployment-test\n\
+                 SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_FILE: /run/secrets/signing-key-previous-encryption-key\n"
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn postgres_database_urls_use_maintenance_database_for_create_and_drop() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-postgres-url-test")?;
