@@ -24,9 +24,37 @@ struct ParallelFixtureTransport {
     created_plans: Mutex<Vec<String>>,
     fail_module_for_plan: Option<String>,
     module_result: String,
+    modules_per_plan: AtomicUsize,
+    failed_modules: Mutex<HashSet<String>>,
+    nonterminal_modules: Mutex<HashSet<String>>,
 }
 
 struct RejectCreatedPlanObserver;
+
+struct RejectCreatedModuleObserver;
+
+impl SuiteResourceObserver for RejectCreatedModuleObserver {
+    fn plan_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn plan_created(
+        &self,
+        _origin: &Origin,
+        _intent_id: &str,
+        _plan_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_create_intent(&self, _origin: &Origin, _intent_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn module_created(&self, _intent_id: &str, _module_id: &str) -> Result<(), String> {
+        Err("simulated durable module persistence failure".to_owned())
+    }
+}
 
 struct RetainSuiteObserver;
 
@@ -138,7 +166,12 @@ impl Transport for ParallelFixtureTransport {
                 serde_json::json!({
                     "id": plan,
                     "name": plan,
-                    "modules": [{"testModule": format!("test-{plan}")}]
+                    "modules": (0..self.modules_per_plan.load(Ordering::SeqCst))
+                        .map(|index| serde_json::json!({"testModule": if index == 0 {
+                            format!("test-{plan}")
+                        } else {
+                            format!("test-{plan}-{index}")
+                        }})).collect::<Vec<_>>()
                 }),
             );
         }
@@ -152,7 +185,17 @@ impl Transport for ParallelFixtureTransport {
             if self.fail_module_for_plan.as_deref() == Some(plan.as_str()) {
                 return Self::response(500, serde_json::json!({}));
             }
-            return Self::response(201, serde_json::json!({"id": format!("m-{plan}")}));
+            let test = request
+                .url()
+                .query_pairs()
+                .find(|(key, _)| key == "test")
+                .unwrap()
+                .1
+                .into_owned();
+            return Self::response(
+                201,
+                serde_json::json!({"id": format!("m-{}", test.trim_start_matches("test-"))}),
+            );
         }
         if path.starts_with("/api/runner/m-") && path.ends_with("/wait-state") {
             let active = self.active_waits.fetch_add(1, Ordering::SeqCst) + 1;
@@ -170,11 +213,14 @@ impl Transport for ParallelFixtureTransport {
             return Self::response(200, serde_json::json!({"state":"FINISHED"}));
         }
         if let Some(module_id) = path.strip_prefix("/api/info/") {
-            let finished = self.finished.lock().expect("finished").contains(module_id);
+            let finished = self.finished.lock().expect("finished").contains(module_id)
+                && !self.nonterminal_modules.lock().unwrap().contains(module_id);
             return Self::response(
                 200,
                 if finished {
-                    serde_json::json!({"status":"FINISHED","result":self.module_result})
+                    serde_json::json!({"status":"FINISHED","result":
+                        if self.failed_modules.lock().unwrap().contains(module_id) { "FAILED" }
+                        else { &self.module_result }})
                 } else {
                     serde_json::json!({"status":"RUNNING"})
                 },
@@ -184,6 +230,10 @@ impl Transport for ParallelFixtureTransport {
             return Self::response(200, serde_json::json!([]));
         }
         if path.starts_with("/api/runner/") && request.method() == HttpMethod::Delete {
+            self.nonterminal_modules
+                .lock()
+                .unwrap()
+                .remove(path.trim_start_matches("/api/runner/"));
             return Self::response(200, serde_json::json!({}));
         }
         if path.starts_with("/api/plan/") && request.method() == HttpMethod::Delete {
@@ -233,6 +283,9 @@ fn parallel_fixture_with_lanes(
         created_plans: Mutex::new(Vec::new()),
         fail_module_for_plan: fail_module_for_plan.map(ToOwned::to_owned),
         module_result: module_result.to_owned(),
+        modules_per_plan: AtomicUsize::new(1),
+        failed_modules: Mutex::new(HashSet::new()),
+        nonterminal_modules: Mutex::new(HashSet::new()),
     });
     let client = SuiteClient::with_transport(
         Origin::parse("https://suite.example").expect("origin"),
@@ -319,6 +372,92 @@ fn parallel_fixture_with_lanes(
 
 #[derive(Default)]
 struct RecordingSink(Vec<ProgressSnapshot>);
+
+#[test]
+fn module_persistence_failure_stops_dispatch_but_preserves_created_instance_for_cleanup() {
+    let (mut runner, _) = parallel_fixture(serde_json::json!({}), &["plan-a", "plan-b"], None);
+    runner.config.jobs = 1;
+    runner.config.suite_resource_observer = Some(Arc::new(RejectCreatedModuleObserver));
+    let report = runner.run(&mut ()).report;
+    assert!(runner.config.control.is_interrupted());
+    assert_eq!(report.plans[0].created_instances, 1);
+    assert_eq!(report.plans[1].created_instances, 0);
+    assert_eq!(report.modules.len(), 1);
+    assert_eq!(report.modules[0].module_id.as_deref(), Some("m-plan-a"));
+    assert_eq!(report.cleanup.cancelled, ["m-plan-a"]);
+    assert!(!report.local_success);
+}
+
+#[test]
+fn serial_failure_policy_controls_later_modules_and_plans() {
+    for fail_fast in [false, true] {
+        let (mut runner, transport) =
+            parallel_fixture(serde_json::json!({}), &["plan-a", "plan-b"], None);
+        runner.config.jobs = 1;
+        runner.config.control = RunControl::with_fail_fast(fail_fast);
+        runner.config.selected_resource_budget.modules = 4;
+        for budget in runner.config.plan_resource_budgets.values_mut() {
+            budget.modules = 2;
+        }
+        transport.modules_per_plan.store(2, Ordering::SeqCst);
+        transport
+            .failed_modules
+            .lock()
+            .unwrap()
+            .insert("m-plan-a".to_owned());
+
+        let report = runner.run(&mut ()).report;
+        assert_eq!(report.modules.len(), if fail_fast { 1 } else { 4 });
+        assert_eq!(
+            report.plans[0].created_instances,
+            if fail_fast { 1 } else { 2 }
+        );
+        assert_eq!(
+            report.plans[1].created_instances,
+            if fail_fast { 0 } else { 2 }
+        );
+        assert_eq!(report.modules[0].official_result.as_deref(), Some("FAILED"));
+        assert_eq!(report.progress.groups[0].status, GroupStatus::Failed);
+        assert!(!report.acceptance_pass);
+        assert_eq!(report.fail_fast, fail_fast);
+        if !fail_fast {
+            assert!(
+                report.modules[1..]
+                    .iter()
+                    .all(|module| module.outcome == ModuleOutcome::Passed)
+            );
+            assert!(report.orchestration_integrity.all_modules_terminal);
+        }
+    }
+}
+
+#[test]
+fn continue_mode_does_not_reuse_an_unsettled_module_alias() {
+    let (mut runner, transport) =
+        parallel_fixture(serde_json::json!({}), &["plan-a", "plan-b"], None);
+    runner.config.jobs = 1;
+    runner.config.selected_resource_budget.modules = 4;
+    for budget in runner.config.plan_resource_budgets.values_mut() {
+        budget.modules = 2;
+    }
+    transport.modules_per_plan.store(2, Ordering::SeqCst);
+    transport
+        .nonterminal_modules
+        .lock()
+        .unwrap()
+        .insert("m-plan-a".to_owned());
+    let report = runner.run(&mut ()).report;
+    assert_eq!(report.plans[0].created_instances, 1);
+    assert_eq!(report.plans[1].created_instances, 2);
+    assert_eq!(report.cleanup.cancelled, ["m-plan-a"]);
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error == "Suite module did not reach a terminal status")
+    );
+    assert!(!report.local_success);
+}
 
 impl ProgressSink for RecordingSink {
     fn update(&mut self, event: &ProgressEvent) {
@@ -607,7 +746,7 @@ fn parallel_non_pass_outcomes_complete_locally_without_claiming_suite_pass() {
 }
 
 #[test]
-fn failed_outcome_stops_queued_plans_immediately() {
+fn failed_outcome_continues_queued_plans_by_default() {
     let (runner, _) = parallel_fixture_with_result(
         serde_json::json!({}),
         &["plan-a", "plan-b", "plan-c"],
@@ -628,8 +767,29 @@ fn failed_outcome_stops_queued_plans_immediately() {
             .find(|plan| plan.matrix_plan_id == "plan-c")
             .expect("queued plan report")
             .created_instances,
-        0,
-        "the first FAILED outcome must stop queued Suite work"
+        1,
+        "a terminal Suite failure must not stop independent queued work by default"
+    );
+}
+
+#[test]
+fn explicit_fail_fast_stops_queued_plans() {
+    let (mut runner, _) = parallel_fixture_with_result(
+        serde_json::json!({}),
+        &["plan-a", "plan-b", "plan-c"],
+        None,
+        "FAILED",
+    );
+    runner.config.control = RunControl::with_fail_fast(true);
+    let report = runner.run(&mut ()).report;
+    assert_eq!(
+        report
+            .plans
+            .iter()
+            .find(|plan| plan.matrix_plan_id == "plan-c")
+            .expect("queued plan report")
+            .created_instances,
+        0
     );
 }
 

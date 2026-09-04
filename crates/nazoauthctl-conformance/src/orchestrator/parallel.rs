@@ -35,6 +35,7 @@ struct ChannelSink {
     index: usize,
     sender: mpsc::Sender<WorkerMessage>,
     stop_launching: Arc<AtomicBool>,
+    fail_fast: bool,
 }
 
 impl ProgressSink for ChannelSink {
@@ -43,11 +44,12 @@ impl ProgressSink for ChannelSink {
     }
 
     fn update(&mut self, event: &ProgressEvent) {
-        if event
-            .snapshot
-            .groups
-            .iter()
-            .any(|group| group.status == GroupStatus::Failed)
+        if self.fail_fast
+            && event
+                .snapshot
+                .groups
+                .iter()
+                .any(|group| group.status == GroupStatus::Failed)
         {
             self.stop_launching.store(true, Ordering::SeqCst);
         }
@@ -143,11 +145,13 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             index: next_index,
                             sender: sender.clone(),
                             stop_launching: Arc::clone(&stop_launching),
+                            fail_fast: runner.config.control.is_fail_fast(),
                         };
                         let summary = child
                             .run_prepared(&mut progress, worker_prepared(&work_ref[next_index]));
-                        if completed_plan_stops_dispatch(&summary.report)
-                            || has_unsettled_suite_resources(&summary.report)
+                        if has_unsettled_suite_resources(&summary.report)
+                            || (runner.config.control.is_fail_fast()
+                                && completed_plan_stops_dispatch(&summary.report))
                         {
                             stop_launching.store(true, Ordering::SeqCst);
                         }
@@ -260,6 +264,7 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
     group.status = GroupStatus::Remaining;
     group.passed = 0;
     group.reviewed = 0;
+    group.warnings = 0;
     group.skipped = 0;
     group.failed = 0;
     group.incomplete = 0;
@@ -299,6 +304,7 @@ fn aggregate_progress(
         group.status = GroupStatus::Remaining;
         group.passed = 0;
         group.reviewed = 0;
+        group.warnings = 0;
         group.skipped = 0;
         group.failed = 0;
         group.incomplete = 0;
@@ -316,6 +322,7 @@ fn aggregate_progress(
         target.completed += source.completed;
         target.passed += source.passed;
         target.reviewed += source.reviewed;
+        target.warnings += source.warnings;
         target.skipped += source.skipped;
         target.failed += source.failed;
         target.incomplete += source.incomplete;
@@ -348,6 +355,12 @@ fn aggregate_progress(
                 .and_then(|snapshot| snapshot.groups.first())
                 .is_some_and(|group| group.status == GroupStatus::Review)
         });
+        let any_warning = indices.iter().any(|index| {
+            snapshots[*index]
+                .as_ref()
+                .and_then(|snapshot| snapshot.groups.first())
+                .is_some_and(|group| group.status == GroupStatus::Warning)
+        });
         let any_skipped = indices.iter().any(|index| {
             snapshots[*index]
                 .as_ref()
@@ -361,6 +374,8 @@ fn aggregate_progress(
         } else if indices.iter().all(|index| finished[*index]) {
             if any_review {
                 GroupStatus::Review
+            } else if any_warning {
+                GroupStatus::Warning
             } else if any_skipped {
                 GroupStatus::Skipped
             } else {
@@ -499,6 +514,7 @@ fn merge_reports(
             &cleanup_plan_ids,
             runner.config.suite_resource_observer.as_ref(),
             &mut cleanup,
+            || {},
         );
     } else {
         cleanup_all(
@@ -507,6 +523,7 @@ fn merge_reports(
             &cleanup_plan_ids,
             runner.config.suite_resource_observer.as_ref(),
             &mut cleanup,
+            || {},
         );
     }
     let retention_candidate_settled =
@@ -544,7 +561,10 @@ fn merge_reports(
         && orchestration_integrity.suite_resources_settled;
     RunSummary {
         report: ConformanceReport {
-            schema: if deferred_review_modules > 0 { 4 } else { 3 },
+            excluded_plans: Vec::new(),
+            fail_fast: runner.config.control.is_fail_fast(),
+            // Schema 5 adds explicit warning and execution-boundary facts.
+            schema: 5,
             matrix_digest: runner.config.matrix.digest.clone(),
             suite_origin: runner.config.client.origin().to_string(),
             auth_probe: prepared.auth_probe,
@@ -555,6 +575,7 @@ fn merge_reports(
             review_pending: deferred_review_modules > 0 || external_review_pending,
             human_review_required: !outcomes.human_review_modules.is_empty(),
             human_review_modules: outcomes.human_review_modules,
+            warning_modules: outcomes.warning_modules,
             deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
             expected_skipped_modules: matrix_expectations.expected_skipped_modules,

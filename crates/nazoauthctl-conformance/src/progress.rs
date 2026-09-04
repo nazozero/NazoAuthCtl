@@ -38,6 +38,7 @@ pub fn redacted_variant(values: &BTreeMap<String, String>) -> BTreeMap<String, S
 pub enum GroupStatus {
     Passed,
     Review,
+    Warning,
     Skipped,
     Failed,
     Incomplete,
@@ -125,6 +126,11 @@ pub struct GroupProgress {
     pub passed: usize,
     #[serde(default)]
     pub reviewed: usize,
+    /// Modules whose terminal outcome is `WARNING`. A `REVIEW` result that
+    /// also has warning conditions remains in `reviewed`; it is listed in the
+    /// report's separate warning detail.
+    #[serde(default)]
+    pub warnings: usize,
     #[serde(default)]
     pub skipped: usize,
     #[serde(default)]
@@ -144,6 +150,8 @@ pub struct ProgressSnapshot {
     pub groups: Vec<GroupProgress>,
     pub passed_groups: usize,
     pub review_groups: usize,
+    #[serde(default)]
+    pub warning_groups: usize,
     pub skipped_groups: usize,
     pub failed_groups: usize,
     pub incomplete_groups: usize,
@@ -155,6 +163,8 @@ pub struct ProgressSnapshot {
     pub passed: usize,
     #[serde(default)]
     pub reviewed: usize,
+    #[serde(default)]
+    pub warnings: usize,
     #[serde(default)]
     pub skipped: usize,
     #[serde(default)]
@@ -211,7 +221,7 @@ impl<W: Write> ProgressSink for StableRenderer<W> {
         let labels = labels(self.language);
         let _ = writeln!(
             self.writer,
-            "{}: {}/{} ({:>3}%) {} {} · {} {} · {} {} · {} {} · {} {} · {} {} · {} {}{}",
+            "{}: {}/{} ({:>3}%) {} {} · {} {} · {} {} · {} {} · {} {} · {} {} · {} {} · {} {}{}",
             labels.title,
             event.snapshot.completed,
             event.snapshot.total,
@@ -220,6 +230,8 @@ impl<W: Write> ProgressSink for StableRenderer<W> {
             event.snapshot.passed,
             labels.review,
             event.snapshot.reviewed,
+            labels.warning,
+            event.snapshot.warnings,
             labels.skipped,
             event.snapshot.skipped,
             labels.failed,
@@ -252,6 +264,7 @@ struct Labels {
     current: &'static str,
     passed: &'static str,
     review: &'static str,
+    warning: &'static str,
     skipped: &'static str,
     failed: &'static str,
     incomplete: &'static str,
@@ -267,6 +280,7 @@ fn labels(language: OutputLanguage) -> Labels {
             current: "当前",
             passed: "通过",
             review: "待复核",
+            warning: "警告模块",
             skipped: "跳过",
             failed: "失败",
             incomplete: "未完成",
@@ -279,6 +293,7 @@ fn labels(language: OutputLanguage) -> Labels {
             current: "Current",
             passed: "Passed",
             review: "Review",
+            warning: "Warning modules",
             skipped: "Skipped",
             failed: "Failed",
             incomplete: "Incomplete",
@@ -508,6 +523,7 @@ mod tests {
                 groups: vec![],
                 passed_groups: 0,
                 review_groups: 0,
+                warning_groups: 0,
                 skipped_groups: 0,
                 failed_groups: 0,
                 incomplete_groups: 0,
@@ -515,6 +531,7 @@ mod tests {
                 remaining_groups: 0,
                 passed: 1,
                 reviewed: 0,
+                warnings: 0,
                 skipped: 0,
                 failed: 0,
                 incomplete: 0,
@@ -546,6 +563,7 @@ mod tests {
                     status: GroupStatus::Running,
                     passed: 0,
                     reviewed: 0,
+                    warnings: 0,
                     skipped: 0,
                     failed: 0,
                     incomplete: 0,
@@ -554,6 +572,7 @@ mod tests {
                 }],
                 passed_groups: 0,
                 review_groups: 0,
+                warning_groups: 0,
                 skipped_groups: 0,
                 failed_groups: 0,
                 incomplete_groups: 0,
@@ -561,6 +580,7 @@ mod tests {
                 remaining_groups: 0,
                 passed: 0,
                 reviewed: 0,
+                warnings: 0,
                 skipped: 0,
                 failed: 0,
                 incomplete: 0,

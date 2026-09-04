@@ -64,17 +64,10 @@ struct BrowserReviewEvidence {
     entered_browser_program: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RunControl {
     interrupted: Arc<AtomicBool>,
-}
-
-impl Default for RunControl {
-    fn default() -> Self {
-        Self {
-            interrupted: Arc::new(AtomicBool::new(false)),
-        }
-    }
+    fail_fast: bool,
 }
 
 impl RunControl {
@@ -84,6 +77,17 @@ impl RunControl {
 
     pub fn is_interrupted(&self) -> bool {
         self.interrupted.load(Ordering::SeqCst)
+    }
+
+    pub fn with_fail_fast(enabled: bool) -> Self {
+        Self {
+            interrupted: Arc::new(AtomicBool::new(false)),
+            fail_fast: enabled,
+        }
+    }
+
+    pub fn is_fail_fast(&self) -> bool {
+        self.fail_fast
     }
 }
 
@@ -205,6 +209,11 @@ struct PreparedRun {
     current_variant: Option<BTreeMap<String, String>>,
 }
 
+struct CreatedModule {
+    group_index: usize,
+    context: ModuleReportContext,
+}
+
 struct RunErrors {
     values: Vec<String>,
     control: RunControl,
@@ -216,6 +225,13 @@ impl RunErrors {
     }
 
     fn push(&mut self, error: String) {
+        if self.control.is_fail_fast() {
+            self.control.interrupt();
+        }
+        self.values.push(error);
+    }
+
+    fn push_fatal(&mut self, error: String) {
         self.control.interrupt();
         self.values.push(error);
     }
@@ -532,6 +548,84 @@ impl ConformanceRunner {
         }
     }
 
+    /// Once dispatch has stopped, refresh each created instance that still has
+    /// no terminal Suite observation. This is the sole reconciliation path for
+    /// browser errors and shared-interrupt workers, before cleanup can remove
+    /// Suite evidence.
+    fn collect_unreported_terminal_modules(
+        &self,
+        created_modules: &[CreatedModule],
+        groups: &mut [GroupProgress],
+        modules: &mut Vec<ModuleReport>,
+        errors: &mut RunErrors,
+        await_cancellation: bool,
+    ) {
+        let settled_reports = modules
+            .iter()
+            // A terminal observation is final. Deferred/external review owns
+            // capture and retention metadata even before Suite termination.
+            // Every other nonterminal snapshot must be refreshed: from_info
+            // can classify a WAITING instance with a blocking log as Failed.
+            .filter(|module| {
+                module.terminal
+                    || matches!(
+                        module.outcome,
+                        ModuleOutcome::DeferredReviewPending | ModuleOutcome::Review
+                    )
+            })
+            .filter_map(|module| module.module_id.clone())
+            .collect::<BTreeSet<_>>();
+        for created in created_modules {
+            let Some(module_id) = created.context.module_id.as_deref() else {
+                continue;
+            };
+            if settled_reports.contains(module_id) {
+                continue;
+            }
+            let mut info = match self.config.client.module_info(module_id) {
+                Ok(info) => info,
+                Err(error) => {
+                    errors.push(format!(
+                        "Suite module reconciliation info read failed for {module_id}: {}",
+                        safe_error(&error)
+                    ));
+                    continue;
+                }
+            };
+            if await_cancellation
+                && !is_terminal(&info)
+                && let Ok(settled) = self.config.client.wait_for_state(
+                    module_id,
+                    &["FINISHED", "INTERRUPTED"],
+                    Duration::from_secs(5),
+                )
+            {
+                info = settled;
+            }
+            let log = match self.config.client.module_log(module_id) {
+                Ok(log) => log,
+                Err(error) => {
+                    errors.push(format!(
+                        "Suite module reconciliation log read failed for {module_id}: {}",
+                        safe_error(&error)
+                    ));
+                    continue;
+                }
+            };
+            let mut context = created.context.clone();
+            context.terminal = is_terminal(&info);
+            let report = ModuleReport::from_info(context, info, log);
+            if report.terminal {
+                record_module_progress(&mut groups[created.group_index], &report);
+            }
+            // Replace a prior nonterminal snapshot for this exact instance.
+            // A later cancellation can turn it into authoritative FINISHED or
+            // INTERRUPTED state, but no result is invented when it does not.
+            modules.retain(|module| module.module_id.as_deref() != Some(module_id));
+            modules.push(report);
+        }
+    }
+
     fn drive_browser_waiting_interruptible<S: ProgressSink>(
         &self,
         sink: &mut S,
@@ -729,6 +823,7 @@ impl ConformanceRunner {
                 status: GroupStatus::Remaining,
                 passed: 0,
                 reviewed: 0,
+                warnings: 0,
                 skipped: 0,
                 failed: 0,
                 incomplete: 0,
@@ -966,8 +1061,8 @@ impl ConformanceRunner {
         } = prepared;
         let mut errors = RunErrors::new(errors, self.config.control.clone());
         let mut modules = Vec::new();
+        let mut created_modules = Vec::new();
         let mut cleanup = CleanupReport::default();
-        let mut module_ids = Vec::<String>::new();
         let mut current_test = None;
         let retention_requested = self
             .config
@@ -990,10 +1085,13 @@ impl ConformanceRunner {
             None,
         );
 
-        // Phase 2: create and execute all runner instances. The first failure
-        // stops new work while cleanup still covers every allocated resource.
+        // Phase 2: collect all terminal outcomes unless diagnostic fail-fast
+        // or an unsafe execution boundary interrupts dispatch.
         if errors.is_empty() {
-            'execute: for plan in &mut planned {
+            'plans: for plan in &mut planned {
+                if self.config.control.is_interrupted() {
+                    break 'plans;
+                }
                 let group_index = plan.group_index;
                 groups[group_index].status = GroupStatus::Running;
                 current_profile = Some(groups[group_index].profile.clone());
@@ -1005,7 +1103,7 @@ impl ConformanceRunner {
                     current_variant.clone(),
                     None,
                 );
-                for (module_index, module) in plan.modules.iter().enumerate() {
+                'execute: for (module_index, module) in plan.modules.iter().enumerate() {
                     if self.config.control.is_interrupted() {
                         errors.push("run interrupted".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
@@ -1033,7 +1131,7 @@ impl ConformanceRunner {
                             if let Err(error) = observer
                                 .module_create_intent(self.config.client.origin(), &intent_id)
                             {
-                                errors.push(error);
+                                errors.push_fatal(error);
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
@@ -1048,23 +1146,36 @@ impl ConformanceRunner {
                     {
                         Ok(instance) => instance,
                         Err(error) => {
-                            errors.push(safe_error(&error));
+                            errors.push_fatal(safe_error(&error));
                             groups[group_index].status = GroupStatus::Failed;
                             break 'execute;
                         }
                     };
-                    module_ids.push(instance.id.clone());
+                    // Own the returned allocation before durable persistence can
+                    // fail, so reconciliation and cleanup cannot lose its ID.
+                    plans[plan.report_index].created_instances += 1;
+                    created_modules.push(CreatedModule {
+                        group_index,
+                        context: ModuleReportContext {
+                            matrix_plan_id: plan.matrix_plan_id.clone(),
+                            suite_plan_id: plan.suite_plan_id.clone(),
+                            module_id: Some(instance.id.clone()),
+                            test_name: module.test_name.clone(),
+                            variant: effective_module_identity_variant(plan, module),
+                            terminal: false,
+                            expected_result: plan.expected_results.get(&module.test_name).cloned(),
+                        },
+                    });
+                    groups[group_index].running += 1;
+                    groups[group_index].remaining = groups[group_index].remaining.saturating_sub(1);
                     if let (Some(observer), Some(intent_id)) =
                         (&self.config.suite_resource_observer, &module_create_intent)
                         && let Err(error) = observer.module_created(intent_id, &instance.id)
                     {
-                        errors.push(error);
+                        errors.push_fatal(error);
                         groups[group_index].status = GroupStatus::Failed;
                         break 'execute;
                     }
-                    plans[plan.report_index].created_instances += 1;
-                    groups[group_index].running += 1;
-                    groups[group_index].remaining = groups[group_index].remaining.saturating_sub(1);
                     emit_progress(
                         sink,
                         &groups,
@@ -1565,6 +1676,13 @@ impl ConformanceRunner {
                                     Err(error) => {
                                         errors.push(error);
                                         groups[group_index].status = GroupStatus::Failed;
+                                        emit_progress(
+                                            sink,
+                                            &groups,
+                                            current_profile.clone(),
+                                            current_variant.clone(),
+                                            current_test.clone(),
+                                        );
                                         break 'execute;
                                     }
                                 }
@@ -1598,6 +1716,13 @@ impl ConformanceRunner {
                                 Err(error) => {
                                     errors.push(error);
                                     groups[group_index].status = GroupStatus::Failed;
+                                    emit_progress(
+                                        sink,
+                                        &groups,
+                                        current_profile.clone(),
+                                        current_variant.clone(),
+                                        current_test.clone(),
+                                    );
                                     break 'execute;
                                 }
                             }
@@ -1699,25 +1824,13 @@ impl ConformanceRunner {
                     }
                     modules.push(module_report);
                     let module_outcome = modules.last().map(|module| module.outcome);
-                    if terminal
+                    let module_settled = terminal
                         || external_review_pending
                         || modules
                             .last()
-                            .is_some_and(|module| module.deferred_review_pending.is_some())
-                    {
-                        groups[group_index].running = groups[group_index].running.saturating_sub(1);
-                        groups[group_index].completed += 1;
-                        match module_outcome {
-                            Some(ModuleOutcome::Passed) => groups[group_index].passed += 1,
-                            Some(ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending) => {
-                                groups[group_index].reviewed += 1
-                            }
-                            Some(ModuleOutcome::Skipped) => groups[group_index].skipped += 1,
-                            Some(ModuleOutcome::Failed) => groups[group_index].failed += 1,
-                            Some(ModuleOutcome::Incomplete) | None => {
-                                groups[group_index].incomplete += 1;
-                            }
-                        }
+                            .is_some_and(|module| module.deferred_review_pending.is_some());
+                    if module_settled && let Some(module) = modules.last() {
+                        record_module_progress(&mut groups[group_index], module);
                     }
                     if matches!(module_outcome, Some(ModuleOutcome::Failed)) {
                         groups[group_index].status = GroupStatus::Failed;
@@ -1733,7 +1846,15 @@ impl ConformanceRunner {
                         current_variant.clone(),
                         current_test.clone(),
                     );
-                    if matches!(module_outcome, Some(ModuleOutcome::Failed)) {
+                    if !module_settled {
+                        // The next module would reuse this plan's Suite alias.
+                        // Keep an unsettled allocation at the plan boundary.
+                        break 'execute;
+                    }
+                    if matches!(module_outcome, Some(ModuleOutcome::Failed))
+                        && self.config.control.is_fail_fast()
+                    {
+                        self.config.control.interrupt();
                         break 'execute;
                     }
                     if external_review_pending {
@@ -1748,13 +1869,16 @@ impl ConformanceRunner {
                         groups[group_index].status = GroupStatus::Failed;
                         break 'execute;
                     }
-                    if !errors.is_empty() {
-                        break 'execute;
-                    }
                 }
                 if groups[group_index].status == GroupStatus::Running {
-                    groups[group_index].status = if groups[group_index].reviewed > 0 {
+                    groups[group_index].status = if groups[group_index].failed > 0 {
+                        GroupStatus::Failed
+                    } else if groups[group_index].incomplete > 0 {
+                        GroupStatus::Incomplete
+                    } else if groups[group_index].reviewed > 0 {
                         GroupStatus::Review
+                    } else if groups[group_index].warnings > 0 {
+                        GroupStatus::Warning
                     } else if groups[group_index].skipped > 0 {
                         GroupStatus::Skipped
                     } else {
@@ -1771,6 +1895,14 @@ impl ConformanceRunner {
             }
         }
 
+        self.collect_unreported_terminal_modules(
+            &created_modules,
+            &mut groups,
+            &mut modules,
+            &mut errors,
+            false,
+        );
+
         // A terminal Suite module is already owned by its plan deletion.  A
         // cancellation after a terminal result can race the Suite's final
         // callback, while an unreported allocation still needs cancellation
@@ -1782,7 +1914,6 @@ impl ConformanceRunner {
             .sum::<usize>();
         let terminal_modules = modules.iter().filter(|module| module.terminal).count();
         let all_modules_instantiated = defined_modules == created_instances;
-        let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
         let deferred_review_modules = modules
             .iter()
             .filter(|module| module.deferred_review_pending.is_some())
@@ -1828,13 +1959,26 @@ impl ConformanceRunner {
             .cloned()
             .collect::<Vec<_>>();
         if retained_suite_plan_ids.is_empty() {
-            let cancellable_module_ids = cancellable_module_ids(&module_ids, &modules);
+            let created_module_ids = created_modules
+                .iter()
+                .filter_map(|created| created.context.module_id.clone())
+                .collect::<Vec<_>>();
+            let cancellable_module_ids = cancellable_module_ids(&created_module_ids, &modules);
             cleanup_all(
                 &self.config.client,
                 &cancellable_module_ids,
                 &cleanup_plan_ids,
                 self.config.suite_resource_observer.as_ref(),
                 &mut cleanup,
+                || {
+                    self.collect_unreported_terminal_modules(
+                        &created_modules,
+                        &mut groups,
+                        &mut modules,
+                        &mut errors,
+                        true,
+                    );
+                },
             );
         } else {
             cleanup_all(
@@ -1843,8 +1987,37 @@ impl ConformanceRunner {
                 &cleanup_plan_ids,
                 self.config.suite_resource_observer.as_ref(),
                 &mut cleanup,
+                || {
+                    self.collect_unreported_terminal_modules(
+                        &created_modules,
+                        &mut groups,
+                        &mut modules,
+                        &mut errors,
+                        true,
+                    );
+                },
             );
         }
+        // Cancellation can settle modules that were still running when the
+        // first stop snapshot was taken. Recompute final facts before the
+        // report, while plan deletion has not yet discarded Suite evidence.
+        let terminal_modules = modules.iter().filter(|module| module.terminal).count();
+        let all_modules_terminal = all_modules_instantiated && terminal_modules == defined_modules;
+        let deferred_review_modules = modules
+            .iter()
+            .filter(|module| module.deferred_review_pending.is_some())
+            .count();
+        let external_review_pending = modules
+            .iter()
+            .any(|module| !module.terminal && module.outcome == ModuleOutcome::Review);
+        let all_modules_settled = all_modules_instantiated
+            && terminal_modules
+                .checked_add(deferred_review_modules)
+                .is_some_and(|settled| settled == defined_modules);
+        if let Err(error) = validate_review_screenshot_run_limit(&modules) {
+            errors.push(error);
+        }
+        let outcomes = summarize_module_outcomes(&modules);
         let retention_candidate_settled =
             !retained_suite_plan_ids.is_empty() && cleanup.failures.is_empty();
         let cleanup_complete = retained_suite_plan_ids.is_empty() && cleanup.failures.is_empty();
@@ -1879,9 +2052,10 @@ impl ConformanceRunner {
         let human_review_required = !outcomes.human_review_modules.is_empty();
         let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
-            // Schema 4 is emitted only when a deferred Suite review boundary
-            // exists; terminal-only execution keeps the existing schema.
-            schema: if deferred_review_modules > 0 { 4 } else { 3 },
+            excluded_plans: Vec::new(),
+            fail_fast: self.config.control.is_fail_fast(),
+            // Schema 5 adds explicit warning and execution-boundary facts.
+            schema: 5,
             matrix_digest: self.config.matrix.digest.clone(),
             suite_origin: self.config.client.origin().to_string(),
             auth_probe,
@@ -1892,6 +2066,7 @@ impl ConformanceRunner {
             review_pending: deferred_review_modules > 0 || external_review_pending,
             human_review_required,
             human_review_modules: outcomes.human_review_modules,
+            warning_modules: outcomes.warning_modules,
             deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
             expected_skipped_modules: matrix_expectations.expected_skipped_modules,
@@ -2114,6 +2289,10 @@ fn snapshot(
             .iter()
             .filter(|group| group.status == GroupStatus::Review)
             .count(),
+        warning_groups: groups
+            .iter()
+            .filter(|group| group.status == GroupStatus::Warning)
+            .count(),
         skipped_groups: groups
             .iter()
             .filter(|group| group.status == GroupStatus::Skipped)
@@ -2136,6 +2315,7 @@ fn snapshot(
             .count(),
         passed: groups.iter().map(|group| group.passed).sum(),
         reviewed: groups.iter().map(|group| group.reviewed).sum(),
+        warnings: groups.iter().map(|group| group.warnings).sum(),
         skipped: groups.iter().map(|group| group.skipped).sum(),
         failed: groups.iter().map(|group| group.failed).sum(),
         incomplete: groups.iter().map(|group| group.incomplete).sum(),
@@ -2147,18 +2327,33 @@ fn snapshot(
     }
 }
 
+fn record_module_progress(group: &mut GroupProgress, module: &ModuleReport) {
+    group.running = group.running.saturating_sub(1);
+    group.completed += 1;
+    match module.outcome {
+        ModuleOutcome::Passed => group.passed += 1,
+        ModuleOutcome::Review | ModuleOutcome::DeferredReviewPending => group.reviewed += 1,
+        ModuleOutcome::Warning => group.warnings += 1,
+        ModuleOutcome::Skipped => group.skipped += 1,
+        ModuleOutcome::Failed => group.failed += 1,
+        ModuleOutcome::Incomplete => group.incomplete += 1,
+    }
+}
+
 fn cleanup_all(
     client: &SuiteClient,
     module_ids: &[String],
     plan_ids: &[String],
     observer: Option<&Arc<dyn SuiteResourceObserver>>,
     report: &mut CleanupReport,
+    after_cancel: impl FnOnce(),
 ) {
     // Cancellation is attempted before every plan deletion. A finalisation
     // race is an expected Suite outcome and is retained in `cancelled`.
     for module_id in module_ids {
         cancel_once(client, module_id, report);
     }
+    after_cancel();
     for plan_id in plan_ids {
         match client.delete_plan(plan_id) {
             Ok(
@@ -2286,6 +2481,7 @@ pub fn recover_suite_resources(
         &state.plan_ids,
         None,
         &mut report,
+        || {},
     );
     if report.failures.is_empty() {
         Ok(())
@@ -2519,6 +2715,7 @@ mod tests {
                 status: GroupStatus::Failed,
                 passed: 0,
                 reviewed: 0,
+                warnings: 0,
                 skipped: 0,
                 failed: 0,
                 incomplete: 0,
@@ -3845,7 +4042,7 @@ mod tests {
         let selected = one_plan_matrix(serde_json::json!({"audience":"https://evil.example"}));
         let client = SuiteClient::with_transport(
             Origin::parse("https://suite.example").expect("origin"),
-            None,
+            Some(BearerToken::new("suite-token").expect("token")),
             Arc::new(FixtureTransport {
                 requests: Mutex::new(Vec::new()),
             }),
@@ -3929,6 +4126,21 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_errors_are_collected_without_interrupt_and_fail_fast_is_explicit() {
+        let control = RunControl::with_fail_fast(false);
+        let mut errors = RunErrors::new(Vec::new(), control.clone());
+        errors.push("terminal Suite failure".to_owned());
+        assert_eq!(errors.values, ["terminal Suite failure"]);
+        assert!(!control.is_interrupted());
+
+        let control = RunControl::with_fail_fast(true);
+        let mut errors = RunErrors::new(Vec::new(), control.clone());
+        errors.push("terminal Suite failure".to_owned());
+        assert!(control.is_interrupted());
+        assert_eq!(errors.values, ["terminal Suite failure"]);
+    }
+
+    #[test]
     fn review_is_distinct_from_pass_and_requires_human_follow_up() {
         let report = ModuleReport::from_info(
             ModuleReportContext {
@@ -4002,7 +4214,7 @@ mod tests {
     }
 
     #[test]
-    fn warning_requires_review_but_failure_log_is_failed() {
+    fn warning_is_distinct_from_review_but_failure_log_is_failed() {
         let warning = ModuleReport::from_info(
             ModuleReportContext {
                 matrix_plan_id: "p".into(),
@@ -4016,7 +4228,7 @@ mod tests {
             serde_json::json!({"status":"FINISHED","result":"WARNING"}),
             serde_json::json!([{"result":"WARNING"}]),
         );
-        assert_eq!(warning.outcome, ModuleOutcome::Review);
+        assert_eq!(warning.outcome, ModuleOutcome::Warning);
         assert!(warning.human_review_required);
         assert!(warning.blocking_log_results.is_empty());
         assert_eq!(warning.advisory_log_results, vec!["WARNING"]);
@@ -4085,6 +4297,312 @@ mod tests {
             "run interrupted"
         );
         assert!(transport.requests.lock().expect("lock").is_empty());
+    }
+
+    struct ReconciliationTransport;
+
+    impl Transport for ReconciliationTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+            _max_response_bytes: usize,
+        ) -> Result<HttpResponse, TransportError> {
+            let body = match request.url().path() {
+                "/api/info/passed" => serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+                "/api/info/interrupted" => serde_json::json!({"status":"INTERRUPTED"}),
+                "/api/info/failed" => serde_json::json!({"status":"FINISHED","result":"FAILED"}),
+                "/api/info/waiting" => serde_json::json!({"status":"WAITING"}),
+                "/api/log/failed" => serde_json::json!([
+                    {"result":"WARNING", "src":"ValidateDirectPostResponse"},
+                    {"result":"FAILURE", "src":"EnsureHttpStatusCodeIs200"}
+                ]),
+                _ => serde_json::json!([]),
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::to_vec(&body).expect("json"),
+            })
+        }
+    }
+
+    #[test]
+    fn stopped_run_reconciles_created_modules_without_inventing_a_terminal_state() {
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(ReconciliationTransport),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let control = RunControl::default();
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: SelectedMatrix {
+                document: MatrixDocument {
+                    schema: 1,
+                    name: "matrix".into(),
+                    groups: Vec::new(),
+                },
+                digest: "digest".into(),
+            },
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(30),
+            control: control.clone(),
+            plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+        control.interrupt();
+        let mut groups = vec![GroupProgress {
+            id: "g".into(),
+            profile: "oidc".into(),
+            completed: 0,
+            total: 4,
+            status: GroupStatus::Running,
+            passed: 0,
+            reviewed: 0,
+            warnings: 0,
+            skipped: 0,
+            failed: 0,
+            incomplete: 0,
+            running: 4,
+            remaining: 0,
+        }];
+        let created_modules = ["passed", "interrupted", "failed", "waiting"]
+            .into_iter()
+            .map(|module_id| CreatedModule {
+                group_index: 0,
+                context: ModuleReportContext {
+                    matrix_plan_id: "p".into(),
+                    suite_plan_id: "suite-plan".into(),
+                    module_id: Some(module_id.to_owned()),
+                    test_name: module_id.to_owned(),
+                    variant: BTreeMap::new(),
+                    terminal: false,
+                    expected_result: None,
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut modules = Vec::new();
+        let mut errors = RunErrors::new(Vec::new(), control);
+
+        runner.collect_unreported_terminal_modules(
+            &created_modules,
+            &mut groups,
+            &mut modules,
+            &mut errors,
+            true,
+        );
+
+        assert!(errors.is_empty(), "{:?}", errors.values);
+        assert_eq!(modules.len(), 4);
+        assert_eq!(groups[0].completed, 3);
+        assert_eq!(groups[0].running, 1);
+        assert_eq!(groups[0].passed, 1);
+        assert_eq!(groups[0].failed, 1);
+        assert_eq!(groups[0].incomplete, 1);
+        let outcomes = summarize_module_outcomes(&modules);
+        assert_eq!(outcomes.failed_modules, ["p/failed"]);
+        assert_eq!(outcomes.incomplete_modules, ["p/interrupted", "p/waiting"]);
+        assert_eq!(outcomes.warning_modules.len(), 1);
+        assert_eq!(
+            outcomes.warning_modules[0].warning_conditions[0].source,
+            "ValidateDirectPostResponse"
+        );
+    }
+
+    #[test]
+    fn reconciliation_refreshes_nonterminal_blocking_log_to_terminal_failure() {
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            Arc::new(ReconciliationTransport),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: SelectedMatrix {
+                document: MatrixDocument {
+                    schema: 1,
+                    name: "matrix".into(),
+                    groups: Vec::new(),
+                },
+                digest: "digest".into(),
+            },
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(30),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+        let context = ModuleReportContext {
+            matrix_plan_id: "p".into(),
+            suite_plan_id: "suite-plan".into(),
+            module_id: Some("failed".into()),
+            test_name: "failed".into(),
+            variant: BTreeMap::new(),
+            terminal: false,
+            expected_result: None,
+        };
+        let nonterminal_failure = ModuleReport::from_info(
+            context.clone(),
+            serde_json::json!({"status":"WAITING"}),
+            serde_json::json!([{"result":"FAILURE", "src":"EnsureHttpStatusCodeIs200"}]),
+        );
+        assert_eq!(nonterminal_failure.outcome, ModuleOutcome::Failed);
+        assert!(!nonterminal_failure.terminal);
+        let created = [CreatedModule {
+            group_index: 0,
+            context,
+        }];
+        let mut groups = vec![GroupProgress {
+            id: "g".into(),
+            profile: "openid4vc".into(),
+            completed: 0,
+            total: 1,
+            status: GroupStatus::Running,
+            passed: 0,
+            reviewed: 0,
+            warnings: 0,
+            skipped: 0,
+            failed: 0,
+            incomplete: 0,
+            running: 1,
+            remaining: 0,
+        }];
+        let mut modules = vec![nonterminal_failure];
+        let mut errors = RunErrors::new(Vec::new(), RunControl::default());
+
+        runner.collect_unreported_terminal_modules(
+            &created,
+            &mut groups,
+            &mut modules,
+            &mut errors,
+            true,
+        );
+
+        assert!(errors.is_empty());
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].outcome, ModuleOutcome::Failed);
+        assert!(modules[0].terminal);
+        assert_eq!(groups[0].completed, 1);
+        assert_eq!(groups[0].running, 0);
+        assert_eq!(groups[0].failed, 1);
+    }
+
+    #[test]
+    fn reconciliation_preserves_deferred_review_evidence_without_another_suite_read() {
+        let transport = Arc::new(FixtureTransport {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = SuiteClient::with_transport(
+            Origin::parse("https://suite.example").expect("origin"),
+            Some(BearerToken::new("suite-token").expect("token")),
+            transport.clone(),
+            ClientConfig::default(),
+        )
+        .expect("client");
+        let runner = ConformanceRunner::new(ConformanceRunConfig {
+            client,
+            matrix: SelectedMatrix {
+                document: MatrixDocument {
+                    schema: 1,
+                    name: "matrix".into(),
+                    groups: Vec::new(),
+                },
+                digest: "digest".into(),
+            },
+            target_origin: None,
+            binding: test_binding(),
+            poll_timeout: Duration::from_secs(30),
+            control: RunControl::default(),
+            plan_lanes: BTreeMap::new(),
+            plan_resource_budgets: BTreeMap::new(),
+            selected_resource_budget: budget(0, 0, 0),
+            jobs: 1,
+            upload_review_screenshots: false,
+            automation: Vec::new(),
+            suite_resource_observer: None,
+        })
+        .expect("runner");
+        let context = ModuleReportContext {
+            matrix_plan_id: "p".into(),
+            suite_plan_id: "suite-plan".into(),
+            module_id: Some("deferred".into()),
+            test_name: "deferred".into(),
+            variant: BTreeMap::new(),
+            terminal: false,
+            expected_result: None,
+        };
+        let mut deferred = ModuleReport::from_info(
+            context.clone(),
+            serde_json::json!({"status":"WAITING"}),
+            serde_json::json!([]),
+        );
+        deferred.mark_deferred_review_pending(DeferredReviewPending {
+            placeholder_path: "/test/a/deferred/verification-evidence".into(),
+            marker: crate::browser::ReviewScreenshotMarker::Required,
+            obligation_index: 0,
+        });
+        deferred.review_screenshots = vec![ReviewScreenshotReport {
+            path: "review-screenshots/run/deferred.png".into(),
+            sha256: "a".repeat(64),
+            size: 1,
+        }];
+        deferred.review_screenshots_required = 1;
+        deferred.review_screenshots_required_captured = 1;
+        let created = [CreatedModule {
+            group_index: 0,
+            context,
+        }];
+        let mut groups = vec![GroupProgress {
+            id: "g".into(),
+            profile: "openid4vc".into(),
+            completed: 1,
+            total: 1,
+            status: GroupStatus::Review,
+            passed: 0,
+            reviewed: 1,
+            warnings: 0,
+            skipped: 0,
+            failed: 0,
+            incomplete: 0,
+            running: 0,
+            remaining: 0,
+        }];
+        let mut modules = vec![deferred];
+        let mut errors = RunErrors::new(Vec::new(), RunControl::default());
+
+        runner.collect_unreported_terminal_modules(
+            &created,
+            &mut groups,
+            &mut modules,
+            &mut errors,
+            true,
+        );
+
+        assert!(errors.is_empty());
+        assert!(transport.requests.lock().expect("requests").is_empty());
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].outcome, ModuleOutcome::DeferredReviewPending);
+        assert!(modules[0].deferred_review_pending.is_some());
+        assert_eq!(modules[0].review_screenshots.len(), 1);
+        assert_eq!(modules[0].review_screenshots_required_captured, 1);
     }
 
     struct RepeatedCibaSuiteTransport {

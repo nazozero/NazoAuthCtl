@@ -49,7 +49,7 @@ pub use artifact_driver::{
 pub use artifact_plan::{
     OidfBoundedRunnerContract, OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError,
     OidfPlanSelection, bundled_oidf_matrix, bundled_oidf_selection_choices,
-    open_bundled_oidf_driver_plan, resolve_bundled_oidf_selection,
+    open_bundled_oidf_driver_plan, resolve_bundled_oidf_plan_id, resolve_bundled_oidf_selection,
 };
 pub use browser::{
     BrowserAutomation, BrowserCommand, BrowserDriver, BrowserEntry, BrowserError, BrowserExecutor,
@@ -111,7 +111,7 @@ pub use recovery::{
 };
 pub use report::{
     CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleOutcome,
-    ModuleReport, PlanReport, ReviewScreenshotReport,
+    ModuleReport, PlanReport, ReviewScreenshotReport, WarningCondition, WarningModule,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,
