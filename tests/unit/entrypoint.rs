@@ -78,7 +78,7 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(!workflow.contains("NAZOAUTHCTL_BUILD_COMMIT"));
     assert_eq!(
         workflow
-            .matches("test \"$SERVER_RELEASE\" = v0.2.12")
+            .matches("test \"$SERVER_RELEASE\" = v0.2.13")
             .count(),
         1
     );
@@ -156,7 +156,7 @@ fn release_compatibility_gate_pins_the_current_protocol_three_server() {
         .unwrap()
         .0;
     assert!(gate.contains("controller_ref: ${{ github.sha }}"));
-    assert!(gate.contains("server_release: v0.2.12"));
+    assert!(gate.contains("server_release: v0.2.13"));
     assert!(!gate.contains("previous"));
 }
 
