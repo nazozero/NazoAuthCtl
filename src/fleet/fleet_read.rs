@@ -798,6 +798,7 @@ pub(crate) fn stable_code(rendered: &str) -> String {
         crate::target::ACTIVATION_FAILED,
         crate::target::ROLLBACK_ARTIFACT_MISSING,
         crate::target::update_exec::BACKUP_UPDATE_PRECONDITION_FAILED,
+        crate::target::update_exec::SIGNING_KEY_MIGRATION_REQUIRED,
         crate::target::HOST_ERR_OPERATION_INVALID,
         crate::target::wire::HOST_ERR_UNSUPPORTED_OPERATION,
     ] {

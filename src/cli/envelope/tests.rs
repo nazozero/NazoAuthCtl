@@ -177,6 +177,20 @@ fn release_failures_are_not_reported_as_target_connectivity() {
 }
 
 #[test]
+fn signing_key_migration_refusal_keeps_the_target_code() {
+    let rendered = render(
+        crate::target::update_exec::SIGNING_KEY_MIGRATION_REQUIRED,
+        true,
+    );
+    let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+    assert_eq!(
+        value["code"],
+        crate::target::update_exec::SIGNING_KEY_MIGRATION_REQUIRED
+    );
+    assert_eq!(value["side_effects"], "none");
+}
+
+#[test]
 fn target_install_failure_keeps_remote_code_and_does_not_suggest_host_check() {
     let detail = "install failed on the target and was rolled back locally: SECRET_PROVISION_FAILED: imported MFA key is not base64url";
     let error = anyhow::anyhow!(detail);
