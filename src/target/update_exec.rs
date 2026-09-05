@@ -59,6 +59,9 @@ pub const ROLLBACK_ARTIFACT_MISSING: &str = "ROLLBACK_ARTIFACT_MISSING";
 /// Stable refusal code when the controller-required backup evidence changed
 /// between inspection and execution or aged out before the target lock gate.
 pub const BACKUP_UPDATE_PRECONDITION_FAILED: &str = "BACKUP_UPDATE_PRECONDITION_FAILED";
+/// Stable refusal code for a legacy deployment that has not imported its
+/// file-backed signing keys under a deployment-owned wrapping root.
+pub const SIGNING_KEY_MIGRATION_REQUIRED: &str = "SIGNING_KEY_MIGRATION_REQUIRED";
 
 /// Validate the controller-inspected backup facts against the target-owned
 /// evidence while the caller holds the deployment's TargetJournal lock. This
@@ -95,7 +98,7 @@ fn require_shared_signing_key_root(
 ) -> Result<(), Failure> {
     let refusal = || {
         Failure::new(
-            "SIGNING_KEY_MIGRATION_REQUIRED",
+            SIGNING_KEY_MIGRATION_REQUIRED,
             "provision the deployment signing-key root, import existing keys, and configure its runtime access before updating; no runtime or database change was made",
         )
     };
@@ -1036,7 +1039,7 @@ mod tests {
         let refusal =
             require_shared_signing_key_root(directory, &config, RuntimeBackendKind::Host, &[])
                 .expect_err("old deployment requires explicit key migration");
-        assert_eq!(refusal.code, "SIGNING_KEY_MIGRATION_REQUIRED");
+        assert_eq!(refusal.code, SIGNING_KEY_MIGRATION_REQUIRED);
         assert!(!path.exists());
         filesystem::atomic_write(&path, URL_SAFE_NO_PAD.encode([42_u8; 32]).as_bytes(), 0o600)?;
         require_shared_signing_key_root(directory, &config, RuntimeBackendKind::Host, &[])?;
