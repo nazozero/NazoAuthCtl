@@ -31,6 +31,8 @@ pub(crate) struct CandidatePointer {
     pub object_reference: String,
     pub object_id: String,
     pub loopback_port: u16,
+    #[serde(default)]
+    pub https: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -211,6 +213,7 @@ mod tests {
             object_reference: "oci://candidate@sha256:abc".to_owned(),
             object_id: "immutable-candidate-id".to_owned(),
             loopback_port: 48123,
+            https: true,
         });
         plan.phase = RecoveryPhase::Invalidating;
         plan
@@ -237,6 +240,16 @@ mod tests {
         assert!(resumed.invalidation_operation_id.is_none());
         assert!(resumed.invalidation_request_hash.is_none());
         assert_eq!(resumed.candidate, plan.candidate);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_pointer_preserves_https_and_reads_existing_proxy_records() -> anyhow::Result<()> {
+        let pointer = staged_plan().candidate.unwrap();
+        let mut value = serde_json::to_value(&pointer)?;
+        assert!(serde_json::from_value::<CandidatePointer>(value.clone())?.https);
+        value.as_object_mut().unwrap().remove("https");
+        assert!(!serde_json::from_value::<CandidatePointer>(value)?.https);
         Ok(())
     }
 }

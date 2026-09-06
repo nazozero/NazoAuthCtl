@@ -2066,6 +2066,7 @@ mod tests {
             config_sha256: "b".repeat(64),
             data_root: "/var/lib/nazoauth".to_owned(),
             runtime_root: None,
+            tls_material_root: None,
             secrets: [
                 ("database-runtime-url", true),
                 ("database-lifecycle-url", true),

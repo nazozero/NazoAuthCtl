@@ -204,6 +204,10 @@ pub struct RecoveryCandidateRequest {
     pub secrets_source: PathBuf,
     pub config_source: PathBuf,
     pub valkey_state_epoch: String,
+    /// Parsed from the restored configuration by the target, never inferred from the issuer.
+    pub https: bool,
+    /// The three existing TLS file settings; only their source read-only mounts may be retained.
+    pub tls_files: Vec<PathBuf>,
 }
 
 /// Immutable cleanup identity and the sole endpoint exposed by a recovery
@@ -216,6 +220,8 @@ pub struct RecoveryCandidateEndpoint {
     pub deployment_id: String,
     pub operation_id: String,
     pub loopback_port: u16,
+    #[serde(default)]
+    pub https: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

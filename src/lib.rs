@@ -259,6 +259,7 @@ re-establishes the Controller Key from the offline Recovery Secret (or, with
                       --import-mfa-key-file TARGET_PATH]
                      [--to VERSION]
                      [--runtime podman|docker|host] [--install-root PATH]
+                     [--direct-tls-config FILE --tls-material-root TARGET_DIR]
 
 One verified handshake, one typed install order, one committed DeploymentState
 (local=healthy, control unbound, public unknown). The PostgreSQL and Valkey
@@ -299,6 +300,7 @@ provenance. They never select keys or state from a NazoAuth deployment."
                                     [--warning-window-seconds S]
   nazoauthctl tls certificate plan   --provider-config PATH --tenant T --hostname H
                                      (--certificate F --private-key F | --from-acme-current)
+                                     [--proxy-config COMPLETE_NATIVE_CONFIG]
   nazoauthctl tls certificate apply  ...same inputs...
   nazoauthctl tls certificate recover --tenant T --hostname H
   nazoauthctl tls certificate show   --tenant T --hostname H

@@ -143,6 +143,8 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "--to",
             "--runtime",
             "--install-root",
+            "--direct-tls-config",
+            "--tls-material-root",
             "--database-host",
             "--database-port",
             "--database-name",
@@ -275,6 +277,11 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         Ok(Some(PathBuf::from(value)))
     };
     let import_data_root = target_path("--import-data-root")?;
+    let direct_tls_config = parsed.values.get("--direct-tls-config").map(PathBuf::from);
+    let tls_material_root = target_path("--tls-material-root")?;
+    if direct_tls_config.is_some() != tls_material_root.is_some() {
+        bail!("--direct-tls-config and --tls-material-root must be supplied together");
+    }
     let import_mfa_key_file = target_path("--import-mfa-key-file")?;
     if import_data_root.is_some() != import_mfa_key_file.is_some() {
         bail!(
@@ -288,6 +295,8 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         version,
         runtime,
         install_root,
+        direct_tls_config,
+        tls_material_root,
         database_host,
         database_port,
         database_name,
@@ -533,6 +542,19 @@ mod install_tests {
         let mut legacy = current_args();
         legacy.extend(["--database-user".to_owned(), "legacy".to_owned()]);
         assert!(parse_install_args(legacy).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_tls_install_requires_both_config_and_explicit_target_material_root()
+    -> anyhow::Result<()> {
+        let mut args = current_args();
+        args.extend(["--direct-tls-config".to_owned(), "tls.yaml".to_owned()]);
+        assert!(parse_install_args(args.clone()).is_err());
+        args.extend(["--tls-material-root".to_owned(), "/etc/nazo-tls".to_owned()]);
+        let parsed = parse_install_args(args)?;
+        assert_eq!(parsed.direct_tls_config, Some("tls.yaml".into()));
+        assert_eq!(parsed.tls_material_root, Some("/etc/nazo-tls".into()));
         Ok(())
     }
 

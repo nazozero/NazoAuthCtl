@@ -521,7 +521,11 @@ impl HostLifecycleExecutor {
                         sanitize(error.to_string()),
                     )
                 })?;
-            grant_runtime_config_read(Path::new(job.config_reference))?;
+            grant_runtime_config_read(
+                Path::new(job.config_reference),
+                job.runtime_kind,
+                job.deployment_id,
+            )?;
             performed.wrote_config = true;
         }
 
@@ -694,7 +698,7 @@ impl HostLifecycleExecutor {
         }
 
         // 6. Local readiness gate (G08 boundary: loopback only).
-        probe_local_health(job.port, job.issuer)?;
+        probe_local_health(job.port, job.issuer, job.config_reference)?;
 
         // 7. Commit: previous <- old current, current <- new (+ its release
         // version), optional config CAS advance — replay-safe under this
@@ -810,33 +814,8 @@ impl HostLifecycleExecutor {
                 Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
             })?;
 
-        // 3. Swap the runtime object back onto the previous artifact.
-        let replacement = replacement_from_observation(
-            &observation,
-            job.runtime_object,
-            &previous_runtime_artifact,
-        )?;
-        backend
-            .replace(&replacement)
-            .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
-        backend
-            .start(job.runtime_object)
-            .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
-        performed.replaced_runtime = true;
-
-        // 4. Identity + local health gates.
-        let activated = live_observation(backend.as_ref(), job.runtime_object)?;
-        if !activated.running
-            || observation_digest(&activated).as_deref() != Some(previous_digest.as_str())
-        {
-            return Err(Failure::new(
-                TARGET_IDENTITY_MISMATCH,
-                "the rolled-back runtime does not serve the previous verified artifact",
-            ));
-        }
-        probe_local_health(job.port, job.issuer)?;
-
-        // 5. Restore the snapshot bytes when the decision said so.
+        // Restore configuration before starting the previous artifact: the
+        // runtime and its readiness probe must observe the same transport.
         if let Some((bytes, _)) = &restored_config {
             performed.config_before_rollback = Some(
                 filesystem::read_secure_regular_file(
@@ -861,9 +840,39 @@ impl HostLifecycleExecutor {
                     )
                 },
             )?;
-            grant_runtime_config_read(Path::new(job.config_reference))?;
             performed.wrote_config = true;
+            grant_runtime_config_read(
+                Path::new(job.config_reference),
+                job.runtime_kind,
+                job.deployment_id,
+            )?;
         }
+
+        // 3. Swap the runtime object back onto the previous artifact.
+        let replacement = replacement_from_observation(
+            &observation,
+            job.runtime_object,
+            &previous_runtime_artifact,
+        )?;
+        performed.replaced_runtime = true;
+        backend
+            .replace(&replacement)
+            .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
+        backend
+            .start(job.runtime_object)
+            .map_err(|error| Failure::new(ACTIVATION_FAILED, sanitize(error.to_string())))?;
+
+        // 4. Identity + local health gates.
+        let activated = live_observation(backend.as_ref(), job.runtime_object)?;
+        if !activated.running
+            || observation_digest(&activated).as_deref() != Some(previous_digest.as_str())
+        {
+            return Err(Failure::new(
+                TARGET_IDENTITY_MISMATCH,
+                "the rolled-back runtime does not serve the previous verified artifact",
+            ));
+        }
+        probe_local_health(job.port, job.issuer, job.config_reference)?;
 
         // 6. Commit the reference swap (current <-> previous) under CAS; a
         // restored snapshot advances the config CAS under its own schema.
@@ -2159,7 +2168,12 @@ fn rollback_update(job: &UpdateJob<'_>, performed: &PerformedSteps) -> Result<()
     let mut errors = Vec::new();
     if performed.wrote_config {
         let restore = if performed.snapshotted_config {
-            restore_snapshot_bytes(job.scope_dir, job.config_reference)
+            restore_snapshot_bytes(
+                job.scope_dir,
+                job.config_reference,
+                job.runtime_kind,
+                job.deployment_id,
+            )
         } else {
             filesystem::remove_file_durable(Path::new(job.config_reference)).map_err(|error| {
                 Failure::new(
@@ -2233,9 +2247,11 @@ fn restore_current_after_failed_rollback(
                     errors.push(format!(
                         "restoring the pre-rollback configuration failed: {error}"
                     ));
-                } else if let Err(error) =
-                    grant_runtime_config_read(Path::new(job.config_reference))
-                {
+                } else if let Err(error) = grant_runtime_config_read(
+                    Path::new(job.config_reference),
+                    job.runtime_kind,
+                    job.deployment_id,
+                ) {
                     errors.push(error.detail);
                 }
             }
@@ -2260,7 +2276,12 @@ fn restore_current_after_failed_rollback(
     rollback_result(errors)
 }
 
-fn restore_snapshot_bytes(scope_dir: &Path, config_reference: &str) -> Result<(), Failure> {
+fn restore_snapshot_bytes(
+    scope_dir: &Path,
+    config_reference: &str,
+    kind: RuntimeBackendKind,
+    deployment_id: &str,
+) -> Result<(), Failure> {
     let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
     let bytes = filesystem::read_secure_regular_file(
         &bytes_path,
@@ -2280,10 +2301,28 @@ fn restore_snapshot_bytes(scope_dir: &Path, config_reference: &str) -> Result<()
             sanitize(format!("restoring the config snapshot failed: {error}")),
         )
     })?;
-    grant_runtime_config_read(Path::new(config_reference))
+    grant_runtime_config_read(Path::new(config_reference), kind, deployment_id)
 }
 
-fn grant_runtime_config_read(path: &Path) -> Result<(), Failure> {
+fn grant_runtime_config_read(
+    path: &Path,
+    kind: RuntimeBackendKind,
+    deployment_id: &str,
+) -> Result<(), Failure> {
+    if kind == RuntimeBackendKind::Host {
+        let group = runtime_backend::systemd_service_user(deployment_id);
+        return crate::process::Process::new("chown")
+            .arg(format!("root:{group}"))
+            .arg(path)
+            .run_quiet()
+            .and_then(|()| filesystem::set_mode(path, 0o440))
+            .map_err(|error| {
+                Failure::new(
+                    super::install_exec::CONFIG_INVALID,
+                    sanitize(error.to_string()),
+                )
+            });
+    }
     let preserve_owner = super::install_exec::path_is_owned_by_non_root(path).map_err(|error| {
         Failure::new(
             super::install_exec::CONFIG_INVALID,

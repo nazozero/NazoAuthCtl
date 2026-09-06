@@ -8,7 +8,8 @@ on the authentication serving path.
 
 ## Ownership and prerequisites
 
-The selected deployment must delegate or manage `proxy_tls`. NazoAuthCtl owns
+Run on the registered deployment's owning Unix host with an explicit provider
+document; SSH instance selection is rejected by this local file provider. NazoAuthCtl owns
 the ACME account key and the issued server private key under its private
 deployment state. NazoAuth protocol signing keys remain in NazoAuth or its KMS;
 client and wallet private keys remain client-side.

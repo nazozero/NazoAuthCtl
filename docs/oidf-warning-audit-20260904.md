@@ -85,9 +85,9 @@ record retains its own DS/CA certificates. Rotation therefore does not redirect
 an old certificate to a CRL signed by a different IACA. CRL update bounds and
 revision derive from the existing revocation snapshot.
 
-## Hostinger verification and explicit run policy
+## Linux validation environment verification and explicit run policy
 
-The final source snapshots were built and tested on hostinger with Rust 1.97.1
+The final source snapshots were built and tested on Linux validation environment with Rust 1.97.1
 under `/root/build/oidf-20260904`. Existing deployments were not changed.
 The isolated PostgreSQL 18 and Valkey 8 test containers were removed after the
 server tests. Build artifacts and logs remain in that directory.

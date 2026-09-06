@@ -2960,6 +2960,7 @@ mod tests {
                 deployment_id: "deploy-alpha".to_owned(),
                 operation_id: recovery_operation_id,
                 loopback_port: 49123,
+                https: false,
             },
             state_epoch.clone(),
             CONTROL_JWS_OP_ID,

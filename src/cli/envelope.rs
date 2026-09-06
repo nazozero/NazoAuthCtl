@@ -38,6 +38,9 @@ pub(crate) struct EnvelopeContext {
 /// attempt may have landed something and resuming (never restarting) is safe.
 fn side_effects_hint(code: &str) -> &'static str {
     match code {
+        error_codes::TLS_RECOVERY_REQUIRED => {
+            "possible; run tls certificate recover for the same deployment, tenant and hostname"
+        }
         error_codes::OPERATION_ID_CONFLICT
         | error_codes::CONFIG_REVISION_MISMATCH
         | error_codes::TARGET_IDENTITY_MISMATCH

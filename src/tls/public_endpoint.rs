@@ -19,37 +19,40 @@ pub(super) fn verify_public(
     expected_leaf_sha256: &str,
     roots: RootCertStore,
     provider: &ProviderConfig,
+    expected_configuration_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
     let port = public_url
         .port_or_known_default()
         .context("TLS public URL has no port")?;
-    let addresses = resolve_public_addresses(
+    let mut addresses = resolve_public_addresses(
         hostname,
         port,
         Duration::from_secs(provider.connect_timeout_seconds),
     )?;
+    addresses.sort_unstable();
+    addresses.dedup();
     if addresses.is_empty() {
         bail!("TLS public hostname resolved to no addresses");
+    }
+    if addresses.len() > 4 {
+        bail!("TLS public hostname resolved beyond the certificate proof address bound");
     }
     if addresses.iter().any(|address| !is_public_ip(address.ip())) {
         bail!("TLS public hostname resolved to a non-public address");
     }
-    let mut last_error = None;
-    for address in addresses.into_iter().take(4) {
-        match verify_public_address(
+    for address in addresses {
+        verify_public_address(
             public_url,
             hostname,
             address,
             expected_leaf_sha256,
             roots.clone(),
             provider,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
+            expected_configuration_sha256,
+        )
+        .with_context(|| format!("TLS public verification failed for address {address}"))?;
     }
-    Err(last_error.context("TLS public verification did not attempt an address")?)
-        .context("TLS public verification failed for every resolved address")
+    Ok(())
 }
 
 pub(super) fn verify_public_not_leaf(
@@ -58,6 +61,7 @@ pub(super) fn verify_public_not_leaf(
     forbidden_leaf_sha256: &str,
     roots: RootCertStore,
     provider: &ProviderConfig,
+    require_closed: bool,
 ) -> anyhow::Result<()> {
     let port = public_url
         .port_or_known_default()
@@ -79,6 +83,21 @@ pub(super) fn verify_public_not_leaf(
         bail!("TLS public hostname resolved to a non-public address");
     }
     for address in addresses {
+        if require_closed {
+            match TcpStream::connect_timeout(
+                &address,
+                Duration::from_secs(provider.connect_timeout_seconds),
+            ) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => continue,
+                Err(error) => {
+                    return Err(error)
+                        .context("could not prove the first native proxy generation was stopped");
+                }
+                Ok(_) => bail!(
+                    "the first native proxy generation was rolled back but its public port remains open"
+                ),
+            }
+        }
         verify_public_address_not_leaf(
             public_url,
             hostname,
@@ -118,12 +137,36 @@ pub(super) fn verify_public_address(
     expected_leaf_sha256: &str,
     roots: RootCertStore,
     provider: &ProviderConfig,
+    expected_configuration_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
-    let observed = observe_public_address(public_url, hostname, address, roots, provider)?;
-    if observed != expected_leaf_sha256 {
-        bail!("TLS public endpoint leaf certificate digest does not match the activated material");
+    let deadline = Instant::now() + Duration::from_secs(provider.request_timeout_seconds);
+    loop {
+        let observed = observe_public_address(
+            public_url,
+            hostname,
+            address,
+            roots.clone(),
+            provider,
+            deadline,
+            expected_configuration_sha256.is_some(),
+        )?;
+        if observed.0 == expected_leaf_sha256
+            && expected_configuration_sha256
+                .is_none_or(|expected| observed.1.as_deref() == Some(expected))
+        {
+            return Ok(());
+        }
+        // NazoAuth polls its atomic material pointer; nginx/Angie also reload
+        // asynchronously. Only a healthy, trusted old identity may settle.
+        // TLS/HTTP failures still fail immediately and trigger rollback.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "TLS public endpoint certificate or configuration digest does not match the activated generation before the reload deadline"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100).min(remaining));
     }
-    Ok(())
 }
 
 pub(super) fn verify_public_address_not_leaf(
@@ -134,8 +177,11 @@ pub(super) fn verify_public_address_not_leaf(
     roots: RootCertStore,
     provider: &ProviderConfig,
 ) -> anyhow::Result<()> {
-    let observed = observe_public_address(public_url, hostname, address, roots, provider)?;
-    if observed == forbidden_leaf_sha256 {
+    let deadline = Instant::now() + Duration::from_secs(provider.request_timeout_seconds);
+    let observed = observe_public_address(
+        public_url, hostname, address, roots, provider, deadline, false,
+    )?;
+    if observed.0 == forbidden_leaf_sha256 {
         bail!("TLS public endpoint still presents the rolled-back candidate certificate");
     }
     Ok(())
@@ -147,9 +193,14 @@ fn observe_public_address(
     address: SocketAddr,
     roots: RootCertStore,
     provider: &ProviderConfig,
-) -> anyhow::Result<String> {
-    let connect_timeout = Duration::from_secs(provider.connect_timeout_seconds);
-    let request_timeout = Duration::from_secs(provider.request_timeout_seconds);
+    deadline: Instant,
+    require_configuration: bool,
+) -> anyhow::Result<(String, Option<String>)> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("TLS public request exceeded its absolute timeout");
+    }
+    let connect_timeout = Duration::from_secs(provider.connect_timeout_seconds).min(remaining);
     let mut tcp = TcpStream::connect_timeout(&address, connect_timeout)
         .with_context(|| format!("failed to connect to TLS public address {address}"))?;
     tcp.set_nonblocking(true)?;
@@ -174,10 +225,8 @@ fn observe_public_address(
         connection.writer(),
         "GET {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nUser-Agent: nazoauthctl-tls-verifier/1\r\n\r\n"
     )?;
-    let deadline = Instant::now()
-        .checked_add(request_timeout)
-        .context("TLS public request timeout overflow")?;
-    let response = drive_tls_until_status_line(&mut connection, &mut tcp, deadline)?;
+    let response =
+        drive_tls_until_status_line(&mut connection, &mut tcp, deadline, require_configuration)?;
     let peer = connection
         .peer_certificates()
         .and_then(|certificates| certificates.first())
@@ -201,13 +250,55 @@ fn observe_public_address(
     {
         bail!("TLS public endpoint health status {status} is not accepted");
     }
-    Ok(leaf_sha256)
+    let configuration = if require_configuration {
+        configuration_header(&response)?
+    } else {
+        None
+    };
+    Ok((leaf_sha256, configuration))
+}
+
+fn configuration_header(response: &[u8]) -> anyhow::Result<Option<String>> {
+    let end = response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .context("TLS public endpoint returned incomplete HTTP headers")?;
+    let headers =
+        std::str::from_utf8(&response[..end]).context("TLS public HTTP headers are not UTF-8")?;
+    let mut values = headers.split("\r\n").skip(1).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("X-NazoAuth-TLS-Configuration")
+            .then(|| value.trim().to_owned())
+    });
+    let first = values.next();
+    if values.next().is_some() {
+        bail!("TLS public endpoint returned duplicate configuration proof headers");
+    }
+    Ok(first)
+}
+
+#[cfg(test)]
+#[test]
+fn configuration_proof_rejects_duplicates_and_ignores_body_bytes() {
+    assert_eq!(
+        configuration_header(b"HTTP/1.1 200 OK\r\nx-nazoauth-tls-configuration: value\r\n\r\n\xff")
+            .unwrap()
+            .as_deref(),
+        Some("value")
+    );
+    assert!(configuration_header(b"HTTP/1.1 200 OK\r\nX-NazoAuth-TLS-Configuration: a\r\nX-NazoAuth-TLS-Configuration: b\r\n\r\n").is_err());
+    assert!(
+        configuration_header(b"HTTP/1.1 200 OK\r\n\r\n")
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn drive_tls_until_status_line(
     connection: &mut ClientConnection,
     tcp: &mut TcpStream,
     deadline: Instant,
+    require_headers: bool,
 ) -> anyhow::Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -235,7 +326,11 @@ fn drive_tls_until_status_line(
                     if response.len() as u64 > MAX_HTTP_RESPONSE_BYTES {
                         bail!("TLS public endpoint status line exceeds the response limit");
                     }
-                    if response.contains(&b'\n') {
+                    if if require_headers {
+                        response.windows(4).any(|part| part == b"\r\n\r\n")
+                    } else {
+                        response.contains(&b'\n')
+                    } {
                         return Ok(response);
                     }
                 }

@@ -225,6 +225,7 @@ fn endpoint_from_document(
         deployment_id: request.deployment_id.clone(),
         operation_id: request.operation_id.clone(),
         loopback_port: *loopback_port,
+        https: request.https,
     })
 }
 
@@ -408,7 +409,7 @@ fn recovery_mounts(
         let destination = mount.destination.to_string_lossy().into_owned();
         replacements.push((destination, request.secrets_source.join(name), true));
     }
-    replacements
+    let mut mounts = replacements
         .into_iter()
         .map(|(destination, replacement, read_only)| {
             let matching = source
@@ -429,7 +430,38 @@ fn recovery_mounts(
                 scope: ResourceScope::Deployment,
             })
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ensure!(
+        request.tls_files.len() <= 3,
+        "too many recovery TLS file settings"
+    );
+    for path in &request.tls_files {
+        // These are Linux container paths even when the controller runs on Windows.
+        let text = path.to_str().context("recovery TLS path is not UTF-8")?;
+        ensure!(
+            text.starts_with('/') && !text.split('/').any(|part| matches!(part, "." | "..")),
+            "recovery TLS file must use an absolute container path without traversal"
+        );
+        let matching = source
+            .mounts
+            .iter()
+            .filter(|mount| path.starts_with(&mount.destination))
+            .collect::<Vec<_>>();
+        ensure!(
+            matching.len() == 1 && matching[0].read_only,
+            "recovery TLS file must be covered by exactly one existing read-only mount"
+        );
+        let original = matching[0];
+        if !mounts
+            .iter()
+            .any(|mount| mount.destination == original.destination)
+        {
+            let mut retained = original.clone();
+            retained.ownership = Responsibility::External;
+            mounts.push(retained);
+        }
+    }
+    Ok(mounts)
 }
 
 fn assert_source_surface(
@@ -823,6 +855,8 @@ mod tests {
             secrets_source: root.join("secrets"),
             config_source: root.join("config.yaml"),
             valkey_state_epoch: "018f47f3-7f55-7a10-8a88-64c5f904c002".to_owned(),
+            https: false,
+            tls_files: Vec::new(),
         };
         validate_request(&request).unwrap();
         let mut invalid = request.clone();
@@ -844,7 +878,7 @@ mod tests {
             ownership: Responsibility::Managed,
             scope: ResourceScope::Deployment,
         };
-        let source = RuntimeObservation {
+        let mut source = RuntimeObservation {
             backend: crate::runtime_backend::RuntimeBackendKind::Podman,
             object_reference: "nazo-live".to_owned(),
             display_name: "nazo-live".to_owned(),
@@ -865,7 +899,7 @@ mod tests {
             evidence: Vec::new(),
             missing: Vec::new(),
         };
-        let request = RecoveryCandidateRequest {
+        let mut request = RecoveryCandidateRequest {
             source_object_reference: "nazo-live".to_owned(),
             candidate_object_reference: "nazo-recovery".to_owned(),
             deployment_id: "deploy-a".to_owned(),
@@ -878,6 +912,8 @@ mod tests {
             secrets_source: root.join("restored-secrets"),
             config_source: root.join("restored-config.yaml"),
             valkey_state_epoch: Uuid::now_v7().to_string(),
+            https: false,
+            tls_files: Vec::new(),
         };
 
         let mounts = recovery_mounts(&source, &request)?;
@@ -901,6 +937,33 @@ mod tests {
                 .source,
             request.secrets_source.join("client-secret-pepper")
         );
+        source.mounts.push(mount("/etc/nazoauth/tls"));
+        source.mounts.push(mount("/etc/unrelated"));
+        request.https = true;
+        request.tls_files = vec![
+            PathBuf::from("/etc/nazoauth/tls/current/fullchain.pem"),
+            PathBuf::from("/etc/nazoauth/tls/current/private-key.pem"),
+        ];
+        let mounts = recovery_mounts(&source, &request)?;
+        assert_eq!(mounts.len(), 4);
+        let retained = mounts
+            .iter()
+            .find(|mount| mount.destination == Path::new("/etc/nazoauth/tls"))
+            .unwrap();
+        assert_eq!(retained.source, source.mounts[4].source);
+        assert!(retained.read_only);
+        assert!(
+            !mounts
+                .iter()
+                .any(|mount| mount.destination == Path::new("/etc/unrelated"))
+        );
+        source.mounts[4].read_only = false;
+        assert!(recovery_mounts(&source, &request).is_err());
+        source.mounts[4].read_only = true;
+        request.tls_files[0] = PathBuf::from("/etc/nazoauth/tls/../unrelated/private-key.pem");
+        assert!(recovery_mounts(&source, &request).is_err());
+        request.tls_files[0] = PathBuf::from("/etc/missing/private-key.pem");
+        assert!(recovery_mounts(&source, &request).is_err());
         Ok(())
     }
 }

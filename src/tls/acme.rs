@@ -734,11 +734,15 @@ fn drive_transaction(
         .checked_sub(Utc::now().timestamp())
         .filter(|seconds| *seconds > 0)
         .context("ACME transaction expired")?;
+    let timeout = Duration::from_secs(u64::try_from(remaining)?);
     let result = runtime
-        .block_on(tokio::time::timeout(
-            Duration::from_secs(u64::try_from(remaining)?),
-            drive_async(store, record, provider, acme, transaction),
-        ))
+        .block_on(async {
+            tokio::time::timeout(
+                timeout,
+                drive_async(store, record, provider, acme, transaction),
+            )
+            .await
+        })
         .context("ACME transaction reached its durable expiry")
         .and_then(|result| result);
     if let Err(error) = result {
@@ -1120,6 +1124,7 @@ fn load_or_create_csr(
             let key = KeyPair::generate().context("failed to generate ACME server private key")?;
             let mut params = CertificateParams::new(vec![transaction.hostname.clone()])
                 .context("failed to create ACME certificate parameters")?;
+            params.distinguished_name = rcgen::DistinguishedName::new();
             params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
             let csr = params
                 .serialize_request(&key)
@@ -1885,6 +1890,72 @@ mod tests {
     use crate::filesystem::PrivateTempDir;
 
     #[test]
+    fn synchronous_transaction_driver_persists_account_errors_without_panicking() {
+        let work = PrivateTempDir::new("nazoauthctl-acme-sync-driver").unwrap();
+        let store = TlsStore {
+            config_root: work.path().join("config"),
+            state_root: work.path().join("state"),
+        };
+        let mut transaction = test_transaction_for_store(&store);
+        transaction.phase = Phase::Prepared;
+        transaction.created_at = Utc::now().timestamp();
+        transaction.expires_at = transaction.created_at + 900;
+        let record = TlsRecord {
+            deployment_id: transaction.deployment_id.clone(),
+            declaration_revision: transaction.declaration_revision,
+        };
+        let acme = LoadedAcmeConfig {
+            config: test_config(work.path().join("challenge")),
+            sha256: transaction.acme_config_sha256.clone(),
+            source_bytes: Vec::new(),
+            directory_trust_anchor: None,
+        };
+        let provider = LoadedProvider {
+            config: serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "protocol": super::super::PROVIDER_PROTOCOL,
+                "tenant": "tenant-a",
+                "hostname": "auth.example",
+                "material_root": work.path().join("material"),
+                "activation_link": work.path().join("material/current"),
+                "trust_anchors": work.path().join("trust.pem"),
+                "public_url": "https://auth.example/health",
+                "accepted_statuses": [200],
+                "minimum_validity_seconds": 3600,
+                "connect_timeout_seconds": 1,
+                "request_timeout_seconds": 1,
+                "validate": {"program": "/unused", "args": []},
+                "reload": {"program": "/unused", "args": []}
+            }))
+            .unwrap(),
+            config_sha256: transaction.provider_config_sha256.clone(),
+            trust_anchors: Vec::new(),
+            trust_anchors_sha256: transaction.trust_anchors_sha256.clone(),
+            public_url: Url::parse("https://auth.example/health").unwrap(),
+        };
+        ensure_private_directory(&transaction.workspace, "test ACME workspace").unwrap();
+        // Invalid persisted credentials fail before any ACME network request.
+        atomic_write(&transaction.account_path, b"invalid", 0o600).unwrap();
+        persist_pending(&store, &transaction).unwrap();
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let error = drive_transaction(&store, &record, &provider, &acme, &mut transaction)
+            .expect_err("invalid credentials must return a recoverable error");
+        assert!(format!("{error:#}").contains("ACME account credentials are invalid"));
+        let pending = load_pending(&store, &record, "tenant-a", "auth.example")
+            .unwrap()
+            .expect("failed transaction remains available for recovery");
+        assert_eq!(pending.phase, Phase::Prepared);
+        assert!(
+            pending
+                .last_error
+                .unwrap()
+                .contains("ACME account credentials are invalid")
+        );
+        assert!(!account_key_draft_path(&transaction.account_path).exists());
+    }
+
+    #[test]
     fn strict_configuration_and_network_tokens_fail_closed() {
         let mut config = test_config(PathBuf::from("/srv/http/acme"));
         let mut value = serde_json::to_value(&config).unwrap();
@@ -2140,6 +2211,46 @@ mod tests {
             phase: Phase::Issued,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn csr_requests_only_the_bound_hostname_and_reuses_persisted_material() {
+        use x509_parser::prelude::{
+            FromDer, GeneralName, ParsedExtension, X509CertificationRequest,
+        };
+
+        let work = PrivateTempDir::new("nazoauthctl-acme-csr").unwrap();
+        let store = TlsStore {
+            config_root: work.path().join("config"),
+            state_root: work.path().join("state"),
+        };
+        let mut transaction = test_transaction_for_store(&store);
+        transaction.private_key_sha256 = None;
+        transaction.csr_sha256 = None;
+        ensure_private_directory(&transaction.workspace, "test ACME workspace").unwrap();
+
+        let der = load_or_create_csr(&store, &mut transaction).unwrap();
+        let (remaining, csr) = X509CertificationRequest::from_der(&der).unwrap();
+        assert!(remaining.is_empty());
+        assert!(
+            csr.certification_request_info
+                .subject
+                .iter()
+                .next()
+                .is_none()
+        );
+        let names: Vec<_> = csr
+            .requested_extensions()
+            .unwrap()
+            .filter_map(|extension| match extension {
+                ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(names, vec![&GeneralName::DNSName(&transaction.hostname)]);
+        assert_eq!(transaction.phase, Phase::CsrReady);
+        assert_eq!(load_or_create_csr(&store, &mut transaction).unwrap(), der);
     }
 
     fn test_transaction_for_store(store: &TlsStore) -> AcmeTransaction {

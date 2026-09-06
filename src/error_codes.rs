@@ -20,6 +20,10 @@ pub const HOST_UNREACHABLE: &str = "HOST_UNREACHABLE";
 /// connectivity problem. The detail carries the original bounded error chain.
 pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
+/// A TLS generation may have been activated and its pending journal requires
+/// explicit recovery for the same deployment, tenant and hostname.
+pub const TLS_RECOVERY_REQUIRED: &str = "TLS_RECOVERY_REQUIRED";
+
 /// The requested GitHub Release or one of its required platform assets does
 /// not exist.
 pub const RELEASE_NOT_FOUND: &str = "RELEASE_NOT_FOUND";
