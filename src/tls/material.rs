@@ -1,6 +1,6 @@
 //! Offline PKI validation for imported public-server TLS material.
 
-use std::{path::Path, sync::Arc};
+use std::{io::Read as _, path::Path, sync::Arc};
 
 use anyhow::{Context, bail};
 use chrono::Utc;
@@ -40,12 +40,30 @@ pub(super) fn load_and_validate_material(
         false,
         MAX_CERTIFICATE_BYTES,
     )?;
-    let private_key_pem = read_secure_regular_file(
+    let mut private_key_file = crate::filesystem::open_secure_regular_file(
         private_key_path,
         "TLS private key",
-        true,
-        MAX_PRIVATE_KEY_BYTES,
+        provider.config.reader_gid.is_none(),
     )?;
+    #[cfg(unix)]
+    if let Some(gid) = provider.config.reader_gid {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = private_key_file.metadata()?;
+        let mode = metadata.mode() & 0o7777;
+        // External imports may still be root-only. Installed material must
+        // grant at most the explicitly bound reader group, never world access.
+        if !matches!(mode, 0o400 | 0o600) && (mode != 0o640 || metadata.gid() != gid) {
+            anyhow::bail!("TLS private key grants access beyond its declared reader group");
+        }
+    }
+    let mut private_key_pem = zeroize::Zeroizing::new(Vec::new());
+    private_key_file
+        .by_ref()
+        .take(MAX_PRIVATE_KEY_BYTES + 1)
+        .read_to_end(&mut private_key_pem)?;
+    if private_key_pem.is_empty() || private_key_pem.len() as u64 > MAX_PRIVATE_KEY_BYTES {
+        anyhow::bail!("TLS private key size is invalid");
+    }
     let certificates = CertificateDer::pem_slice_iter(certificate_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .context("TLS certificate PEM is invalid")?;

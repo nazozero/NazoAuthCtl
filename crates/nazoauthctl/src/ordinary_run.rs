@@ -582,8 +582,11 @@ fn execute_with_progress<S: ProgressSink>(
     selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
     let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
     let evidence_directory = create_evidence_directory(&recovery_directory, &request_jti)?;
-    let ephemeral_tenant =
-        EphemeralTenant::new(&invocation.tenant_id, session.oidf_tenant_domain())?;
+    let ephemeral_tenant = EphemeralTenant::new(
+        &invocation.tenant_id,
+        session.oidf_tenant_domain(),
+        session.target_issuer(),
+    )?;
     progress.activity(&ProgressActivity::PreparingTenant {
         issuer: ephemeral_tenant.issuer.clone(),
     });
@@ -631,6 +634,7 @@ fn execute_with_progress<S: ProgressSink>(
         deployment_id: deployment.deployment_id.clone(),
         tenant_id: invocation.tenant_id.clone(),
         tenant_domain: session.oidf_tenant_domain().to_owned(),
+        issuer_port: Url::parse(&ephemeral_tenant.issuer)?.port(),
         realm_id: ephemeral_tenant.realm_id.clone(),
         organization_id: ephemeral_tenant.organization_id.clone(),
         run_id: request_jti.clone(),
@@ -1109,13 +1113,41 @@ mod acceptance_tests {
 
     #[test]
     fn temporary_tenant_uses_the_instance_owned_domain() {
-        let tenant =
-            EphemeralTenant::new("00000000-0000-0000-0000-000000000001", "oidf.example.com")
-                .expect("temporary tenant");
+        let tenant = EphemeralTenant::new(
+            "00000000-0000-0000-0000-000000000001",
+            "oidf.example.com",
+            "https://deployment.example",
+        )
+        .expect("temporary tenant");
         assert_eq!(
             tenant.issuer,
             "https://00000000-0000-0000-0000-000000000001.oidf.example.com"
         );
+    }
+
+    #[test]
+    fn temporary_tenant_retains_the_deployment_port_during_recovery() {
+        let tenant = EphemeralTenant::new(
+            "00000000-0000-0000-0000-000000000001",
+            "oidf.example.com",
+            "https://deployment.example:38443",
+        )
+        .unwrap();
+        let recovered = EphemeralTenant::from_ids(
+            &tenant.tenant_id,
+            &tenant.realm_id,
+            &tenant.organization_id,
+            "oidf.example.com",
+            Some(38443),
+        )
+        .unwrap();
+        assert_eq!(
+            tenant.issuer,
+            "https://00000000-0000-0000-0000-000000000001.oidf.example.com:38443"
+        );
+        assert_eq!(tenant.issuer, recovered.issuer);
+        assert_eq!(tenant.external_host, recovered.external_host);
+        assert_eq!(tenant.create_operation(7), recovered.create_operation(7));
     }
 
     #[test]
@@ -1238,6 +1270,7 @@ mod acceptance_tests {
                 deployment_id: "deployment-1".to_owned(),
                 tenant_id: "00000000-0000-0000-0000-000000000000".to_owned(),
                 tenant_domain: "oidf.example.com".to_owned(),
+                issuer_port: None,
                 realm_id: "00000000-0000-0000-0000-000000000001".to_owned(),
                 organization_id: "00000000-0000-0000-0000-000000000002".to_owned(),
                 run_id: "request-recovery-test".to_owned(),
@@ -1407,6 +1440,7 @@ mod acceptance_tests {
                 deployment_id: "deployment-1".to_owned(),
                 tenant_id: "00000000-0000-0000-0000-000000000010".to_owned(),
                 tenant_domain: "oidf.example.com".to_owned(),
+                issuer_port: None,
                 realm_id: "00000000-0000-0000-0000-000000000011".to_owned(),
                 organization_id: "00000000-0000-0000-0000-000000000012".to_owned(),
                 run_id: "request-failure-recovery-test".to_owned(),
@@ -1527,13 +1561,19 @@ struct EphemeralTenant {
 }
 
 impl EphemeralTenant {
-    fn new(tenant_id: &str, tenant_domain: &str) -> anyhow::Result<Self> {
+    fn new(tenant_id: &str, tenant_domain: &str, target_issuer: &str) -> anyhow::Result<Self> {
         let tenant_id = uuid::Uuid::parse_str(tenant_id)
             .context("generated OIDF tenant ID is invalid")?
             .to_string();
         let realm_id = uuid::Uuid::now_v7().to_string();
         let organization_id = uuid::Uuid::now_v7().to_string();
-        Self::from_ids(&tenant_id, &realm_id, &organization_id, tenant_domain)
+        Self::from_ids(
+            &tenant_id,
+            &realm_id,
+            &organization_id,
+            tenant_domain,
+            Url::parse(target_issuer)?.port(),
+        )
     }
 
     fn from_ids(
@@ -1541,6 +1581,7 @@ impl EphemeralTenant {
         realm_id: &str,
         organization_id: &str,
         tenant_domain: &str,
+        issuer_port: Option<u16>,
     ) -> anyhow::Result<Self> {
         let tenant_id = uuid::Uuid::parse_str(tenant_id)
             .context("OIDF tenant ID is invalid")?
@@ -1555,9 +1596,15 @@ impl EphemeralTenant {
             bail!("OIDF tenant boundaries must use distinct IDs");
         }
         let external_host = format!("{tenant_id}.{tenant_domain}");
+        if issuer_port == Some(0) {
+            bail!("OIDF tenant issuer port must be nonzero");
+        }
+        let port = issuer_port
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
         Ok(Self {
             slug: format!("oidf-{}", tenant_id.replace('-', "")),
-            issuer: format!("https://{external_host}"),
+            issuer: format!("https://{external_host}{port}"),
             external_host,
             tenant_id,
             realm_id,
@@ -2867,6 +2914,7 @@ fn pending_recovery_candidate(
             &binding.realm_id,
             &binding.organization_id,
             &binding.tenant_domain,
+            binding.issuer_port,
         )?
         .create_operation(binding.tenant_create_expected_revision),
         PendingRecoveryStep::TenantKeyGenerate(_) => {
@@ -3410,6 +3458,7 @@ fn recover_ephemeral_tenant(
         &recovery.ordinary_binding().realm_id,
         &recovery.ordinary_binding().organization_id,
         &recovery.ordinary_binding().tenant_domain,
+        recovery.ordinary_binding().issuer_port,
     )?;
     if !recovery.tenant_created() {
         let expected_revision = recovery.ordinary_binding().tenant_create_expected_revision;

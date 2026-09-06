@@ -159,6 +159,46 @@ fn install_order(operation: &HostOperation) -> &InstallOrder {
     order
 }
 
+#[test]
+fn direct_tls_install_uses_existing_config_and_binds_the_external_material_root()
+-> anyhow::Result<()> {
+    let fixture = LocalFixture::new(None)?;
+    let mut request = fixture.request(Some("direct"));
+    request.install_root = Some("/opt/nazo-test".into());
+    request.issuer = "https://auth.example.com:38443".to_owned();
+    request.direct_tls_config = Some("TRANSPORT_MODE: direct-tls\nTLS_BIND: 0.0.0.0:8443\nMTLS_ENDPOINT_BASE_URL: https://auth.example.com:38444\nTLS_CERTIFICATE_FILE: /etc/nazo-tls/bootstrap/fullchain.pem\nTLS_PRIVATE_KEY_FILE: /etc/nazo-tls/bootstrap/private-key.pem\nTLS_CLIENT_CA_FILE: /etc/nazo-tls/client-ca.pem\n".to_owned());
+    request.tls_material_root = Some("/etc/nazo-tls".into());
+    let host_id = Uuid::now_v7();
+    let hash = canonical_install_request_hash(&request, host_id)?;
+    let mut hello = test_hello(vec!["podman".to_owned()]);
+    hello.os = "linux".to_owned();
+    let prepared = prepare_install_operation(&mut request, &hello)?;
+    prepared.operation.validate()?;
+    let order = install_order(&prepared.operation);
+    let config: std::collections::BTreeMap<String, yaml_serde::Value> =
+        yaml_serde::from_str(&order.config_content)?;
+    assert_eq!(config["TRANSPORT_MODE"].as_str(), Some("direct-tls"));
+    assert_eq!(config["BIND"].as_str(), Some("0.0.0.0:8000"));
+    assert!(!config.contains_key("TRUSTED_PROXY_CIDRS"));
+    assert!(!config.contains_key("MTLS_CERTIFICATE_SOURCE"));
+    assert_eq!(order.tls_material_root.as_deref(), Some("/etc/nazo-tls"));
+    assert_eq!(
+        crate::target::install_exec::direct_tls_public_ports(
+            &request.issuer,
+            order.config_content.as_bytes()
+        )
+        .unwrap(),
+        vec![(38443, 8000), (38444, 8443)]
+    );
+    request.tls_material_root = Some("/etc/other-tls".into());
+    assert_ne!(hash, canonical_install_request_hash(&request, host_id)?);
+    assert!(
+        render_direct_tls_config("TRANSPORT_MODE: direct-tls\nDATABASE_URL: forbidden").is_err()
+    );
+    assert!(render_direct_tls_config("TRANSPORT_MODE: trusted-proxy").is_err());
+    Ok(())
+}
+
 fn test_secret(value: &str) -> Option<crate::target::SecretMaterial> {
     Some(crate::target::SecretMaterial::try_new(value.as_bytes().to_vec()).expect("test secret"))
 }
@@ -171,6 +211,7 @@ enum FailAt {
     ArtifactVerify,
     Health,
     StateCommit,
+    DatabaseInitializationThenPreflight,
 }
 
 /// Scripted executor performing REAL filesystem work with REAL rollback so
@@ -191,6 +232,23 @@ impl install_exec::InstallExecutor for ScriptedInstall {
     ) -> Result<crate::target::InstanceInspection, crate::target::Failure> {
         let mut performed = install_exec::PerformedSteps::default();
         self.steps.lock().unwrap().push("verify");
+        let attempt = self
+            .steps
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|step| **step == "verify")
+            .count();
+        if self.fail_at == Some(FailAt::DatabaseInitializationThenPreflight) && attempt == 2 {
+            return Err(install_exec::rollback_or_outcome_unknown(
+                job,
+                &performed,
+                crate::target::Failure::new(
+                    ARTIFACT_UNVERIFIED,
+                    "temporary verification failure on retry",
+                ),
+            ));
+        }
         if self.fail_at == Some(FailAt::ArtifactVerify) {
             // Nothing has been touched yet — abort before any side effect.
             return Err(crate::target::Failure::new(
@@ -213,6 +271,17 @@ impl install_exec::InstallExecutor for ScriptedInstall {
         }
 
         self.steps.lock().unwrap().push("start");
+        if self.fail_at == Some(FailAt::DatabaseInitializationThenPreflight) && attempt == 1 {
+            install_exec::mark_install_database_started(job)?;
+            return Err(install_exec::rollback_or_outcome_unknown(
+                job,
+                &performed,
+                crate::target::Failure::new(
+                    HEALTH_PROBE_FAILED,
+                    "initialization committed keys before failing",
+                ),
+            ));
+        }
         if self.fail_at == Some(FailAt::Health) {
             // Executor contract: undo own partial work before failing.
             install_exec::rollback(job, &performed).expect("fixture rollback");
@@ -341,6 +410,8 @@ impl LocalFixture {
             version: Some("v0.2.0".to_owned()),
             runtime: None,
             install_root: Some(self._temp.path().join("install")),
+            direct_tls_config: None,
+            tls_material_root: None,
             database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
                 port: 5432,
@@ -599,6 +670,8 @@ impl SshFixture {
             version: Some("v0.2.0".to_owned()),
             runtime: None,
             install_root: Some(self.stub._dir.path().join("install")),
+            direct_tls_config: None,
+            tls_material_root: None,
             database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
                 port: 5432,
@@ -821,6 +894,68 @@ fn artifact_failure_over_ssh_reports_stable_code_without_registering() -> anyhow
 }
 
 // ------------------------------------------------ shared scenario: rollback
+
+#[test]
+fn database_initialization_failure_retains_identity_through_failed_retry() -> anyhow::Result<()> {
+    let fixture = LocalFixture::new(Some(FailAt::DatabaseInitializationThenPreflight))?;
+    let request = || fixture.request(Some("production"));
+    let first = run_clean_install(&fixture.context, request()).expect_err("initialization failed");
+    assert!(
+        first.to_string().contains(INSTALL_OUTCOME_UNKNOWN),
+        "{first:#}"
+    );
+    assert!(!first.to_string().contains("was rolled back locally"));
+    let journal_path =
+        std::fs::read_dir(fixture.context.registry.root().join("prepared-installs"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .context("initialization must retain the prepared identity")?;
+    let journal_bytes = std::fs::read(&journal_path)?;
+    let plan: serde_json::Value = serde_json::from_slice(&journal_bytes)?;
+    let deployment_id = plan["deployment_id"].as_str().context("deployment id")?;
+    let install_root = request().install_root.context("install root")?;
+    let config_path = install_root
+        .join("config")
+        .join(deployment_id)
+        .join("config.json");
+    let config = std::fs::read(&config_path)?;
+    let secret_path = install_root
+        .join("secrets")
+        .join(deployment_id)
+        .join("mfa-totp-key");
+    let secret = std::fs::read(&secret_path)?;
+    let root_path = fixture
+        .context
+        .registry
+        .root()
+        .join("secrets")
+        .join(deployment_id)
+        .join("signing-key-encryption-key");
+    let signing_root = std::fs::read(&root_path)?;
+    let second =
+        run_clean_install(&fixture.context, request()).expect_err("retry preflight failed");
+    assert!(
+        second.to_string().contains(INSTALL_OUTCOME_UNKNOWN),
+        "{second:#}"
+    );
+    assert_eq!(std::fs::read(&journal_path)?, journal_bytes);
+    assert_eq!(std::fs::read(&config_path)?, config);
+    assert_eq!(std::fs::read(&secret_path)?, secret);
+    assert_eq!(std::fs::read(&root_path)?, signing_root);
+    assert!(fixture.context.registry.list_instances()?.is_empty());
+    run_clean_install(&fixture.context, request())?;
+    assert!(!journal_path.exists());
+    let instances = fixture.context.registry.list_instances()?;
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0].deployment_id, deployment_id);
+    assert_eq!(std::fs::read(&config_path)?, config);
+    assert_eq!(std::fs::read(&root_path)?, signing_root);
+    Ok(())
+}
 
 #[test]
 fn health_failure_rolls_back_config_and_secrets_locally() -> anyhow::Result<()> {
@@ -1054,15 +1189,27 @@ fn linux_target_paths_are_posix_even_when_constructed_on_windows() -> anyhow::Re
     assert!(!order.config_content.contains("DATABASE_URL_FILE"));
     assert!(!order.config_content.contains("VALKEY_URL_FILE"));
     assert!(!order.config_content.contains("database-lifecycle-url"));
+    // A fresh OAuth/OIDC install has no authority to invent an identity or
+    // driving-licence issuance profile, jurisdiction, or verifier policy.
     assert!(
-        order
+        !order
             .config_content
-            .contains("ENABLE_DIRECTORY_OPENID4VCI_ISSUER: \"true\"")
+            .contains("ENABLE_DIRECTORY_OPENID4VCI_ISSUER")
     );
     assert!(
-        order
+        !order
             .config_content
-            .contains("ENABLE_DIRECTORY_OPENID4VP_VERIFIER: \"true\"")
+            .contains("ENABLE_DIRECTORY_OPENID4VP_VERIFIER")
+    );
+    assert!(
+        !order
+            .config_content
+            .contains("OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON")
+    );
+    assert!(
+        !order
+            .config_content
+            .contains("OPENID4VC_MDOC_ISSUING_COUNTRY")
     );
     for file_setting in [
         "SIGNING_KEY_ENCRYPTION_KEY_FILE",
@@ -1249,6 +1396,8 @@ fn lost_install_response_resumes_exact_identity_without_a_second_instance() -> a
         version: Some("v0.2.0".to_owned()),
         runtime: None,
         install_root: Some(temp.path().join("install")),
+        direct_tls_config: None,
+        tls_material_root: None,
         database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
             host: "db.internal".to_owned(),
             port: 5432,

@@ -1,5 +1,25 @@
 use super::*;
 
+#[test]
+fn pending_tls_recovery_never_claims_no_effects_or_recommends_reapplying() {
+    let value: serde_json::Value =
+        serde_json::from_str(&render(crate::error_codes::TLS_RECOVERY_REQUIRED, true)).unwrap();
+    assert_eq!(value["code"], crate::error_codes::TLS_RECOVERY_REQUIRED);
+    assert!(
+        value["side_effects"]
+            .as_str()
+            .unwrap()
+            .starts_with("possible")
+    );
+    assert!(
+        value["side_effects"]
+            .as_str()
+            .unwrap()
+            .contains("tls certificate recover")
+    );
+    assert!(value["next_command"].is_null());
+}
+
 fn render(code_line: &str, json_mode: bool) -> String {
     let error = anyhow::anyhow!("{code_line}: something specific happened");
     render_failure(

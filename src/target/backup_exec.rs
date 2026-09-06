@@ -1231,6 +1231,13 @@ pub(crate) fn stage_recovery_candidate(
             "recorded recovery candidate Release differs from the requested version",
         ));
     }
+    let config_bytes = crate::filesystem::read_secure_regular_file(
+        &config,
+        "restored deployment configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )
+    .map_err(restore_failure)?;
     let request = RecoveryCandidateRequest {
         source_object_reference: state.runtime.object.clone(),
         candidate_object_reference: format!("nazoauth-recovery-{operation}"),
@@ -1241,15 +1248,21 @@ pub(crate) fn stage_recovery_candidate(
         secrets_source: secrets,
         config_source: config,
         valkey_state_epoch: state_epoch.to_owned(),
+        https: super::install_exec::local_runtime_uses_https(&config_bytes)?,
+        tls_files: recovery_tls_files(&config_bytes).map_err(restore_failure)?,
     };
     let endpoint = backend
         .stage_recovery_candidate(&request)
         .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
     let checked = (|| -> anyhow::Result<()> {
-        let authority = issuer_authority(&state.issuer)?;
-        fetch_http(endpoint.loopback_port, LOCAL_READINESS_PATH, &authority)?;
+        fetch_runtime(
+            endpoint.loopback_port,
+            LOCAL_READINESS_PATH,
+            &state.issuer,
+            &config_bytes,
+        )?;
         ensure!(
-            oidc_signing_key_ids(endpoint.loopback_port, &state.issuer)?
+            oidc_signing_key_ids(endpoint.loopback_port, &state.issuer, &config_bytes)?
                 == manifest.oidc_signing_key_ids,
             "recovery candidate OIDC signing keys differ from the snapshot"
         );
@@ -1463,11 +1476,18 @@ pub(crate) fn activate_recovered_runtime(
             "recovery activation did not start the verified target Release",
         ));
     }
-    let authority = issuer_authority(&state.issuer).map_err(restore_failure)?;
-    fetch_http(
+    let config_bytes = crate::filesystem::read_secure_regular_file(
+        Path::new(&state.config.reference),
+        "restored deployment configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )
+    .map_err(restore_failure)?;
+    fetch_runtime(
         state.runtime.loopback_port,
         LOCAL_READINESS_PATH,
-        &authority,
+        &state.issuer,
+        &config_bytes,
     )
     .map_err(restore_failure)?;
     store.apply_update_healthy(
@@ -2593,10 +2613,9 @@ fn start_candidate(
         container_policy: Some(ContainerRuntimePolicy::managed_app()),
     };
     backend.replace(&replacement)?;
-    let authority = issuer_authority(&state.issuer)?;
-    fetch_http(port, LOCAL_READINESS_PATH, &authority)?;
+    fetch_runtime(port, LOCAL_READINESS_PATH, &state.issuer, &config_bytes)?;
     ensure!(
-        oidc_signing_key_ids(port, &state.issuer)? == manifest.oidc_signing_key_ids,
+        oidc_signing_key_ids(port, &state.issuer, &config_bytes)? == manifest.oidc_signing_key_ids,
         "candidate OIDC signing keys differ from the snapshot"
     );
     let observed = backend.inspect(candidate)?;
@@ -2631,23 +2650,13 @@ fn reserve_loopback_port() -> anyhow::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
 }
-fn fetch_http(port: u16, path: &str, host: &str) -> anyhow::Result<Vec<u8>> {
-    let endpoint = format!("http://127.0.0.1:{port}{path}");
+fn fetch_runtime(port: u16, path: &str, issuer: &str, config: &[u8]) -> anyhow::Result<Vec<u8>> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut last = String::from("probe did not run");
     while Instant::now() < deadline {
-        let mut command = Command::new("curl");
-        command.args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--connect-timeout",
-            "2",
-            "--max-time",
-            "5",
-        ]);
-        command.args(["--header", &format!("Host: {host}")]);
-        let output = command.arg(&endpoint).output();
+        let output = super::install_exec::local_runtime_probe(port, issuer, config, path)
+            .map_err(|error| anyhow::anyhow!(error.detail))?
+            .output();
         match output {
             Ok(output) if output.status.success() => {
                 ensure!(
@@ -2672,9 +2681,16 @@ fn source_oidc_signing_key_ids(state: &DeploymentState) -> anyhow::Result<Vec<St
     let port = observation
         .ports
         .iter()
-        .find_map(|binding| host_port_for_container_8000(binding))
+        .filter_map(|binding| host_port_for_container_8000(binding))
+        .find(|port| *port == state.runtime.loopback_port)
         .context("runtime has no loopback host binding for container port 8000")?;
-    oidc_signing_key_ids(port, &state.issuer)
+    let config = crate::filesystem::read_secure_regular_file(
+        Path::new(&state.config.reference),
+        "deployment configuration",
+        false,
+        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+    )?;
+    oidc_signing_key_ids(port, &state.issuer, &config)
 }
 
 fn host_port_for_container_8000(binding: &str) -> Option<u16> {
@@ -2684,13 +2700,17 @@ fn host_port_for_container_8000(binding: &str) -> Option<u16> {
     host.trim_end_matches(':').rsplit(':').next()?.parse().ok()
 }
 
-fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<String>> {
+fn oidc_signing_key_ids(
+    port: u16,
+    expected_issuer: &str,
+    config: &[u8],
+) -> anyhow::Result<Vec<String>> {
     let issuer = Url::parse(expected_issuer)?;
-    let authority = issuer_authority(expected_issuer)?;
-    let discovery: serde_json::Value = serde_json::from_slice(&fetch_http(
+    let discovery: serde_json::Value = serde_json::from_slice(&fetch_runtime(
         port,
         "/.well-known/openid-configuration",
-        &authority,
+        expected_issuer,
+        config,
     )?)?;
     ensure!(
         discovery.get("issuer").and_then(serde_json::Value::as_str) == Some(expected_issuer),
@@ -2713,7 +2733,7 @@ fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<
         None => jwks.path().to_owned(),
     };
     let document: serde_json::Value =
-        serde_json::from_slice(&fetch_http(port, &path, &authority)?)?;
+        serde_json::from_slice(&fetch_runtime(port, &path, expected_issuer, config)?)?;
     let mut key_ids = document
         .get("keys")
         .and_then(serde_json::Value::as_array)
@@ -2735,13 +2755,26 @@ fn oidc_signing_key_ids(port: u16, expected_issuer: &str) -> anyhow::Result<Vec<
     Ok(key_ids)
 }
 
-fn issuer_authority(expected_issuer: &str) -> anyhow::Result<String> {
-    let issuer = Url::parse(expected_issuer)?;
-    let host = issuer.host_str().context("deployment issuer has no host")?;
-    Ok(match issuer.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    })
+fn recovery_tls_files(config: &[u8]) -> anyhow::Result<Vec<PathBuf>> {
+    let config: BTreeMap<String, yaml_serde::Value> = yaml_serde::from_slice(config)
+        .map_err(|_| anyhow::anyhow!("recovery configuration must be a YAML mapping"))?;
+    let mut files = Vec::new();
+    for key in [
+        "TLS_CERTIFICATE_FILE",
+        "TLS_PRIVATE_KEY_FILE",
+        "TLS_CLIENT_CA_FILE",
+    ] {
+        if let Some(value) = config.get(key) {
+            let path = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("recovery {key} must be a nonempty path"))?;
+            files.push(PathBuf::from(path));
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 fn candidate_name(source: &str, id: Uuid) -> String {
     format!(

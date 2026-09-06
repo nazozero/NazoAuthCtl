@@ -24,10 +24,11 @@ pub(crate) struct RecoveryCeremonyTransport {
     issuer: Url,
     issuer_authority: String,
     local_port: u16,
+    https: bool,
 }
 
 impl RecoveryCeremonyTransport {
-    pub(crate) fn new(issuer: &str, local_port: u16) -> anyhow::Result<Self> {
+    pub(crate) fn new(issuer: &str, local_port: u16, https: bool) -> anyhow::Result<Self> {
         let issuer = Url::parse(issuer).context("recovery ceremony issuer is not a URL")?;
         if issuer.scheme() != "https"
             || issuer.host().is_none()
@@ -44,6 +45,7 @@ impl RecoveryCeremonyTransport {
             issuer_authority: authority(&issuer)?,
             issuer,
             local_port,
+            https,
         })
     }
 
@@ -76,16 +78,17 @@ impl RecoveryCeremonyTransport {
             bail!("recovery ceremony transport rejected a non-ceremony request")
         }
     }
-}
 
-impl AdminApiTransport for RecoveryCeremonyTransport {
-    fn send(&self, request: AdminHttpRequest) -> anyhow::Result<AdminHttpResponse> {
-        let path = self.validate_request(&request)?;
-        // The HTTPS URL above is the authority contract.  The actual socket
-        // has no DNS, no TLS downgrade decision, and no proxy route: it is
-        // exactly the selected candidate or process-owned forward on
-        // `127.0.0.1`.
-        let local_url = format!("http://127.0.0.1:{}{path}", self.local_port);
+    fn command(&self, request: &AdminHttpRequest) -> anyhow::Result<crate::process::Process> {
+        let path = self.validate_request(request)?;
+        // The restored configuration selects the transport. HTTPS keeps the
+        // issuer's SNI and certificate validation while connecting only to
+        // the candidate or process-owned SSH forward on IPv4 loopback.
+        let local_url = if self.https {
+            self.issuer.join(path)?.to_string()
+        } else {
+            format!("http://127.0.0.1:{}{path}", self.local_port)
+        };
         let mut command = crate::process::Process::new("curl").args([
             "--disable",
             "--silent",
@@ -105,11 +108,30 @@ impl AdminApiTransport for RecoveryCeremonyTransport {
             "--write-out",
             "\n%{http_code}",
         ]);
+        if self.https {
+            command = command.args([
+                "--proto",
+                "=https",
+                "--connect-to",
+                &format!(
+                    "{}:{}:127.0.0.1:{}",
+                    self.issuer.host().unwrap(),
+                    self.issuer.port_or_known_default().unwrap(),
+                    self.local_port
+                ),
+            ]);
+        }
         if request.body.is_some() {
             command = command.arg("--data-binary").arg("@-");
         }
-        let output = command
-            .arg(local_url)
+        Ok(command.arg(local_url))
+    }
+}
+
+impl AdminApiTransport for RecoveryCeremonyTransport {
+    fn send(&self, request: AdminHttpRequest) -> anyhow::Result<AdminHttpResponse> {
+        let output = self
+            .command(&request)?
             .stdin_output(request.body.as_deref().unwrap_or_default())
             .context("recovery ceremony loopback request failed")?;
         if !output.status.success() {
@@ -158,7 +180,7 @@ mod tests {
 
     #[test]
     fn admits_only_the_two_bound_https_ceremony_paths() -> anyhow::Result<()> {
-        let transport = RecoveryCeremonyTransport::new("https://auth.example.test", 43123)?;
+        let transport = RecoveryCeremonyTransport::new("https://auth.example.test", 43123, true)?;
         assert!(
             transport
                 .validate_request(&request(
@@ -199,7 +221,7 @@ mod tests {
 
     #[test]
     fn rejects_admin_access_and_queries() -> anyhow::Result<()> {
-        let transport = RecoveryCeremonyTransport::new("https://auth.example.test", 43123)?;
+        let transport = RecoveryCeremonyTransport::new("https://auth.example.test", 43123, false)?;
         let mut with_cookie = request("https://auth.example.test/controller-recovery/recover");
         with_cookie
             .headers
@@ -212,6 +234,106 @@ mod tests {
                 ))
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_ceremony_checks_tls_identity_and_sends_json_only_to_the_bound_candidate()
+    -> anyhow::Result<()> {
+        use rustls::pki_types::{PrivateKeyDer, pem::PemObject};
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::Arc,
+            time::Duration,
+        };
+        let identity = rcgen::generate_simple_self_signed(vec!["auth.example".to_owned()])?;
+        let temp = crate::filesystem::PrivateTempDir::new("tls-recovery")?;
+        let ca = temp.path().join("ca.pem");
+        std::fs::write(&ca, identity.cert.pem())?;
+        let tls = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![identity.cert.der().clone()],
+                PrivateKeyDer::from_pem_slice(identity.signing_key.serialize_pem().as_bytes())?,
+            )?,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                let (tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut stream = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(tls.clone()).unwrap(),
+                    tcp,
+                );
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 2048];
+                while let Ok(count) = stream.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if bytes.ends_with(b"\r\n\r\n{}") {
+                        received.push((
+                            stream.conn.server_name().unwrap().to_owned(),
+                            String::from_utf8(bytes).unwrap(),
+                        ));
+                        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+                        stream.flush().unwrap();
+                        break;
+                    }
+                }
+            }
+            received
+        });
+        let transport = RecoveryCeremonyTransport::new("https://auth.example:8443", port, true)?;
+        let request = request("https://auth.example:8443/controller-recovery/challenges");
+        assert!(
+            transport.send(request.clone()).is_err(),
+            "unknown CA must fail"
+        );
+        let output = transport
+            .command(&request)?
+            .arg("--cacert")
+            .arg(ca.as_os_str())
+            .stdin_output(b"{}")?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}\n400");
+        let wrong = RecoveryCeremonyTransport::new("https://wrong.example:8443", port, true)?;
+        let mut wrong_request = request.clone();
+        wrong_request.url = "https://wrong.example:8443/controller-recovery/challenges".to_owned();
+        assert!(
+            !wrong
+                .command(&wrong_request)?
+                .arg("--cacert")
+                .arg(ca.as_os_str())
+                .stdin_output(b"{}")?
+                .status
+                .success()
+        );
+        let received = server.join().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, "auth.example");
+        assert!(
+            received[0]
+                .1
+                .starts_with("POST /controller-recovery/challenges HTTP/1.1\r\n")
+        );
+        assert!(received[0].1.contains("Host: auth.example:8443\r\n"));
+        assert!(
+            !received[0]
+                .1
+                .to_ascii_lowercase()
+                .contains("authorization:")
+        );
+        assert!(!received[0].1.to_ascii_lowercase().contains("cookie:"));
         Ok(())
     }
 }

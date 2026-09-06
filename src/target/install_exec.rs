@@ -57,6 +57,7 @@ pub(crate) const LOCAL_READINESS_PATH: &str = "/health";
 /// The target journal deliberately keeps this operation pending and the
 /// control-side prepared-install pointer must be retained for exact replay.
 pub const INSTALL_OUTCOME_UNKNOWN: &str = "OUTCOME_UNKNOWN";
+const INSTALL_DATABASE_STARTED: &str = "install-database-started";
 
 /// Closed vocabulary of secret files written on the target. External
 /// dependency credentials and deployment security roots are supplied by the
@@ -221,6 +222,10 @@ pub struct InstallOrder {
     /// container runtimes, whose executable lives inside the verified image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_root: Option<String>,
+    /// Explicit external TLS directory. Mounted read-only at the same absolute
+    /// path so an atomic `current` switch remains visible inside the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_material_root: Option<String>,
     /// Target-local secret files backing the config references.
     pub secrets: Vec<PlannedSecret>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,6 +248,7 @@ impl std::fmt::Debug for InstallOrder {
             .field("config_sha256", &self.config_sha256)
             .field("data_root", &self.data_root)
             .field("runtime_root", &self.runtime_root)
+            .field("tls_material_root", &self.tls_material_root)
             .field("secrets", &self.secrets)
             .field("current_data_import", &self.current_data_import)
             .field("database_runtime_endpoint", &self.database_runtime_endpoint)
@@ -342,6 +348,16 @@ impl InstallOrder {
             return Err(super::wire::MessageRejection::new(
                 super::wire::RejectionCode::OperationMalformed,
                 "install runtime_root must be a bounded absolute path",
+            ));
+        }
+        if self
+            .tls_material_root
+            .as_ref()
+            .is_some_and(|path| !valid_tls_material_root(path))
+        {
+            return Err(super::wire::MessageRejection::new(
+                super::wire::RejectionCode::OperationMalformed,
+                "TLS material root must be a dedicated absolute POSIX directory",
             ));
         }
         if self.database_runtime_endpoint.host != self.database_lifecycle_endpoint.host
@@ -844,7 +860,7 @@ impl HostInstallExecutor {
         if config_or_marker_exists
             && (!config_metadata
                 .is_some_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-                || !ownership_marker_matches(&config_owned, job.deployment_id))
+                || !ownership_marker_matches(&config_owned, job.deployment_id, job.runtime.kind))
         {
             return Err(Failure::new(
                 CONFIG_PATH_OCCUPIED,
@@ -885,7 +901,11 @@ impl HostInstallExecutor {
             if let Ok(metadata) = std::fs::symlink_metadata(path)
                 && (!metadata.is_dir()
                     || metadata.file_type().is_symlink()
-                    || !ownership_marker_matches(&path.join(".nazoauth-owned"), job.deployment_id))
+                    || !ownership_marker_matches(
+                        &path.join(".nazoauth-owned"),
+                        job.deployment_id,
+                        job.runtime.kind,
+                    ))
             {
                 return Err(Failure::new(
                     CONFIG_PATH_OCCUPIED,
@@ -911,6 +931,96 @@ impl HostInstallExecutor {
 
         // 1. Official artifact: verify first, use afterwards (H01 single entry).
         let kind = job.runtime.kind;
+        if let Some(tls_mount) = install_tls_mount(
+            job.order.config_content.as_bytes(),
+            job.order.tls_material_root.as_deref(),
+            kind,
+        )? {
+            filesystem::validate_secure_directory(&tls_mount.source, "TLS material root", false)
+                .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
+            let metadata = fs::symlink_metadata(&tls_mount.source).map_err(|_| {
+                Failure::new(
+                    CONFIG_INVALID,
+                    "TLS material root is not an accessible directory",
+                )
+            })?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || managed_directories.iter().any(|managed| {
+                    managed.starts_with(&tls_mount.source) || tls_mount.source.starts_with(managed)
+                })
+            {
+                return Err(Failure::new(
+                    CONFIG_INVALID,
+                    "TLS material root must be a real directory disjoint from managed installation paths",
+                ));
+            }
+            let config: std::collections::BTreeMap<String, yaml_serde::Value> =
+                yaml_serde::from_str(&job.order.config_content).map_err(|_| {
+                    Failure::new(CONFIG_INVALID, "invalid Direct TLS configuration")
+                })?;
+            for key in [
+                "TLS_CERTIFICATE_FILE",
+                "TLS_PRIVATE_KEY_FILE",
+                "TLS_CLIENT_CA_FILE",
+            ] {
+                let path = config
+                    .get(key)
+                    .and_then(yaml_serde::Value::as_str)
+                    .ok_or_else(|| {
+                        Failure::new(
+                            CONFIG_INVALID,
+                            "incomplete Direct TLS material configuration",
+                        )
+                    })?;
+                let resolved = fs::canonicalize(path).map_err(|_| {
+                    Failure::new(
+                        CONFIG_INVALID,
+                        format!("{key} is unavailable on the target"),
+                    )
+                })?;
+                if !resolved.starts_with(&tls_mount.source) {
+                    return Err(Failure::new(
+                        CONFIG_INVALID,
+                        format!("{key} resolves outside the declared TLS material root"),
+                    ));
+                }
+                #[cfg(unix)]
+                filesystem::open_secure_regular_file_for_uid(
+                    &resolved,
+                    key,
+                    false,
+                    NAZOAUTH_RUNTIME_UID,
+                )
+                .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
+            }
+            let public_ports =
+                direct_tls_public_ports(job.issuer, job.order.config_content.as_bytes())?;
+            if public_ports
+                .iter()
+                .any(|(port, _)| *port == job.runtime.loopback_port)
+            {
+                return Err(Failure::new(
+                    CONFIG_INVALID,
+                    "public TLS port conflicts with local readiness port",
+                ));
+            }
+            if runtime_backend::backend(kind)
+                .inspect(&job.runtime.object)
+                .is_err()
+            {
+                for (port, _) in public_ports {
+                    std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+                        .map(drop)
+                        .map_err(|_| {
+                            Failure::new(
+                                RUNTIME_START_FAILED,
+                                format!("public TLS port {port} is already in use on the target"),
+                            )
+                        })?;
+                }
+            }
+        }
         require_loopback_port_available(kind, &job.runtime.object, job.runtime.loopback_port)?;
         for (label, endpoint) in [
             ("database runtime", &job.order.database_runtime_endpoint),
@@ -1129,7 +1239,7 @@ impl HostInstallExecutor {
 
         // 7. Local health/readiness probe. Public reachability is deliberately
         // absent here (G08): loopback readiness is the only install gate.
-        probe_local_health(job.runtime.loopback_port, job.issuer)?;
+        probe_local_health(job.runtime.loopback_port, job.issuer, job.config_reference)?;
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{}", verified.digest),
@@ -1195,10 +1305,32 @@ fn prepare_owned_directory(
     Ok(())
 }
 
-fn ownership_marker_matches(marker: &Path, deployment_id: &str) -> bool {
-    let Ok(bytes) =
-        filesystem::read_secure_regular_file(marker, "install ownership marker", false, 256)
-    else {
+fn ownership_marker_matches(
+    marker: &Path,
+    deployment_id: &str,
+    runtime: RuntimeBackendKind,
+) -> bool {
+    let bytes =
+        filesystem::read_secure_regular_file(marker, "install ownership marker", false, 256);
+    #[cfg(unix)]
+    let bytes = bytes.or_else(|_| {
+        // Installation hands the data directory to this exact runtime user.
+        // Its receipt and ancestors remain valid on a resumed installation.
+        let uid = match runtime {
+            RuntimeBackendKind::Host => runtime_backend::systemd_service_user_uid(deployment_id)?,
+            RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => NAZOAUTH_RUNTIME_UID,
+        };
+        filesystem::read_secure_regular_file_for_uid(
+            marker,
+            "install ownership marker",
+            false,
+            256,
+            uid,
+        )
+    });
+    #[cfg(not(unix))]
+    let _ = runtime;
+    let Ok(bytes) = bytes else {
         return false;
     };
     std::str::from_utf8(bytes.as_ref()).is_ok_and(|owner| owner.trim() == deployment_id)
@@ -1261,6 +1393,19 @@ fn start_container_runtime(
             false,
         ),
     ];
+    let mut ports = vec![format!("127.0.0.1:{}:8000/tcp", job.runtime.loopback_port)];
+    if let Some(tls_mount) = install_tls_mount(
+        job.order.config_content.as_bytes(),
+        job.order.tls_material_root.as_deref(),
+        kind,
+    )? {
+        mounts.push(tls_mount);
+        ports.extend(
+            direct_tls_public_ports(job.issuer, job.order.config_content.as_bytes())?
+                .into_iter()
+                .map(|(public, internal)| format!("0.0.0.0:{public}:{internal}/tcp")),
+        );
+    }
     // Database and Valkey URLs are direct values in the mounted configuration;
     // lifecycle credentials remain ctl-owned. Runtime key roots are mounted as
     // individual read-only files.
@@ -1333,7 +1478,7 @@ fn start_container_runtime(
         environment,
         networks: Vec::new(),
         ip_address: None,
-        ports: vec![format!("127.0.0.1:{}:8000/tcp", job.runtime.loopback_port)],
+        ports,
         labels: [(
             "io.nazoauth.deployment-id".to_owned(),
             job.deployment_id.to_owned(),
@@ -1467,7 +1612,9 @@ fn start_systemd_runtime(
         mounts: Vec::new(),
         environment,
         working_directory: Some(PathBuf::from(&job.order.data_root)),
-        service_user: None,
+        // The service owns the data directory. Root with an empty capability
+        // set cannot bypass its DAC permissions during the migration.
+        service_user: Some(service_user),
         transient_credentials: std::collections::BTreeMap::new(),
         read_only_paths: std::iter::once(PathBuf::from(job.config_reference))
             .chain(secret_paths)
@@ -1477,6 +1624,7 @@ fn start_systemd_runtime(
         private_mounts: false,
         stdin: Vec::new(),
     };
+    mark_install_database_started(job)?;
     backend.run_one_shot(&task).map_err(|error| {
         Failure::new(
             RUNTIME_START_FAILED,
@@ -1596,6 +1744,7 @@ fn run_prestart_database_tasks(
         private_mounts: false,
         stdin: Vec::new(),
     };
+    mark_install_database_started(job)?;
     backend.run_one_shot(&task).map_err(|error| {
         Failure::new(
             RUNTIME_START_FAILED,
@@ -1603,6 +1752,17 @@ fn run_prestart_database_tasks(
         )
     })?;
     Ok(())
+}
+
+/// Initialization can commit database keys before returning an error. Retain
+/// the original identity and files across retries, including process crashes.
+pub(crate) fn mark_install_database_started(job: &InstallJob<'_>) -> Result<(), Failure> {
+    atomic_write(
+        &job.scope_dir.join(INSTALL_DATABASE_STARTED),
+        job.deployment_id.as_bytes(),
+        0o600,
+    )
+    .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))
 }
 
 fn install_secret_value(job: &InstallJob<'_>, purpose: &str) -> Result<String, Failure> {
@@ -1810,6 +1970,121 @@ pub(super) fn set_runtime_identity_directory(
     Ok(())
 }
 
+/// Public endpoints are derived from the existing server configuration; the
+/// generated readiness binding and internal public listener remain unchanged.
+pub(crate) fn direct_tls_public_ports(
+    issuer: &str,
+    content: &[u8],
+) -> Result<Vec<(u16, u16)>, Failure> {
+    let invalid = || {
+        Failure::new(
+            CONFIG_INVALID,
+            "Direct TLS requires distinct HTTPS issuer/mTLS ports on one hostname and an unspecified IPv4 TLS_BIND",
+        )
+    };
+    let config: std::collections::BTreeMap<String, yaml_serde::Value> =
+        yaml_serde::from_slice(content).map_err(|_| invalid())?;
+    let required = |key: &str| {
+        config
+            .get(key)
+            .and_then(yaml_serde::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(invalid)
+    };
+    if required("TRANSPORT_MODE")? != "direct-tls" {
+        return Err(invalid());
+    }
+    let issuer = url::Url::parse(issuer).map_err(|_| invalid())?;
+    let mtls = url::Url::parse(required("MTLS_ENDPOINT_BASE_URL")?).map_err(|_| invalid())?;
+    let bare_https = |url: &url::Url| {
+        url.scheme() == "https"
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/"
+    };
+    if !bare_https(&issuer) || !bare_https(&mtls) || issuer.host() != mtls.host() {
+        return Err(invalid());
+    }
+    let public = issuer.port_or_known_default().ok_or_else(invalid)?;
+    let mutual = mtls.port_or_known_default().ok_or_else(invalid)?;
+    let bind: std::net::SocketAddr = required("TLS_BIND")?.parse().map_err(|_| invalid())?;
+    if public == 0
+        || mutual == 0
+        || public == mutual
+        || !bind.is_ipv4()
+        || !bind.ip().is_unspecified()
+        || bind.port() == 0
+        || bind.port() == 8000
+    {
+        return Err(invalid());
+    }
+    Ok(vec![(public, 8000), (mutual, bind.port())])
+}
+
+fn install_tls_mount(
+    content: &[u8],
+    root: Option<&str>,
+    kind: RuntimeBackendKind,
+) -> Result<Option<runtime_backend::NeutralMount>, Failure> {
+    let direct_tls = local_runtime_uses_https(content)?;
+    let Some(root) = root else {
+        if direct_tls {
+            return Err(Failure::new(
+                CONFIG_INVALID,
+                "Direct TLS install requires an explicit TLS material root",
+            ));
+        }
+        return Ok(None);
+    };
+    if !direct_tls || !kind.is_container() || !valid_tls_material_root(root) {
+        return Err(Failure::new(
+            CONFIG_INVALID,
+            "TLS material installation requires Direct TLS on Podman or Docker",
+        ));
+    }
+    let config: std::collections::BTreeMap<String, yaml_serde::Value> =
+        yaml_serde::from_slice(content)
+            .map_err(|_| Failure::new(CONFIG_INVALID, "invalid Direct TLS configuration"))?;
+    for key in [
+        "TLS_CERTIFICATE_FILE",
+        "TLS_PRIVATE_KEY_FILE",
+        "TLS_CLIENT_CA_FILE",
+    ] {
+        let valid = config
+            .get(key)
+            .and_then(yaml_serde::Value::as_str)
+            .is_some_and(|path| {
+                safe_absolute_install_path(path)
+                    && path.starts_with(&format!("{root}/"))
+                    && !path.contains('\\')
+            });
+        if !valid {
+            return Err(Failure::new(
+                CONFIG_INVALID,
+                format!("{key} must be inside the declared TLS material root"),
+            ));
+        }
+    }
+    let mut material = mount(PathBuf::from(root), root, true);
+    material.ownership = runtime_backend::Responsibility::External;
+    Ok(Some(material))
+}
+
+fn valid_tls_material_root(path: &str) -> bool {
+    safe_absolute_install_path(path)
+        && path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.contains(['\\', ':', ','])
+        && !path.starts_with("//")
+        && !path
+            .split('/')
+            .skip(1)
+            .any(|part| matches!(part, "" | "." | ".."))
+}
+
 fn mount(source: PathBuf, destination: &str, read_only: bool) -> runtime_backend::NeutralMount {
     runtime_backend::NeutralMount {
         source,
@@ -1821,12 +2096,80 @@ fn mount(source: PathBuf, destination: &str, read_only: bool) -> runtime_backend
     }
 }
 
-/// Bounded loopback readiness probe against `http://127.0.0.1:{port}/health`.
+/// Bounded loopback readiness probe using the configured transport.
 /// Shared with the update/rollback executors (G03/G04): activation is only
 /// ever gated by the same local readiness fact. This is a LOOPBACK probe —
-/// it must never depend on public DNS, TLS, or any external boundary (G08).
-pub(crate) fn probe_local_health(port: u16, issuer: &str) -> Result<(), Failure> {
-    let endpoint = format!("http://127.0.0.1:{port}{LOCAL_READINESS_PATH}");
+/// HTTPS preserves issuer SNI and certificate verification while connecting
+/// directly to loopback, without public DNS or a reverse proxy.
+pub(crate) fn probe_local_health(
+    port: u16,
+    issuer: &str,
+    config_reference: &str,
+) -> Result<(), Failure> {
+    let config = crate::filesystem::read_secure_regular_file(
+        Path::new(config_reference),
+        "readiness configuration",
+        false,
+        MAX_CONFIG_CONTENT_BYTES as u64,
+    )
+    .map_err(|_| Failure::new(HEALTH_PROBE_FAILED, "cannot read readiness configuration"))?;
+    let probe = local_health_probe(port, issuer, &config)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last: Option<Failure> = None;
+    while std::time::Instant::now() < deadline {
+        match probe.run_quiet() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last = Some(Failure::new(
+                    HEALTH_PROBE_FAILED,
+                    sanitize(error.to_string()),
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(last
+        .unwrap_or_else(|| Failure::new(HEALTH_PROBE_FAILED, "local readiness probe timed out")))
+}
+
+fn local_health_probe(port: u16, issuer: &str, config: &[u8]) -> Result<Process, Failure> {
+    local_runtime_probe(port, issuer, config, LOCAL_READINESS_PATH)
+}
+
+pub(super) fn local_runtime_uses_https(config: &[u8]) -> Result<bool, Failure> {
+    // Do not include parser errors: the full config can contain credentials.
+    let config: std::collections::BTreeMap<String, yaml_serde::Value> =
+        yaml_serde::from_slice(config).map_err(|_| {
+            Failure::new(
+                HEALTH_PROBE_FAILED,
+                "readiness configuration must be a YAML mapping",
+            )
+        })?;
+    let direct_tls = match config.get("TRANSPORT_MODE") {
+        None => false,
+        Some(yaml_serde::Value::String(mode))
+            if matches!(mode.as_str(), "trusted-proxy" | "loopback-http") =>
+        {
+            false
+        }
+        Some(yaml_serde::Value::String(mode)) if mode == "direct-tls" => true,
+        _ => {
+            return Err(Failure::new(
+                HEALTH_PROBE_FAILED,
+                "unsupported readiness transport mode",
+            ));
+        }
+    };
+    Ok(direct_tls)
+}
+
+pub(super) fn local_runtime_probe(
+    port: u16,
+    issuer: &str,
+    config: &[u8],
+    path: &str,
+) -> Result<Process, Failure> {
+    let direct_tls = local_runtime_uses_https(config)?;
     let issuer = url::Url::parse(issuer).map_err(|error| {
         Failure::new(
             HEALTH_PROBE_FAILED,
@@ -1844,36 +2187,48 @@ pub(crate) fn probe_local_health(port: u16, issuer: &str) -> Result<(), Failure>
         authority.push_str(&port.to_string());
     }
     let host_header = format!("Host: {authority}");
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let mut last: Option<Failure> = None;
-    while std::time::Instant::now() < deadline {
-        let attempt = Process::new("curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--connect-timeout",
-                "3",
-                "--max-time",
-                "5",
-                "--header",
-                &host_header,
-                &endpoint,
-            ])
-            .run_quiet();
-        match attempt {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last = Some(Failure::new(
-                    HEALTH_PROBE_FAILED,
-                    sanitize(error.to_string()),
-                ));
-            }
+    let mut probe = Process::new("curl").args([
+        "--disable",
+        "--noproxy",
+        "*",
+        "--proto",
+        "=http,https",
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--connect-timeout",
+        "3",
+        "--max-time",
+        "5",
+        "--header",
+        &host_header,
+    ]);
+    if direct_tls {
+        if issuer.scheme() != "https" {
+            return Err(Failure::new(
+                HEALTH_PROBE_FAILED,
+                "direct TLS readiness requires an HTTPS issuer",
+            ));
         }
-        std::thread::sleep(Duration::from_millis(500));
+        let connect = format!(
+            "{}:{}:127.0.0.1:{port}",
+            issuer.host().unwrap(),
+            issuer.port_or_known_default().unwrap()
+        );
+        let endpoint = issuer
+            .join(path)
+            .map_err(|_| Failure::new(HEALTH_PROBE_FAILED, "invalid local probe path"))?;
+        if endpoint.origin() != issuer.origin() || endpoint.fragment().is_some() {
+            return Err(Failure::new(
+                HEALTH_PROBE_FAILED,
+                "local probe path changes issuer origin",
+            ));
+        }
+        probe = probe.args(["--connect-to", &connect, endpoint.as_str()]);
+    } else {
+        probe = probe.arg(format!("http://127.0.0.1:{port}{path}"));
     }
-    Err(last
-        .unwrap_or_else(|| Failure::new(HEALTH_PROBE_FAILED, "local readiness probe timed out")))
+    Ok(probe)
 }
 
 /// Roll every performed step back. Every cleanup is attempted, and any
@@ -1888,9 +2243,24 @@ pub(crate) fn rollback(job: &InstallJob<'_>, performed: &PerformedSteps) -> Resu
         {
             errors.push(format!("stopping runtime failed: {error}"));
         }
-        if let Err(error) = backend.remove(&job.runtime.object) {
-            errors.push(format!("removing runtime failed: {error}"));
+    }
+    // The external database is not part of filesystem rollback. Even a failed
+    // initialization may have persisted encrypted keys bound to these files.
+    // Check the durable marker on every retry, before deleting any material.
+    match std::fs::symlink_metadata(job.scope_dir.join(INSTALL_DATABASE_STARTED)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            errors.push(
+                "database initialization may have committed; retained install identity, configuration, secrets and data; rerun the same install command"
+                    .to_owned(),
+            );
+            return Err(Failure::new(INSTALL_FAILED, sanitize(errors.join("; "))));
         }
+    }
+    if performed.installed_runtime
+        && let Err(error) = runtime_backend::backend(job.runtime.kind).remove(&job.runtime.object)
+    {
+        errors.push(format!("removing runtime failed: {error}"));
     }
     for path in &performed.generated_secrets {
         if let Err(error) = filesystem::remove_file_durable(Path::new(path)) {
@@ -1942,7 +2312,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod endpoint_tests {
-    use super::{RuntimeBackendKind, validate_endpoint_reachability};
+    use super::{
+        RuntimeBackendKind, direct_tls_public_ports, install_tls_mount,
+        validate_endpoint_reachability,
+    };
 
     #[test]
     fn container_endpoints_keep_exact_network_semantics() {
@@ -1960,6 +2333,194 @@ mod endpoint_tests {
         }
         assert!(
             validate_endpoint_reachability(RuntimeBackendKind::Host, "Valkey", "127.0.0.1").is_ok()
+        );
+    }
+
+    #[test]
+    fn direct_install_keeps_the_declared_parent_mount_and_exact_public_ports() {
+        let config = b"TRANSPORT_MODE: direct-tls\nTLS_BIND: 0.0.0.0:8443\nMTLS_ENDPOINT_BASE_URL: https://auth.example:38444\nTLS_CERTIFICATE_FILE: /etc/nazo-tls/current/fullchain.pem\nTLS_PRIVATE_KEY_FILE: /etc/nazo-tls/current/private-key.pem\nTLS_CLIENT_CA_FILE: /etc/nazo-tls/client-ca.pem\n";
+        let material = install_tls_mount(config, Some("/etc/nazo-tls"), RuntimeBackendKind::Podman)
+            .unwrap()
+            .unwrap();
+        assert_eq!(material.source, std::path::Path::new("/etc/nazo-tls"));
+        assert_eq!(material.destination, material.source);
+        assert!(material.read_only);
+        assert_eq!(
+            material.ownership,
+            crate::runtime_backend::Responsibility::External
+        );
+        assert_eq!(
+            direct_tls_public_ports("https://auth.example:38443", config).unwrap(),
+            vec![(38443, 8000), (38444, 8443)]
+        );
+        assert!(install_tls_mount(config, None, RuntimeBackendKind::Podman).is_err());
+        assert!(install_tls_mount(config, Some("/etc/nazo"), RuntimeBackendKind::Podman).is_err());
+        assert!(
+            install_tls_mount(config, Some("/etc/nazo-tls"), RuntimeBackendKind::Host).is_err()
+        );
+        assert!(direct_tls_public_ports("https://other.example:38443", config).is_err());
+        assert!(direct_tls_public_ports("https://auth.example:38444", config).is_err());
+        assert!(direct_tls_public_ports("http://auth.example:38443", config).is_err());
+        for invalid in [
+            "/",
+            "/etc/nazo-tls,ro",
+            "/etc/nazo-tls:rw",
+            "/etc/../nazo-tls",
+            "/etc/nazo-tls/",
+        ] {
+            assert!(!super::valid_tls_material_root(invalid));
+        }
+        let escaped = String::from_utf8(config.to_vec())
+            .unwrap()
+            .replace("current/private-key.pem", "../private-key.pem");
+        assert!(
+            install_tls_mount(
+                escaped.as_bytes(),
+                Some("/etc/nazo-tls"),
+                RuntimeBackendKind::Podman
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_readiness_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    #[test]
+    fn proxy_readiness_connects_to_loopback_with_the_issuer_host() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = [0; 2048];
+            let count = tcp.read(&mut request).unwrap();
+            tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(request[..count].to_vec()).unwrap()
+        });
+        local_health_probe(
+            port,
+            "https://auth.example:8443",
+            b"TRANSPORT_MODE: trusted-proxy",
+        )
+        .unwrap()
+        .run_quiet()
+        .unwrap();
+        let request = server.join().unwrap();
+        assert!(request.starts_with(&format!("GET {LOCAL_READINESS_PATH} HTTP/1.1\r\n")));
+        assert!(request.contains("Host: auth.example:8443\r\n"));
+    }
+
+    #[test]
+    fn direct_readiness_requires_trusted_tls_and_preserves_sni_on_loopback() {
+        use rustls::pki_types::{PrivateKeyDer, pem::PemObject};
+        let identity = rcgen::generate_simple_self_signed(vec!["auth.example".to_owned()]).unwrap();
+        let temp = crate::filesystem::PrivateTempDir::new("tls-readiness").unwrap();
+        let trust = temp.path().join("ca.pem");
+        fs::write(&trust, identity.cert.pem()).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![identity.cert.der().clone()],
+                PrivateKeyDer::from_pem_slice(identity.signing_key.serialize_pem().as_bytes())
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut stream = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(config.clone()).unwrap(),
+                    tcp,
+                );
+                let mut request = [0; 2048];
+                if let Ok(count) = stream.read(&mut request) {
+                    if count == 0 {
+                        continue;
+                    }
+                    requests.push((
+                        stream.conn.server_name().unwrap().to_owned(),
+                        String::from_utf8(request[..count].to_vec()).unwrap(),
+                    ));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+            requests
+        });
+        let probe = local_health_probe(
+            port,
+            "https://auth.example:8443",
+            b"TRANSPORT_MODE: direct-tls",
+        )
+        .unwrap();
+        assert!(
+            probe.clone().run_quiet().is_err(),
+            "an untrusted certificate must fail"
+        );
+        probe
+            .arg("--cacert")
+            .arg(trust.as_os_str())
+            .run_quiet()
+            .unwrap();
+        assert!(
+            local_health_probe(
+                port,
+                "https://wrong.example:8443",
+                b"TRANSPORT_MODE: direct-tls"
+            )
+            .unwrap()
+            .arg("--cacert")
+            .arg(trust.as_os_str())
+            .run_quiet()
+            .is_err(),
+            "hostname mismatch must fail"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "auth.example");
+        assert!(requests[0].1.contains("Host: auth.example:8443\r\n"));
+        assert!(
+            requests[0]
+                .1
+                .starts_with(&format!("GET {LOCAL_READINESS_PATH} HTTP/1.1\r\n"))
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_invalid_transport_without_http_fallback_or_config_disclosure() {
+        for config in [
+            b"TRANSPORT_MODE: unknown".as_slice(),
+            b"TRANSPORT_MODE: true",
+            b"[secret-value",
+        ] {
+            let error = local_health_probe(8000, "https://auth.example", config)
+                .err()
+                .unwrap();
+            assert!(!error.detail.contains("secret-value"));
+        }
+        assert!(
+            local_health_probe(8000, "http://127.0.0.1", b"TRANSPORT_MODE: direct-tls").is_err()
         );
     }
 }
@@ -2032,6 +2593,36 @@ mod current_data_import_tests {
             .map_err(|failure| anyhow::anyhow!(failure.detail))?;
         fs::write(&mfa_source, b"invalid")?;
         assert!(copy_import_file(&mfa_source, &mfa_destination, "MFA").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_install_accepts_only_its_known_runtime_ownership() -> anyhow::Result<()> {
+        use std::os::unix::fs::{chown, symlink};
+
+        let temp = crate::filesystem::PrivateTempDir::new("install-runtime-ownership")?;
+        let data = temp.path().join("data");
+        fs::create_dir(&data)?;
+        let marker = data.join(".nazoauth-owned");
+        fs::write(&marker, b"deploy-test")?;
+        for path in [&data, &marker] {
+            match chown(path, Some(NAZOAUTH_RUNTIME_UID), Some(NAZOAUTH_RUNTIME_UID)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let matches = |id| super::ownership_marker_matches(&marker, id, RuntimeBackendKind::Podman);
+        assert!(matches("deploy-test"));
+        assert!(!matches("deploy-other"));
+        chown(&marker, Some(NAZOAUTH_RUNTIME_UID + 1), None)?;
+        assert!(!matches("deploy-test"));
+        fs::remove_file(&marker)?;
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"deploy-test")?;
+        symlink(&outside, &marker)?;
+        assert!(!matches("deploy-test"));
         Ok(())
     }
 

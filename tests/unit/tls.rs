@@ -61,6 +61,103 @@ fn transaction_provider_snapshot_detects_recovery_command_drift() {
     assert!(validate_provider_snapshot(&transaction).is_err());
 }
 
+#[test]
+fn service_reader_is_bound_to_the_recovery_snapshot() {
+    let mut transaction = test_transaction(PathBuf::from("/srv/tls"));
+    transaction.provider.reader_gid = Some(10001);
+    assert!(validate_provider_snapshot(&transaction).is_err());
+    transaction.provider_snapshot_sha256 = provider_snapshot_sha256(&transaction.provider).unwrap();
+    assert!(validate_provider_snapshot(&transaction).is_ok());
+    transaction.provider.reader_gid = Some(10002);
+    assert!(validate_provider_snapshot(&transaction).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_material_is_readable_only_by_root_and_the_declared_service_group() {
+    use std::os::unix::{
+        fs::{MetadataExt as _, PermissionsExt as _},
+        process::CommandExt as _,
+    };
+    let temp = PrivateTempDir::new("tls-reader").unwrap();
+    let owner = fs::metadata(temp.path()).unwrap();
+    let gid = if owner.uid() == 0 { 10001 } else { owner.gid() };
+    let mut transaction = test_transaction(temp.path().join("material"));
+    transaction.provider.reader_gid = Some(gid);
+    let (ca, cert, key) = test_server_identity();
+    let source_cert = temp.path().join("source-cert.pem");
+    let source_key = temp.path().join("source-key.pem");
+    // rcgen's fixture returns DER; stage an independently validated material
+    // built from PEM encoded with the same production certificate helpers.
+    use base64::Engine as _;
+    let pem = |label: &str, der: &[u8]| {
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            base64::engine::general_purpose::STANDARD.encode(der)
+        )
+    };
+    atomic_write(
+        &source_cert,
+        pem("CERTIFICATE", cert.as_ref()).as_bytes(),
+        0o644,
+    )
+    .unwrap();
+    atomic_write(
+        &source_key,
+        pem("PRIVATE KEY", key.secret_der()).as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    let provider = LoadedProvider {
+        config: transaction.provider.clone(),
+        config_sha256: "a".repeat(64),
+        trust_anchors: ca.as_bytes().to_vec(),
+        trust_anchors_sha256: sha256(ca.as_bytes()),
+        public_url: Url::parse("https://auth.example/health").unwrap(),
+    };
+    let material =
+        load_and_validate_material(&source_cert, &source_key, "auth.example", &provider).unwrap();
+    stage_generation(&transaction, &material).unwrap();
+    let installed_key = transaction.generation.join("private-key.pem");
+    load_and_validate_material(
+        &transaction.generation.join("fullchain.pem"),
+        &installed_key,
+        "auth.example",
+        &provider,
+    )
+    .unwrap();
+    // The fixture's outer directory is not part of the provider's secret root.
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let access = |uid, gid| {
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "test -r \"$1\" && ! test -w \"$1\"", "tls-reader"])
+            .arg(&installed_key)
+            .uid(uid)
+            .gid(gid)
+            .status()
+            .unwrap()
+            .success()
+    };
+    let metadata = fs::metadata(&installed_key).unwrap();
+    assert_eq!(metadata.uid(), owner.uid());
+    assert_eq!(metadata.gid(), gid);
+    assert_eq!(metadata.mode() & 0o7777, 0o640);
+    if owner.uid() == 0 {
+        assert!(access(10001, 10001));
+        assert!(!access(10002, 10002));
+    }
+    fs::set_permissions(&installed_key, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        load_and_validate_material(
+            &transaction.generation.join("fullchain.pem"),
+            &installed_key,
+            "auth.example",
+            &provider
+        )
+        .is_err()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn provider_snapshot_path_encoding_preserves_unix_backslash_components() {
@@ -118,12 +215,24 @@ fn recovery_accepts_only_the_exact_previous_or_committed_receipt() {
         transaction.leaf_certificate_sha256.clone(),
     );
     assert!(validate_committed_receipt_binding(&transaction, &committed).is_ok());
-    assert!(ensure_source_not_current(Some(&committed), &transaction.source).is_err());
+    assert!(ensure_source_not_current(Some(&committed), &transaction.source, None).is_err());
     let different_source = CertificateSourceBinding::ExternalFiles {
         certificate_sha256: "1".repeat(64),
         private_key_sha256: "2".repeat(64),
     };
-    assert!(ensure_source_not_current(Some(&committed), &different_source).is_ok());
+    assert!(ensure_source_not_current(Some(&committed), &different_source, None).is_ok());
+    let proxy_digest = "9".repeat(64);
+    assert!(
+        ensure_source_not_current(Some(&committed), &transaction.source, Some(&proxy_digest))
+            .is_ok()
+    );
+    committed.proxy_configuration_sha256 = Some(proxy_digest.clone());
+    assert!(
+        ensure_source_not_current(Some(&committed), &transaction.source, Some(&proxy_digest))
+            .is_err()
+    );
+    assert!(validate_committed_receipt_binding(&transaction, &committed).is_err());
+    committed.proxy_configuration_sha256 = None;
     committed.provider_config_sha256 = "f".repeat(64);
     assert!(validate_committed_receipt_binding(&transaction, &committed).is_err());
 }
@@ -386,6 +495,8 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
             protocol: PROVIDER_PROTOCOL.to_owned(),
             tenant: "tenant-a".to_owned(),
             hostname: "auth.example".to_owned(),
+            reader_gid: None,
+            native_proxy_program: None,
             material_root: work.path().join("material"),
             activation_link: work.path().join("material/current"),
             trust_anchors: work.path().join("root.pem"),
@@ -410,6 +521,7 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     };
     let input = TlsCertificateInput {
         provider_config: work.path().join("provider.json"),
+        proxy_config: None,
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
         source: TlsCertificateSource::ExternalFiles {
@@ -544,6 +656,8 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         protocol: PROVIDER_PROTOCOL.to_owned(),
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
+        reader_gid: None,
+        native_proxy_program: None,
         material_root: PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example"),
         activation_link: PathBuf::from("/srv/nazoauth/tls/tenant-a/auth.example/current"),
         trust_anchors: PathBuf::from("/etc/ssl/auth-root.pem"),
@@ -568,6 +682,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         &sha256(leaf_der.as_ref()),
         root_store_from_pem(ca_pem.as_bytes()).unwrap(),
         &provider,
+        None,
     )
     .unwrap();
     verify_public_address_not_leaf(
@@ -590,6 +705,139 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
     .unwrap_err();
     assert!(format!("{error:#}").contains("still presents"));
     server.join().unwrap();
+}
+
+#[test]
+fn public_verification_waits_for_new_identity_and_can_verify_rollback() {
+    use std::net::TcpListener;
+
+    let mut ca_params = CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let issuer = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+    let identity = || {
+        let mut params = CertificateParams::new(vec!["auth.example".to_owned()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        let digest = sha256(cert.der().as_ref());
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::from_pem_slice(key.serialize_pem().as_bytes()).unwrap(),
+        )
+        .unwrap();
+        (digest, Arc::new(config))
+    };
+    let (old_digest, old) = identity();
+    let (new_digest, new) = identity();
+    assert_ne!(old_digest, new_digest);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        // Forward switch, then rollback: both initially serve the prior identity.
+        for config in [old.clone(), new.clone(), new, old] {
+            let (tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut stream =
+                rustls::StreamOwned::new(rustls::ServerConnection::new(config).unwrap(), tcp);
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    let mut provider = test_transaction(PathBuf::from("/srv/tls")).provider;
+    provider.request_timeout_seconds = 2;
+    for digest in [new_digest, old_digest] {
+        verify_public_address(
+            &Url::parse("https://auth.example/health").unwrap(),
+            "auth.example",
+            address,
+            &digest,
+            root_store_from_pem(issuer.pem().as_bytes()).unwrap(),
+            &provider,
+            None,
+        )
+        .unwrap();
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn public_verification_stops_when_a_healthy_identity_never_switches() {
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let (ca_pem, leaf_der, key_der) = test_server_identity();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf_der], key_der)
+        .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let end = Instant::now() + Duration::from_millis(1500);
+        let mut count = 0;
+        while Instant::now() < end {
+            let (tcp, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            tcp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            tcp.set_nonblocking(false).unwrap();
+            let mut stream = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(config.clone()).unwrap(),
+                tcp,
+            );
+            let mut request = [0; 1024];
+            // The verifier may close the final attempt at its absolute
+            // deadline while the fixture is still handshaking or writing.
+            if matches!(stream.read(&mut request), Ok(read) if read > 0)
+                && stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .is_ok()
+                && stream.flush().is_ok()
+            {
+                count += 1;
+            }
+        }
+        count
+    });
+    let mut provider = test_transaction(PathBuf::from("/srv/tls")).provider;
+    provider.request_timeout_seconds = 1;
+    let start = Instant::now();
+    let error = verify_public_address(
+        &Url::parse("https://auth.example/health").unwrap(),
+        "auth.example",
+        address,
+        &"0".repeat(64),
+        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        &provider,
+        None,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("timeout") || format!("{error:#}").contains("deadline"));
+    assert!(start.elapsed() < Duration::from_millis(1500));
+    assert!(server.join().unwrap() > 1);
 }
 
 #[test]
@@ -625,10 +873,72 @@ fn public_verification_uses_an_absolute_request_deadline() {
         &sha256(leaf_der.as_ref()),
         root_store_from_pem(ca_pem.as_bytes()).unwrap(),
         &provider,
+        None,
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("absolute timeout"));
     server.join().unwrap();
+}
+
+#[test]
+fn unchanged_certificate_waits_for_the_live_proxy_configuration() -> anyhow::Result<()> {
+    use std::net::TcpListener;
+    let (ca_pem, leaf, key) = test_server_identity();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf.clone()], key)?,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut count = 0;
+        while count < 2 && std::time::Instant::now() < deadline {
+            let (tcp, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            tcp.set_nonblocking(false).unwrap();
+            tcp.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut stream = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(config.clone()).unwrap(),
+                tcp,
+            );
+            let mut request = [0_u8; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let digest = if count == 0 { "a" } else { "b" }.repeat(64);
+            write!(stream, "HTTP/1.1 200 OK\r\nX-NazoAuth-TLS-Configuration: {digest}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            count += 1;
+        }
+        count
+    });
+    let provider = test_transaction(PathBuf::from("/srv/tls")).provider;
+    verify_public_address(
+        &Url::parse("https://auth.example/health")?,
+        "auth.example",
+        address,
+        &sha256(leaf.as_ref()),
+        root_store_from_pem(ca_pem.as_bytes())?,
+        &provider,
+        Some(&"b".repeat(64)),
+    )?;
+    assert_eq!(
+        server.join().unwrap(),
+        2,
+        "the old configuration must not satisfy the new receipt"
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -642,6 +952,8 @@ fn activated_generation_is_deactivated_before_rollback_public_proof() {
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
         activation_link: material_root.join("current"),
+        reader_gid: None,
+        native_proxy_program: None,
         material_root: material_root.clone(),
         trust_anchors: work.path().join("root.pem"),
         public_url: "https://auth.example/health".to_owned(),
@@ -668,6 +980,7 @@ fn activated_generation_is_deactivated_before_rollback_public_proof() {
         hostname: "auth.example".to_owned(),
         expected_revision: 0,
         target_revision: 1,
+        proxy_configuration_sha256: None,
         source: CertificateSourceBinding::ExternalFiles {
             certificate_sha256: "f".repeat(64),
             private_key_sha256: "e".repeat(64),
@@ -713,6 +1026,72 @@ fn activated_generation_is_deactivated_before_rollback_public_proof() {
     assert!(!generation.exists());
 }
 
+#[test]
+fn proxy_configuration_is_digest_bound_and_removed_with_its_generation() -> anyhow::Result<()> {
+    let work = PrivateTempDir::new("nazoauth-proxy-configuration")?;
+    let mut transaction = test_transaction(work.path().join("material"));
+    let template = b"ssl_certificate \"@NAZOAUTH_TLS_CERTIFICATE_FILE@\"; ssl_certificate_key \"@NAZOAUTH_TLS_PRIVATE_KEY_FILE@\"; add_header X-NazoAuth-TLS-Configuration \"@NAZOAUTH_TLS_CONFIGURATION_SHA256@\" always;";
+    transaction.proxy_configuration_sha256 = Some(sha256(template));
+    ensure_private_directory(&transaction.generation, "test generation")?;
+    proxy_config::stage(&transaction, Some(template))?;
+    proxy_config::validate_generation(
+        &transaction.generation,
+        transaction.proxy_configuration_sha256.as_deref(),
+    )?;
+    atomic_write(
+        &transaction.generation.join("proxy.conf"),
+        b"changed",
+        0o600,
+    )?;
+    assert!(
+        proxy_config::validate_generation(
+            &transaction.generation,
+            transaction.proxy_configuration_sha256.as_deref()
+        )
+        .is_err()
+    );
+    proxy_config::stage(&transaction, Some(template))?;
+    atomic_write(
+        &transaction.generation.join("proxy.conf.template"),
+        b"changed",
+        0o600,
+    )?;
+    assert!(
+        proxy_config::validate_generation(
+            &transaction.generation,
+            transaction.proxy_configuration_sha256.as_deref()
+        )
+        .is_err()
+    );
+    remove_inactive_generation(&transaction)?;
+    assert!(!transaction.generation.exists());
+    Ok(())
+}
+
+#[test]
+fn native_proxy_executable_is_bound_without_changing_legacy_snapshots() -> anyhow::Result<()> {
+    let mut transaction = test_transaction(PathBuf::from("/etc/tls/material"));
+    let old_snapshot = provider_snapshot_sha256(&transaction.provider)?;
+    let legacy = serde_json::to_value(&transaction.provider)?;
+    assert!(legacy.get("native_proxy_program").is_none());
+    assert!(
+        serde_json::to_value(&transaction)?
+            .get("proxy_configuration_sha256")
+            .is_none()
+    );
+    transaction.provider.native_proxy_program = Some(PathBuf::from("/usr/sbin/nginx"));
+    assert_ne!(
+        provider_snapshot_sha256(&transaction.provider)?,
+        old_snapshot
+    );
+    assert!(validate_provider_snapshot(&transaction).is_err());
+    transaction.provider_snapshot_sha256 = provider_snapshot_sha256(&transaction.provider)?;
+    validate_provider_snapshot(&transaction)?;
+    transaction.provider.native_proxy_program = Some(PathBuf::from("/usr/sbin/angie"));
+    assert!(validate_provider_snapshot(&transaction).is_err());
+    Ok(())
+}
+
 fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
     let provider = ProviderConfig {
         schema: PROVIDER_SCHEMA,
@@ -720,6 +1099,8 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
         tenant: "tenant-a".to_owned(),
         hostname: "auth.example".to_owned(),
         activation_link: material_root.join("current"),
+        reader_gid: None,
+        native_proxy_program: None,
         material_root: material_root.clone(),
         trust_anchors: PathBuf::from("/etc/ssl/auth-root.pem"),
         public_url: "https://auth.example/health".to_owned(),
@@ -746,6 +1127,7 @@ fn test_transaction(material_root: PathBuf) -> CertificateTransaction {
         hostname: "auth.example".to_owned(),
         expected_revision: 0,
         target_revision: 1,
+        proxy_configuration_sha256: None,
         source: CertificateSourceBinding::ExternalFiles {
             certificate_sha256: "f".repeat(64),
             private_key_sha256: "e".repeat(64),
@@ -810,6 +1192,7 @@ fn test_receipt(
         hostname: transaction.hostname.clone(),
         revision,
         source: transaction.source.clone(),
+        proxy_configuration_sha256: transaction.proxy_configuration_sha256.clone(),
         material_sha256: transaction.material_sha256.clone(),
         leaf_certificate_sha256,
         certificate_not_after: transaction.certificate_not_after,

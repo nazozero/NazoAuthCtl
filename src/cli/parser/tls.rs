@@ -162,6 +162,7 @@ fn parse_acme_input(
 
 fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInput> {
     let mut provider_config = None;
+    let mut proxy_config = None;
     let mut tenant = None;
     let mut hostname = None;
     let mut certificate = None;
@@ -192,6 +193,9 @@ fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInp
             "--hostname" => set_once(&mut hostname, value, "--hostname")?,
             "--certificate" => set_once(&mut certificate, PathBuf::from(value), "--certificate")?,
             "--private-key" => set_once(&mut private_key, PathBuf::from(value), "--private-key")?,
+            "--proxy-config" => {
+                set_once(&mut proxy_config, PathBuf::from(value), "--proxy-config")?
+            }
             other => bail!("unknown tls certificate option {other}"),
         }
         index += 2;
@@ -212,6 +216,7 @@ fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInp
     };
     Ok(TlsCertificateInput {
         provider_config: provider_config.context("--provider-config is required")?,
+        proxy_config,
         tenant: tenant.context("--tenant is required")?,
         hostname: hostname.context("--hostname is required")?,
         source,
@@ -250,4 +255,32 @@ fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> anyhow::Result<(
         bail!("{option} may be specified only once");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_configuration_composes_with_acme_and_rejects_duplicate_flags() -> anyhow::Result<()> {
+        let mut values = [
+            "--provider-config",
+            "/etc/provider.json",
+            "--tenant",
+            "a",
+            "--hostname",
+            "auth.example",
+            "--from-acme-current",
+            "--proxy-config",
+            "/etc/proxy.conf",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let parsed = parse_material_input(values.clone())?;
+        assert_eq!(parsed.proxy_config, Some(PathBuf::from("/etc/proxy.conf")));
+        assert_eq!(parsed.source, TlsCertificateSource::CurrentAcmeReceipt);
+        values.extend(["--proxy-config".to_owned(), "/etc/other.conf".to_owned()]);
+        assert!(parse_material_input(values).is_err());
+        Ok(())
+    }
 }

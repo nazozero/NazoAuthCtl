@@ -301,6 +301,8 @@ pub(crate) struct InstallArgs {
     pub(crate) version: Option<String>,
     pub(crate) runtime: Option<crate::runtime_backend::RuntimeBackendKind>,
     pub(crate) install_root: Option<PathBuf>,
+    pub(crate) direct_tls_config: Option<PathBuf>,
+    pub(crate) tls_material_root: Option<PathBuf>,
     pub(crate) database_host: String,
     pub(crate) database_port: u16,
     pub(crate) database_name: String,
@@ -374,6 +376,7 @@ pub(crate) struct AdminCreateArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TlsCertificateInput {
     pub(crate) provider_config: PathBuf,
+    pub(crate) proxy_config: Option<PathBuf>,
     pub(crate) tenant: String,
     pub(crate) hostname: String,
     pub(crate) source: TlsCertificateSource,

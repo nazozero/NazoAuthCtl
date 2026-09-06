@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use url::Url;
 
+mod proxy_config;
+
 use crate::{
     cli::{TlsCertificateCheckInput, TlsCertificateInput, TlsCertificateSource, TlsCommand},
     file_lock::FileLock,
@@ -86,6 +88,11 @@ impl TlsStore {
         let host = registry
             .host_by_id(instance.host_id)?
             .context("TLS instance references a missing host")?;
+        if host.transport != crate::registry::HostTransport::Local {
+            bail!(
+                "TLS file-provider commands must run on the selected deployment's host; remote instance paths cannot be used on the controller"
+            );
+        }
         let target = crate::fleet::production_target(&host)?;
         crate::fleet::live_probe(target.as_ref(), &host)
             .context("TLS target helper verification failed")?;
@@ -152,6 +159,11 @@ struct ProviderConfig {
     tenant: String,
     hostname: String,
     material_root: PathBuf,
+    /// Dedicated local service group; permits reading without runtime writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reader_gid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_proxy_program: Option<PathBuf>,
     activation_link: PathBuf,
     trust_anchors: PathBuf,
     public_url: String,
@@ -244,6 +256,8 @@ struct CertificatePlan {
     provider_config_sha256: String,
     trust_anchors_sha256: String,
     source: CertificateSourceBinding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy_configuration_sha256: Option<String>,
     material_sha256: String,
     leaf_certificate_sha256: String,
     certificate_not_after: i64,
@@ -323,6 +337,8 @@ struct CertificateTransaction {
     expected_revision: u64,
     target_revision: u64,
     source: CertificateSourceBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_configuration_sha256: Option<String>,
     material_sha256: String,
     leaf_certificate_sha256: String,
     certificate_not_after: i64,
@@ -352,6 +368,8 @@ struct CertificateReceipt {
     hostname: String,
     revision: u64,
     source: CertificateSourceBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_configuration_sha256: Option<String>,
     material_sha256: String,
     leaf_certificate_sha256: String,
     certificate_not_after: i64,
@@ -504,6 +522,7 @@ fn check(
         &receipt.leaf_certificate_sha256,
         material.root_store.clone(),
         &provider.config,
+        receipt.proxy_configuration_sha256.as_deref(),
     )?;
     let checked_at = Utc::now().timestamp();
     let seconds_remaining = ensure_outside_warning_window(
@@ -609,11 +628,17 @@ fn apply(
     let material = load_and_validate_material(certificate, private_key, &hostname, &provider)?;
     let source = bind_certificate_source(&resolved_source, &material)?;
     let previous = load_receipt(store, &record, &tenant, &hostname)?;
+    let proxy_template = proxy_config::load_template(input, &provider.config)?;
+    let proxy_configuration_sha256 = proxy_template.as_deref().map(sha256);
     validate_active_receipt(&provider.config, previous.as_ref())?;
     if let Some(previous) = previous.as_ref() {
         validate_receipt_provider_authority(previous, &provider)?;
     }
-    ensure_source_not_current(previous.as_ref(), &source)?;
+    ensure_source_not_current(
+        previous.as_ref(),
+        &source,
+        proxy_configuration_sha256.as_deref(),
+    )?;
     let expected_revision = previous.as_ref().map_or(0, |receipt| receipt.revision);
     let target_revision = expected_revision
         .checked_add(1)
@@ -642,6 +667,7 @@ fn apply(
         expected_revision,
         target_revision,
         source: source.clone(),
+        proxy_configuration_sha256: proxy_configuration_sha256.clone(),
         material_sha256: material.material_sha256.clone(),
         leaf_certificate_sha256: material.leaf_sha256.clone(),
         certificate_not_after: material.not_after,
@@ -668,10 +694,12 @@ fn apply(
     let result = (|| -> anyhow::Result<CertificateReceipt> {
         ensure_transaction_fresh(&transaction)?;
         stage_generation(&transaction, &material)?;
+        proxy_config::stage(&transaction, proxy_template.as_deref())?;
         transaction.phase = TransactionPhase::Staged;
         persist_pending(store, &transaction)?;
         ensure_transaction_fresh(&transaction)?;
         execute_provider_command(&transaction, &transaction.provider.validate, "validate")?;
+        proxy_config::validate_candidate(&transaction)?;
         ensure_transaction_fresh(&transaction)?;
         transaction.phase = TransactionPhase::Activating;
         persist_pending(store, &transaction)?;
@@ -689,8 +717,13 @@ fn apply(
             &material.leaf_sha256,
             material.root_store.clone(),
             &provider.config,
+            transaction.proxy_configuration_sha256.as_deref(),
         )?;
         transaction.phase = TransactionPhase::Verified;
+        proxy_config::validate_generation(
+            &transaction.generation,
+            transaction.proxy_configuration_sha256.as_deref(),
+        )?;
         persist_pending(store, &transaction)?;
         Ok(CertificateReceipt {
             schema: RECEIPT_SCHEMA,
@@ -701,6 +734,7 @@ fn apply(
             hostname,
             revision: target_revision,
             source: transaction.source.clone(),
+            proxy_configuration_sha256: transaction.proxy_configuration_sha256.clone(),
             material_sha256: material.material_sha256.clone(),
             leaf_certificate_sha256: material.leaf_sha256.clone(),
             certificate_not_after: material.not_after,
@@ -740,7 +774,9 @@ fn apply(
                         Some(format!("apply={error:#}; rollback={rollback:#}"));
                     persist_pending(store, &transaction)?;
                     bail!(
-                        "TLS certificate apply failed and rollback requires `tls certificate recover`: apply={error:#}; rollback={rollback:#}"
+                        "{}: pending TLS transaction {} requires `tls certificate recover`: apply={error:#}; rollback={rollback:#}",
+                        crate::error_codes::TLS_RECOVERY_REQUIRED,
+                        transaction.jti
                     )
                 }
             }
@@ -785,6 +821,10 @@ fn recover(
     };
     if let Some(receipt) = committed.as_ref() {
         validate_committed_receipt_binding(&transaction, receipt)?;
+        proxy_config::validate_generation(
+            &receipt.generation,
+            receipt.proxy_configuration_sha256.as_deref(),
+        )?;
         if active_generation(&transaction.provider)?.as_ref() != Some(&transaction.generation) {
             bail!("committed TLS receipt exists but the active generation differs");
         }
@@ -801,7 +841,13 @@ fn recover(
     let observed = active_generation(&transaction.provider)?;
     validate_recovery_activation_state(&transaction, observed.as_deref())?;
     let provider = loaded_provider_from_transaction(store, &transaction)?;
-    rollback_transaction(&mut transaction, previous.as_ref(), &provider)?;
+    rollback_transaction(&mut transaction, previous.as_ref(), &provider).with_context(|| {
+        format!(
+            "{}: pending TLS transaction {} still requires recovery",
+            crate::error_codes::TLS_RECOVERY_REQUIRED,
+            transaction.jti
+        )
+    })?;
     finalize_transaction(store, &transaction)?;
     println!("{}", serde_json::to_string_pretty(&transaction)?);
     Ok(())
@@ -877,7 +923,10 @@ fn validate_installed_material(
     {
         bail!("active TLS generation differs from the committed certificate receipt");
     }
-    Ok(())
+    proxy_config::validate_generation(
+        &receipt.generation,
+        receipt.proxy_configuration_sha256.as_deref(),
+    )
 }
 
 fn validate_receipt_provider_authority(
@@ -920,7 +969,9 @@ fn build_plan(
     if let Some(current) = current {
         validate_receipt_provider_authority(current, provider)?;
     }
-    ensure_source_not_current(current, source)?;
+    let proxy_template = proxy_config::load_template(input, &provider.config)?;
+    let proxy_configuration_sha256 = proxy_template.as_deref().map(sha256);
+    ensure_source_not_current(current, source, proxy_configuration_sha256.as_deref())?;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
     Ok(CertificatePlan {
         schema: PLAN_SCHEMA,
@@ -933,6 +984,7 @@ fn build_plan(
         provider_config_sha256: provider.config_sha256.clone(),
         trust_anchors_sha256: provider.trust_anchors_sha256.clone(),
         source: source.clone(),
+        proxy_configuration_sha256,
         material_sha256: material.material_sha256.clone(),
         leaf_certificate_sha256: material.leaf_sha256.clone(),
         certificate_not_after: material.not_after,
@@ -956,8 +1008,12 @@ fn build_plan(
 fn ensure_source_not_current(
     current: Option<&CertificateReceipt>,
     source: &CertificateSourceBinding,
+    proxy_configuration_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
-    if current.is_some_and(|receipt| &receipt.source == source) {
+    if current.is_some_and(|receipt| {
+        &receipt.source == source
+            && receipt.proxy_configuration_sha256.as_deref() == proxy_configuration_sha256
+    }) {
         bail!("the selected TLS certificate source is already the active committed revision");
     }
     Ok(())
@@ -1041,7 +1097,14 @@ fn validate_provider_config(
     validate_absolute_normalized(&config.material_root, "TLS material root")?;
     validate_absolute_normalized(&config.activation_link, "TLS activation link")?;
     validate_absolute_normalized(&config.trust_anchors, "TLS trust anchors")?;
-    validate_secure_directory(&config.material_root, "TLS material root", true)?;
+    validate_secure_directory(
+        &config.material_root,
+        "TLS material root",
+        config.reader_gid.is_none(),
+    )?;
+    if config.reader_gid == Some(0) {
+        bail!("TLS reader_gid must name a dedicated non-root service group");
+    }
     if config.activation_link != config.material_root.join("current") {
         bail!("TLS activation_link must be material_root/current");
     }
@@ -1081,6 +1144,15 @@ fn validate_provider_config(
     }
     validate_provider_command(&config.validate, "validate")?;
     validate_provider_command(&config.reload, "reload")?;
+    if let Some(program) = &config.native_proxy_program {
+        validate_provider_command(
+            &ProviderCommand {
+                program: program.clone(),
+                args: vec![],
+            },
+            "native proxy",
+        )?;
+    }
     Ok(())
 }
 
@@ -1099,8 +1171,14 @@ fn stage_generation(
     material: &ValidatedMaterial,
 ) -> anyhow::Result<()> {
     let generations = transaction.provider.material_root.join("generations");
-    ensure_private_directory(&transaction.provider.material_root, "TLS material root")?;
-    ensure_private_directory(&generations, "TLS generation root")?;
+    for directory in [&transaction.provider.material_root, &generations] {
+        if transaction.provider.reader_gid.is_some() && directory.exists() {
+            // Do not revoke the running service's access during a rotation.
+            validate_secure_directory(directory, "TLS material directory", false)?;
+        } else {
+            ensure_private_directory(directory, "TLS material directory")?;
+        }
+    }
     match fs::symlink_metadata(&transaction.generation) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(_) => bail!("TLS target generation already exists"),
@@ -1136,10 +1214,36 @@ fn stage_generation(
             "material_sha256": transaction.material_sha256,
             "leaf_certificate_sha256": transaction.leaf_certificate_sha256,
             "certificate_not_after": transaction.certificate_not_after,
+            "proxy_configuration_sha256": transaction.proxy_configuration_sha256,
         }))?,
         0o600,
     )?;
+    if let Some(gid) = transaction.provider.reader_gid {
+        grant_material_read_access(&transaction.provider.material_root, gid, true)?;
+        grant_material_read_access(&generations, gid, true)?;
+        grant_material_read_access(&transaction.generation, gid, true)?;
+        grant_material_read_access(&transaction.generation.join("private-key.pem"), gid, false)?;
+    }
     Ok(())
+}
+
+fn grant_material_read_access(path: &Path, gid: u32, directory: bool) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt as _, chown};
+        chown(path, None, Some(gid)).context("failed to set TLS service reader group")?;
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if directory { 0o750 } else { 0o640 }),
+        )?;
+        fs::File::open(path)?.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, gid, directory);
+        bail!("TLS service reader groups require Unix filesystem permissions");
+    }
 }
 
 fn activate(transaction: &CertificateTransaction) -> anyhow::Result<()> {
@@ -1170,6 +1274,7 @@ fn rollback_transaction(
                 &previous.leaf_certificate_sha256,
                 roots,
                 &transaction.provider,
+                previous.proxy_configuration_sha256.as_deref(),
             )?,
             (None, None) => verify_public_not_leaf(
                 &provider.public_url,
@@ -1177,6 +1282,7 @@ fn rollback_transaction(
                 &transaction.leaf_certificate_sha256,
                 root_store_from_pem(&provider.trust_anchors)?,
                 &transaction.provider,
+                transaction.provider.native_proxy_program.is_some(),
             )?,
             _ => bail!("TLS rollback proof state is inconsistent"),
         }
@@ -1189,6 +1295,7 @@ fn rollback_transaction(
 fn restore_previous_activation(transaction: &CertificateTransaction) -> anyhow::Result<()> {
     match &transaction.previous_generation {
         Some(previous_generation) => {
+            proxy_config::validate_native(transaction, previous_generation)?;
             symlink_atomic(previous_generation, &transaction.provider.activation_link)?;
         }
         None => remove_file_durable(&transaction.provider.activation_link)?,
@@ -1223,7 +1330,13 @@ fn remove_inactive_generation(transaction: &CertificateTransaction) -> anyhow::R
     if transaction.generation.parent() != Some(expected_parent.as_path()) {
         bail!("TLS transaction generation escaped the provider generation root");
     }
-    for name in ["material.json", "private-key.pem", "fullchain.pem"] {
+    for name in [
+        "material.json",
+        "private-key.pem",
+        "fullchain.pem",
+        "proxy.conf",
+        "proxy.conf.template",
+    ] {
         remove_file_durable(&transaction.generation.join(name))?;
     }
     match fs::remove_dir(&transaction.generation) {
@@ -1435,6 +1548,7 @@ fn validate_committed_receipt_binding(
         || receipt.hostname != transaction.hostname
         || receipt.revision != transaction.target_revision
         || receipt.source != transaction.source
+        || receipt.proxy_configuration_sha256 != transaction.proxy_configuration_sha256
         || receipt.material_sha256 != transaction.material_sha256
         || receipt.leaf_certificate_sha256 != transaction.leaf_certificate_sha256
         || receipt.certificate_not_after != transaction.certificate_not_after
@@ -1524,8 +1638,12 @@ fn ensure_no_pending(
     tenant: &str,
     hostname: &str,
 ) -> anyhow::Result<()> {
-    if load_pending(store, record, tenant, hostname)?.is_some() {
-        bail!("a TLS transaction is pending for this binding; run tls certificate recover")
+    if let Some(pending) = load_pending(store, record, tenant, hostname)? {
+        bail!(
+            "{}: TLS transaction {} is pending for this binding; run tls certificate recover",
+            crate::error_codes::TLS_RECOVERY_REQUIRED,
+            pending.jti
+        )
     }
     Ok(())
 }
@@ -1607,7 +1725,9 @@ fn ensure_provider_not_pending(
                     || pending.hostname != hostname)
             {
                 bail!(
-                    "the TLS provider activation resource is fenced by another pending deployment/tenant/hostname transaction"
+                    "{}: the TLS provider activation resource is fenced by another pending deployment/tenant/hostname transaction {}",
+                    crate::error_codes::TLS_RECOVERY_REQUIRED,
+                    pending.jti
                 );
             }
         }
@@ -1687,11 +1807,21 @@ fn provider_snapshot_sha256(provider: &ProviderConfig) -> anyhow::Result<String>
         (validate_program, &provider.validate.args),
         (reload_program, &provider.reload.args),
     );
-    Ok(sha256(&serde_json::to_vec(&(
-        PROVIDER_SNAPSHOT_DIGEST_PROTOCOL,
-        authority,
-        commands,
-    ))?))
+    let snapshot = serde_json::to_vec(&(PROVIDER_SNAPSHOT_DIGEST_PROTOCOL, authority, commands))?;
+    // Preserve existing root-only journal identities. A declared reader is
+    // additional authority and must be bound by recovery's snapshot digest.
+    let digest = match provider.reader_gid {
+        None => sha256(&snapshot),
+        Some(gid) => sha256(&serde_json::to_vec(&(snapshot, "reader_gid", gid))?),
+    };
+    match &provider.native_proxy_program {
+        None => Ok(digest),
+        Some(program) => Ok(sha256(&serde_json::to_vec(&(
+            digest,
+            "native_proxy_program",
+            canonical_digest_path(program, "native proxy executable")?,
+        ))?)),
+    }
 }
 
 fn canonical_digest_path(path: &Path, label: &str) -> anyhow::Result<Vec<(u8, String)>> {
@@ -1842,6 +1972,10 @@ fn load_receipt_at(
         || !valid_sha256(&receipt.leaf_certificate_sha256)
         || !valid_sha256(&receipt.provider_config_sha256)
         || !valid_sha256(&receipt.trust_anchors_sha256)
+        || receipt
+            .proxy_configuration_sha256
+            .as_deref()
+            .is_some_and(|digest| !valid_sha256(digest))
         || !valid_certificate_source_binding(
             &receipt.source,
             receipt.declaration_revision,
@@ -1898,6 +2032,12 @@ fn validate_transaction_binding(
         || !valid_sha256(&transaction.leaf_certificate_sha256)
         || !valid_sha256(&transaction.provider_config_sha256)
         || !valid_sha256(&transaction.trust_anchors_sha256)
+        || transaction
+            .proxy_configuration_sha256
+            .as_deref()
+            .is_some_and(|digest| !valid_sha256(digest))
+        || transaction.proxy_configuration_sha256.is_some()
+            != transaction.provider.native_proxy_program.is_some()
         || !valid_certificate_source_binding(
             &transaction.source,
             transaction.declaration_revision,

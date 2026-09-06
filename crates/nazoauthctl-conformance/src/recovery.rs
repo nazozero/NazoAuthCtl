@@ -41,6 +41,8 @@ pub struct TenantResourceRecoveryBinding {
     pub deployment_id: String,
     pub tenant_id: String,
     pub tenant_domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_port: Option<u16>,
     pub realm_id: String,
     pub organization_id: String,
     pub run_id: String,
@@ -2464,6 +2466,7 @@ fn validate_ordinary_binding(
     };
     if binding.deployment_id != deployment_id
         || tenant_domain != binding.tenant_domain
+        || binding.issuer_port == Some(0)
         || !tenant_domain.contains('.')
         || tenant_id.to_string() != binding.tenant_id
         || realm_id.to_string() != binding.realm_id
@@ -2628,6 +2631,7 @@ mod tests {
             deployment_id: "deployment-1".to_owned(),
             tenant_id: "00000000-0000-0000-0000-000000000000".to_owned(),
             tenant_domain: "oidf.example.com".to_owned(),
+            issuer_port: None,
             realm_id: "00000000-0000-0000-0000-000000000001".to_owned(),
             organization_id: "00000000-0000-0000-0000-000000000002".to_owned(),
             run_id: "run-1".to_owned(),
@@ -2638,6 +2642,26 @@ mod tests {
             vp_evidence_trust_anchor: None,
             resource_identities: vec![identity()],
         }
+    }
+
+    #[test]
+    fn recovery_preserves_nondefault_issuer_ports_and_accepts_existing_bindings() {
+        let mut binding = binding();
+        let legacy = serde_json::to_value(&binding).unwrap();
+        assert!(legacy.get("issuer_port").is_none());
+        assert_eq!(
+            serde_json::from_value::<TenantResourceRecoveryBinding>(legacy)
+                .unwrap()
+                .issuer_port,
+            None
+        );
+        binding.issuer_port = Some(38443);
+        let restored: TenantResourceRecoveryBinding =
+            serde_json::from_slice(&serde_json::to_vec(&binding).unwrap()).unwrap();
+        assert_eq!(restored.issuer_port, Some(38443));
+        validate_ordinary_binding(&restored, "deployment-1").unwrap();
+        binding.issuer_port = Some(0);
+        assert!(validate_ordinary_binding(&binding, "deployment-1").is_err());
     }
 
     fn operation(result: ControlResultData) -> TenantResourceControlOperation {

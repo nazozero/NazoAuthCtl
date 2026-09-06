@@ -1,7 +1,7 @@
 # TLS certificate provider contract
 
-This document defines the first independently deployable part of issue #31: an
-external certificate import transaction for an already configured TLS consumer.
+This document defines the certificate transaction part of issue #31, including
+optional native Nginx/Angie configuration in the same atomic generation.
 It is a NazoAuthCtl provider protocol, not a NazoAuth server protocol and not a
 claim that NazoAuth Direct TLS capability discovery already exists. The v1
 provider is Unix-only because its security contract requires atomic symlink
@@ -10,9 +10,12 @@ filesystem APIs.
 
 ## Ownership boundary
 
-The transaction is available only for a registered current-protocol deployment whose `proxy_tls`
-capability is explicitly `delegated` or `managed`. A fresh ctl installation
-leaves that capability external, so TLS material cannot be changed accidentally.
+The transaction runs on the Unix host that owns a registered deployment. Ctl
+verifies the target-helper protocol, deployment identity and current revision.
+Selecting an SSH instance is rejected before accessing provider files: local
+paths are never interpreted as remote paths. Run the TLS command on the owning
+host with its local registry. The provider document is an explicit host-side
+delegation; the current fleet model has no `proxy_tls=delegated` registry flag.
 
 The provider owns only the public server certificate and its matching private
 key under a deployment-owned secret path. NazoAuth protocol signing keys remain
@@ -32,7 +35,7 @@ scanned across deployments so a crashed transaction continues to fence its
 
 Unknown fields and unknown protocols fail closed. Every path is an absolute,
 normalized path. `activation_link` must equal `material_root/current`, and the
-owner-only material root must not overlap ctl configuration, state, or
+material root must not overlap ctl configuration, state, or
 break-glass roots. Every existing ancestor of the material root and provider
 executables must be root-owned and must not be replaceable by another user.
 
@@ -60,6 +63,21 @@ executables must be root-owned and must not be replaceable by another user.
   }
 }
 ```
+
+For a non-root TLS consumer, optionally set `"reader_gid": 10001` to its actual
+dedicated service group (the number is an example, not a default). Ctl retains
+file ownership, grants group traversal/read on material directories (`0750`)
+and read on the installed private key (`0640`). The service cannot write the
+key or replace the generation. Without this field, material remains owner-only.
+Root-only external imports are accepted in either case; a group-readable key
+must use exactly the declared group and mode `0640`. Choose this authority
+before the first receipt; changing it later is rejected as provider drift.
+
+On an already configured and running NazoAuth Direct TLS consumer, `validate`
+and `reload` may both use the root-owned `/usr/bin/true`: ctl validates material
+offline and proves the public identity after the server's automatic reload.
+This does not configure or start a service. See
+[`tls-deployment.md`](tls-deployment.md) for the transport boundary.
 
 For Angie, use its root-owned configuration-test executable and the matching
 service reload command. A dedicated helper may be used, but it and its complete
@@ -108,6 +126,65 @@ in-progress issuance, stale deployment declaration, or provider/trust digest
 change fails closed. External paths and `--from-acme-current` are mutually
 exclusive.
 
+## Native proxy configuration
+
+An optional `native_proxy_program` in the provider names the absolute,
+root-owned Nginx or Angie executable. Choose this authority before the first
+receipt, just like `reader_gid`. Supply `--proxy-config /secure/proxy.conf` to
+every plan/apply for that provider, including ACME-backed renewals. Omitting
+either half is rejected; renewal cannot silently drop a managed configuration.
+
+The input is a complete, owner-only UTF-8 native configuration, at most 1 MiB.
+Use these exact quoted placeholders in its TLS directives:
+
+```nginx
+ssl_certificate "@NAZOAUTH_TLS_CERTIFICATE_FILE@";
+ssl_certificate_key "@NAZOAUTH_TLS_PRIVATE_KEY_FILE@";
+add_header X-NazoAuth-TLS-Configuration "@NAZOAUTH_TLS_CONFIGURATION_SHA256@" always;
+```
+
+Ctl substitutes the generation's certificate paths with native string escaping,
+writes `proxy.conf.template` and `proxy.conf` with fsync, and binds the template
+digest into the plan, pending transaction and receipt. Its check and recovery
+paths verify the template digest and exact rendered bytes. Configuration-only
+changes can use the existing certificate; an unchanged certificate/configuration
+pair is rejected as already current.
+
+Ctl invokes `native_proxy_program -t -c GENERATION/proxy.conf` in addition to
+the provider's validate hook, before switching `current`. The proxy service must
+read `material_root/current/proxy.conf` as its main configuration so the existing
+reload hook loads that exact generation. Configure a dedicated service/PID and
+explicit absolute log, upstream and other runtime paths. Those referenced
+resources and the service unit remain operator-owned; the receipt binds the
+managed main configuration, not mutable include files or unrelated websites.
+Use a self-contained configuration for reproducible configuration receipts.
+
+The reload hook must start/reload this dedicated service when `current` exists
+and stop it when the first installation is rolled back and `current` is absent.
+The hook must wait for reload completion and retirement of previous workers
+before returning; sending SIGHUP alone is asynchronous and can let a previous
+worker satisfy a rollback proof before the failed candidate has stopped.
+A systemd service with its main configuration set to that path is one option.
+It must never reload or stop an unrelated proxy master. The existing hook
+ownership, bounded execution and cleared-environment requirements still apply.
+
+The diagnostic header must be returned by the configured public health URL;
+locations that override `add_header` must include it too. Ctl requires the
+exact template digest from the live HTTPS response before committing, including
+configuration-only changes with an unchanged certificate. Duplicate proof
+headers are rejected. Keep upstream responses from adding this header.
+
+After activation, the public TLS/health/configuration proof gates the receipt. On
+failure, ctl validates the previous native configuration, restores its pointer,
+reloads it and verifies the previous public identity. A failed restoration keeps
+the pending journal for `tls certificate recover`; a crash does not release the
+binding. For a first native generation with no previous configuration, rollback
+requires the dedicated public port to refuse connections after the stop hook;
+a timeout does not prove successful removal. Keep the previous generation and its service dependencies until that
+recovery completes. Switching an existing externally managed proxy to this
+layout requires explicit service wiring; ctl does not rewrite a shared proxy
+configuration or infer its ownership.
+
 ## Readiness and renewal warning
 
 Run the read-only check from an external monitoring scheduler; ctl does not need
@@ -145,6 +222,13 @@ validity window, and certificate/private-key match. Apply then:
    HTTP health status;
 7. atomically commits the current receipt, or restores and reloads the previous
    generation.
+
+Public verification checks every resolved address (at most four, deduplicated).
+A healthy, trusted endpoint that still serves an old leaf is polled within
+`request_timeout_seconds`. TLS/HTTP errors fail immediately; a permanently stale
+leaf times out and rolls back. Rollback to a previous receipt uses the same
+bounded identity proof. Set this timeout above the server's
+`TLS_RELOAD_INTERVAL_SECONDS` (default five seconds), to allow asynchronous reload.
 
 The current receipt is the commit marker. A crash before it is written is
 recovered by rollback. A crash after it is written is recovered by idempotently
@@ -208,21 +292,27 @@ transaction journals and revision receipts remain under the deployment state
 directory. The active generation and TLS consumer do not depend on a running ctl
 process, so stopping or uninstalling the ctl binary does not stop authentication.
 
-## Current boundary and later phases
+## Lifecycle and compatibility boundary
 
-This contract closes external import, file activation, reload, public
+This contract implements external import, file activation, reload, public
 verification, receipt, and crash recovery without inventing a server API.
 ACME HTTP-01 issuance is a separate transaction documented in
 [`tls-acme-http01.md`](tls-acme-http01.md); its receipt can be supplied to this
-provider's plan/apply commands. NazoAuth PR #131 established the server's Direct
-TLS transport baseline and #127 is closed, but that stage explicitly does not
-provide atomic certificate/trust reload with last-known-good rollback or real
-trusted-proxy parity. It also is not an authenticated machine-management
-protocol for this controller. Direct TLS configuration/reload,
-trusted-proxy/internal transport changes, multi-tenant authority, and
-Nginx/Angie configuration generation therefore remain outside this provider
-contract and depend on the ordinary capability/protocol work tracked by
-NazoAuth #128/#129 and parent #130. Those later operations must negotiate
-capabilities at runtime; they must not infer compatibility from an issue state
-or a NazoAuth release number. No HTTP fallback is implemented or permitted
-here.
+provider's plan/apply commands. Current NazoAuth includes atomic server
+certificate/key hot reload with last-good retention. It does not reload the
+client CA through that same operation; client trust is a separate authority.
+Existing `update --config-file --config-schema` owns server configuration
+changes and rollback. Readiness follows `TRANSPORT_MODE` while connecting only
+to loopback; HTTPS retains SNI and certificate verification.
+
+Installation owns listener ports and material mounts; existing deployments keep
+that topology during config updates. Native Nginx/Angie configuration is supplied
+as a complete operator-owned template and validated by the selected native
+binary. Ctl does not infer routes or runtime tenant/SNI selection.
+
+Compatibility uses the existing target-helper handshake, deployment config schema,
+explicit provider protocol, native validation and actual endpoint verification.
+The helper handshake does not attest a server transport capability. There is no
+additional TLS capability endpoint or NazoAuth version table. A server that cannot
+load the selected configuration fails readiness and follows ordinary recovery.
+No HTTP fallback is implemented or permitted here.

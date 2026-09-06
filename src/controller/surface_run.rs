@@ -731,6 +731,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 deployment_id: record.deployment_id.clone(),
                 operation_id: plan.recover_operation_id.clone(),
                 loopback_port: candidate.loopback_port,
+                https: candidate.https,
             };
             let result = target.execute_host_operation(
                 &crate::target::HostOperation::backup_recovery_candidate_cleanup(
@@ -840,6 +841,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             object_reference: endpoint.object_reference,
             object_id: endpoint.object_id,
             loopback_port: endpoint.loopback_port,
+            https: endpoint.https,
         });
         plan.phase = RecoveryPhase::Invalidating;
         journal.store(&plan)?;
@@ -922,6 +924,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     deployment_id: record.deployment_id.clone(),
                     operation_id: plan.recover_operation_id.clone(),
                     loopback_port: candidate.loopback_port,
+                    https: candidate.https,
                 },
                 plan.state_epoch.clone(),
                 prepared.signed.operation_id.clone(),
@@ -983,6 +986,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     Box::new(RecoveryCeremonyTransport::new(
                         &record.issuer,
                         local_port,
+                        candidate.https,
                     )?),
                 )?;
                 let delivery = crate::controller_identity::recovery::InteractiveSecretDelivery;
@@ -1132,6 +1136,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             deployment_id: record.deployment_id.clone(),
             operation_id: plan.recover_operation_id.clone(),
             loopback_port: candidate.loopback_port,
+            https: candidate.https,
         };
         let result = target.execute_host_operation(
             &crate::target::HostOperation::backup_recovery_candidate_cleanup(
@@ -1262,6 +1267,21 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         version: args.version,
         runtime: args.runtime,
         install_root: args.install_root,
+        direct_tls_config: args
+            .direct_tls_config
+            .map(|path| {
+                let bytes = crate::filesystem::read_secure_regular_file(
+                    &path,
+                    "Direct TLS configuration",
+                    false,
+                    crate::target::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+                )?;
+                std::str::from_utf8(&bytes)
+                    .map(str::to_owned)
+                    .context("Direct TLS configuration is not UTF-8")
+            })
+            .transpose()?,
+        tls_material_root: args.tls_material_root,
         database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
             host: args.database_host.clone(),
             port: args.database_port,

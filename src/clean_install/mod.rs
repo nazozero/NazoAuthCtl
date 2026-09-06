@@ -60,7 +60,6 @@ const LOOPBACK_PORT_COUNT: u16 = 20_000;
 
 /// Config schema token recorded in the DeploymentState for seed documents.
 pub(crate) const CONFIG_SCHEMA_SEED: &str = "nazauth-seed-v2";
-const DIRECTORY_OPENID4VC_CREDENTIAL_CONFIGURATIONS: &str = r#"{"eu.example.pid":{"format":"dc+sd-jwt","scope":"eu.example.pid","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"vct":"urn:eudi:pid:1"},"eu.europa.ec.eudi.pid.1":{"format":"dc+sd-jwt","scope":"eu.europa.ec.eudi.pid.1","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"vct":"urn:eudi:pid:1"},"org.iso.18013.5.1.mDL":{"format":"mso_mdoc","scope":"org.iso.18013.5.1.mDL","cryptographic_binding_methods_supported":["jwk"],"credential_signing_alg_values_supported":["ES256"],"proof_types_supported":{"jwt":{"proof_signing_alg_values_supported":["ES256"]},"attestation":{"proof_signing_alg_values_supported":["ES256"],"key_attestations_required":{"key_storage":["iso_18045_moderate"]}}},"doctype":"org.iso.18013.5.1.mDL"}}"#;
 
 /// One clean-install invocation. Defaults are deliberately minimal: only the
 /// issuer is mandatory because it is a real external fact that cannot be
@@ -80,6 +79,8 @@ pub(crate) struct CleanInstallRequest {
     /// Optional custom installation root. Absent resolves to the platform
     /// defaults; set, every managed path derives from it.
     pub(crate) install_root: Option<std::path::PathBuf>,
+    pub(crate) direct_tls_config: Option<String>,
+    pub(crate) tls_material_root: Option<std::path::PathBuf>,
     /// External PostgreSQL endpoint (host, port, database, role).
     pub(crate) database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint,
     pub(crate) database_lifecycle_endpoint: crate::target::install_exec::ExternalEndpoint,
@@ -314,13 +315,13 @@ fn target_path(path: &std::path::Path, flag: &str) -> anyhow::Result<String> {
 /// External connection URLs are direct configuration values; only key
 /// material uses the file-provider contract.
 ///
-/// TRANSPORT_MODE is `trusted-proxy`: the container terminates plain HTTP on
-/// a loopback-published port and the public TLS endpoint is an external
-/// reverse proxy — the only topology a containerized install creates. A
-/// loopback HTTP issuer keeps the server-side default (loopback-http).
+/// HTTPS defaults to `trusted-proxy`. An explicit Direct TLS document selects
+/// the two container TLS listeners and a declared read-only material root.
+/// A loopback HTTP issuer keeps the server-side default (loopback-http).
 struct RuntimeSeedConfig {
     bind: String,
     trusted_proxy_cidrs: String,
+    direct_tls_config: Option<String>,
     data_dir: String,
     database_url: String,
     valkey_url: String,
@@ -405,7 +406,9 @@ fn render_config_yaml(
     if issuer.contains(['"', '\\']) || issuer.chars().any(|c| c.is_control()) {
         bail!("issuer must not contain YAML-special characters");
     }
-    let transport_mode = if issuer.starts_with("https://") {
+    let transport_mode = if let Some(content) = &runtime.direct_tls_config {
+        render_direct_tls_config(content)?
+    } else if issuer.starts_with("https://") {
         // The engine-default bridge networks and the host loopback are the
         // only sources that can reach the loopback-published container port.
         // Operators with a dedicated proxy network tighten this via
@@ -424,10 +427,6 @@ fn render_config_yaml(
          VALKEY_STATE_EPOCH: \"{state_epoch}\"\n\
          {transport_mode}\
          SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE: \"true\"\n\
-         ENABLE_DIRECTORY_OPENID4VCI_ISSUER: \"true\"\n\
-         ENABLE_DIRECTORY_OPENID4VP_VERIFIER: \"true\"\n\
-         OPENID4VC_REVOCATION_POLICY: \"required\"\n\
-         OPENID4VCI_CREDENTIAL_CONFIGURATIONS_JSON: '{DIRECTORY_OPENID4VC_CREDENTIAL_CONFIGURATIONS}'\n\
          DATABASE_URL: \"{}\"\n\
          VALKEY_URL: \"{}\"\n\
          MFA_TOTP_ENCRYPTION_KEY_FILE: \"{}\"\n\
@@ -452,6 +451,34 @@ fn render_config_yaml(
         runtime.openid4vp_management_token_file,
         runtime.data_dir,
     ))
+}
+
+fn render_direct_tls_config(content: &str) -> anyhow::Result<String> {
+    let values: std::collections::BTreeMap<String, yaml_serde::Value> =
+        yaml_serde::from_str(content)
+            .map_err(|_| anyhow::anyhow!("Direct TLS configuration must be a YAML mapping"))?;
+    for key in values.keys() {
+        if !matches!(
+            key.as_str(),
+            "TRANSPORT_MODE"
+                | "TLS_CERTIFICATE_FILE"
+                | "TLS_PRIVATE_KEY_FILE"
+                | "TLS_CLIENT_CA_FILE"
+                | "TLS_BIND"
+                | "MTLS_ENDPOINT_BASE_URL"
+                | "TLS_RELOAD_INTERVAL_SECONDS"
+        ) {
+            bail!("Direct TLS configuration contains a non-transport setting");
+        }
+    }
+    if values
+        .get("TRANSPORT_MODE")
+        .and_then(yaml_serde::Value::as_str)
+        != Some("direct-tls")
+    {
+        bail!("Direct TLS configuration must declare TRANSPORT_MODE: direct-tls");
+    }
+    yaml_serde::to_string(&values).context("failed to render Direct TLS configuration")
 }
 
 /// Pick the runtime class from what the verified helper actually announced.
@@ -586,6 +613,7 @@ fn build_install_order(
             ),
             bind: format!("127.0.0.1:{loopback_port}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128".to_owned(),
+            direct_tls_config: request.direct_tls_config.clone(),
         }
     } else {
         RuntimeSeedConfig {
@@ -623,6 +651,7 @@ fn build_install_order(
             ),
             bind: format!("0.0.0.0:{CONTAINER_PORT}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128,10.88.0.0/16".to_owned(),
+            direct_tls_config: request.direct_tls_config.clone(),
         }
     };
     let config_content = render_config_yaml(&request.issuer, deployment_id, state_epoch, &runtime)?;
@@ -644,6 +673,11 @@ fn build_install_order(
         },
         config_content,
         config_sha256,
+        tls_material_root: request
+            .tls_material_root
+            .as_ref()
+            .map(|path| target_path(path, "--tls-material-root"))
+            .transpose()?,
         data_root: paths.data_root.clone(),
         runtime_root: (runtime_kind == RuntimeBackendKind::Host)
             .then(|| paths.runtime_root.clone()),
@@ -749,6 +783,10 @@ struct CanonicalInstallRequest<'a> {
     version: &'a Option<String>,
     runtime: &'a Option<RuntimeBackendKind>,
     install_root: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_tls_config: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_material_root: &'a Option<std::path::PathBuf>,
     database_runtime_endpoint: &'a crate::target::install_exec::ExternalEndpoint,
     database_lifecycle_endpoint: &'a crate::target::install_exec::ExternalEndpoint,
     valkey_endpoint: &'a crate::target::install_exec::ExternalEndpoint,
@@ -793,6 +831,8 @@ fn canonical_install_request_hash(
         version: &request.version,
         runtime: &request.runtime,
         install_root,
+        direct_tls_config: &request.direct_tls_config,
+        tls_material_root: &request.tls_material_root,
         database_runtime_endpoint: &request.database_runtime_endpoint,
         database_lifecycle_endpoint: &request.database_lifecycle_endpoint,
         valkey_endpoint: &request.valkey_endpoint,
@@ -862,7 +902,26 @@ fn prepare_install_operation_with_identity(
         format!("nazoauth-{}", deployment_id.trim_start_matches("deploy-"))
     };
     let paths = resolve_paths(request, &hello.os, deployment_id)?;
-    let loopback_port = deployment_loopback_port(deployment_id);
+    if request.direct_tls_config.is_some() != request.tls_material_root.is_some() {
+        bail!("Direct TLS configuration and material root must be supplied together");
+    }
+    if request.direct_tls_config.is_some()
+        && (!runtime_kind.is_container() || target_os != TargetOs::Linux)
+    {
+        bail!("Direct TLS clean install requires a Linux Podman or Docker target");
+    }
+    let mut loopback_port = deployment_loopback_port(deployment_id);
+    if let Some(content) = &request.direct_tls_config {
+        let rendered = render_direct_tls_config(content)?;
+        let public_ports = crate::target::install_exec::direct_tls_public_ports(
+            &request.issuer,
+            rendered.as_bytes(),
+        )
+        .map_err(|error| anyhow::anyhow!(error.detail))?;
+        while public_ports.iter().any(|(port, _)| *port == loopback_port) {
+            loopback_port += 1;
+        }
+    }
     let order = build_install_order(
         request,
         &paths,
@@ -873,7 +932,7 @@ fn prepare_install_operation_with_identity(
         loopback_port,
         security_roots,
     )?;
-    let resources = declare_resources(
+    let mut resources = declare_resources(
         &target_os.parent(&paths.config_reference)?,
         &paths.data_root,
         &paths.secrets_dir,
@@ -881,6 +940,15 @@ fn prepare_install_operation_with_identity(
         &request.database_runtime_endpoint,
         &request.valkey_endpoint,
     )?;
+    if let Some(root) = &order.tls_material_root {
+        resources.push(Resource::new(
+            "tls-material",
+            "directory",
+            root,
+            ResourceOwnership::External,
+            ResourceScope::Deployment,
+        )?);
+    }
     let operation = HostOperation::state_mutate(
         operation_id,
         deployment_id,
@@ -1109,8 +1177,9 @@ pub(crate) fn run_clean_install(
     if let HostOutcome::Failed { code, .. } = &result.outcome {
         // An incomplete target rollback is intentionally non-terminal: the
         // target journal remains pending and this exact prepared identity is
-        // the only safe replay key. Ordinary failures proved full cleanup and
-        // may release the pointer so a corrected request starts fresh.
+        // the only safe replay key. This includes database initialization:
+        // filesystem cleanup cannot undo database keys bound to our secrets.
+        // Ordinary failures before that boundary may release the pointer.
         if code != INSTALL_OUTCOME_UNKNOWN {
             lease.clear()?;
         }
@@ -1147,6 +1216,9 @@ fn interpret_result(result: &HostResult) -> anyhow::Result<&crate::target::Insta
         HostOutcome::Failed { code, detail } => {
             if code == REMOTE_HELPER_MISMATCH || detail.contains(REMOTE_HELPER_MISMATCH) {
                 bail!("{code}: {detail}")
+            }
+            if code == INSTALL_OUTCOME_UNKNOWN {
+                bail!("install is incomplete; rerun the same install command: {code}: {detail}")
             }
             bail!("install failed on the target and was rolled back locally: {code}: {detail}")
         }
