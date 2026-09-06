@@ -153,7 +153,7 @@ remains pending; an unreachable endpoint is not proof of rollback.
 Run `tls certificate check` periodically with a warning window larger than
 expected renewal/recovery time, and alert on nonzero exit. Local tests cover real
 TLS, delayed leaf switching/rollback, deadlines and permissions. On 2026-09-06,
-Hostinger candidate acceptance also exercised public ACME issuance, renewal and
+Candidate acceptance in a Linux environment also exercised public ACME issuance, renewal and
 key replacement, both transport modes, native proxy config transactions,
 interrupted recovery and protocol service with ctl absent. These results identify
 the tested candidate binaries; distributed Release validation is separate evidence.
