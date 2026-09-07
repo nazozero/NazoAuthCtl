@@ -70,6 +70,22 @@ fn windows_private_key_file_denies_other_account() {
 }
 
 #[test]
+fn windows_read_only_mode_does_not_grant_owner_write() {
+    let (_dir, path) = fixture("nazoauth-win-mode");
+    atomic_write(&path, b"read-only", 0o400).expect("read-only private key should be written");
+    assert!(
+        fs::OpenOptions::new().write(true).open(&path).is_err(),
+        "0400 must not map to FILE_ALL_ACCESS for the owner"
+    );
+    assert_eq!(
+        read_secure_regular_file(&path, "read-only fixture", true, 128)
+            .expect("owner should still read the file")
+            .as_slice(),
+        b"read-only"
+    );
+}
+
+#[test]
 fn windows_atomic_replacement_preserves_complete_values() {
     let (_dir, path) = fixture("nazoauth-win-replace");
     atomic_write(&path, b"old-value", 0o600).expect("initial value should be written");
