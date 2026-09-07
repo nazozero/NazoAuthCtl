@@ -34,11 +34,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use chrono::{DateTime, Utc};
-use http_body_util::BodyExt as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -165,18 +165,31 @@ impl AdminApiTransport for HttpsAdminTransport {
             )))
             .context("failed to build the admin API request")?;
 
-        let response = self
-            .runtime
-            .block_on(async {
-                match tokio::time::timeout(REQUEST_TIMEOUT, self.client.request(outgoing)).await {
-                    Ok(result) => result.map_err(anyhow::Error::from),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "admin API request timed out after {}s",
-                        REQUEST_TIMEOUT.as_secs()
-                    )),
-                }
-            })
-            .context("admin API request failed")?;
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        self.runtime
+            .block_on(complete_admin_request(
+                self.client.request(outgoing),
+                deadline,
+            ))
+            .context("admin API request failed")
+    }
+}
+
+/// Complete one admin response under a single absolute deadline.  The same
+/// helper is used by the production transport and deterministic body tests so
+/// headers, every body frame, and response construction share one timeout.
+async fn complete_admin_request<F, B, E>(
+    request: F,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<AdminHttpResponse>
+where
+    F: Future<Output = Result<http::Response<B>, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+    B: http_body_util::BodyExt<Data = bytes::Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let operation = async move {
+        let response = request.await.map_err(anyhow::Error::from)?;
         let status = response.status().as_u16();
         let set_cookie_headers = response
             .headers()
@@ -189,28 +202,28 @@ impl AdminApiTransport for HttpsAdminTransport {
                     .context("admin API returned a non-text Set-Cookie header")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (_, body) = response.into_parts();
-
-        let bytes = self
-            .runtime
-            .block_on(async {
-                let mut body = body;
-                let mut bytes = Vec::new();
-                while let Some(frame) = body.frame().await {
-                    let frame = frame.map_err(anyhow::Error::from)?;
-                    if let Ok(data) = frame.into_data() {
-                        append_response_frame(&mut bytes, &data)?;
-                    }
-                }
-                Ok::<_, anyhow::Error>(bytes)
-            })
-            .context("failed to read the admin API response body")?;
-        Ok(AdminHttpResponse {
+        let (_, mut body) = response.into_parts();
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(anyhow::Error::from)?;
+            if let Ok(data) = frame.into_data() {
+                append_response_frame(&mut bytes, &data)?;
+            }
+        }
+        Ok::<_, anyhow::Error>(AdminHttpResponse {
             status,
             body: bytes,
             set_cookie_headers,
         })
-    }
+    };
+    tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "admin API request timed out after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            )
+        })?
 }
 
 /// The cap is enforced as each frame arrives so a malicious peer cannot make

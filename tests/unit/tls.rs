@@ -482,7 +482,12 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     let leaf_key = KeyPair::generate().unwrap();
     let leaf = leaf_params.signed_by(&leaf_key, &ca).unwrap();
     fs::write(&certificate_path, leaf.pem()).unwrap();
-    fs::write(&private_key_path, leaf_key.serialize_pem()).unwrap();
+    crate::filesystem::atomic_write(
+        &private_key_path,
+        leaf_key.serialize_pem().as_bytes(),
+        0o600,
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -566,7 +571,12 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     assert!(validate_rollback_material(&receipt, &changed_provider).is_err());
 
     let wrong_key = KeyPair::generate().unwrap();
-    fs::write(&private_key_path, wrong_key.serialize_pem()).unwrap();
+    crate::filesystem::atomic_write(
+        &private_key_path,
+        wrong_key.serialize_pem().as_bytes(),
+        0o600,
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -594,7 +604,7 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     assert!(format!("{error:#}").contains("TLS certificate PEM is invalid"));
 
     fs::write(&certificate_path, leaf.pem()).unwrap();
-    fs::write(&private_key_path, ca.pem()).unwrap();
+    crate::filesystem::atomic_write(&private_key_path, ca.pem().as_bytes(), 0o600).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

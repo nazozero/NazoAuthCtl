@@ -1,11 +1,22 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, Write},
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
+};
+
+#[cfg(not(windows))]
+use std::{
+    fs::OpenOptions,
+    io::{Seek, Write},
 };
 
 use anyhow::{Context, bail};
 use sha2::{Digest, Sha256};
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "filesystem/windows.rs"]
+mod windows;
 
 pub struct PrivateTempDir {
     path: PathBuf,
@@ -17,8 +28,19 @@ impl PrivateTempDir {
         for _ in 0..32 {
             let suffix = hex(&rand::random::<[u8; 12]>());
             let path = root.join(format!("{prefix}.{suffix}"));
-            match fs::create_dir(&path) {
+            let create_result = {
+                #[cfg(windows)]
+                {
+                    windows::create_private_directory(&path)
+                }
+                #[cfg(not(windows))]
+                {
+                    fs::create_dir(&path).map_err(anyhow::Error::from)
+                }
+            };
+            match create_result {
                 Ok(()) => {
+                    #[cfg(not(windows))]
                     set_mode(&path, 0o700)?;
                     let canonical = fs::canonicalize(&path)
                         .inspect_err(|_| {
@@ -54,35 +76,42 @@ impl Drop for PrivateTempDir {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .context("atomic-write target has no parent directory")?;
-    ensure_directory_chain(parent)?;
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    #[cfg(windows)]
     {
-        bail!(
-            "atomic-write target is not a regular file: {}",
-            path.display()
-        );
+        windows::atomic_write(path, bytes, mode)
     }
-    // `std::fs::rename` cannot atomically replace an existing destination on
-    // Windows. A two-rename fallback creates a power-loss window in which the
-    // authoritative journal/configuration path does not exist. Keep the
-    // replacement in one platform-native commit operation instead. The
-    // implementation also anchors Unix operations to the opened parent
-    // directory, so a concurrent ancestor rename cannot redirect the commit.
-    let mut file = atomic_write_file::AtomicWriteFile::open(path)
-        .with_context(|| format!("failed to stage atomic write for {}", path.display()))?;
-    set_file_mode(file.as_file(), mode)?;
-    file.write_all(bytes)
-        .with_context(|| format!("failed to write staged {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to persist staged {}", path.display()))?;
-    file.commit()
-        .with_context(|| format!("failed to atomically activate {}", path.display()))?;
-    sync_parent(path)?;
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .context("atomic-write target has no parent directory")?;
+        ensure_directory_chain(parent)?;
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            bail!(
+                "atomic-write target is not a regular file: {}",
+                path.display()
+            );
+        }
+        // `std::fs::rename` cannot atomically replace an existing destination on
+        // Windows. A two-rename fallback creates a power-loss window in which the
+        // authoritative journal/configuration path does not exist. Keep the
+        // replacement in one platform-native commit operation instead. The
+        // implementation also anchors Unix operations to the opened parent
+        // directory, so a concurrent ancestor rename cannot redirect the commit.
+        let mut file = atomic_write_file::AtomicWriteFile::open(path)
+            .with_context(|| format!("failed to stage atomic write for {}", path.display()))?;
+        set_file_mode(file.as_file(), mode)?;
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write staged {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to persist staged {}", path.display()))?;
+        file.commit()
+            .with_context(|| format!("failed to atomically activate {}", path.display()))?;
+        sync_parent(path)?;
+        Ok(())
+    }
 }
 
 /// Open a controller-owned regular file without accepting a symlink, a hard
@@ -92,9 +121,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> 
 ///
 /// Unix ownership and permission checks are intentionally kept behind cfg so
 /// the controller remains buildable on Windows, where these metadata concepts
-/// do not have a portable std equivalent.  Windows callers therefore get
-/// path/reparse-point validation, but this function does not claim an
-/// owner-only ACL guarantee.
+/// do not have a portable std equivalent.  Windows callers use the native
+/// descriptor implementation, which validates owner and DACL policy on the
+/// opened handle.
 pub fn open_secure_regular_file(path: &Path, label: &str, private: bool) -> anyhow::Result<File> {
     open_secure_regular_file_with_owner(path, label, private, None)
 }
@@ -114,6 +143,7 @@ pub fn open_secure_regular_file_for_uid(
     open_secure_regular_file_with_owner(path, label, private, Some(expected_owner_uid))
 }
 
+#[cfg(not(windows))]
 fn open_secure_regular_file_with_owner(
     path: &Path,
     label: &str,
@@ -141,7 +171,21 @@ fn open_secure_regular_file_with_owner(
         .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
     validate_secure_file_metadata(&opened, path, label, private, expected_owner_uid)?;
     validate_same_file(&before, &opened, label)?;
+    #[cfg(windows)]
+    windows::validate_file_handle(&file, path, label, private)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_secure_regular_file_with_owner(
+    path: &Path,
+    label: &str,
+    private: bool,
+    _expected_owner_uid: Option<u32>,
+) -> anyhow::Result<File> {
+    validate_normalized_absolute_path(path, label)?;
+    validate_secure_ancestors(path.parent().context("secure file has no parent")?, label)?;
+    windows::open_secure_regular_file(path, label, private)
 }
 
 /// Read a controller-owned regular file through the descriptor returned by
@@ -261,10 +305,8 @@ pub fn validate_secure_directory(path: &Path, label: &str, private: bool) -> any
 }
 
 /// Create a private directory chain and verify it after creation.  Existing
-/// ancestors are never relaxed; only the requested leaf is made owner-only on
-/// Unix.  On Windows, the standard library cannot inspect or enforce ACLs, so
-/// `private` means the path is normalized and contains no symlink/reparse-point
-/// component; callers must apply an external ACL policy when one is required.
+/// ancestors are never relaxed; the requested leaf is made owner-only on Unix
+/// and receives the equivalent protected native DACL on Windows.
 pub fn ensure_private_directory(path: &Path, label: &str) -> anyhow::Result<()> {
     validate_secure_directory(path, label, false)?;
     ensure_directory_chain(path)?;
@@ -275,6 +317,45 @@ pub fn ensure_private_directory(path: &Path, label: &str) -> anyhow::Result<()> 
 /// Open a lifecycle lock without following or replacing a symlink.  Creation
 /// uses `create_new`; an existing entry is opened only after the same secure
 /// metadata checks used by key and driver readers.
+#[cfg(windows)]
+pub fn open_lock_file(path: &Path, read_only: bool, label: &str) -> anyhow::Result<File> {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        bail!("{label} must be a normalized absolute path");
+    }
+    let parent = path.parent().context("lock path has no parent directory")?;
+    if read_only {
+        return open_secure_regular_file(path, label, true);
+    }
+    validate_secure_ancestors(parent, label)?;
+    ensure_directory_chain(parent)?;
+    validate_secure_ancestors(parent, label)?;
+    windows::open_lock_file(path, label)
+}
+
+/// Open a journal file for append while carrying the same protected creation
+/// descriptor as other private runtime files.  This is crate-visible because
+/// the journal owns append semantics; callers still receive the one handle
+/// that was validated before any bytes are written.
+#[cfg(windows)]
+pub fn open_append_file(path: &Path, label: &str) -> anyhow::Result<File> {
+    validate_normalized_absolute_path(path, label)?;
+    let parent = path
+        .parent()
+        .context("append path has no parent directory")?;
+    validate_secure_ancestors(parent, label)?;
+    ensure_directory_chain(parent)?;
+    windows::open_append_file(path, label)
+}
+
+#[cfg(not(windows))]
 pub fn open_lock_file(path: &Path, read_only: bool, label: &str) -> anyhow::Result<File> {
     if !path.is_absolute()
         || path.parent().is_none()
@@ -340,10 +421,16 @@ fn set_secure_directory_mode(path: &Path, label: &str, mode: u32) -> anyhow::Res
 
 #[cfg(not(unix))]
 fn set_secure_directory_mode(path: &Path, label: &str, mode: u32) -> anyhow::Result<()> {
-    // Windows ACLs are not represented by the portable std metadata API; do
-    // not open the directory as a regular File (which fails on Windows).
     validate_secure_directory(path, label, false)?;
-    apply_windows_owner_only_acl(path, mode)
+    #[cfg(windows)]
+    {
+        windows::set_mode(path, mode)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = mode;
+        Ok(())
+    }
 }
 
 fn validate_secure_ancestors(path: &Path, label: &str) -> anyhow::Result<()> {
@@ -391,6 +478,7 @@ fn validate_secure_ancestors_for_owner(
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_secure_file_metadata(
     metadata: &fs::Metadata,
     path: &Path,
@@ -432,6 +520,9 @@ fn validate_secure_file_metadata(
     }
     #[cfg(not(unix))]
     {
+        #[cfg(windows)]
+        windows::validate_file_path_acl(path, label, private)?;
+        #[cfg(not(windows))]
         let _ = (path, private);
     }
     Ok(())
@@ -472,9 +563,9 @@ fn validate_secure_directory_metadata(
     }
     #[cfg(not(unix))]
     {
-        // Windows ACLs have no portable owner/mode equivalent in std.  The
-        // private flag is intentionally limited to the path and reparse-point
-        // checks above; it must not be interpreted as an ACL assertion.
+        #[cfg(windows)]
+        windows::validate_directory_path_acl(path, label, private)?;
+        #[cfg(not(windows))]
         let _ = (path, private);
     }
     Ok(())
@@ -536,15 +627,6 @@ fn validate_same_file(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn validate_same_file(
-    _before: &fs::Metadata,
-    _opened: &fs::Metadata,
-    _label: &str,
-) -> anyhow::Result<()> {
-    Ok(())
-}
-
 pub fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         validate_directory_chain(parent)?;
@@ -565,7 +647,11 @@ pub fn ensure_directory_chain(path: &Path) -> anyhow::Result<()> {
     {
         ensure_directory_chain_at(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::ensure_directory_chain(path)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         validate_directory_chain(path)?;
         fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
@@ -701,33 +787,40 @@ pub fn copy_atomic_verified(
 /// that validated a digest cannot be redirected to a replacement path between
 /// validation and activation.
 pub fn copy_atomic_from_file(source: &mut File, target: &Path, mode: u32) -> anyhow::Result<()> {
-    source
-        .rewind()
-        .context("failed to rewind validated source before activation")?;
-    let parent = target
-        .parent()
-        .context("atomic-copy target has no parent directory")?;
-    ensure_directory_chain(parent)?;
-    if let Ok(metadata) = fs::symlink_metadata(target)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    #[cfg(windows)]
     {
-        bail!(
-            "atomic-copy target is not a regular file: {}",
-            target.display()
-        );
+        windows::copy_atomic_from_file(source, target, mode)
     }
-    let mut staged = atomic_write_file::AtomicWriteFile::open(target)
-        .with_context(|| format!("failed to stage atomic copy for {}", target.display()))?;
-    set_file_mode(staged.as_file(), mode)?;
-    std::io::copy(source, &mut staged)
-        .with_context(|| format!("failed to copy validated source to {}", target.display()))?;
-    staged
-        .sync_all()
-        .with_context(|| format!("failed to persist staged copy for {}", target.display()))?;
-    staged
-        .commit()
-        .with_context(|| format!("failed to activate atomic copy for {}", target.display()))?;
-    sync_parent(target)
+    #[cfg(not(windows))]
+    {
+        source
+            .rewind()
+            .context("failed to rewind validated source before activation")?;
+        let parent = target
+            .parent()
+            .context("atomic-copy target has no parent directory")?;
+        ensure_directory_chain(parent)?;
+        if let Ok(metadata) = fs::symlink_metadata(target)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            bail!(
+                "atomic-copy target is not a regular file: {}",
+                target.display()
+            );
+        }
+        let mut staged = atomic_write_file::AtomicWriteFile::open(target)
+            .with_context(|| format!("failed to stage atomic copy for {}", target.display()))?;
+        set_file_mode(staged.as_file(), mode)?;
+        std::io::copy(source, &mut staged)
+            .with_context(|| format!("failed to copy validated source to {}", target.display()))?;
+        staged
+            .sync_all()
+            .with_context(|| format!("failed to persist staged copy for {}", target.display()))?;
+        staged
+            .commit()
+            .with_context(|| format!("failed to activate atomic copy for {}", target.display()))?;
+        sync_parent(target)
+    }
 }
 
 pub fn generate_secret(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
@@ -766,6 +859,7 @@ pub fn sha256(path: &Path) -> anyhow::Result<String> {
     sha256_file(&mut file, &description)
 }
 
+#[cfg(unix)]
 fn configure_secure_open(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
@@ -805,75 +899,22 @@ pub fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 pub fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
-    // P1-13: NTFS has no POSIX modes, but the security INTENT of the Unix
-    // modes used across this codebase (0700 dirs, 0600/0440 files) is exactly
-    // an owner-only ACL. Enforce it with the system `icacls`: strip inherited
-    // ACEs and grant only SYSTEM, Administrators and the current account.
-    // Read-only modes map to read-only ACEs.
-    apply_windows_owner_only_acl(path, mode)
-}
-
-/// P1-13 Windows implementation detail. SIDs are used for SYSTEM and
-/// Administrators so localized group names cannot break the call; the
-/// current account comes from the process environment.
-#[cfg(not(unix))]
-fn apply_windows_owner_only_acl(path: &Path, mode: u32) -> anyhow::Result<()> {
-    use crate::process::Process;
-
-    let write_allowed = mode & 0o200 != 0;
-    let read_grant = "R";
-    let full_grant = "F";
-    let grant = if write_allowed {
-        full_grant
-    } else {
-        read_grant
-    };
-    let inheritance = if path.is_dir() { "(OI)(CI)" } else { "" };
-
-    let user = std::env::var("USERNAME")
-        .with_context(|| "USERNAME is not set; cannot build the owner-only ACL")?;
-    let account = match std::env::var("USERDOMAIN") {
-        Ok(domain) if !domain.is_empty() => format!(r"{domain}\{user}"),
-        _ => user,
-    };
-
-    let output = Process::new("icacls")
-        .arg(path)
-        .args(["/inheritance:r"])
-        .args([
-            "/grant:r".to_owned(),
-            format!("*S-1-5-18:{inheritance}({grant})"),
-        ])
-        .args([
-            "/grant:r".to_owned(),
-            format!("*S-1-5-32-544:{inheritance}({grant})"),
-        ])
-        .args([
-            "/grant:r".to_owned(),
-            format!("{account}:{inheritance}({grant})"),
-        ])
-        .output()
-        .with_context(|| "failed to start icacls for the owner-only ACL")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "icacls refused to set the owner-only ACL on {}: {}",
-            path.display(),
-            stderr.trim().chars().take(200).collect::<String>()
-        );
-    }
-    Ok(())
-}
-
-fn set_file_mode(file: &File, mode: u32) -> anyhow::Result<()> {
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(mode))
-            .context("failed to set file permissions")?;
+        windows::set_mode(path, mode)
     }
-    #[cfg(not(unix))]
-    let _ = (file, mode);
+    #[cfg(not(windows))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn set_file_mode(file: &File, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .context("failed to set file permissions")?;
     Ok(())
 }
 
