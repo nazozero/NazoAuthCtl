@@ -2529,6 +2529,10 @@ mod local_readiness_tests {
 mod current_data_import_tests {
     use super::*;
 
+    fn write_fixture(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> anyhow::Result<()> {
+        crate::filesystem::atomic_write(path.as_ref(), bytes.as_ref(), 0o600)
+    }
+
     fn source_fixture(root: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(root.join("keys"))?;
         fs::create_dir_all(root.join("avatars"))?;
@@ -2536,16 +2540,16 @@ mod current_data_import_tests {
         fs::create_dir_all(root.join("instance"))?;
         fs::create_dir_all(root.join("bootstrap"))?;
         fs::create_dir_all(root.join("ui-releases"))?;
-        fs::write(root.join("keys/signing.pem"), b"key")?;
-        fs::write(root.join("avatars/user.jpg"), b"avatar")?;
+        write_fixture(root.join("keys/signing.pem"), b"key")?;
+        write_fixture(root.join("avatars/user.jpg"), b"avatar")?;
         for name in IMPORT_APP_SECRETS {
-            fs::write(root.join("secrets").join(name), name.as_bytes())?;
+            write_fixture(root.join("secrets").join(name), name.as_bytes())?;
         }
-        fs::write(root.join("secrets/unknown"), b"excluded")?;
-        fs::write(root.join("instance/state"), b"excluded")?;
-        fs::write(root.join("bootstrap/token"), b"excluded")?;
-        fs::write(root.join("ui-releases/bundle"), b"excluded")?;
-        fs::write(root.join("unknown"), b"excluded")?;
+        write_fixture(root.join("secrets/unknown"), b"excluded")?;
+        write_fixture(root.join("instance/state"), b"excluded")?;
+        write_fixture(root.join("bootstrap/token"), b"excluded")?;
+        write_fixture(root.join("ui-releases/bundle"), b"excluded")?;
+        write_fixture(root.join("unknown"), b"excluded")?;
         Ok(())
     }
 
@@ -2577,13 +2581,13 @@ mod current_data_import_tests {
             assert!(!destination.join(excluded).exists(), "copied {excluded}");
         }
 
-        fs::write(destination.join("keys/signing.pem"), b"drift")?;
+        write_fixture(destination.join("keys/signing.pem"), b"drift")?;
         assert!(import_current_data(&source, &destination).is_err());
 
         let mfa_source = temp.path().join("mfa-source");
         let mfa_destination = temp.path().join("mfa-destination");
         use base64::Engine as _;
-        fs::write(
+        write_fixture(
             &mfa_source,
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
         )?;
@@ -2591,7 +2595,7 @@ mod current_data_import_tests {
             .map_err(|failure| anyhow::anyhow!(failure.detail))?;
         copy_import_file(&mfa_source, &mfa_destination, "MFA")
             .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        fs::write(&mfa_source, b"invalid")?;
+        write_fixture(&mfa_source, b"invalid")?;
         assert!(copy_import_file(&mfa_source, &mfa_destination, "MFA").is_err());
         Ok(())
     }
@@ -2697,7 +2701,7 @@ mod current_data_import_tests {
         for (suffix, name) in [("\n", "lf"), ("\r\n", "crlf")] {
             let source = temp.path().join(format!("source-{name}"));
             let destination = temp.path().join(format!("destination-{name}"));
-            fs::write(&source, format!("{key}{suffix}"))?;
+            write_fixture(&source, format!("{key}{suffix}"))?;
             copy_import_file(&source, &destination, "MFA")
                 .map_err(|failure| anyhow::anyhow!(failure.detail))?;
         }
@@ -2712,7 +2716,7 @@ mod current_data_import_tests {
         ] {
             let source = temp.path().join(format!("invalid-source-{name}"));
             let destination = temp.path().join(format!("invalid-destination-{name}"));
-            fs::write(&source, value)?;
+            write_fixture(&source, value)?;
             assert!(
                 copy_import_file(&source, &destination, "MFA").is_err(),
                 "{name}"

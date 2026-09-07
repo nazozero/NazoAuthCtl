@@ -3028,11 +3028,15 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    fn write_fixture(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> anyhow::Result<()> {
+        crate::filesystem::atomic_write(path.as_ref(), bytes.as_ref(), 0o600)
+    }
+
     #[test]
     fn recovery_config_replaces_runtime_database_and_state_epoch() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-config")?;
         let config = temp.path().join("config.yaml");
-        fs::write(
+        write_fixture(
             &config,
             "BIND: 0.0.0.0:8000\r\nDATABASE_URL: \"postgresql://old/old\"\r\nVALKEY_STATE_EPOCH: \"old\"\r\nISSUER: \"https://auth.example\"\r\n",
         )?;
@@ -3058,7 +3062,7 @@ mod tests {
     fn recovery_config_requires_single_authoritative_runtime_values() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-recovery-config-invalid")?;
         let config = temp.path().join("config.yaml");
-        fs::write(&config, "DATABASE_URL: \"postgresql://old/old\"\n")?;
+        write_fixture(&config, "DATABASE_URL: \"postgresql://old/old\"\n")?;
 
         let error = rewrite_recovery_config(
             &config,
@@ -3130,8 +3134,8 @@ mod tests {
             .join("backup/snapshots")
             .join(operation_id.as_str());
         fs::create_dir_all(&final_dir)?;
-        fs::write(final_dir.join("postgresql.dump"), b"database")?;
-        fs::write(final_dir.join("deployment.tar"), b"archive")?;
+        write_fixture(final_dir.join("postgresql.dump"), b"database")?;
+        write_fixture(final_dir.join("deployment.tar"), b"archive")?;
         let files = ["postgresql.dump", "deployment.tar"]
             .into_iter()
             .map(|name| snapshot_file(&final_dir.join(name), &final_dir))
@@ -3162,8 +3166,8 @@ mod tests {
         };
         manifest.manifest_sha256 = manifest.computed_sha256()?;
         backup::write_manifest_at(&final_dir.join(IMMUTABLE_MANIFEST_FILE), &manifest)?;
-        fs::write(backup::receipt_path(&scope_dir), b"stale")?;
-        fs::write(backup::off_host_receipt_path(&scope_dir), b"stale")?;
+        write_fixture(backup::receipt_path(&scope_dir), b"stale")?;
+        write_fixture(backup::off_host_receipt_path(&scope_dir), b"stale")?;
 
         let replayed = snapshot(&scope_dir, &state, &operation_id)?;
         assert_eq!(replayed, manifest);
@@ -3227,18 +3231,18 @@ mod tests {
         let secrets = temp.path().join("secrets");
         fs::create_dir_all(data.join("instance"))?;
         fs::create_dir_all(&secrets)?;
-        fs::write(data.join("instance/identity.pub"), b"identity")?;
+        write_fixture(data.join("instance/identity.pub"), b"identity")?;
         for name in crate::target::install_exec::SECRET_PURPOSES {
-            fs::write(secrets.join(name), name.as_bytes())?;
+            write_fixture(secrets.join(name), name.as_bytes())?;
         }
         let previous_root = URL_SAFE_NO_PAD.encode([8_u8; 32]);
-        fs::write(
+        write_fixture(
             secrets.join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET),
             previous_root.as_bytes(),
         )?;
-        fs::write(secrets.join("unknown-legacy-secret"), b"excluded")?;
+        write_fixture(secrets.join("unknown-legacy-secret"), b"excluded")?;
         let config = temp.path().join("config.yaml");
-        fs::write(
+        write_fixture(
             &config,
             format!(
                 "BIND: 0.0.0.0:8000\n{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: \"/run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\"\nSIGNING_KEY_ENCRYPTION_KEY_ID: \"deployment-test\"\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING}: \"/run/secrets/{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET}\"\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING}: \"deployment-test-previous\"\n"
@@ -3264,11 +3268,11 @@ mod tests {
             previous_root.as_bytes()
         );
         assert!(!restored.join("app-secrets/unknown-legacy-secret").exists());
-        fs::write(restored.join("extra"), b"not in manifest")?;
+        write_fixture(restored.join("extra"), b"not in manifest")?;
         let second = temp.path().join("second");
         fs::create_dir(&second)?;
         extract_deployment_archive(&archive, &second, &files)?;
-        fs::write(second.join("extra"), b"not in manifest")?;
+        write_fixture(second.join("extra"), b"not in manifest")?;
         let mut found = Vec::new();
         collect_regular_files(&second, &second, &mut found)?;
         assert_ne!(found.len(), files.len());
@@ -3284,10 +3288,10 @@ mod tests {
         fs::create_dir_all(data.join("instance"))?;
         fs::create_dir_all(&secrets)?;
         for &name in crate::target::install_exec::SECRET_PURPOSES {
-            fs::write(secrets.join(name), name.as_bytes())?;
+            write_fixture(secrets.join(name), name.as_bytes())?;
         }
         let config = temp.path().join("config.yaml");
-        fs::write(
+        write_fixture(
             &config,
             format!(
                 "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: current\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING}: previous\n"
@@ -3315,14 +3319,14 @@ mod tests {
         let secrets = temp.path().join("secrets");
         fs::create_dir_all(data.join("instance"))?;
         fs::create_dir_all(&secrets)?;
-        fs::write(data.join("instance/identity.pub"), b"identity")?;
+        write_fixture(data.join("instance/identity.pub"), b"identity")?;
         for &name in crate::target::install_exec::SECRET_PURPOSES {
             if name != SIGNING_KEY_ENCRYPTION_KEY_SECRET {
-                fs::write(secrets.join(name), name.as_bytes())?;
+                write_fixture(secrets.join(name), name.as_bytes())?;
             }
         }
         let config = temp.path().join("config.yaml");
-        fs::write(&config, b"BIND: 0.0.0.0:8000\n")?;
+        write_fixture(&config, b"BIND: 0.0.0.0:8000\n")?;
         let archive = temp.path().join("deployment.tar");
 
         let files = create_deployment_archive(&archive, &data, &secrets, &config, b"sentinel")?;
@@ -3342,7 +3346,7 @@ mod tests {
     fn recovery_rejects_old_snapshot_before_path_switch() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-old-recovery")?;
         let config = temp.path().join("config.yaml");
-        fs::write(&config, b"BIND: 0.0.0.0:8000\n")?;
+        write_fixture(&config, b"BIND: 0.0.0.0:8000\n")?;
         let paths_switching = temp.path().join("paths-switching");
 
         let error = validate_recovery_secret_contract(
@@ -3368,7 +3372,7 @@ mod tests {
     fn configured_wrapping_key_must_be_present_in_snapshot_archive() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-new-recovery")?;
         let config = temp.path().join("config.yaml");
-        fs::write(
+        write_fixture(
             &config,
             format!(
                 "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: \"/run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\"\nSIGNING_KEY_ENCRYPTION_KEY_ID: \"deployment-test\"\n"
@@ -3400,11 +3404,11 @@ mod tests {
         let secrets = temp.path().join("secrets");
         fs::create_dir(&secrets)?;
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-        fs::write(
+        write_fixture(
             secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET),
             key.as_bytes(),
         )?;
-        fs::write(
+        write_fixture(
             &config,
             format!(
                 "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/other-key\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: deployment-test\n"
@@ -3436,8 +3440,8 @@ mod tests {
         let secrets = temp.path().join("secrets");
         fs::create_dir(&secrets)?;
         let key = b"invalid";
-        fs::write(secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET), key)?;
-        fs::write(
+        write_fixture(secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET), key)?;
+        write_fixture(
             &config,
             format!(
                 "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: deployment-test\n"
@@ -3474,11 +3478,11 @@ mod tests {
         let secrets = temp.path().join("secrets");
         fs::create_dir(&secrets)?;
         let current_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
-        fs::write(
+        write_fixture(
             secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET),
             current_key.as_bytes(),
         )?;
-        fs::write(
+        write_fixture(
             &config,
             format!(
                 "{SIGNING_KEY_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_ENCRYPTION_KEY_ID_SETTING}: current\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SETTING}: /run/secrets/{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET}\n{SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING}: previous\n"
@@ -3552,7 +3556,7 @@ mod tests {
     fn postgres_database_urls_use_maintenance_database_for_create_and_drop() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("backup-postgres-url-test")?;
         let path = temp.path().join("database-lifecycle-url");
-        fs::write(&path, "postgresql://user:s%2Be%3Dcret@db.example/app")?;
+        write_fixture(&path, "postgresql://user:s%2Be%3Dcret@db.example/app")?;
         let connection = postgres_connection(&path)?;
         assert_eq!(connection.password, "s+e=cret");
         assert_eq!(
@@ -3595,7 +3599,7 @@ mod tests {
             .join("backup/recoveries")
             .join(operation.to_string());
         fs::create_dir_all(&recovery)?;
-        fs::write(recovery.join("paths-switching"), operation.to_string())?;
+        write_fixture(recovery.join("paths-switching"), operation.to_string())?;
         assert!(recovery_path_switch_started(
             temp.path(),
             &operation.to_string()
@@ -3617,9 +3621,9 @@ mod tests {
         let staged = sibling_operation_path(&target, operation, "data-stage")?;
         let rollback = sibling_operation_path(&target, operation, "data-rollback")?;
         fs::create_dir(&target)?;
-        fs::write(target.join("value"), b"old")?;
+        write_fixture(target.join("value"), b"old")?;
         fs::create_dir(&staged)?;
-        fs::write(staged.join("value"), b"restored")?;
+        write_fixture(staged.join("value"), b"restored")?;
         fs::rename(&target, &rollback)?;
 
         switch_recovery_path(&target, &staged, operation, "data")?;

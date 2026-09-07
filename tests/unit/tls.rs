@@ -9,6 +9,10 @@ use rustls_pki_types::{PrivateKeyDer, pem::PemObject};
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
+fn write_fixture(path: &std::path::Path, bytes: impl AsRef<[u8]>) {
+    crate::filesystem::atomic_write(path, bytes.as_ref(), 0o600).unwrap();
+}
+
 #[test]
 fn tenant_and_hostname_bindings_are_canonical_and_path_safe() {
     assert_eq!(canonical_tenant("tenant-a").unwrap(), "tenant-a");
@@ -481,7 +485,7 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let leaf_key = KeyPair::generate().unwrap();
     let leaf = leaf_params.signed_by(&leaf_key, &ca).unwrap();
-    fs::write(&certificate_path, leaf.pem()).unwrap();
+    write_fixture(&certificate_path, leaf.pem());
     crate::filesystem::atomic_write(
         &private_key_path,
         leaf_key.serialize_pem().as_bytes(),
@@ -587,23 +591,22 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
     );
     assert!(validate_rollback_material(&receipt, &provider).is_err());
 
-    fs::write(&certificate_path, b"").unwrap();
+    write_fixture(&certificate_path, b"");
     let error = load_and_validate_material(certificate, private_key, &input.hostname, &provider)
         .err()
         .expect("empty certificate chain must fail");
     assert!(format!("{error:#}").contains("TLS certificate chain contains no certificate"));
 
-    fs::write(
+    write_fixture(
         &certificate_path,
         b"-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
-    )
-    .unwrap();
+    );
     let error = load_and_validate_material(certificate, private_key, &input.hostname, &provider)
         .err()
         .expect("malformed certificate PEM must fail");
     assert!(format!("{error:#}").contains("TLS certificate PEM is invalid"));
 
-    fs::write(&certificate_path, leaf.pem()).unwrap();
+    write_fixture(&certificate_path, leaf.pem());
     crate::filesystem::atomic_write(&private_key_path, ca.pem().as_bytes(), 0o600).unwrap();
     #[cfg(unix)]
     {
@@ -615,11 +618,10 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
         .expect("certificate PEM is not a supported private key");
     assert!(format!("{error:#}").contains("TLS private key PEM contains no supported private key"));
 
-    fs::write(
+    write_fixture(
         &private_key_path,
         b"-----BEGIN PRIVATE KEY-----\nnot-base64\n-----END PRIVATE KEY-----\n",
-    )
-    .unwrap();
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
