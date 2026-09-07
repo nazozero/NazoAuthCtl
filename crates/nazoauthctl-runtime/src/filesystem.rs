@@ -28,10 +28,10 @@ impl PrivateTempDir {
         for _ in 0..32 {
             let suffix = hex(&rand::random::<[u8; 12]>());
             let path = root.join(format!("{prefix}.{suffix}"));
-            let create_result = {
+            let create_result: anyhow::Result<()> = {
                 #[cfg(windows)]
                 {
-                    windows::create_private_directory(&path)
+                    windows::create_private_directory(&path).map_err(anyhow::Error::from)
                 }
                 #[cfg(not(windows))]
                 {
@@ -54,7 +54,12 @@ impl PrivateTempDir {
                         })?;
                     return Ok(Self { path: canonical });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_error| {
+                            io_error.kind() == std::io::ErrorKind::AlreadyExists
+                        }) => {}
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("failed to create {}", path.display()));
