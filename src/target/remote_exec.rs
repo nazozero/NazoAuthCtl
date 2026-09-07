@@ -414,7 +414,6 @@ mod tests {
     fn interrupted_state_mutations_resume_without_double_applying() -> anyhow::Result<()> {
         use crate::target::journal::{JournalLine, JournalStatus, TargetJournal};
         use crate::target::wire::canonical_operation_hash;
-        use std::io::Write as _;
 
         let (_temp, root) = temp_state()?;
         seed_deployment(&root)?;
@@ -436,13 +435,10 @@ mod tests {
             .join("deployments")
             .join("deploy-alpha")
             .join("operations.jsonl");
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&journal_path)?;
-        file.write_all(pending.as_bytes())?;
-        file.write_all(b"\n")?;
-        drop(file);
+        let mut journal_bytes = std::fs::read(&journal_path).unwrap_or_default();
+        journal_bytes.extend_from_slice(pending.as_bytes());
+        journal_bytes.push(b'\n');
+        crate::filesystem::atomic_write(&journal_path, &journal_bytes, 0o600)?;
         drop(journal);
 
         let resumed = answered(&serde_json::to_vec(&operation)?, &root)?;

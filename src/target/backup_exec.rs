@@ -3133,7 +3133,7 @@ mod tests {
         let final_dir = scope_dir
             .join("backup/snapshots")
             .join(operation_id.as_str());
-        fs::create_dir_all(&final_dir)?;
+        crate::filesystem::ensure_private_directory(&final_dir, "test snapshot directory")?;
         write_fixture(final_dir.join("postgresql.dump"), b"database")?;
         write_fixture(final_dir.join("deployment.tar"), b"archive")?;
         let files = ["postgresql.dump", "deployment.tar"]
