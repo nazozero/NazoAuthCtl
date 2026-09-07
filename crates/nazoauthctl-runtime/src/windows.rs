@@ -29,7 +29,8 @@ use windows_sys::Win32::{
         INHERIT_ONLY_ACE, InitializeAcl, InitializeSecurityDescriptor, MakeSelfRelativeSD,
         OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
         SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        TOKEN_QUERY, TOKEN_USER,
         TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinBuiltinUsersSid,
         WinLocalSystemSid, WinWorldSid,
     },
@@ -234,6 +235,20 @@ fn with_security_attributes<T>(
             )
         },
         "SetSecurityDescriptorDacl",
+    )?;
+    // A token running with an elevated Administrators owner can cause
+    // CreateFileW/CreateDirectoryW to choose the token's default owner rather
+    // than TokenUser.  Set the owner explicitly so the descriptor we pass at
+    // creation time has the same identity that validation requires.
+    check_bool(
+        unsafe {
+            SetSecurityDescriptorOwner(
+                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                sids[0].as_ptr() as PSID,
+                0,
+            )
+        },
+        "SetSecurityDescriptorOwner",
     )?;
     check_bool(
         unsafe {
