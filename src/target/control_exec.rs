@@ -515,6 +515,12 @@ mod tests {
         let staged = stage_change_set(b"exact change-set bytes")?;
         let path = staged.path.clone();
         assert_eq!(std::fs::read(&path)?, b"exact change-set bytes");
+        #[cfg(windows)]
+        drop(crate::filesystem::open_secure_regular_file(
+            &path,
+            "staged control secret",
+            true,
+        )?);
         drop(staged);
         assert!(
             !path.exists(),

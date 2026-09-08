@@ -33,8 +33,7 @@ use windows_sys::Win32::{
         SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
         SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
         TOKEN_QUERY, TOKEN_USER,
-        TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinBuiltinUsersSid,
-        WinLocalSystemSid, WinWorldSid,
+        TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE,
@@ -153,17 +152,17 @@ fn trusted_sids() -> anyhow::Result<[Vec<u8>; 3]> {
 }
 
 /// Translate the small Unix mode contract used by the controller into the
-/// Windows access mask for one class of principals.  The creation-only mask is
+/// Windows access mask for the trusted principals. The creation-only mask is
 /// kept separate from the requested mode so a 0400/0440 object never becomes
 /// writable merely because it was opened through the staging path.
-fn mode_access_mask(bits: u32, owner: bool, is_directory: bool, owner_extra: u32) -> u32 {
+fn mode_access_mask(bits: u32, is_directory: bool, owner_extra: u32) -> u32 {
     let read = bits & 0o4 != 0;
     let write = bits & 0o2 != 0;
     let execute = bits & 0o1 != 0;
     // Keep the established controller contract for writable owner objects:
     // the controller must be able to rotate/retire them and replace their
     // DACL.  Read-only modes below deliberately do not receive this upgrade.
-    if owner && write && read {
+    if write && read {
         return FILE_ALL_ACCESS | owner_extra;
     }
     let mut mask = 0;
@@ -179,13 +178,10 @@ fn mode_access_mask(bits: u32, owner: bool, is_directory: bool, owner_extra: u32
     // FILE_GENERIC_WRITE maps FILE_ADD_FILE/FILE_ADD_SUBDIRECTORY for a
     // directory but not FILE_DELETE_CHILD.  Deleting/replacing a child is
     // the directory analogue of the owner write bit in the Unix contract.
-    if owner && is_directory && write {
+    if is_directory && write {
         mask |= FILE_DELETE_CHILD;
     }
-    if owner {
-        mask |= owner_extra;
-    }
-    mask
+    mask | owner_extra
 }
 
 fn with_security_attributes<T>(
@@ -197,20 +193,11 @@ fn with_security_attributes<T>(
     if mode & 0o022 != 0 {
         bail!("Windows secure ACL cannot grant non-owner write access");
     }
-    let trusted = trusted_sids()?;
-    let mut sids: Vec<Vec<u8>> = trusted.into_iter().collect();
-    let trusted_mask = mode_access_mask((mode >> 6) & 0o7, true, is_directory, owner_extra);
-    let mut masks = vec![trusted_mask; sids.len()];
-    let group_mask = mode_access_mask((mode >> 3) & 0o7, false, is_directory, 0);
-    if group_mask != 0 {
-        sids.push(well_known_sid(WinBuiltinUsersSid)?);
-        masks.push(group_mask);
-    }
-    let other_mask = mode_access_mask(mode & 0o7, false, is_directory, 0);
-    if other_mask != 0 {
-        sids.push(well_known_sid(WinWorldSid)?);
-        masks.push(other_mask);
-    }
+    let sids = trusted_sids()?;
+    let trusted_mask = mode_access_mask((mode >> 6) & 0o7, is_directory, owner_extra);
+    // Unix service-group/world read bits do not identify a Windows service
+    // identity. Keep every controller-created object within this allowlist,
+    // including secret files whose Unix mode is 0440 or 0444.
     let acl_size =
         (size_of::<ACL>() + sids.iter().map(|sid| 8usize + sid.len()).sum::<usize>()) as u32;
     let mut acl_bytes = vec![0u8; acl_size as usize];
@@ -224,10 +211,16 @@ fn with_security_attributes<T>(
     } else {
         0
     };
-    for (sid, mask) in sids.iter().zip(masks) {
+    for sid in &sids {
         check_bool(
             unsafe {
-                AddAccessAllowedAceEx(acl, ACL_REVISION, ace_flags, mask, sid.as_ptr() as PSID)
+                AddAccessAllowedAceEx(
+                    acl,
+                    ACL_REVISION,
+                    ace_flags,
+                    trusted_mask,
+                    sid.as_ptr() as PSID,
+                )
             },
             "AddAccessAllowedAceEx",
         )?;
@@ -832,32 +825,31 @@ fn commit_staged(
     target: &Path,
     mode: u32,
 ) -> anyhow::Result<()> {
-    if let Err(error) = staged
-        .sync_all()
-        .with_context(|| format!("failed to persist staged {}", target.display()))
-    {
+    let result = (|| {
+        // Finalize permissions on the same object before publishing it. The
+        // existing handle retains its write/delete rights for sync and rename
+        // even when new opens will be read-only. A same-directory NTFS rename
+        // retains this object's DACL; publication is the last fallible step.
+        set_acl(staged.as_raw_handle(), mode)?;
+        validate_acl_handle(&staged, true)?;
+        staged
+            .sync_all()
+            .with_context(|| format!("failed to persist staged {}", target.display()))?;
+        rename_replace(&staged, parent, target)
+    })();
+    if let Err(error) = result {
         drop(staged);
         let _ = fs::remove_file(stage);
         return Err(error);
     }
-    if let Err(error) = rename_replace(&staged, parent, target) {
-        drop(staged);
-        let _ = fs::remove_file(stage);
-        return Err(error);
-    }
-    // A few Windows providers reconstruct the destination security
-    // descriptor during an absolute same-directory rename.  Re-apply the
-    // already validated ACL through the still-open object handle before
-    // releasing it, so the committed file retains the protected DACL.
-    set_acl(staged.as_raw_handle(), mode)?;
     drop(staged);
     Ok(())
 }
 
 fn staging_mode(mode: u32) -> u32 {
     // A staged object must be writable by its owner until its bytes are
-    // durable.  The requested mode is applied again after activation, so a
-    // read-only final object (0400/0440) is still exposed with the exact
+    // durable. The requested mode is applied before activation, so a
+    // read-only final object (0400/0440/0444) is exposed with the exact
     // caller contract without ever creating an ambiently-accessible file.
     mode | 0o600
 }
@@ -968,4 +960,57 @@ pub fn open_append_file(path: &Path, label: &str) -> anyhow::Result<File> {
     let mut file = file;
     file.seek(SeekFrom::End(0))?;
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_file_is_private_before_secret_bytes_are_written() {
+        let dir = super::super::PrivateTempDir::new("nazoauth-win-stage-acl").unwrap();
+        for mode in [0o400, 0o440, 0o444, 0o600] {
+            let path = dir.path().join(format!("stage-{mode:o}"));
+            let mut staged = open_handle_with_mode(
+                &path,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | WRITE_DAC,
+                CREATE_NEW,
+                Some(staging_mode(mode)),
+            )
+            .unwrap();
+            assert_eq!(staged.metadata().unwrap().len(), 0);
+            validate_acl_handle(&staged, true)
+                .expect("empty staging file must already have only trusted ACEs");
+            staged.write_all(b"secret").unwrap();
+        }
+    }
+
+    #[test]
+    fn final_acl_failure_preserves_target_and_removes_stage() {
+        let dir = super::super::PrivateTempDir::new("nazoauth-win-stage-failure").unwrap();
+        let target = dir.path().join("target");
+        atomic_write(&target, b"old", 0o600).unwrap();
+        let stage = stage_path(&target).unwrap();
+        let mut staged = open_handle_with_mode(
+            &stage,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | WRITE_DAC,
+            CREATE_NEW,
+            Some(0o600),
+        )
+        .unwrap();
+        staged.write_all(b"new").unwrap();
+        let parent = open_directory_handle(
+            dir.path(),
+            FILE_ADD_FILE | FILE_DELETE_CHILD | READ_CONTROL,
+        )
+        .unwrap();
+        let error = commit_staged(staged, &stage, &parent, &target, 0o622).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot grant non-owner write access")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert!(!stage.exists());
+    }
 }
