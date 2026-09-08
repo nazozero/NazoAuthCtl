@@ -70,7 +70,7 @@ fn persisted_secrets_are_stable_single_line_regular_files() {
     );
     assert_eq!(generate_secret(&path).unwrap(), generated);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     set_mode(&path, 0o600).unwrap();
     fs::write(&path, "multiline\nsecret").unwrap();
     assert!(generate_secret(&path).is_err());

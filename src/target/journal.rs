@@ -64,10 +64,13 @@
 
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
+    fs,
     io::Write as _,
     path::{Path, PathBuf},
 };
+
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
@@ -389,13 +392,18 @@ impl TargetJournal {
             format!("failed to serialize a journal line for {}", path.display())
         })?;
         bytes.push(b'\n');
+        #[cfg(windows)]
+        let mut file = filesystem::open_append_file(path, "target operation journal")?;
+        #[cfg(not(windows))]
         let mut options = OpenOptions::new();
+        #[cfg(not(windows))]
         options.append(true).create(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
+        #[cfg(not(windows))]
         let mut file = options
             .open(path)
             .with_context(|| format!("failed to open the journal {}", path.display()))?;

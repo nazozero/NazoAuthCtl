@@ -439,11 +439,16 @@ fn verified_release_candidate(
         }
     };
     if let Some(root) = cache {
-        // Only fully verified bytes reach the persistent store; the
-        // recomputed digest above already proved what we are storing.
         let destination = root.join(repository).join(version).join(blob);
-        if crate::filesystem::ensure_directory_chain(&destination).is_ok() {
-            let _ = fs::copy(work.join(blob), destination);
+        // Only fully verified bytes reach the persistent store; the
+        // recomputed digest above already proved what we are storing.  The
+        // shared atomic-copy primitive creates only the parent chain and
+        // commits the blob as one complete regular file.
+        if let Err(error) = crate::filesystem::copy_atomic(&work.join(blob), &destination, 0o600) {
+            eprintln!(
+                "warning: verified release cache write failed at {}: {error:#}",
+                destination.display()
+            );
         }
     }
     Ok(manifest)
