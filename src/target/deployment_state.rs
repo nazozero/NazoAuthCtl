@@ -73,7 +73,7 @@ use super::install_exec::InstallOrder;
 use super::journal;
 
 /// Schema discriminator carried by the persisted DeploymentState document.
-pub const DEPLOYMENT_STATE_SCHEMA: u32 = 7;
+pub const DEPLOYMENT_STATE_SCHEMA: u32 = 8;
 
 /// Upper bound for one persisted DeploymentState document (~1 MiB).
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
@@ -370,14 +370,12 @@ pub struct ActiveHostOperationRef {
 }
 
 /// Durable fence written immediately after a successful MigrateApply and
-/// cleared only when the matching release generation commits (or a verified
-/// schema-compatible automatic rollback completes).
+/// cleared only when the matching release generation commits or backup recovery completes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppliedMigration {
     pub operation_id: String,
     pub target_artifact: String,
-    pub rollback_policy: crate::model::ReleaseRollbackPolicy,
     pub applied_at: DateTime<Utc>,
 }
 
@@ -395,11 +393,6 @@ pub struct DeploymentState {
     pub config: ConfigState,
     pub resources: Vec<Resource>,
     pub local_health: HealthRecord,
-    /// Verified Release policy governing a rollback from `artifact.current`
-    /// to `artifact.previous`.
-    pub current_rollback_policy: crate::model::ReleaseRollbackPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_rollback_policy: Option<crate::model::ReleaseRollbackPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_migration: Option<AppliedMigration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,12 +418,7 @@ impl DeploymentState {
         validate_issuer(&self.issuer)?;
         self.runtime.validate()?;
         self.artifact.validate()?;
-        self.current_rollback_policy.validate()?;
-        if let Some(policy) = &self.previous_rollback_policy {
-            policy.validate()?;
-        }
         if let Some(migration) = &self.applied_migration {
-            migration.rollback_policy.validate()?;
             crate::registry::validate_identifier(
                 &migration.operation_id,
                 128,
@@ -603,7 +591,6 @@ pub struct BootstrapParams {
     pub resources: Vec<Resource>,
     /// Verified release version of the content-addressed artifact, when known.
     pub current_release: Option<ReleaseVersion>,
-    pub current_rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 /// Handle to one target's DeploymentState store rooted at the formalized
@@ -619,7 +606,6 @@ pub struct TargetStateStore {
 pub(crate) struct UpdateCommit {
     pub(crate) artifact: String,
     pub(crate) release: Option<ReleaseVersion>,
-    pub(crate) rollback_policy: crate::model::ReleaseRollbackPolicy,
     pub(crate) config: Option<(String, String)>,
     pub(crate) operation_id: String,
 }
@@ -782,7 +768,6 @@ impl TargetStateStore {
             config_schema,
             resources,
             current_release,
-            current_rollback_policy,
         } = params;
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
         if let Ok(existing) = self.load_existing(deployment_id) {
@@ -832,8 +817,6 @@ impl TargetStateStore {
             local_health,
             current_release,
             previous_release: None,
-            current_rollback_policy,
-            previous_rollback_policy: None,
             applied_migration: None,
         };
         state.validate().map_err(|error| {
@@ -899,7 +882,6 @@ impl TargetStateStore {
         expected_revision: u64,
         operation_id: &str,
         target_artifact: &str,
-        rollback_policy: &crate::model::ReleaseRollbackPolicy,
     ) -> Result<(), Failure> {
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
         let mut state = self.load_existing(deployment_id)?;
@@ -915,13 +897,10 @@ impl TargetStateStore {
         let candidate = AppliedMigration {
             operation_id: operation_id.to_owned(),
             target_artifact: target_artifact.to_owned(),
-            rollback_policy: rollback_policy.clone(),
             applied_at: Utc::now(),
         };
         if let Some(existing) = &state.applied_migration {
-            if existing.operation_id == operation_id
-                && existing.target_artifact == target_artifact
-                && existing.rollback_policy == *rollback_policy
+            if existing.operation_id == operation_id && existing.target_artifact == target_artifact
             {
                 return Ok(());
             }
@@ -934,30 +913,6 @@ impl TargetStateStore {
         state.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
         })?;
-        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
-            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
-        })?;
-        persist(&scope_path(&self.root, &scope), &state)
-    }
-
-    pub(crate) fn clear_applied_migration(
-        &self,
-        deployment_id: &str,
-        operation_id: &str,
-    ) -> Result<(), Failure> {
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
-        let mut state = self.load_existing(deployment_id)?;
-        match &state.applied_migration {
-            None => return Ok(()),
-            Some(applied) if applied.operation_id == operation_id => {}
-            Some(_) => {
-                return Err(Failure::new(
-                    ROLLBACK_RECOVERY_REQUIRED,
-                    "refusing to clear a migration fence owned by a different operation",
-                ));
-            }
-        }
-        state.applied_migration = None;
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
@@ -992,7 +947,6 @@ impl TargetStateStore {
         let UpdateCommit {
             artifact: new_current,
             release: new_release,
-            rollback_policy: new_rollback_policy,
             config,
             operation_id,
         } = commit;
@@ -1023,27 +977,32 @@ impl TargetStateStore {
                 Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
             })?;
         }
-        new_rollback_policy.validate().map_err(|error| {
-            Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
-        })?;
+        if let Some(migration) = &state.applied_migration {
+            if migration.operation_id != operation_id || migration.target_artifact != new_current {
+                return Err(Failure::new(
+                    ROLLBACK_RECOVERY_REQUIRED,
+                    "the update does not match the recorded migration; resume that operation or recover a verified backup",
+                ));
+            }
+            // A completed migration does not prove compatibility with the old binary.
+            state.artifact.previous = None;
+            state.previous_release = None;
+        }
         let artifact_changed = state.artifact.current.as_deref() != Some(new_current.as_str());
         if artifact_changed {
-            if recorded_current_was_live {
+            if recorded_current_was_live && state.applied_migration.is_none() {
                 state.artifact.previous = state.artifact.current.take();
                 // The release version swap mirrors the artifact reference
                 // swap so the envelope facts stay attached to the right
                 // generation.
                 state.previous_release = state.current_release.take();
-                state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
             } else {
                 state.artifact.previous = None;
                 state.previous_release = None;
-                state.previous_rollback_policy = None;
             }
             state.artifact.current = Some(new_current);
         }
         state.current_release = new_release;
-        state.current_rollback_policy = new_rollback_policy;
         state.applied_migration = None;
         if let Some((reference, schema)) = config {
             state
@@ -1105,19 +1064,14 @@ impl TargetStateStore {
         facts.release.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
         })?;
-        facts.rollback_policy.validate().map_err(|error| {
-            Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
-        })?;
         let new_current = canonical_recovery_artifact(&facts.artifact)?;
 
-        // The old generation remains available as the explicit rollback
-        // history. The release versions move with their artifact generations.
-        state.artifact.previous = state.artifact.current.take();
+        // The restored database belongs to the restored artifact. The pre-recovery
+        // binary is not a rollback candidate for that database.
+        state.artifact.previous = None;
         state.artifact.current = Some(new_current);
-        state.previous_release = state.current_release.take();
+        state.previous_release = None;
         state.current_release = Some(facts.release.clone());
-        state.previous_rollback_policy = Some(state.current_rollback_policy.clone());
-        state.current_rollback_policy = facts.rollback_policy.clone();
         state.applied_migration = None;
 
         // Keep the formal locator from the live state. Only the schema comes
@@ -1171,14 +1125,10 @@ impl TargetStateStore {
                 ),
             ));
         }
-        if state.applied_migration.is_some()
-            || !state
-                .current_rollback_policy
-                .artifact_rollback_allowed_after_migration()
-        {
+        if state.applied_migration.is_some() {
             return Err(Failure::new(
                 ROLLBACK_RECOVERY_REQUIRED,
-                "the verified Release migration policy forbids artifact/config rollback; keep the writer stopped and run verified backup recover",
+                "an applied migration forbids artifact/config rollback; keep the writer stopped and recover a verified backup",
             ));
         }
         let Some(previous) = state.artifact.previous.clone() else {
@@ -1200,15 +1150,6 @@ impl TargetStateStore {
         let old_release = state.current_release.take();
         state.current_release = state.previous_release.take();
         state.previous_release = old_release;
-        let old_policy = state.current_rollback_policy.clone();
-        let Some(previous_policy) = state.previous_rollback_policy.take() else {
-            return Err(Failure::new(
-                ROLLBACK_UNAVAILABLE,
-                "the previous artifact has no verified Release rollback policy",
-            ));
-        };
-        state.current_rollback_policy = previous_policy;
-        state.previous_rollback_policy = Some(old_policy);
         if let Some((reference, schema)) = config {
             state
                 .config
@@ -1642,56 +1583,55 @@ mod tests {
             config_schema: "nazauth-config-v1".to_owned(),
             resources: Vec::new(),
             current_release: None,
-            current_rollback_policy: crate::model::test_release_rollback_policy(),
         }
     }
 
-    fn irreversible_policy() -> crate::model::ReleaseRollbackPolicy {
-        let mut policy = crate::model::test_release_rollback_policy();
-        policy.schema_compatible = false;
-        policy.irreversible_migration = true;
-        policy.rationale = "test migration is irreversible".to_owned();
-        policy
-    }
-
     #[test]
-    fn applied_migration_and_irreversible_release_both_refuse_artifact_rollback()
-    -> anyhow::Result<()> {
+    fn migration_fences_rollback_and_discards_the_previous_generation() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-migration-fence")?;
         let store = TargetStateStore::open(temp.path().join("state"))?;
+        let current = format!("sha256:{}", "a".repeat(64));
+        let target = format!("sha256:{}", "b".repeat(64));
         let mut params = sample_params("https://auth.example.com", "nazoauth-main");
-        params.artifact.current = Some(format!("sha256:{}", "a".repeat(64)));
+        params.artifact.current = Some(current.clone());
+        params.artifact.previous = Some(format!("sha256:{}", "c".repeat(64)));
         store.bootstrap("deploy-fence", params, "bootstrap-op")?;
-
-        let migration_operation = "01900000-0000-7000-8000-000000000001";
-        store.record_migration_applied(
-            "deploy-fence",
-            1,
-            migration_operation,
-            &format!("sha256:{}", "b".repeat(64)),
-            &irreversible_policy(),
-        )?;
+        let operation = "01900000-0000-7000-8000-000000000001";
+        store.record_migration_applied("deploy-fence", 1, operation, &target)?;
         let fenced = store
             .apply_rollback_healthy("deploy-fence", 1, None, "rollback-op")
-            .expect_err("an applied migration fence must refuse rollback");
+            .expect_err("an applied migration must refuse rollback");
         assert_eq!(fenced.code, ROLLBACK_RECOVERY_REQUIRED);
-
-        store.clear_applied_migration("deploy-fence", migration_operation)?;
-        store.apply_update_healthy(
-            "deploy-fence",
-            1,
-            UpdateCommit {
-                artifact: format!("sha256:{}", "b".repeat(64)),
-                release: None,
-                rollback_policy: irreversible_policy(),
-                config: None,
-                operation_id: "update-op".to_owned(),
-            },
-        )?;
-        let irreversible = store
-            .apply_rollback_healthy("deploy-fence", 1, None, "rollback-op-2")
-            .expect_err("irreversible release policy must refuse rollback");
-        assert_eq!(irreversible.code, ROLLBACK_RECOVERY_REQUIRED);
+        let commit = |operation_id: &str, artifact: &str| UpdateCommit {
+            artifact: artifact.to_owned(),
+            release: None,
+            config: None,
+            operation_id: operation_id.to_owned(),
+        };
+        for invalid in [
+            commit("wrong-operation", &target),
+            commit(operation, &current),
+        ] {
+            assert_eq!(
+                store
+                    .apply_update_healthy("deploy-fence", 1, invalid)
+                    .unwrap_err()
+                    .code,
+                ROLLBACK_RECOVERY_REQUIRED
+            );
+        }
+        let updated = store.apply_update_healthy("deploy-fence", 1, commit(operation, &target))?;
+        assert_eq!(updated.artifact.current, Some(target));
+        assert_eq!(updated.artifact.previous, None);
+        assert_eq!(updated.previous_release, None);
+        assert!(updated.applied_migration.is_none());
+        assert_eq!(
+            store
+                .apply_rollback_healthy("deploy-fence", 1, None, "rollback-op-2")
+                .unwrap_err()
+                .code,
+            ROLLBACK_UNAVAILABLE
+        );
         Ok(())
     }
 
@@ -1709,11 +1649,9 @@ mod tests {
             previous: Some(previous.clone()),
         };
         params.current_release = Some(current_release.clone());
-        let previous_policy = crate::model::test_release_rollback_policy();
         let state = store.bootstrap("deploy-same", params, "bootstrap")?;
         let mut state = state;
         state.previous_release = Some(previous_release.clone());
-        state.previous_rollback_policy = Some(previous_policy.clone());
         let scope = journal::deployment_scope("deploy-same")?;
         persist(&scope_path(&store.root, &scope), &state)?;
 
@@ -1723,7 +1661,6 @@ mod tests {
             UpdateCommit {
                 artifact: current.clone(),
                 release: Some(current_release),
-                rollback_policy: crate::model::test_release_rollback_policy(),
                 config: None,
                 operation_id: "same-artifact".to_owned(),
             },
@@ -1735,7 +1672,6 @@ mod tests {
             Some(previous.as_str())
         );
         assert_eq!(updated.previous_release, Some(previous_release));
-        assert_eq!(updated.previous_rollback_policy, Some(previous_policy));
         Ok(())
     }
 
@@ -1754,7 +1690,6 @@ mod tests {
         params.current_release = Some(ReleaseVersion::new("v1")?);
         let mut state = store.bootstrap("deploy-drift", params, "bootstrap")?;
         state.previous_release = Some(ReleaseVersion::new("v0")?);
-        state.previous_rollback_policy = Some(crate::model::test_release_rollback_policy());
         let scope = journal::deployment_scope("deploy-drift")?;
         persist(&scope_path(&store.root, &scope), &state)?;
 
@@ -1764,7 +1699,6 @@ mod tests {
             UpdateCommit {
                 artifact: verified_live.clone(),
                 release: Some(ReleaseVersion::new("v2")?),
-                rollback_policy: crate::model::test_release_rollback_policy(),
                 config: None,
                 operation_id: "converge-live-drift".to_owned(),
             },
@@ -1777,7 +1711,6 @@ mod tests {
         );
         assert_eq!(updated.artifact.previous, None);
         assert_eq!(updated.previous_release, None);
-        assert_eq!(updated.previous_rollback_policy, None);
         Ok(())
     }
 
@@ -1851,13 +1784,12 @@ mod tests {
             restored_database: "nazo_recovered".to_owned(),
             artifact,
             release: ReleaseVersion::new("v2").expect("release version"),
-            rollback_policy: crate::model::test_release_rollback_policy(),
             config_schema: config_schema.to_owned(),
         }
     }
 
     #[test]
-    fn recovery_advances_live_revision_and_preserves_previous_generation() -> anyhow::Result<()> {
+    fn recovery_advances_live_revision_and_clears_previous_generation() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("nazauthctl-state-recovery")?;
         let store = TargetStateStore::open(temp.path().join("state"))?;
         let old_current = format!("sha256:{}", "b".repeat(64));
@@ -1869,8 +1801,6 @@ mod tests {
             previous: Some(old_previous),
         };
         params.current_release = Some(old_release.clone());
-        params.current_rollback_policy.rationale = "old generation policy".to_owned();
-        let old_policy = params.current_rollback_policy.clone();
         store.bootstrap("deploy-alpha", params, "bootstrap")?;
 
         let facts = recovery_facts(
@@ -1890,10 +1820,8 @@ mod tests {
             state.artifact.current,
             Some(format!("sha256:{}", "d".repeat(64)))
         );
-        assert_eq!(state.artifact.previous, Some(old_current));
-        assert_eq!(state.previous_release, Some(old_release));
-        assert_eq!(state.current_rollback_policy, facts.rollback_policy);
-        assert_eq!(state.previous_rollback_policy, Some(old_policy));
+        assert_eq!(state.artifact.previous, None);
+        assert_eq!(state.previous_release, None);
         assert_eq!(
             state
                 .current_release

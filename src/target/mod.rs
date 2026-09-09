@@ -36,7 +36,6 @@ use crate::runtime_backend;
 
 use self::wire::{local_hello_for_target, sanitize};
 
-pub use crate::model::{DatabaseRestore, ReleaseRollbackPolicy};
 pub use backup::{BackupProjection, RestoreTestReceipt, SnapshotManifest, SnapshotProjection};
 pub use backup_exec::{BACKUP_EXECUTION_FAILED, RESTORE_TEST_FAILED};
 pub use control_exec::{
@@ -867,7 +866,6 @@ fn dispatch_validated_host_operation(
                                 config_schema: config_schema.clone(),
                                 resources: resources.clone(),
                                 current_release: facts.release.clone(),
-                                current_rollback_policy: facts.rollback_policy.clone(),
                             };
                             commit_clean_install(store, &deployment_id, params, operation)
                         }) {
@@ -1231,14 +1229,10 @@ fn answer_rollback(
     };
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
-    if state.applied_migration.is_some()
-        || !state
-            .current_rollback_policy
-            .artifact_rollback_allowed_after_migration()
-    {
+    if state.applied_migration.is_some() {
         return Err(Failure::new(
             deployment_state::ROLLBACK_RECOVERY_REQUIRED,
-            "the verified Release migration policy forbids artifact/config rollback; keep the writer stopped and run verified backup recover",
+            "an applied migration forbids artifact/config rollback; keep the writer stopped and recover a verified backup",
         ));
     }
     let scope_dir = store.scope_dir(&deployment_id)?;
@@ -1266,7 +1260,6 @@ fn answer_rollback(
         config_schema: &state.config.schema.clone(),
         current_artifact: &current_artifact,
         previous_artifact: state.artifact.previous.as_deref(),
-        current_rollback_policy: &state.current_rollback_policy,
         expected_revision,
         scope_dir: &scope_dir,
         store,
@@ -2049,7 +2042,6 @@ mod tests {
                     )?,
                 ],
                 current_release: None,
-                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             &Uuid::now_v7().to_string(),
         )?;
@@ -2244,7 +2236,6 @@ mod tests {
                         ResourceScope::Deployment,
                     )?],
                     current_release: Some(ReleaseVersion::new("v1")?),
-                    current_rollback_policy: crate::model::test_release_rollback_policy(),
                 },
                 &Uuid::now_v7().to_string(),
             )?;
@@ -2757,7 +2748,6 @@ mod tests {
                     ResourceScope::Deployment,
                 )?],
                 current_release: Some(ReleaseVersion::new("1.0.0")?),
-                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             "bootstrap-op",
         )?;

@@ -88,7 +88,6 @@ impl Fixture {
                 config_schema: CONFIG_SCHEMA.to_owned(),
                 resources,
                 current_release: release,
-                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             &uuid::Uuid::now_v7().to_string(),
         )?;

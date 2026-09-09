@@ -126,8 +126,9 @@ nazoauthctl verify --instance INSTANCE
 
 The explicit tag pins this transaction to the selected artifact. Omitting
 `--to` uses ordinary dynamic release resolution. Update still performs migration
-admission and obeys the release rollback policy; this is not a separate
-no-migration command. Rollback restores config before starting the old artifact.
+admission. An applied migration requires verified database recovery rather than
+artifact-only rollback. Before migration, rollback restores config before
+starting the old artifact.
 
 Readiness follows the configured transport. HTTPS connects to loopback while
 preserving issuer SNI and host trust-store validation; install a private CA in

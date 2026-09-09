@@ -10,19 +10,9 @@ pub(crate) struct ReleaseManifest {
     pub(crate) version: String,
     pub(crate) target: String,
     pub(crate) release_identity: String,
-    pub(crate) operator_protocol: OperatorProtocolCompatibility,
+    pub(crate) operator_protocol: u32,
     pub(crate) artifacts: BTreeMap<String, Artifact>,
-    pub(crate) frontend: FrontendRelease,
     pub(crate) oci: OciRelease,
-    pub(crate) rollback: ReleaseRollbackPolicy,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OperatorProtocolCompatibility {
-    pub(crate) version: u32,
-    pub(crate) minimum_ctl_version: String,
-    pub(crate) maximum_ctl_version_exclusive: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -36,94 +26,25 @@ pub(crate) struct Artifact {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct FrontendRelease {
-    pub(crate) repository: String,
-    pub(crate) version: String,
-    pub(crate) release_identity: String,
-    pub(crate) artifact: Artifact,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct OciRelease {
     pub(crate) repository: String,
     pub(crate) index_digest: String,
     pub(crate) platform_manifests: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseRollbackPolicy {
-    pub artifact: bool,
-    pub schema_compatible: bool,
-    pub database_restore: DatabaseRestore,
-    pub irreversible_migration: bool,
-    pub minimum_supported_version: String,
-    pub migration_floor: String,
-    pub rationale: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DatabaseRestore {
-    Backup,
-    Pitr,
-    None,
-}
-
-impl ReleaseRollbackPolicy {
-    pub(crate) fn validate(&self) -> anyhow::Result<()> {
-        if self.rationale.trim().is_empty()
-            || !semantic_tag(&format!("v{}", self.minimum_supported_version))
-            || self.migration_floor.is_empty()
-            || !self
-                .migration_floor
-                .chars()
-                .all(|character| character.is_ascii_digit())
-        {
-            bail!("signed release manifest has invalid recovery policy");
-        }
-        if self.irreversible_migration && self.schema_compatible {
-            bail!("irreversible migrations cannot claim schema-compatible rollback");
-        }
-        if self.schema_compatible && !self.artifact {
-            bail!("schema-compatible rollback requires a retained artifact");
-        }
-        Ok(())
-    }
-
-    pub(crate) fn artifact_rollback_allowed_after_migration(&self) -> bool {
-        self.artifact && self.schema_compatible && !self.irreversible_migration
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_release_rollback_policy() -> ReleaseRollbackPolicy {
-    ReleaseRollbackPolicy {
-        artifact: true,
-        schema_compatible: true,
-        database_restore: DatabaseRestore::Backup,
-        irreversible_migration: false,
-        minimum_supported_version: "0.2.0".to_owned(),
-        migration_floor: "20260828000600".to_owned(),
-        rationale: "test release permits schema-compatible artifact rollback".to_owned(),
-    }
-}
-
 impl ReleaseManifest {
     pub(crate) fn validate(&self, version: &str, expected_identity: &str) -> anyhow::Result<()> {
         let target = release_target().context("this platform has no official Release target")?;
-        if self.schema != 6
+        if self.schema != 7
             || self.version != version
             || self.target != target
             || self.release_identity != expected_identity
         {
             bail!("signed release manifest failed policy validation");
         }
-        if self.operator_protocol.version != nazo_operator_protocol::PROTOCOL_VERSION {
+        if self.operator_protocol != nazo_operator_protocol::PROTOCOL_VERSION {
             bail!("signed release manifest has an invalid operator protocol contract");
         }
-        self.rollback.validate()?;
         let expected = BTreeSet::from(["binary".to_owned()]);
         if self.artifacts.keys().cloned().collect::<BTreeSet<_>>() != expected {
             bail!("signed release manifest has an unexpected artifact set");
@@ -142,24 +63,7 @@ impl ReleaseManifest {
                 bail!("signed release manifest contains an invalid artifact");
             }
         }
-        self.validate_frontend()?;
         self.validate_oci()?;
-        Ok(())
-    }
-
-    pub(crate) fn validate_controller_compatibility(&self) -> anyhow::Result<()> {
-        let protocol = &self.operator_protocol;
-        if protocol.version != nazo_operator_protocol::PROTOCOL_VERSION {
-            bail!("server Release operator protocol version is unsupported");
-        }
-        let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
-        let minimum = semver::Version::parse(&protocol.minimum_ctl_version)
-            .context("server Release minimum ctl version is invalid")?;
-        let maximum = semver::Version::parse(&protocol.maximum_ctl_version_exclusive)
-            .context("server Release maximum ctl version is invalid")?;
-        if minimum >= maximum || current < minimum || current >= maximum {
-            bail!("controller version is outside the server Release compatibility range");
-        }
         Ok(())
     }
 
@@ -169,26 +73,6 @@ impl ReleaseManifest {
             .get(platform)
             .map(String::as_str)
             .context("signed Release has no manifest for this OCI platform")
-    }
-
-    fn validate_frontend(&self) -> anyhow::Result<()> {
-        let frontend = &self.frontend;
-        let expected_identity = format!(
-            "https://github.com/{}/.github/workflows/release.yml@refs/tags/{}",
-            frontend.repository, frontend.version
-        );
-        if frontend.repository != "nazozero/NazoAuthWeb"
-            || !semantic_tag(&frontend.version)
-            || frontend.release_identity != expected_identity
-            || frontend.artifact.repository != frontend.repository
-            || frontend.artifact.name != "nazoauth-web.tar.gz"
-            || frontend.artifact.size == 0
-            || frontend.artifact.size > 64 * 1024 * 1024
-            || !is_lower_hex(&frontend.artifact.sha256, 64)
-        {
-            bail!("signed release manifest contains an invalid frontend release");
-        }
-        Ok(())
     }
 
     fn validate_oci(&self) -> anyhow::Result<()> {
