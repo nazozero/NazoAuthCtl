@@ -27,12 +27,15 @@ prompts for the selected Suite API token and stores it in the platform
 credential store. Non-interactive jobs may pipe the token with
 `--token-stdin`.
 
-Execution stops at the first Suite failure or ctl automation error. Started
-Suite plans are retained and their exact IDs and Suite origin are printed so
-the operator can inspect the same records in the Suite UI; plans that never
-started are deleted. A CIBA test that explicitly requires uploaded visual
-evidence is likewise retained as review pending instead of being reported as
-an automated pass.
+Ordinary Suite module failures are collected while later selected work continues
+by default; the final run still fails when any module failed. `--fail-fast`
+stops later dispatch after the first ordinary failure. Interrupts, ctl
+automation failures, unresolved resource ownership, and cleanup-safety
+conditions stop the run regardless of that option. Started Suite plans are
+retained and their exact IDs and Suite origin are printed so the operator can
+inspect the same records in the Suite UI; plans that never started are deleted.
+A CIBA test that explicitly requires uploaded visual evidence is likewise
+retained as review pending instead of being reported as an automated pass.
 
 The remaining commands in this document are maintainer-facing artifact
 inspection tools. They do not supply inputs to `oidf run`.

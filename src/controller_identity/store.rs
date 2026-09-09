@@ -24,7 +24,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use fs2::FileExt as _;
 use nazo_operator_protocol::controller_key_id;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize as _;
+use zeroize::Zeroizing;
 
 use crate::error_codes::STATE_RESET_REQUIRED;
 use crate::filesystem;
@@ -89,7 +89,7 @@ pub(super) fn validate_kid_shape(kid: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyRecord {
     schema: u32,
@@ -98,7 +98,7 @@ struct KeyRecord {
     public_key: String,
     /// Unpadded base64url of the raw Ed25519 seed (32 bytes). This is the
     /// only secret field in the store.
-    private_key: String,
+    private_key: Zeroizing<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -135,7 +135,6 @@ struct ActivePointer {
 /// A loaded active signing identity. The Ed25519 seed lives inside
 /// [`SigningKey`], which zeroizes its secret scalar on drop; no accessor
 /// exposes private bytes.
-#[derive(Clone)]
 pub struct LoadedControllerKey {
     kid: String,
     signing_key: SigningKey,
@@ -273,10 +272,9 @@ impl ControllerKeyStore {
     ) -> anyhow::Result<ControllerKeySummary> {
         // rand's ThreadRng is reseeded from the OS entropy source; the code
         // base uses the same generator for persisted secrets.
-        let mut seed: [u8; 32] = rand::random();
+        let seed = Zeroizing::new(rand::random::<[u8; 32]>());
         let signing_key = SigningKey::from_bytes(&seed);
-        let private_text = URL_SAFE_NO_PAD.encode(seed);
-        seed.zeroize();
+        let private_text = Zeroizing::new(URL_SAFE_NO_PAD.encode(seed.as_slice()));
         let verifying_key = signing_key.verifying_key();
         let kid = controller_key_id(&verifying_key);
         let record = KeyRecord {
@@ -293,8 +291,10 @@ impl ControllerKeyStore {
                 path.display()
             );
         }
-        let bytes = serde_json::to_vec_pretty(&record)
-            .context("failed to serialize controller key record")?;
+        let bytes = Zeroizing::new(
+            serde_json::to_vec_pretty(&record)
+                .context("failed to serialize controller key record")?,
+        );
         filesystem::atomic_write(&path, &bytes, 0o600)
             .with_context(|| format!("failed to persist controller key {}", path.display()))?;
         drop(signing_key);
@@ -609,10 +609,10 @@ impl ControllerKeyStore {
                 kid
             );
         }
-        let private_seed: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(record.private_key.as_bytes())
+        let mut private_seed = Zeroizing::new([0u8; 32]);
+        let private_seed_len = URL_SAFE_NO_PAD
+            .decode_slice(record.private_key.as_bytes(), &mut *private_seed)
             .ok()
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
             .with_context(|| {
                 format!(
                     "{STATE_RESET_REQUIRED}: controller key record private material is not \
@@ -620,6 +620,13 @@ impl ControllerKeyStore {
                     path.display()
                 )
             })?;
+        if private_seed_len != private_seed.len() {
+            bail!(
+                "{STATE_RESET_REQUIRED}: controller key record private material is not 32 \
+                 base64url bytes ({})",
+                path.display()
+            );
+        }
         let public_bytes: [u8; 32] = URL_SAFE_NO_PAD
             .decode(record.public_key.as_bytes())
             .ok()

@@ -21,14 +21,17 @@
 //! unknown-outcome operations are never replaced by a new one.
 
 use anyhow::{Context as _, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{
-    ControlOperationPayload, ControlOutcome, ControlResult, ControlResultData, constant_time_eq,
+    ControlOperationPayload, ControlOutcome, ControlResult, ControlResultData,
+    canonical_control_operation_bytes, constant_time_eq, control_operation_request_hash,
     validate_control_result,
 };
 
 use crate::controller_identity::journal::{JournalState, OperationJournal, OperationJournalEntry};
 use crate::controller_identity::operation::{
-    ControlOperationInput, SignedControlOperation, build_signed_control_operation_with_id,
+    ControlOperationInput, SignedControlOperation, build_control_operation_with_id_and_kid,
+    build_signed_control_operation_with_id,
 };
 use crate::registry::{InstanceRecord, RegistryStore};
 use crate::target::{
@@ -76,6 +79,7 @@ impl PreparedOperation {
             self.signed.operation_id.clone(),
             self.signed.request_hash.clone(),
             self.signed.kid.clone(),
+            self.signed.compact_jws.clone(),
         )
     }
 }
@@ -134,7 +138,7 @@ fn resolve_instance(registry: &RegistryStore, selector: &str) -> anyhow::Result<
 }
 
 /// Prepare one control operation for `instance_selector`, resuming the
-/// journaled operation when the rebuilt envelope is byte-identical in hash.
+/// journaled operation when the current command maps to its exact hash.
 ///
 /// Fresh attempts persist their write-ahead journal entry before returning;
 /// resumed attempts leave the existing entry untouched.
@@ -149,23 +153,8 @@ pub fn prepare_control_operation(
 
     let journaled = journal.load()?;
     if let Some(entry) = &journaled {
-        // Resume only when the current active key can rebuild EXACTLY the
-        // same canonical payload. Any difference (rotated kid, changed
-        // revision/payload) means the stored id must never be replayed.
-        let rebuilt = build_signed_control_operation_with_id(
-            keys,
-            &record,
-            clone_input(&input),
-            Some(&entry.operation_id),
-        );
-        if let Ok(signed) = rebuilt
-            && signed.request_hash == entry.request_hash
-            && signed.kid == entry.kid
-        {
-            return Ok(PreparedOperation {
-                signed,
-                kind: AttemptKind::Resumed,
-            });
+        if let Some(prepared) = prepare_entry_resume(keys, journal, entry, &record, input)? {
+            return Ok(prepared);
         }
         // P1-2: the journal slot is single-occupancy. A changed payload under
         // an existing entry used to mint a fresh id and silently overwrite
@@ -215,22 +204,107 @@ pub fn prepare_pending_control_operation(
             expected.operation_id
         );
     }
-    let signed =
-        build_signed_control_operation_with_id(keys, &record, input, Some(&entry.operation_id))?;
-    if signed.request_hash != entry.request_hash || signed.kid != entry.kid {
+    prepare_entry_resume(keys, journal, &entry, &record, input)
+}
+
+/// Prove current command mapping against an existing journal record, then
+/// construct the exact request that may be
+/// resent. Schema 2 never loads a signing key: the signed JWS is immutable
+/// recovery data. Schema 1 is a narrow migration path only while the original
+/// key still rebuilds exactly the same deterministic signature.
+fn prepare_entry_resume(
+    keys: &ControllerKeyStore,
+    journal: &OperationJournal,
+    entry: &OperationJournalEntry,
+    record: &InstanceRecord,
+    input: ControlOperationInput,
+) -> anyhow::Result<Option<PreparedOperation>> {
+    if entry.is_legacy() {
+        let signed = build_signed_control_operation_with_id(
+            keys,
+            record,
+            input,
+            Some(&entry.operation_id),
+        )
+        .with_context(|| {
+            format!(
+                "legacy operation journal '{}' can resume only while its original signing key remains locally available; inspect the target outcome before clearing this entry",
+                entry.operation_id
+            )
+        })?;
+        if signed.kid != entry.kid {
+            bail!(
+                "legacy operation journal '{}' was signed by retired key '{}'; it cannot be safely migrated or replayed. Inspect the target outcome before clearing this entry",
+                entry.operation_id,
+                entry.kid
+            );
+        }
+        if signed.request_hash != entry.request_hash {
+            return Ok(None);
+        }
+        let prepared = PreparedOperation {
+            signed,
+            kind: AttemptKind::Resumed,
+        };
+        journal.upgrade_legacy_if_matches(entry, &prepared.journal_entry())?;
+        return Ok(Some(prepared));
+    }
+
+    let operation = build_control_operation_with_id_and_kid(
+        record,
+        input,
+        Some(&entry.operation_id),
+        &entry.kid,
+    );
+    let request_hash = control_operation_request_hash(&operation)?;
+    if request_hash != entry.request_hash {
         return Ok(None);
     }
+    if !journaled_payload_matches(entry, &operation)? {
+        bail!(
+            "journaled compact JWS payload does not match the stored operation identity; refusing to replay it"
+        );
+    }
+    let compact_jws = entry
+        .compact_jws
+        .as_deref()
+        .context("current operation journal schema lacks the original compact JWS")?;
     Ok(Some(PreparedOperation {
-        signed,
+        signed: SignedControlOperation {
+            operation_id: entry.operation_id.clone(),
+            kid: entry.kid.clone(),
+            deployment_id: record.deployment_id.clone(),
+            request_hash,
+            compact_jws: compact_jws.to_owned(),
+            operation,
+        },
         kind: AttemptKind::Resumed,
     }))
 }
 
-fn clone_input(input: &ControlOperationInput) -> ControlOperationInput {
-    ControlOperationInput {
-        operation: input.operation.clone(),
-        config_revision: input.config_revision.clone(),
-    }
+/// The journal is protected by the private directory boundary, but recovery
+/// still binds its retained JWS payload to the canonical operation reconstructed
+/// from the current command. The shared protocol canonicalizer is the single
+/// authority for this comparison; no current key lookup or signature check is
+/// valid after a successful server-side acceptance and local key retirement.
+fn journaled_payload_matches(
+    entry: &OperationJournalEntry,
+    operation: &nazo_operator_protocol::ControlOperation,
+) -> anyhow::Result<bool> {
+    let compact_jws = entry
+        .compact_jws
+        .as_deref()
+        .context("current operation journal schema lacks the original compact JWS")?;
+    let payload = compact_jws
+        .split('.')
+        .nth(1)
+        .context("journaled compact JWS has no payload segment")?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .map_err(|_| anyhow::anyhow!("journaled compact JWS has an invalid payload encoding"))?;
+    let canonical = canonical_control_operation_bytes(operation)
+        .map_err(|error| anyhow::anyhow!("could not canonicalize recovery operation: {error}"))?;
+    Ok(constant_time_eq(&payload, &canonical))
 }
 
 /// Send one prepared operation through an execution target and classify the
@@ -433,7 +507,7 @@ mod tests {
     use super::*;
     use crate::controller_identity::admin_api::SlotsSnapshot;
     use crate::controller_identity::expiry;
-    use crate::controller_identity::journal::JournalState;
+    use crate::controller_identity::journal::{JournalState, OPERATION_JOURNAL_SCHEMA};
     use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
     use crate::filesystem;
     use crate::registry::{InstanceRecord, ObservationCache};
@@ -443,7 +517,7 @@ mod tests {
     use nazo_operator_protocol::{
         CONTROL_RESULT_SCHEMA, ControlErrorCode, ControlOperation, ControlOperationPayload,
         TenantResourceIdentity, TenantResourceKind, control_operation_request_hash,
-        verify_control_operation_signature,
+        protected_header, verify_control_operation_signature,
     };
     use std::cell::RefCell;
 
@@ -850,6 +924,188 @@ mod tests {
     }
 
     #[test]
+    fn schema2_replay_reuses_the_original_jws_after_key_rotation_and_retirement()
+    -> anyhow::Result<()> {
+        for expected_state in [JournalState::Dispatched, JournalState::Accepted] {
+            let f = fixture()?;
+            let old_key = f.keys.get_or_create_active("deploy-alpha")?;
+            let old_kid = old_key.kid().to_owned();
+            let journal = f.journal()?;
+            let first = prepare_control_operation(
+                &f.registry,
+                &f.keys,
+                &journal,
+                "production",
+                input("rev-1"),
+            )?;
+            if expected_state == JournalState::Accepted {
+                journal.mark_accepted(&first.signed.operation_id)?;
+            }
+            let journaled = journal.load()?.context("write-ahead entry")?;
+            assert_eq!(journaled.state, expected_state);
+
+            let replacement = f.keys.generate_candidate("deploy-alpha")?;
+            f.keys.set_active_kid("deploy-alpha", &replacement.kid)?;
+            f.keys.retire_kid("deploy-alpha", &old_kid)?;
+            assert_eq!(
+                f.keys.load_active("deploy-alpha")?.unwrap().kid(),
+                replacement.kid
+            );
+            // Schema-2 recovery uses the signed request as its authorization
+            // snapshot. It must not rediscover the retired signing key or consult
+            // the current local binding before replaying that original request.
+            f.registry
+                .update_controller_binding("deploy-alpha", None, None)?;
+            f.keys.clear_active("deploy-alpha")?;
+            assert!(f.keys.load_active("deploy-alpha")?.is_none());
+            drop(old_key);
+
+            let resumed = prepare_control_operation(
+                &f.registry,
+                &f.keys,
+                &journal,
+                "production",
+                input("rev-1"),
+            )?;
+            assert_eq!(resumed.kind, AttemptKind::Resumed);
+            assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+            assert_eq!(resumed.signed.request_hash, first.signed.request_hash);
+            assert_eq!(resumed.signed.kid, old_kid);
+            assert_eq!(resumed.signed.compact_jws, first.signed.compact_jws);
+            assert!(resumed.journal_entry().has_same_identity(&journaled));
+            assert_eq!(journal.load()?.context("retained journal")?, journaled);
+            assert_eq!(
+                protected_header(&resumed.signed.compact_jws)?.kid,
+                old_kid,
+                "the replay is the original signed request, not a new-key resign"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replay_refuses_a_journaled_jws_whose_payload_no_longer_matches_its_identity()
+    -> anyhow::Result<()> {
+        let f = fixture()?;
+        f.keys.get_or_create_active("deploy-alpha")?;
+        let journal = f.journal()?;
+        let first = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        let mut tampered = journal.load()?.context("write-ahead entry")?;
+        let mut different = first.signed.operation.clone();
+        different.config_revision = "rev-2".to_owned();
+        let replacement_payload = URL_SAFE_NO_PAD.encode(
+            canonical_control_operation_bytes(&different)
+                .map_err(|error| anyhow::anyhow!("test operation must canonicalize: {error}"))?,
+        );
+        let mut parts = first.signed.compact_jws.split('.');
+        let protected = parts.next().context("test JWS header")?;
+        let _original_payload = parts.next().context("test JWS payload")?;
+        let signature = parts.next().context("test JWS signature")?;
+        tampered.compact_jws = Some(format!("{protected}.{replacement_payload}.{signature}"));
+        filesystem::atomic_write(
+            journal.path(),
+            &serde_json::to_vec_pretty(&tampered)?,
+            0o600,
+        )?;
+
+        let error =
+            prepare_control_operation(&f.registry, &f.keys, &journal, "production", input("rev-1"))
+                .expect_err("payload/metadata drift must not reach the target");
+        assert!(
+            format!("{error:#}").contains("payload does not match"),
+            "{error:#}"
+        );
+        assert_eq!(journal.load()?.context("retained journal")?, tampered);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_journal_migrates_only_while_the_original_identity_is_still_active()
+    -> anyhow::Result<()> {
+        let f = fixture()?;
+        let old_key = f.keys.get_or_create_active("deploy-alpha")?;
+        let journal = f.journal()?;
+        let record = f.registry.instance_by_alias("production")?.unwrap();
+        let signed = build_signed_control_operation_with_id(
+            &f.keys,
+            &record,
+            input("rev-1"),
+            Some("01900000-0000-7000-8000-0000000000aa"),
+        )?;
+        let legacy = OperationJournalEntry {
+            schema: 1,
+            operation_id: signed.operation_id.clone(),
+            request_hash: signed.request_hash.clone(),
+            kid: signed.kid.clone(),
+            compact_jws: None,
+            created_at: chrono::Utc::now(),
+            state: JournalState::Dispatched,
+        };
+        journal.record_dispatched(&legacy)?;
+
+        let resumed = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        assert_eq!(resumed.kind, AttemptKind::Resumed);
+        assert_eq!(resumed.signed.compact_jws, signed.compact_jws);
+        let upgraded = journal.load()?.context("upgraded legacy journal")?;
+        assert_eq!(upgraded.schema, OPERATION_JOURNAL_SCHEMA);
+        assert_eq!(
+            upgraded.compact_jws.as_deref(),
+            Some(signed.compact_jws.as_str())
+        );
+        assert_eq!(upgraded.created_at, legacy.created_at);
+        drop(old_key);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_journal_refuses_replay_after_its_key_is_retired() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let old_key = f.keys.get_or_create_active("deploy-alpha")?;
+        let old_kid = old_key.kid().to_owned();
+        let journal = f.journal()?;
+        let record = f.registry.instance_by_alias("production")?.unwrap();
+        let signed = build_signed_control_operation_with_id(
+            &f.keys,
+            &record,
+            input("rev-1"),
+            Some("01900000-0000-7000-8000-0000000000bb"),
+        )?;
+        let legacy = OperationJournalEntry {
+            schema: 1,
+            operation_id: signed.operation_id,
+            request_hash: signed.request_hash,
+            kid: signed.kid,
+            compact_jws: None,
+            created_at: chrono::Utc::now(),
+            state: JournalState::Dispatched,
+        };
+        journal.record_dispatched(&legacy)?;
+        let replacement = f.keys.generate_candidate("deploy-alpha")?;
+        f.keys.set_active_kid("deploy-alpha", &replacement.kid)?;
+        f.keys.retire_kid("deploy-alpha", &old_kid)?;
+        drop(old_key);
+
+        let error =
+            prepare_control_operation(&f.registry, &f.keys, &journal, "production", input("rev-1"))
+                .expect_err("an unupgradeable legacy record must not be resigned by the new key");
+        assert!(format!("{error:#}").contains("retired key"), "{error:#}");
+        assert_eq!(journal.load()?.unwrap().schema, 1);
+        Ok(())
+    }
+
+    #[test]
     fn crash_resume_reuses_the_stored_operation_id_byte_identically() -> anyhow::Result<()> {
         let f = fixture()?;
         f.keys.get_or_create_active("deploy-alpha")?;
@@ -1061,6 +1317,7 @@ mod tests {
                 .get_or_create_active("deploy-alpha")?
                 .kid()
                 .to_owned(),
+            "unused".to_owned(),
         );
 
         assert!(

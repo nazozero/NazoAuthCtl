@@ -99,17 +99,70 @@ pub fn build_signed_control_operation(
 
 /// Same as [`build_signed_control_operation`] with an explicit operation id.
 /// `None` mints a fresh UUIDv7; `Some(id)` rebuilds the exact envelope for a
-/// journaled resume (E06): combined with deterministic Ed25519 this yields a
-/// byte-identical compact JWS, so the server sees one operation, never a new
-/// identity. The caller owns resume-safety checks (hash equality); this
-/// function performs no gating of its own. The caller must pass the already
-/// resolved record so selector lookup is not repeated inside a dispatch.
+/// legacy journal migration (E06): combined with deterministic Ed25519 this
+/// yields a byte-identical compact JWS. Current-schema recovery reuses the
+/// durable original JWS directly and therefore never reaches this signer. The
+/// caller owns resume-safety checks (hash equality); this function performs no
+/// gating of its own. The caller must pass the already resolved record so
+/// selector lookup is not repeated inside a dispatch.
 pub(crate) fn build_signed_control_operation_with_id(
     keys: &ControllerKeyStore,
     record: &InstanceRecord,
     input: ControlOperationInput,
     operation_id: Option<&str>,
 ) -> anyhow::Result<SignedControlOperation> {
+    validate_record_key_ref(record)?;
+    let loaded: LoadedControllerKey =
+        keys.load_active(&record.deployment_id)?.with_context(|| {
+            format!(
+                "instance '{}' has no locally stored active controller key",
+                record.alias
+            )
+        })?;
+    let operation =
+        build_control_operation_with_id_and_kid(record, input, operation_id, loaded.kid());
+    let request_hash = control_operation_request_hash(&operation)?;
+    let compact_jws = sign_control_operation(&operation, loaded.signing_key())?;
+    Ok(SignedControlOperation {
+        operation_id: operation.operation_id.clone(),
+        kid: operation.kid.clone(),
+        deployment_id: record.deployment_id.clone(),
+        request_hash,
+        compact_jws,
+        operation,
+    })
+}
+
+/// Rebuild the canonical envelope without loading or using a private key.
+///
+/// Current-schema recovery uses this only to prove that the current command
+/// still maps to the journaled request hash before it resends the immutable
+/// compact JWS. Supplying the stored kid deliberately permits that proof after
+/// the original key has been retired; it never authorizes a new operation or
+/// revalidates the current registry key binding.
+pub(crate) fn build_control_operation_with_id_and_kid(
+    record: &InstanceRecord,
+    input: ControlOperationInput,
+    operation_id: Option<&str>,
+    kid: &str,
+) -> ControlOperation {
+    ControlOperation {
+        schema: CONTROL_OPERATION_SCHEMA,
+        operation_id: match operation_id {
+            Some(id) => id.to_owned(),
+            None => Uuid::now_v7().to_string(),
+        },
+        kid: kid.to_owned(),
+        deployment_id: record.deployment_id.clone(),
+        config_revision: input.config_revision,
+        operation: input.operation,
+    }
+}
+
+/// Prove that a record's key locator is exactly the instance that is about to
+/// sign. This is a fresh-signing and legacy-migration boundary; immutable
+/// schema-2 recovery deliberately does not consult it.
+fn validate_record_key_ref(record: &InstanceRecord) -> anyhow::Result<()> {
     let key_ref = record.controller_key_ref.as_deref().with_context(|| {
         format!(
             "{}: instance '{}' has no bound controller key; run `nazoauthctl bind --instance {}` first",
@@ -128,35 +181,7 @@ pub(crate) fn build_signed_control_operation_with_id(
             record.deployment_id
         );
     }
-    let loaded: LoadedControllerKey =
-        keys.load_active(&record.deployment_id)?.with_context(|| {
-            format!(
-                "instance '{}' has no locally stored active controller key",
-                record.alias
-            )
-        })?;
-
-    let operation = ControlOperation {
-        schema: CONTROL_OPERATION_SCHEMA,
-        operation_id: match operation_id {
-            Some(id) => id.to_owned(),
-            None => Uuid::now_v7().to_string(),
-        },
-        kid: loaded.kid().to_owned(),
-        deployment_id: record.deployment_id.clone(),
-        config_revision: input.config_revision,
-        operation: input.operation,
-    };
-    let request_hash = control_operation_request_hash(&operation)?;
-    let compact_jws = sign_control_operation(&operation, loaded.signing_key())?;
-    Ok(SignedControlOperation {
-        operation_id: operation.operation_id.clone(),
-        kid: loaded.kid().to_owned(),
-        deployment_id: record.deployment_id.clone(),
-        request_hash,
-        compact_jws,
-        operation,
-    })
+    Ok(())
 }
 
 #[cfg(test)]

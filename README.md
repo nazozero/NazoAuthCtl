@@ -59,7 +59,7 @@ and the required backup and root-mount checks before a managed update.
 | `status` / `doctor` | Live or cached fleet views (`--all`, `--json`) |
 | `verify` | Public TLS + issuer discovery report |
 | `update` / `rollback` | Crash-safe artifact/config lifecycle with one signed migration |
-| `operation` | Recent operation journal entries per instance |
+| `operation` | Read-only view of the ctl and target operation journals per instance |
 | `policy backup-before-update` | Select `off`, `warn`, or a blocking maximum restore-test age |
 | `backup` | Create, inspect, restore-test, and byte-verify snapshots |
 | `recover` | Restore a verified snapshot and complete token invalidation |
@@ -89,6 +89,18 @@ standard administrator password login and MFA flow itself, keeps the rotated
 cookie/CSRF session only in memory, and requests approval for the exact
 proposal. Use an owner-only `--credentials-file` to avoid retyping the email
 and password; use `--approval-token` instead for non-interactive automation.
+
+**Control-operation recovery.** Before ctl sends a control mutation, its
+per-instance journal writes one recovery record. The current schema retains the
+original compact JWS and public identity metadata, never an Apply change set,
+credential, or private key. After a lost response, ctl rechecks that the same
+command produces the stored canonical request hash and resends that exact JWS;
+it does not re-sign it with the current key. An operation already accepted by
+the target remains recoverable after local key rotation or retirement; a
+never-accepted request must still pass the target's current admission policy.
+Older journal records can
+be migrated only while their original active key remains available; otherwise
+inspect the target outcome before explicitly clearing the record.
 
 **Administrator creation.** `admin create` is the ctl deployment-root path for
 administrator provisioning. It sends one journaled, instance-bound
@@ -147,5 +159,4 @@ cargo fmt --check
 cargo test --workspace
 ```
 
-License: AGPL-3.0-or-later (see [LICENSES/AGPL-3.0-or-later.txt](LICENSES/AGPL-3.0-or-later.txt));
-commercial licensing in [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+License: AGPL-3.0-or-later.
