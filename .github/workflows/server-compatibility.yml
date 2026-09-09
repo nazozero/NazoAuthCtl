@@ -8,8 +8,8 @@ on:
         required: true
         type: string
       server_release:
-        description: Exact supported NazoAuth release tag
-        required: true
+        description: NazoAuth release tag; empty selects the latest stable release
+        required: false
         type: string
   workflow_call:
     inputs:
@@ -18,8 +18,8 @@ on:
         required: true
         type: string
       server_release:
-        description: Exact supported NazoAuth release tag
-        required: true
+        description: NazoAuth release tag; empty selects the latest stable release
+        required: false
         type: string
 
 concurrency:
@@ -59,7 +59,7 @@ jobs:
 
   signed-current-server:
     needs: current-controller
-    name: current ctl / server ${{ inputs.server_release }}
+    name: current ctl / server ${{ inputs.server_release || 'latest' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -75,13 +75,19 @@ jobs:
         with:
           name: current-controller
           path: controller
-      - name: Assert the supported server release
+      - name: Resolve the server release once
+        id: server_release
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           SERVER_RELEASE: ${{ inputs.server_release }}
         run: |
           set -euo pipefail
-          test "$SERVER_RELEASE" = v0.2.13
+          if [[ -z "$SERVER_RELEASE" ]]; then
+            SERVER_RELEASE="$(gh release view --repo nazozero/NazoAuth --json tagName --jq .tagName)"
+          fi
+          [[ "$SERVER_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+          echo "version=$SERVER_RELEASE" >> "$GITHUB_OUTPUT"
       - name: Execute the exact controller artifact through its production protocol path
         shell: bash
         run: |
@@ -105,7 +111,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          SERVER_RELEASE: ${{ inputs.server_release }}
+          SERVER_RELEASE: ${{ steps.server_release.outputs.version }}
         run: |
           set -euo pipefail
           gh release download "$SERVER_RELEASE" --repo nazozero/NazoAuth \
@@ -118,7 +124,7 @@ jobs:
       - name: Verify the protocol-3 host release identity
         shell: bash
         env:
-          SERVER_RELEASE: ${{ inputs.server_release }}
+          SERVER_RELEASE: ${{ steps.server_release.outputs.version }}
         run: |
           set -euo pipefail
           server=signed-server/nazoauth-x86_64-unknown-linux-gnu
@@ -129,7 +135,7 @@ jobs:
       - name: Verify the signed OCI identity at its immutable digest
         shell: bash
         env:
-          SERVER_RELEASE: ${{ inputs.server_release }}
+          SERVER_RELEASE: ${{ steps.server_release.outputs.version }}
         run: |
           set -euo pipefail
           repository=ghcr.io/nazozero/nazoauth
@@ -164,7 +170,7 @@ jobs:
         shell: bash
         env:
           NAZOAUTHCTL_COMPAT_VERIFY_RELEASE: '1'
-          EXPECTED_SERVER_RELEASE: ${{ inputs.server_release }}
+          EXPECTED_SERVER_RELEASE: ${{ steps.server_release.outputs.version }}
         run: |
           set -euo pipefail
           export EXPECTED_OCI_INDEX_DIGEST="$SERVER_OCI_INDEX_DIGEST"

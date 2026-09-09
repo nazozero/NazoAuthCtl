@@ -74,14 +74,16 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(!top_level.contains("packages: read"));
     assert!(!top_level.contains("pull_request:"));
     assert!(top_level.contains("server_release:"));
-    assert!(top_level.contains("description: Exact supported NazoAuth release tag"));
-    assert!(!workflow.contains("NAZOAUTHCTL_BUILD_COMMIT"));
-    assert_eq!(
-        workflow
-            .matches("test \"$SERVER_RELEASE\" = v0.2.13")
-            .count(),
-        1
+    assert!(
+        top_level
+            .contains("description: NazoAuth release tag; empty selects the latest stable release")
     );
+    assert!(!workflow.contains("NAZOAUTHCTL_BUILD_COMMIT"));
+    assert!(workflow.contains("id: server_release"));
+    assert!(
+        workflow.contains("gh release view --repo nazozero/NazoAuth --json tagName --jq .tagName")
+    );
+    assert!(workflow.contains("SERVER_RELEASE: ${{ steps.server_release.outputs.version }}"));
     assert!(!workflow.contains("v0.2.2"));
     assert!(!workflow.contains("previous-v"));
     assert!(!workflow.contains("python3"));
@@ -142,7 +144,7 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
 }
 
 #[test]
-fn release_compatibility_gate_pins_the_current_protocol_three_server() {
+fn release_compatibility_gate_resolves_a_server_without_a_fixed_version_pair() {
     let workflow = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/release.yml"
@@ -156,7 +158,7 @@ fn release_compatibility_gate_pins_the_current_protocol_three_server() {
         .unwrap()
         .0;
     assert!(gate.contains("controller_ref: ${{ github.sha }}"));
-    assert!(gate.contains("server_release: v0.2.13"));
+    assert!(!gate.contains("server_release:"));
     assert!(!gate.contains("previous"));
 }
 

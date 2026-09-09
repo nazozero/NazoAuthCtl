@@ -1,10 +1,7 @@
 use anyhow::{Context as _, ensure};
 use serde::Deserialize;
 
-use crate::{
-    model::ReleaseRollbackPolicy,
-    target::{OfficialArtifactRef, ReleaseVersion},
-};
+use crate::target::{OfficialArtifactRef, ReleaseVersion};
 
 const EMBEDDED_CANDIDATE: Option<&str> = option_env!("NAZOAUTHCTL_PRE_RELEASE_CANDIDATE_JSON");
 
@@ -18,7 +15,6 @@ pub(crate) struct CandidateRelease {
     oci_runtime_digest: Option<String>,
     host_binary_path: Option<String>,
     host_binary_sha256: Option<String>,
-    pub(crate) rollback: ReleaseRollbackPolicy,
 }
 
 impl CandidateRelease {
@@ -70,7 +66,7 @@ impl CandidateRelease {
             validate_sha256(digest, "host binary digest")?;
         }
         self.release_version()?;
-        self.rollback.validate()
+        Ok(())
     }
 
     pub(crate) fn oci_artifact(&self) -> Option<(&str, &str, &str)> {
@@ -136,16 +132,7 @@ mod tests {
                 "oci_pull_digest":"sha256:{}",
                 "oci_runtime_digest":"sha256:{}",
                 "host_binary_path":"/opt/nazoauth-candidate",
-                "host_binary_sha256":"{}",
-                "rollback":{{
-                    "artifact":true,
-                    "schema_compatible":false,
-                    "database_restore":"backup",
-                    "irreversible_migration":true,
-                    "minimum_supported_version":"0.2.2",
-                    "migration_floor":"20260828000700",
-                    "rationale":"candidate migration requires verified backup recovery"
-                }}
+                "host_binary_sha256":"{}"
             }}"#,
             "a".repeat(64),
             "c".repeat(64),

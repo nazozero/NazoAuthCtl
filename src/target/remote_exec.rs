@@ -265,7 +265,6 @@ mod tests {
                     )?,
                 ],
                 current_release: None,
-                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             &Uuid::now_v7().to_string(),
         )?;

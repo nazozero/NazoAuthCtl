@@ -298,7 +298,6 @@ impl install_exec::InstallExecutor for ScriptedInstall {
         let facts = install_exec::InstallFacts {
             release: None,
             artifact_reference: format!("sha256:{}", digest()),
-            rollback_policy: crate::model::test_release_rollback_policy(),
         };
         commit(&facts)
             .map_err(|failure| install_exec::rollback_or_outcome_unknown(job, &performed, failure))
