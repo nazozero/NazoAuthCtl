@@ -2042,6 +2042,77 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "set NAZO_SERVER_TEST_BINARY to the NazoAuth authorization-server unit-test executable"]
+    fn start_accepts_server_typed_dcql_digest() {
+        struct ServerDigestTransport {
+            binary: std::path::PathBuf,
+            directory: std::path::PathBuf,
+        }
+        impl Transport for ServerDigestTransport {
+            fn send(&self, request: HttpRequest, _: usize) -> Result<HttpResponse, TransportError> {
+                let input = self.directory.join("request.json");
+                let output = self.directory.join("sha256.txt");
+                let raw = request.body().expect("actual controller start body");
+                let body: Value = serde_json::from_slice(raw).unwrap();
+                assert!(
+                    body["dcql_query"]["credentials"][0]
+                        .get("multiple")
+                        .is_none()
+                );
+                std::fs::write(&input, raw).unwrap();
+                let status = std::process::Command::new(&self.binary)
+                    .args([
+                        "canonicalize_controller_start_wire",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("NAZO_VP_WIRE_INPUT", &input)
+                    .env("NAZO_VP_HASH_OUTPUT", &output)
+                    .status()
+                    .expect("run server's real typed DCQL canonicalization");
+                assert!(status.success());
+                let hash = std::fs::read_to_string(output).unwrap();
+                Ok(HttpResponse {
+                    status: 201,
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
+                        "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "expires_in": 300,
+                        "create_request_jti": body["create_request_jti"],
+                        "create_request_sha256": hash,
+                    }))
+                    .unwrap(),
+                })
+            }
+        }
+        let directory = std::env::temp_dir().join(format!("nazo-vp-contract-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let transport = Arc::new(ServerDigestTransport {
+            binary: std::env::var_os("NAZO_SERVER_TEST_BINARY")
+                .expect("server test binary")
+                .into(),
+            directory: directory.clone(),
+        });
+        let mut client = OpenId4VpVerifierClient::with_transport(
+            BrowserTargetOrigin::parse("https://issuer.example").unwrap(),
+            Origin::parse("https://suite.example").unwrap(),
+            Zeroizing::new("management-secret".to_owned()),
+            transport,
+            binding(),
+        )
+        .unwrap();
+        let request =
+            OpenId4VpStartRequest::new("vp", "happy", BTreeMap::new(), false, binding()).unwrap();
+        client
+            .start(&request)
+            .expect("controller must accept the digest computed from the server's typed request");
+        std::fs::remove_file(directory.join("request.json")).unwrap();
+        std::fs::remove_file(directory.join("sha256.txt")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn create_never_sends_evidence_context_before_actual_browser_entry_selection() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
         let suite = Origin::parse("https://suite.example").expect("suite");

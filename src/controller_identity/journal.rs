@@ -218,8 +218,12 @@ impl OperationJournal {
         )?;
         if let Some(existing) = self.load()? {
             if existing.operation_id == entry.operation_id {
-                // Byte-identical rebuild of the SAME attempt: safe to persist
-                // again (idempotent retry of the write itself).
+                if !existing.has_same_identity(entry) {
+                    bail!(
+                        "operation '{}' is already journaled with different content or signing identity",
+                        existing.operation_id
+                    );
+                }
                 if existing.state != JournalState::Dispatched {
                     bail!(
                         "operation '{}' is already journaled as {:?}; refusing to rewind it to \
@@ -228,6 +232,9 @@ impl OperationJournal {
                         existing.state
                     );
                 }
+                // The same attempt is already durable. Preserve its original
+                // timestamp and avoid another filesystem replacement.
+                return Ok(());
             } else {
                 let existing_state = format!("{:?}", existing.state);
                 bail!(
@@ -476,6 +483,40 @@ mod tests {
         let mut entry = sample_entry("01900000-0000-7000-8000-000000000004");
         entry.state = JournalState::Accepted;
         assert!(journal.record_dispatched(&entry).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dispatched_retry_preserves_original_record_and_rejects_identity_drift() -> anyhow::Result<()>
+    {
+        let f = fixture()?;
+        let journal = journal(&f)?;
+        let original = sample_entry("01900000-0000-7000-8000-000000000020");
+        journal.record_dispatched(&original)?;
+        let original_bytes = fs::read(journal.path())?;
+        let original_modified = fs::metadata(journal.path())?.modified()?;
+
+        let mut retry = original.clone();
+        retry.created_at += chrono::Duration::seconds(1);
+        journal.record_dispatched(&retry)?;
+        assert_eq!(fs::read(journal.path())?, original_bytes);
+        assert_eq!(fs::metadata(journal.path())?.modified()?, original_modified);
+
+        retry.request_hash = "cd".repeat(32);
+        assert!(journal.record_dispatched(&retry).is_err());
+        retry = original.clone();
+        retry.kid = "b".repeat(43);
+        assert!(journal.record_dispatched(&retry).is_err());
+        retry = original.clone();
+        retry.operation_id = "01900000-0000-7000-8000-000000000021".to_owned();
+        assert!(journal.record_dispatched(&retry).is_err());
+        assert_eq!(fs::read(journal.path())?, original_bytes);
+        assert_eq!(fs::metadata(journal.path())?.modified()?, original_modified);
+
+        journal.mark_accepted(&original.operation_id)?;
+        let accepted_bytes = fs::read(journal.path())?;
+        assert!(journal.record_dispatched(&original).is_err());
+        assert_eq!(fs::read(journal.path())?, accepted_bytes);
         Ok(())
     }
 
