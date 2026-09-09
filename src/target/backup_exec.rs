@@ -176,7 +176,6 @@ pub(crate) struct RecoveryFacts {
     pub restored_database: String,
     pub artifact: ArtifactReference,
     pub release: ReleaseVersion,
-    pub rollback_policy: crate::model::ReleaseRollbackPolicy,
     pub config_schema: String,
 }
 
@@ -187,7 +186,6 @@ struct RecoveryCandidateFacts {
     operation_id: String,
     artifact: ArtifactReference,
     release: ReleaseVersion,
-    rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 pub(crate) fn snapshot(
@@ -293,7 +291,6 @@ fn create_snapshot(
         created_at: Utc::now(),
         runtime_artifact,
         release,
-        rollback_policy: state.current_rollback_policy.clone(),
         config_schema: state.config.schema.clone(),
         files,
         archive_files,
@@ -822,7 +819,6 @@ pub(crate) fn recover(
             || facts.manifest_sha256 != manifest.manifest_sha256
             || facts.artifact != manifest.runtime_artifact
             || facts.release != manifest.release
-            || facts.rollback_policy != manifest.rollback_policy
             || facts.config_schema != manifest.config_schema
         {
             return Err(Failure::new(
@@ -1058,7 +1054,6 @@ pub(crate) fn recover(
         restored_database: database,
         artifact: manifest.runtime_artifact,
         release: manifest.release,
-        rollback_policy: manifest.rollback_policy,
         config_schema: manifest.config_schema,
     };
     let bytes = serde_json::to_vec_pretty(&facts).map_err(|error| restore_failure(error.into()))?;
@@ -1125,9 +1120,7 @@ pub(crate) fn stage_recovery_candidate(
         || facts.manifest_sha256 != manifest.manifest_sha256
         || facts.artifact != manifest.runtime_artifact
         || facts.release != manifest.release
-        || facts.rollback_policy != manifest.rollback_policy
         || facts.config_schema != manifest.config_schema
-        || state.current_rollback_policy != facts.rollback_policy
     {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
@@ -1195,11 +1188,10 @@ pub(crate) fn stage_recovery_candidate(
         )
         .map_err(restore_failure)?;
         let facts = RecoveryCandidateFacts {
-            schema: 1,
+            schema: 2,
             operation_id: recovery_operation_id.to_owned(),
             artifact: verified.runtime_artifact,
             release,
-            rollback_policy: verified.rollback_policy,
         };
         crate::filesystem::atomic_write(
             &candidate_facts_path,
@@ -1292,14 +1284,13 @@ fn load_recovery_candidate_facts(
     .map_err(restore_failure)?;
     let facts: RecoveryCandidateFacts =
         serde_json::from_slice(&bytes).map_err(|error| restore_failure(error.into()))?;
-    if facts.schema != 1 || facts.operation_id != recovery_operation_id {
+    if facts.schema != 2 || facts.operation_id != recovery_operation_id {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
             "recovery candidate release facts do not bind this recovery",
         ));
     }
     facts.release.validate().map_err(restore_failure)?;
-    facts.rollback_policy.validate().map_err(restore_failure)?;
     Ok(facts)
 }
 
@@ -1315,11 +1306,10 @@ pub(super) fn seed_recovery_candidate_facts(
         .join(recovery_operation_id);
     crate::filesystem::ensure_private_directory(&directory, "test recovery directory")?;
     let facts = RecoveryCandidateFacts {
-        schema: 1,
+        schema: 2,
         operation_id: recovery_operation_id.to_owned(),
         artifact,
         release: ReleaseVersion::new("v1")?,
-        rollback_policy: crate::model::test_release_rollback_policy(),
     };
     crate::filesystem::atomic_write(
         &directory.join("candidate-release.json"),
@@ -1424,7 +1414,6 @@ pub(crate) fn activate_recovered_runtime(
         serde_json::from_slice(&completed).map_err(|error| restore_failure(error.into()))?;
     if recovery_facts.operation_id != recovery_operation_id
         || state.current_release.as_ref() != Some(&recovery_facts.release)
-        || state.current_rollback_policy != recovery_facts.rollback_policy
     {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
@@ -1498,7 +1487,6 @@ pub(crate) fn activate_recovered_runtime(
                 &candidate_facts.artifact,
             )?,
             release: Some(candidate_facts.release),
-            rollback_policy: candidate_facts.rollback_policy,
             config: None,
             operation_id: activation_operation_id.to_owned(),
         },
@@ -3124,7 +3112,6 @@ mod tests {
                 config_schema: "nazoauth-config-v1".to_owned(),
                 resources: Vec::new(),
                 current_release: Some(ReleaseVersion::new("v1")?),
-                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             "bootstrap-op",
         )?;
@@ -3150,7 +3137,6 @@ mod tests {
                 sha256: artifact_digest,
             },
             release: ReleaseVersion::new("v1")?,
-            rollback_policy: crate::model::test_release_rollback_policy(),
             config_schema: "nazoauth-config-v1".to_owned(),
             files,
             archive_files: vec![SnapshotFile {

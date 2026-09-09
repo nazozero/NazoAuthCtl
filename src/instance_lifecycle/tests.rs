@@ -169,7 +169,6 @@ impl LifecycleExecutor for ScriptedLifecycle {
             crate::target::deployment_state::UpdateCommit {
                 artifact: NEW_REF.to_owned(),
                 release: Some(crate::target::ReleaseVersion::new("v9").expect("identity")),
-                rollback_policy: crate::model::test_release_rollback_policy(),
                 config,
                 operation_id: job.operation_id.to_owned(),
             },
@@ -308,7 +307,6 @@ impl Fixture {
                 config_schema: "nazauth-seed-v1".to_owned(),
                 resources,
                 current_release,
-                current_rollback_policy: crate::model::test_release_rollback_policy(),
             },
             "bootstrap-op-0001",
         )?;
@@ -580,7 +578,6 @@ fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
         crate::target::deployment_state::UpdateCommit {
             artifact: NEW_REF.to_owned(),
             release: None,
-            rollback_policy: crate::model::test_release_rollback_policy(),
             config: None,
             operation_id: "prior-update-op".to_owned(),
         },

@@ -771,7 +771,6 @@ pub(crate) struct InstallJob<'a> {
 pub(crate) struct InstallFacts {
     pub artifact_reference: String,
     pub release: Option<super::deployment_state::ReleaseVersion>,
-    pub rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 /// The injectable seam executing one clean-install order on the target.
@@ -1244,7 +1243,6 @@ impl HostInstallExecutor {
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{}", verified.digest),
             release: verified.release,
-            rollback_policy: verified.rollback_policy,
         })
     }
 }

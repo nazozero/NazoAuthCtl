@@ -123,19 +123,12 @@ pub(crate) struct ReleaseRequest<'a> {
 }
 
 impl VerifiedRelease {
-    /// Rollback policy from the attested Release manifest. Callers receive
-    /// this only through a fully verified handle, so it can be carried into
-    /// target state without re-parsing unsigned metadata.
-    pub(crate) fn rollback_policy(&self) -> crate::model::ReleaseRollbackPolicy {
-        self.manifest.rollback.clone()
-    }
-
     /// Verify an official server Release through the single entry point.
     ///
     /// Exactly once per accepted artifact this performs: the bounded download,
     /// its content-digest check, the bounded GitHub attestation query, cosign
     /// bundle verification under the pinned release-workflow identity, the
-    /// signed-manifest policy validation, controller compatibility, and the
+    /// signed-manifest validation, protocol compatibility, and the
     /// anti-downgrade floor. The returned handle covers those facts; callers
     /// must not re-run them.
     pub(crate) fn verify(request: ReleaseRequest<'_>) -> anyhow::Result<Self> {
@@ -161,7 +154,6 @@ impl VerifiedRelease {
             &identity,
             cache.as_deref(),
         )?;
-        manifest.validate_controller_compatibility()?;
         if let Some(floor) = request.trusted_version_floor {
             enforce_release_trust_floor(floor, &manifest)?;
         }
@@ -172,8 +164,8 @@ impl VerifiedRelease {
     ///
     /// Each artifact's digest is checked exactly once, when its bytes first
     /// enter the workspace: attested subjects were digest-bound during
-    /// [`Self::verify`], and artifacts fetched on demand (for example the
-    /// frontend tarball) are bound here against their signed manifest entry.
+    /// [`Self::verify`], and artifacts fetched on demand are bound here
+    /// against their signed manifest entry.
     /// The workspace is private to this handle, so existence implies coverage;
     /// re-hashing on every access would only duplicate the same fact (H03).
     pub(crate) fn artifact(&self, key: &str, repository: &str) -> anyhow::Result<PathBuf> {

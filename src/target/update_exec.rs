@@ -247,7 +247,6 @@ pub(crate) struct RollbackJob<'a> {
     pub config_schema: &'a str,
     pub current_artifact: &'a str,
     pub previous_artifact: Option<&'a str>,
-    pub current_rollback_policy: &'a crate::model::ReleaseRollbackPolicy,
     pub expected_revision: u64,
     pub scope_dir: &'a Path,
     pub store: &'a TargetStateStore,
@@ -284,8 +283,8 @@ pub(crate) enum UpdateExecution {
 
 /// The injectable seam executing update/rollback orders on the target.
 ///
-/// Contract: resumable by re-execution; on any failure the implementation has
-/// already restored the pre-order runtime/config before returning `Err`.
+/// Contract: resumable by re-execution. Failures before migration restore the
+/// pre-order runtime/config; applied or uncertain migrations keep the writer stopped.
 pub(crate) trait LifecycleExecutor: Send + Sync {
     fn execute_update(&self, job: &UpdateJob<'_>) -> Result<UpdateExecution, Failure>;
     fn execute_rollback(&self, job: &RollbackJob<'_>) -> Result<LifecycleFacts, Failure>;
@@ -301,7 +300,6 @@ pub(crate) struct PerformedSteps {
     pub(crate) migration_applied: bool,
     pub(crate) migration_outcome_unknown: bool,
     pub(crate) migration_result: Option<nazo_operator_protocol::ControlResult>,
-    pub(crate) verified_rollback_policy: Option<crate::model::ReleaseRollbackPolicy>,
     pub(crate) runtime_before_update: Option<runtime_backend::RuntimeReplacement>,
     pub(crate) runtime_before_update_was_running: bool,
 }
@@ -312,12 +310,37 @@ pub(crate) struct HostLifecycleExecutor;
 
 impl LifecycleExecutor for HostLifecycleExecutor {
     fn execute_update(&self, job: &UpdateJob<'_>) -> Result<UpdateExecution, Failure> {
-        let mut performed = PerformedSteps::default();
+        let migration = job
+            .store
+            .load_existing(job.deployment_id)?
+            .applied_migration;
+        if migration
+            .as_ref()
+            .is_some_and(|migration| migration.operation_id != job.operation_id)
+        {
+            return Err(Failure::new(
+                super::deployment_state::ROLLBACK_RECOVERY_REQUIRED,
+                "another operation has already applied a migration; resume that operation or recover a verified backup",
+            ));
+        }
+        let mut performed = PerformedSteps {
+            migration_applied: migration.is_some(),
+            ..PerformedSteps::default()
+        };
         match self.run_update(job, &mut performed) {
             Ok(UpdateExecution::Noop { revision }) => Ok(UpdateExecution::Noop { revision }),
             Ok(UpdateExecution::Activated(facts)) => Ok(UpdateExecution::Activated(facts)),
             Ok(UpdateExecution::RecoveryRequired { result, detail }) => {
                 Ok(UpdateExecution::RecoveryRequired { result, detail })
+            }
+            Ok(UpdateExecution::MigrationFailed(_)) if performed.migration_applied => {
+                Err(stop_writer_for_recovery(
+                    job,
+                    Failure::new(
+                        super::deployment_state::ROLLBACK_RECOVERY_REQUIRED,
+                        "migration replay conflicts with the recorded successful migration",
+                    ),
+                ))
             }
             Ok(UpdateExecution::MigrationFailed(result)) => {
                 match rollback_update(job, &performed) {
@@ -331,15 +354,7 @@ impl LifecycleExecutor for HostLifecycleExecutor {
                     )),
                 }
             }
-            Err(failure)
-                if performed.migration_applied
-                    && performed
-                        .verified_rollback_policy
-                        .as_ref()
-                        .is_some_and(|policy| {
-                            !policy.artifact_rollback_allowed_after_migration()
-                        }) =>
-            {
+            Err(failure) if performed.migration_applied => {
                 let failure = stop_writer_for_recovery(job, failure);
                 match performed.migration_result {
                     Some(result) => Ok(UpdateExecution::RecoveryRequired {
@@ -353,13 +368,7 @@ impl LifecycleExecutor for HostLifecycleExecutor {
                 Err(stop_writer_for_unknown_migration(job, failure))
             }
             Err(failure) => match rollback_update(job, &performed) {
-                Ok(()) => {
-                    if performed.migration_applied {
-                        job.store
-                            .clear_applied_migration(job.deployment_id, job.operation_id)?;
-                    }
-                    Err(failure)
-                }
+                Ok(()) => Err(failure),
                 Err(cleanup) => Err(Failure::new(
                     failure.code,
                     format!(
@@ -424,19 +433,20 @@ impl HostLifecycleExecutor {
             version_floor_for_update(job.artifact, job.current_version),
             job.runtime_root,
         )?;
-        performed.verified_rollback_policy = Some(verified.rollback_policy.clone());
         let new_digest = verified.digest.clone();
 
         // Verification is the target's authority. Once it proves that the
         // selected digest is already current and no config was staged, the
         // update is complete: do not snapshot, dispatch migration, rotate the
         // rollback generation, or advance the config revision.
-        if update_is_noop(
-            &live_digest,
-            job.current_artifact,
-            &new_digest,
-            job.config.is_some(),
-        ) {
+        if !performed.migration_applied
+            && update_is_noop(
+                &live_digest,
+                job.current_artifact,
+                &new_digest,
+                job.config.is_some(),
+            )
+        {
             return Ok(UpdateExecution::Noop {
                 revision: job.expected_revision,
             });
@@ -648,7 +658,6 @@ impl HostLifecycleExecutor {
                         job.expected_revision,
                         job.operation_id,
                         &format!("sha256:{new_digest}"),
-                        &verified.rollback_policy,
                     )?;
                     migration_result = Some(control_result);
                 }
@@ -709,7 +718,6 @@ impl HostLifecycleExecutor {
             super::deployment_state::UpdateCommit {
                 artifact: format!("sha256:{new_digest}"),
                 release: verified.release.clone(),
-                rollback_policy: verified.rollback_policy.clone(),
                 config: staged_config_change(job.config_reference, job.config),
                 operation_id: job.operation_id.to_owned(),
             },
@@ -730,16 +738,6 @@ impl HostLifecycleExecutor {
         let kind = job.runtime_kind;
         let backend = runtime_backend::backend(kind);
         privilege_gate(kind)?;
-
-        if !job
-            .current_rollback_policy
-            .artifact_rollback_allowed_after_migration()
-        {
-            return Err(Failure::new(
-                super::deployment_state::ROLLBACK_RECOVERY_REQUIRED,
-                "the verified Release migration policy forbids artifact/config rollback; keep the writer stopped and run verified backup recover",
-            ));
-        }
 
         let previous = job.previous_artifact.ok_or_else(|| {
             Failure::new(
@@ -1756,7 +1754,6 @@ pub(crate) fn verify_pinned_artifact_facts(
             runtime_artifact,
             local_artifact_id,
             release: Some(release),
-            rollback_policy: candidate.rollback,
         });
     }
     let release = VerifiedRelease::verify(ReleaseRequest {
@@ -1845,7 +1842,6 @@ pub(crate) fn verify_pinned_artifact_facts(
         digest,
         runtime_artifact,
         local_artifact_id,
-        rollback_policy: release.rollback_policy(),
         release: Some(
             super::deployment_state::ReleaseVersion::new(&release.manifest.version).map_err(
                 |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
@@ -1861,7 +1857,6 @@ pub(crate) struct VerifiedArtifactFacts {
     pub(crate) runtime_artifact: runtime_backend::ArtifactReference,
     pub(crate) local_artifact_id: Option<String>,
     pub(crate) release: Option<super::deployment_state::ReleaseVersion>,
-    pub(crate) rollback_policy: crate::model::ReleaseRollbackPolicy,
 }
 
 /// Rebuild the runtime replacement from the LIVE observation, changing only
