@@ -1,7 +1,6 @@
 # ACME HTTP-01 issuance contract
 
-This contract is the certificate-issuance part of NazoAuthCtl issue #31. It
-creates deployment-owned public-server certificate material without changing a
+This contract creates deployment-owned public-server certificate material without changing a
 TLS consumer. Installation, reload, public verification, and rollback remain the
 separate `tls certificate` transaction. A stopped controller is therefore not
 on the authentication serving path.
@@ -137,7 +136,7 @@ not claim that any live endpoint changed certificates.
 The ACME server performs the authoritative public HTTP-01 fetch. This phase does
 not claim a local loopback request proves public reachability. It also does not
 configure Direct TLS, Nginx/Angie, trusted proxy headers, or NazoAuth transport
-capabilities. NazoAuth #127's closed Direct TLS baseline does not provide the
-atomic reload or authenticated controller protocol for those operations; they
-still require the ordinary dynamically negotiated capabilities tracked by
-NazoAuth #128/#129 and parent #130.
+capabilities. Install and activate issued material through the existing
+[certificate transaction](tls-certificate-provider.md) and
+[deployment lifecycle](tls-deployment.md); issuance does not configure the
+consumer or prove that a live endpoint uses the new certificate.

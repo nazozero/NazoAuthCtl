@@ -170,3 +170,10 @@ attestation inputs supplied by that workflow.
 </details>
 
 Licensed under [AGPL-3.0-or-later](Cargo.toml).
+
+## Documentation maintenance
+
+Keep command contracts, deployment/recovery guides, and versioned release notes
+with the code they describe. Put one-time task plans, finding lists, suite
+investigations, and acceptance reports in CI artifacts or the associated
+issue/PR. Update affected guides and links when behavior or paths change.
