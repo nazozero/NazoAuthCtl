@@ -2212,11 +2212,10 @@ mod local_readiness_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod install_exec_tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn resumed_install_accepts_only_its_known_runtime_ownership() -> anyhow::Result<()> {
         use std::os::unix::fs::{chown, symlink};
@@ -2246,7 +2245,6 @@ mod install_exec_tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn rootless_runtime_identity_preserves_owner_and_ctl_write_access() -> anyhow::Result<()> {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -2274,7 +2272,6 @@ mod install_exec_tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn runtime_data_ownership_covers_nested_files_without_changing_file_modes() -> anyhow::Result<()>
     {
