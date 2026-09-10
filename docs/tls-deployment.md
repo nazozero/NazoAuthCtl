@@ -152,9 +152,8 @@ another apply. A failed first install without a provable prior TLS identity
 remains pending; an unreachable endpoint is not proof of rollback.
 
 Run `tls certificate check` periodically with a warning window larger than
-expected renewal/recovery time, and alert on nonzero exit. Local tests cover real
-TLS, delayed leaf switching/rollback, deadlines and permissions. On 2026-09-06,
-Candidate acceptance in a Linux environment also exercised public ACME issuance, renewal and
-key replacement, both transport modes, native proxy config transactions,
-interrupted recovery and protocol service with ctl absent. These results identify
-the tested candidate binaries; distributed Release validation is separate evidence.
+expected renewal/recovery time, and alert on nonzero exit. Validate the actual
+deployment's initial installation, renewal/key replacement, public leaf switch,
+rollback, interrupted recovery, and service continuity with ctl stopped. Keep
+run-specific binaries, logs, and receipts in CI artifacts or the associated
+issue/PR; local tests do not establish distributed Release acceptance.
