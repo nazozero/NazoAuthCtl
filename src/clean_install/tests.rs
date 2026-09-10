@@ -432,16 +432,7 @@ impl LocalFixture {
             database_runtime_password: test_secret("db-runtime-secret"),
             database_lifecycle_password: test_secret("db-lifecycle-secret"),
             valkey_password: test_secret("cache-secret"),
-            import_data_root: None,
-            import_mfa_key_file: None,
         }
-    }
-
-    fn imported_request(&self, alias: Option<&str>) -> CleanInstallRequest {
-        let mut request = self.request(alias);
-        request.import_data_root = Some(self._temp.path().join("imported-data"));
-        request.import_mfa_key_file = Some(self._temp.path().join("imported-mfa-key"));
-        request
     }
 }
 
@@ -692,8 +683,6 @@ impl SshFixture {
             database_runtime_password: test_secret("db-runtime-secret"),
             database_lifecycle_password: test_secret("db-lifecycle-secret"),
             valkey_password: test_secret("cache-secret"),
-            import_data_root: None,
-            import_mfa_key_file: None,
         }
     }
 }
@@ -703,15 +692,6 @@ impl SshFixture {
 #[test]
 fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(None)?;
-    let hello = test_hello(vec!["podman".to_owned()]);
-    let mut fresh_request = fixture.request(Some("fresh-order"));
-    let fresh_order = prepare_install_operation(&mut fresh_request, &hello)?;
-    assert!(
-        install_order(&fresh_order.operation)
-            .current_data_import
-            .is_none()
-    );
-
     let text = run_clean_install(&fixture.context, fixture.request(Some("production")))?;
 
     // Report: committed facts plus exact next steps (G01/G08 wording).
@@ -768,43 +748,6 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
         fixture.executor.steps.lock().unwrap().clone(),
         vec!["verify", "start"]
     );
-    Ok(())
-}
-
-#[test]
-fn current_data_import_is_rejected_before_target_execution() -> anyhow::Result<()> {
-    let fixture = LocalFixture::new(None)?;
-    let hello = test_hello(vec!["podman".to_owned()]);
-    let mut order_request = fixture.imported_request(Some("production"));
-    let prepared = prepare_install_operation(&mut order_request, &hello)?;
-    let order = install_order(&prepared.operation);
-    assert!(order.current_data_import.is_some());
-
-    let rejection = order
-        .validate()
-        .expect_err("legacy data import must not reach a database-backed install");
-    assert_eq!(
-        rejection.code,
-        crate::target::wire::RejectionCode::OperationMalformed
-    );
-    assert!(rejection.detail.contains("nazoauth keys-import"));
-    assert!(rejection.detail.contains("same deployment wrapping key"));
-    assert!(rejection.detail.contains("managed update"));
-
-    let error = run_clean_install(
-        &fixture.context,
-        fixture.imported_request(Some("production")),
-    )
-    .expect_err("clean install must refuse before creating a target instance");
-    assert!(
-        error.to_string().contains("nazoauth keys-import"),
-        "{error:#}"
-    );
-    assert!(
-        fixture.executor.steps.lock().unwrap().is_empty(),
-        "target install executor must not run"
-    );
-    assert!(fixture.context.registry.list_instances()?.is_empty());
     Ok(())
 }
 
@@ -1418,8 +1361,6 @@ fn lost_install_response_resumes_exact_identity_without_a_second_instance() -> a
         database_runtime_password: test_secret("db-runtime-secret"),
         database_lifecycle_password: test_secret("db-lifecycle-secret"),
         valkey_password: test_secret("cache-secret"),
-        import_data_root: None,
-        import_mfa_key_file: None,
     };
 
     let first = run_clean_install(&context, request()).expect_err("first response is lost");

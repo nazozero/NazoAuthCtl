@@ -313,10 +313,6 @@ pub(crate) struct InstallArgs {
     pub(crate) valkey_host: String,
     pub(crate) valkey_port: u16,
     pub(crate) valkey_password_file: PathBuf,
-    /// Optional target-local current-format material. These paths are sent as
-    /// path facts only; no imported bytes cross the control transport.
-    pub(crate) import_data_root: Option<PathBuf>,
-    pub(crate) import_mfa_key_file: Option<PathBuf>,
 }
 
 /// Update arguments (G03); maps onto

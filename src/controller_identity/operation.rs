@@ -94,22 +94,15 @@ pub fn build_signed_control_operation(
     input: ControlOperationInput,
 ) -> anyhow::Result<SignedControlOperation> {
     let record = resolve_instance(registry, instance_selector)?;
-    build_signed_control_operation_with_id(keys, &record, input, None)
+    build_signed_control_operation_for_record(keys, &record, input)
 }
 
-/// Same as [`build_signed_control_operation`] with an explicit operation id.
-/// `None` mints a fresh UUIDv7; `Some(id)` rebuilds the exact envelope for a
-/// legacy journal migration (E06): combined with deterministic Ed25519 this
-/// yields a byte-identical compact JWS. Current-schema recovery reuses the
-/// durable original JWS directly and therefore never reaches this signer. The
-/// caller owns resume-safety checks (hash equality); this function performs no
-/// gating of its own. The caller must pass the already resolved record so
-/// selector lookup is not repeated inside a dispatch.
-pub(crate) fn build_signed_control_operation_with_id(
+/// Build, hash, and sign a fresh operation for an already resolved record.
+/// The caller passes that record only to avoid repeating selector lookup.
+pub(crate) fn build_signed_control_operation_for_record(
     keys: &ControllerKeyStore,
     record: &InstanceRecord,
     input: ControlOperationInput,
-    operation_id: Option<&str>,
 ) -> anyhow::Result<SignedControlOperation> {
     validate_record_key_ref(record)?;
     let loaded: LoadedControllerKey =
@@ -119,8 +112,9 @@ pub(crate) fn build_signed_control_operation_with_id(
                 record.alias
             )
         })?;
+    let operation_id = Uuid::now_v7().to_string();
     let operation =
-        build_control_operation_with_id_and_kid(record, input, operation_id, loaded.kid());
+        build_control_operation_with_id_and_kid(record, input, &operation_id, loaded.kid());
     let request_hash = control_operation_request_hash(&operation)?;
     let compact_jws = sign_control_operation(&operation, loaded.signing_key())?;
     Ok(SignedControlOperation {
@@ -143,15 +137,12 @@ pub(crate) fn build_signed_control_operation_with_id(
 pub(crate) fn build_control_operation_with_id_and_kid(
     record: &InstanceRecord,
     input: ControlOperationInput,
-    operation_id: Option<&str>,
+    operation_id: &str,
     kid: &str,
 ) -> ControlOperation {
     ControlOperation {
         schema: CONTROL_OPERATION_SCHEMA,
-        operation_id: match operation_id {
-            Some(id) => id.to_owned(),
-            None => Uuid::now_v7().to_string(),
-        },
+        operation_id: operation_id.to_owned(),
         kid: kid.to_owned(),
         deployment_id: record.deployment_id.clone(),
         config_revision: input.config_revision,
@@ -160,8 +151,8 @@ pub(crate) fn build_control_operation_with_id_and_kid(
 }
 
 /// Prove that a record's key locator is exactly the instance that is about to
-/// sign. This is a fresh-signing and legacy-migration boundary; immutable
-/// schema-2 recovery deliberately does not consult it.
+/// sign. This is a fresh-signing boundary; immutable schema-2 recovery
+/// deliberately does not consult it.
 fn validate_record_key_ref(record: &InstanceRecord) -> anyhow::Result<()> {
     let key_ref = record.controller_key_ref.as_deref().with_context(|| {
         format!(

@@ -1,6 +1,6 @@
-# Controller and server compatibility
+# Version policy and protocol contract
 
-The controller and server are independently released. Compatibility is defined
+The controller and server are independently released. Interoperability is defined
 by the operator protocol version and the signed release-manifest schema, not
 by an independently maintained controller SemVer range. This controller accepts
 operator protocol 3 and release-manifest schema 7. The protocol crate remains
@@ -15,12 +15,11 @@ subject. Host and OCI artifacts must report the same selected release and
 protocol version. The gate also runs the production `VerifiedRelease::verify`
 path; unknown manifest schemas and protocol versions are rejected.
 
-Removing the asserted rollback policy changes the closed local formats:
-deployment state is schema 8, backup manifests are schema 5, and recovery
-candidate facts are schema 2. Existing older formats are not silently converted.
-Retain the prior controller and its recovery material when preparing a deployed
-format transition. Updating this source does not migrate or delete existing
-state or backups.
+Before 0.5.0, the project iterates rapidly and does not preserve compatibility
+with historical releases. Only current formats are supported. This controller
+accepts only the exact current formats: host protocol 11, deployment state 8,
+backup manifest 5, and recovery plan 2. It rejects a mismatch; it does not
+convert historical state, backups, or operation records.
 
 Rollback after a migration is governed by recorded execution facts. A pending
 applied migration fences artifact rollback, and a successful migrated update

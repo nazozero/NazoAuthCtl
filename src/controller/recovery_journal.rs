@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{file_lock::FileLock, filesystem};
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const FILE_NAME: &str = "recovery-plan.json";
 const LOCK_NAME: &str = "recovery-plan.lock";
 const MAX_BYTES: u64 = 16 * 1024;
@@ -31,7 +31,6 @@ pub(crate) struct CandidatePointer {
     pub object_reference: String,
     pub object_id: String,
     pub loopback_port: u16,
-    #[serde(default)]
     pub https: bool,
 }
 
@@ -244,12 +243,18 @@ mod tests {
     }
 
     #[test]
-    fn recovery_pointer_preserves_https_and_reads_existing_proxy_records() -> anyhow::Result<()> {
-        let pointer = staged_plan().candidate.unwrap();
-        let mut value = serde_json::to_value(&pointer)?;
-        assert!(serde_json::from_value::<CandidatePointer>(value.clone())?.https);
-        value.as_object_mut().unwrap().remove("https");
-        assert!(!serde_json::from_value::<CandidatePointer>(value)?.https);
+    fn recovery_pointer_requires_its_transport_fact() -> anyhow::Result<()> {
+        let mut pointer = staged_plan().candidate.unwrap();
+        for https in [false, true] {
+            pointer.https = https;
+            let mut value = serde_json::to_value(&pointer)?;
+            assert_eq!(
+                serde_json::from_value::<CandidatePointer>(value.clone())?.https,
+                https
+            );
+            value.as_object_mut().unwrap().remove("https");
+            assert!(serde_json::from_value::<CandidatePointer>(value).is_err());
+        }
         Ok(())
     }
 }

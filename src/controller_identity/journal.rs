@@ -77,11 +77,6 @@ impl Drop for InstanceJournalLock {
 /// Schema discriminator for the operation journal file.
 pub const OPERATION_JOURNAL_SCHEMA: u32 = 2;
 
-/// Schema written before the immutable compact JWS was retained. It is read
-/// only so a still-valid original key can perform one exact, deterministic
-/// migration; it is never written again.
-const LEGACY_OPERATION_JOURNAL_SCHEMA: u32 = 1;
-
 /// The compact JWS is bounded by the shared protocol. The remaining envelope
 /// fields are deliberately capped tightly enough to reject accidental files
 /// that are not one journal entry.
@@ -107,8 +102,7 @@ pub struct OperationJournalEntry {
     /// The exact original request. This is public protocol data, never
     /// change-set material; it lets accepted-operation recovery survive key
     /// rotation and local retirement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compact_jws: Option<String>,
+    pub compact_jws: String,
     pub created_at: DateTime<Utc>,
     pub state: JournalState,
 }
@@ -125,7 +119,7 @@ impl OperationJournalEntry {
             operation_id,
             request_hash,
             kid,
-            compact_jws: Some(compact_jws),
+            compact_jws,
             created_at: Utc::now(),
             state: JournalState::Dispatched,
         }
@@ -137,10 +131,6 @@ impl OperationJournalEntry {
             && self.kid == other.kid
             && self.compact_jws == other.compact_jws
     }
-
-    pub fn is_legacy(&self) -> bool {
-        self.schema == LEGACY_OPERATION_JOURNAL_SCHEMA
-    }
 }
 
 /// Handle to one instance's operation journal.
@@ -151,10 +141,7 @@ pub struct OperationJournal {
 
 impl OperationJournal {
     fn validate_entry(entry: &OperationJournalEntry, path: &std::path::Path) -> anyhow::Result<()> {
-        if !matches!(
-            entry.schema,
-            LEGACY_OPERATION_JOURNAL_SCHEMA | OPERATION_JOURNAL_SCHEMA
-        ) {
+        if entry.schema != OPERATION_JOURNAL_SCHEMA {
             bail!(
                 "{STATE_RESET_REQUIRED}: unsupported operation journal schema {} ({})",
                 entry.schema,
@@ -177,35 +164,19 @@ impl OperationJournal {
                 path.display()
             );
         }
-        match entry.schema {
-            LEGACY_OPERATION_JOURNAL_SCHEMA if entry.compact_jws.is_none() => {}
-            LEGACY_OPERATION_JOURNAL_SCHEMA => bail!(
-                "{STATE_RESET_REQUIRED}: legacy operation journal entry carries unsupported recovery fields ({})",
+        let header = nazo_operator_protocol::protected_header(&entry.compact_jws).map_err(|error| {
+            anyhow::anyhow!(
+                "{STATE_RESET_REQUIRED}: operation journal compact JWS is malformed ({error}) ({})",
                 path.display()
-            ),
-            OPERATION_JOURNAL_SCHEMA => {
-                let compact_jws = entry.compact_jws.as_deref().with_context(|| {
-                    format!(
-                        "{STATE_RESET_REQUIRED}: operation journal lacks its original compact JWS ({})",
-                        path.display()
-                    )
-                })?;
-                let header = nazo_operator_protocol::protected_header(compact_jws).map_err(|error| {
-                    anyhow::anyhow!(
-                        "{STATE_RESET_REQUIRED}: operation journal compact JWS is malformed ({error}) ({})",
-                        path.display()
-                    )
-                })?;
-                if header.kid != entry.kid
-                    || header.typ != nazo_operator_protocol::CONTROL_OPERATION_JWS_TYPE
-                {
-                    bail!(
-                        "{STATE_RESET_REQUIRED}: operation journal recovery fields do not conform ({})",
-                        path.display()
-                    );
-                }
-            }
-            _ => unreachable!("validated schema set is closed"),
+            )
+        })?;
+        if header.kid != entry.kid
+            || header.typ != nazo_operator_protocol::CONTROL_OPERATION_JWS_TYPE
+        {
+            bail!(
+                "{STATE_RESET_REQUIRED}: operation journal recovery fields do not conform ({})",
+                path.display()
+            );
         }
         Ok(())
     }
@@ -305,46 +276,6 @@ impl OperationJournal {
         }
         let bytes = serde_json::to_vec_pretty(entry)
             .context("failed to serialize the operation journal entry")?;
-        filesystem::atomic_write(&self.path, &bytes, 0o600)
-            .with_context(|| format!("failed to persist {}", self.path.display()))
-    }
-
-    /// Convert the only legacy representation to the current recovery
-    /// envelope. The caller must have rebuilt the same canonical request with
-    /// the still-valid original key; this method merely makes that exact JWS
-    /// durable while preserving the observed journal state.
-    pub fn upgrade_legacy_if_matches(
-        &self,
-        expected: &OperationJournalEntry,
-        upgraded: &OperationJournalEntry,
-    ) -> anyhow::Result<()> {
-        if !expected.is_legacy() || upgraded.schema != OPERATION_JOURNAL_SCHEMA {
-            bail!("operation journal migration requires legacy-to-current entries");
-        }
-        Self::validate_entry(upgraded, &self.path)?;
-        let _lock = InstanceJournalLock::acquire(
-            self.path
-                .parent()
-                .context("journal path has no parent directory")?,
-        )?;
-        let Some(current) = self.load()? else {
-            bail!("the legacy journaled operation is no longer present");
-        };
-        if !current.is_legacy()
-            || current.operation_id != expected.operation_id
-            || current.request_hash != expected.request_hash
-            || current.kid != expected.kid
-        {
-            bail!(
-                "the operation journal changed while legacy operation '{}' was being migrated",
-                expected.operation_id
-            );
-        }
-        let mut upgraded = upgraded.clone();
-        upgraded.created_at = current.created_at;
-        upgraded.state = current.state;
-        let bytes = serde_json::to_vec_pretty(&upgraded)
-            .context("failed to serialize the upgraded operation journal entry")?;
         filesystem::atomic_write(&self.path, &bytes, 0o600)
             .with_context(|| format!("failed to persist {}", self.path.display()))
     }
@@ -583,6 +514,28 @@ mod tests {
             .load()
             .expect_err("malformed controller kid");
         assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_journal_format_is_rejected_without_rewriting() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let journal = journal(&f)?;
+        for (schema, include_original_jws) in [(1, false), (1, true), (2, false)] {
+            let mut value =
+                serde_json::to_value(sample_entry("01900000-0000-7000-8000-000000000022"))?;
+            value["schema"] = serde_json::json!(schema);
+            if !include_original_jws {
+                value.as_object_mut().unwrap().remove("compact_jws");
+            }
+            let bytes = serde_json::to_vec(&value)?;
+            filesystem::atomic_write(journal.path(), &bytes, 0o600)?;
+            let error = journal
+                .load()
+                .expect_err("unsupported journal format accepted");
+            assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
+            assert_eq!(fs::read(journal.path())?, bytes);
+        }
         Ok(())
     }
 

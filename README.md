@@ -1,162 +1,172 @@
-# nazoauthctl
+<div align="center">
+  <h1>NazoAuthCtl</h1>
+  <p>Install, operate, and recover NazoAuth across local and SSH hosts.</p>
+  <p>
+    <a href="https://github.com/nazozero/NazoAuthCtl/actions/workflows/ci.yml"><img src="https://github.com/nazozero/NazoAuthCtl/actions/workflows/ci.yml/badge.svg?branch=main" alt="Controller CI"></a>
+    <a href="https://github.com/nazozero/NazoAuthCtl/releases"><img src="https://img.shields.io/github/v/release/nazozero/NazoAuthCtl?label=release" alt="Latest release"></a>
+    <a href="Cargo.toml"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-2563eb" alt="AGPL-3.0-or-later"></a>
+  </p>
+  <p>
+    <a href="https://github.com/nazozero/NazoAuthCtl/releases">Download</a> ·
+    <a href="https://github.com/nazozero/NazoAuth/blob/main/docs/operations/one-click-update.md">Deployment guide</a> ·
+    <a href="docs/compatibility.md">Version policy</a> ·
+    <a href="https://github.com/nazozero/NazoAuth">NazoAuth server</a>
+  </p>
+</div>
 
-`nazoauthctl` is the local and SSH-remote, multi-host, multi-instance operator
-console for [NazoAuth](https://github.com/nazozero/NazoAuth). One console
-remembers every host and instance you register; the target machine always stays
-the authority for its own runtime state.
+NazoAuthCtl is the host lifecycle controller for
+[NazoAuth](https://github.com/nazozero/NazoAuth). Register hosts, install signed
+releases, inspect instances, and verify backups from one CLI. It uses local
+execution or existing OpenSSH aliases and supports Docker, Podman, and host
+binaries.
 
-```text
-                      |- local host
-                      |- SSH server-a -- NazoAuth production
-Operator -> nazoauthctl|- SSH server-b -- NazoAuth staging
-                      |- SSH server-c -- NazoAuth test-1 / test-2
-```
+The controller ships separately from the server. Its recovery path can run
+when the active NazoAuth process is unavailable.
 
-## The happy path
+> [!WARNING]
+> **Before 0.5.0, this project iterates rapidly. Version updates do not preserve
+> compatibility with historical releases.** Only current local state, journal,
+> configuration, and control-message formats are supported. Older formats are
+> not converted. Retain verified backups and their matching recovery tools
+> before changing a deployment.
 
-```bash
-nazoauthctl host add server-a --ssh prod-a --privilege sudo
-nazoauthctl install --host server-a --name production \
-  --public-url https://auth.example.com \
+## Operations
+
+| Task | Commands |
+| --- | --- |
+| Set up hosts and instances | host add/check, discover, install, instance list/register |
+| Inspect a deployment | status, logs, doctor, verify |
+| Manage controller access | bind, controller add/rotate/revoke/recover |
+| Change a running instance | update, rollback, operation |
+| Prove recovery | backup snapshot, backup restore-test, backup copy, recover |
+| Maintain the controller | self check, self update, self rollback |
+| Manage deployment TLS | tls certificate, tls acme |
+
+Read-only inspection works before controller binding. Mutations use signed
+control operations, with the first administrator created through the target's
+local deployment authority. Binding a Controller Key requires administrator
+approval with fresh MFA.
+
+## Start a deployment
+
+Download a [release](https://github.com/nazozero/NazoAuthCtl/releases) for your
+platform. For SSH targets, install the same controller build on both ends and
+use an existing OpenSSH Host alias.
+
+Prepare a public HTTPS issuer, PostgreSQL with distinct runtime and lifecycle
+roles, and Valkey. NazoAuthCtl manages the application deployment; the external
+data services remain under your administration.
+
+<details>
+<summary><strong>Install, create an administrator, then bind</strong></summary>
+
+Replace the release-tag placeholder with the signed NazoAuth version you intend
+to deploy. Password files are local controller inputs.
+
+~~~sh
+nazoauthctl host add production-host --ssh production --privilege sudo
+
+nazoauthctl install \
+  --host production-host --name production \
+  --to '<nazoauth-release-tag>' \
+  --runtime podman --public-url https://auth.example.com \
   --database-host db.internal --database-port 5432 \
-  --database-name oauth \
+  --database-name nazoauth \
   --database-runtime-user nazo_runtime \
   --database-runtime-password-file ./database-runtime-password \
   --database-lifecycle-user nazo_lifecycle \
   --database-lifecycle-password-file ./database-lifecycle-password \
-  --valkey-host cache.internal --valkey-port 6379 \
+  --valkey-host valkey.internal --valkey-port 6379 \
   --valkey-password-file ./valkey-password
+
 nazoauthctl admin create --instance production
+~~~
+
+Sign in at https://auth.example.com/ui/auth and enroll MFA before binding:
+
+~~~sh
 nazoauthctl bind --instance production --label operations \
   --output-secret-file ./production-recovery-secret
-nazoauthctl status
-nazoauthctl update
-nazoauthctl instance list
-nazoauthctl status --all
-```
+nazoauthctl verify --instance production
+~~~
 
-That is the whole deployment story: register the host, install, create an
-administrator through the deployment root, bind a Controller Key, operate.
-`install` commits as soon as the target reports local health - public DNS/TLS verification (`verify`) and backup setup are separate
-next steps, never hidden gates.
+Store the recovery secret offline. The install result covers target-local
+health; public DNS, TLS, and OIDC are checked by the separate verify command.
 
-For database-backed deployments, clean install does not import a legacy `keys/`
-directory or current data. Follow [shared signing-key migration and recovery](docs/shared-signing-keys.md)
-for the server's explicit offline key import, the same deployment wrapping key,
-and the required backup and root-mount checks before a managed update.
+</details>
 
-## Commands
+Use the server's [deployment guide](https://github.com/nazozero/NazoAuth/blob/main/docs/operations/one-click-update.md)
+for configuration, TLS, and the complete operating sequence.
+Run <code>nazoauthctl &lt;command&gt; --help</code> for exact options.
 
-| Command | Purpose |
-|---|---|
-| `host add/list/show/check/forget` | Register and inspect SSH targets or the local machine |
-| `instance register/list/show/rename/forget/relocate` | Register or inventory current-protocol NazoAuth deployments per host |
-| `controller list/add/rotate/revoke/recover` | Per-instance Controller Key lifecycle |
-| `install` | Clean install onto a registered host |
-| `discover` | Read-only sweep for existing NazoAuth deployments |
-| `bind` | Attach this console's Controller Key to an instance |
-| `admin create` | Create an administrator through the instance's fixed target-local provisioner |
-| `status` / `doctor` | Live or cached fleet views (`--all`, `--json`) |
-| `verify` | Public TLS + issuer discovery report |
-| `update` / `rollback` | Crash-safe artifact/config lifecycle with one signed migration |
-| `operation` | Read-only view of the ctl and target operation journals per instance |
-| `policy backup-before-update` | Select `off`, `warn`, or a blocking maximum restore-test age |
-| `backup` | Create, inspect, restore-test, and byte-verify snapshots |
-| `recover` | Restore a verified snapshot and complete token invalidation |
-| `uninstall` | Remove exactly the resources this deployment owns |
-| `self check/update/rollback` | Maintain the current ctl release; unknown self-state schemas fail closed and must be reset from a backup, never migrated |
-| `tls certificate/acme`, `remote exec` | Target TLS and the fixed remote protocol |
+## Recovery is part of the workflow
 
-## Concepts you actually need
+~~~sh
+nazoauthctl backup snapshot --instance production
+nazoauthctl backup restore-test --instance production
+nazoauthctl policy backup-before-update require \
+  --instance production --max-age-seconds 86400
+nazoauthctl backup copy --instance production --to-host recovery-host
+~~~
 
-**Hosts vs instances.** A *host* is a machine (local or an OpenSSH profile
-alias). An *instance* is one NazoAuth deployment on that host, identified by
-its immutable `deployment_id`; friendly aliases are selectors only.
+A snapshot records the database dump, data, secrets, configuration, and
+artifact identity. A restore test executes against an isolated target.
+Off-host copies provide a separate recovery location.
 
-**Local and SSH targets.** Local targets execute directly. Remote execution
-shells out to the installed system `ssh` with its config, agent, and
-`known_hosts`. ctl stores only the profile alias; it does not store SSH keys or
-run a target daemon. Backup copy uses the same target abstraction on both
-sides, so either endpoint can be local or SSH as long as they are distinct
-registered hosts.
+Interrupted operations retain their identity. The operation journal replays
+the original signed request, including after controller-key retirement; it
+does not sign the same operation with a replacement key. A request the server
+has never accepted still needs current authorization.
 
-**Controller Key (30 days).** Every instance trusts up to three Ed25519
-Controller Keys minted on the control machine; private keys never leave it.
-Every key expires after exactly 30 days and any lifecycle change needs a fresh
-administrator 2FA approval in NazoAuth. Expired keys fail admission;
-`controller rotate` replaces them. For an interactive change, ctl performs the
-standard administrator password login and MFA flow itself, keeps the rotated
-cookie/CSRF session only in memory, and requests approval for the exact
-proposal. Use an owner-only `--credentials-file` to avoid retyping the email
-and password; use `--approval-token` instead for non-interactive automation.
+Artifact rollback is available only when recorded schema and migration facts
+allow it. Database recovery uses a verified snapshot; switching a binary alone
+does not reverse a database migration. Recovery does not depend on the active
+server process or its current executable.
 
-**Control-operation recovery.** Before ctl sends a control mutation, its
-per-instance journal writes one recovery record. The current schema retains the
-original compact JWS and public identity metadata, never an Apply change set,
-credential, or private key. After a lost response, ctl rechecks that the same
-command produces the stored canonical request hash and resends that exact JWS;
-it does not re-sign it with the current key. An operation already accepted by
-the target remains recoverable after local key rotation or retirement; a
-never-accepted request must still pass the target's current admission policy.
-Older journal records can
-be migrated only while their original active key remains available; otherwise
-inspect the target outcome before explicitly clearing the record.
+## Ownership
 
-**Administrator creation.** `admin create` is the ctl deployment-root path for
-administrator provisioning. It sends one journaled, instance-bound
-HostOperation to the live target, which runs only the fixed
-`nazoauth admin-provision` command from the DeploymentState artifact. The
-credential JSON is supplied interactively or with `--credentials-stdin`; the
-password is never an argv token, environment value, log, or persistent ctl
-file; the target journal stores only the operation's canonical hash and public
-receipt, never the credential JSON. The current target runtime and config are
-checked before the one-shot run, and a retry reuses the target journal's
-operation result.
+~~~mermaid
+flowchart LR
+    Operator["Operator"] --> Ctl["NazoAuthCtl"]
+    Ctl --> Registry["Local host / instance registry"]
+    Ctl --> Host["Local execution or OpenSSH"]
+    Host --> State["Target deployment state"]
+    Host --> Runtime["NazoAuth runtime"]
+    Host --> Backups["Verified backups"]
+~~~
 
-**Recovery Secret.** On first enrollment you receive a one-time offline secret
-(shown once, stored nowhere). If every Controller Key slot is lost,
-`controller recover` uses it to sign a challenge and reinstall exactly one new
-slot - nothing else. It is not a data backup and not an admin password.
+The local registry identifies hosts and instances. The target owns deployment
+state and execution records. Signed release metadata identifies the artifact;
+signed control operations identify each requested change. See the
+[version and protocol policy](docs/compatibility.md) for the format boundaries.
 
-**forget / revoke / uninstall are three different things.**
+## Build and test
 
-- `instance forget` - remove the local inventory entry only; the target keeps
-  running and its slots are untouched.
-- `controller revoke` - revoke one slot in NazoAuth; the instance and files
-  stay.
-- `uninstall` - delete exactly the managed, deployment-scoped resources after
-  showing you the plan. External/shared PostgreSQL, Valkey, and proxies are
-  never deleted.
+Use the pinned Rust toolchain:
 
-**Backup policy is explicit.** Public reachability and backup timestamps remain
-reported facts. `policy backup-before-update require --max-age-seconds N`
-makes update refuse unless the target still has the exact restore-tested
-snapshot manifest within that age. `warn` reports missing evidence and `off`
-does not require it.
+~~~sh
+cargo build --release --locked -p nazoauthctl
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+~~~
 
-**Current protocol only.** `discover` sweeps a host read-only. `instance
-register` accepts only a deployment whose target-owned state and verified
-helper implement the current protocol. There is no old controller-state,
-command, task-envelope, or deployment-state conversion path.
+[CI](.github/workflows/ci.yml) runs on Linux, Windows, and both macOS
+architectures. The [signed-server gate](.github/workflows/server-compatibility.yml)
+checks the selected release through the production artifact verifier.
+The optional external server and signed-release tests require the binary and
+attestation inputs supplied by that workflow.
 
-## Errors
+<details>
+<summary><strong>Conformance and TLS references</strong></summary>
 
-Failures carry stable codes (`HOST_UNREACHABLE`, `SSH_AUTH_FAILED`,
-`CONFIG_REVISION_MISMATCH`, `EXTERNAL_RESOURCE_PROTECTED`, ...) plus the next
-command to run. Use `--json` for machine-readable output with one result or
-error per instance.
+- [OIDF artifact workflow](docs/oidf-artifacts.md)
+- [Conformance run options](docs/conformance-run-options.md)
+- [Shared signing keys](docs/shared-signing-keys.md)
+- [TLS deployment](docs/tls-deployment.md)
+- [Certificate providers](docs/tls-certificate-provider.md)
+- [ACME HTTP-01](docs/tls-acme-http01.md)
 
-## Development
+</details>
 
-The published binary is `nazoauthctl`; CI formats, tests, lints, and builds the
-complete Cargo workspace. Server compatibility jobs download signed NazoAuth
-Release binaries and OCI images; they never rebuild the server.
-
-```bash
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-cargo test --workspace
-```
-
-License: AGPL-3.0-or-later.
+Licensed under [AGPL-3.0-or-later](Cargo.toml).

@@ -25,7 +25,6 @@
 
 use std::{
     fs,
-    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -140,15 +139,6 @@ pub struct PlannedSecret {
     pub value: Option<super::wire::SecretMaterial>,
 }
 
-/// Optional current-format material copied entirely on the target before the
-/// first runtime start. It is path-only wire data, never imported bytes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CurrentDataImport {
-    pub source_data_root: String,
-    pub source_mfa_key_file: String,
-}
-
 /// New configuration content staged by an update (G03). Values follow the
 /// same rules as the install order's config: bounded content plus the exact
 /// SHA-256 over its bytes so wire corruption can never reach disk. The
@@ -228,8 +218,6 @@ pub struct InstallOrder {
     pub tls_material_root: Option<String>,
     /// Target-local secret files backing the config references.
     pub secrets: Vec<PlannedSecret>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_data_import: Option<CurrentDataImport>,
     /// External PostgreSQL endpoint facts supplied by the operator (G01 item
     /// 3: real external facts are the only install inputs). Credentials live
     /// in the matching planned secret entries, not in this public endpoint.
@@ -250,7 +238,6 @@ impl std::fmt::Debug for InstallOrder {
             .field("runtime_root", &self.runtime_root)
             .field("tls_material_root", &self.tls_material_root)
             .field("secrets", &self.secrets)
-            .field("current_data_import", &self.current_data_import)
             .field("database_runtime_endpoint", &self.database_runtime_endpoint)
             .field(
                 "database_lifecycle_endpoint",
@@ -370,15 +357,6 @@ impl InstallOrder {
                 "install requires distinct runtime/lifecycle roles for one PostgreSQL database",
             ));
         }
-        if self.current_data_import.is_some() {
-            return Err(super::wire::MessageRejection::new(
-                super::wire::RejectionCode::OperationMalformed,
-                "legacy current-data import is refused for database-backed signing keys; migrate \
-                 the existing deployment with `nazoauth keys-import --tenant <tenant-uuid> --from \
-                 <legacy-jwk-keys-directory>` using the same deployment wrapping key, then use \
-                 managed update; do not rerun clean install with a new root",
-            ));
-        }
         if self.secrets.len() != SECRET_PURPOSES.len() {
             return Err(super::wire::MessageRejection::new(
                 super::wire::RejectionCode::OperationMalformed,
@@ -467,289 +445,9 @@ fn safe_absolute_install_path(value: &str) -> bool {
         })
 }
 
-const MAX_IMPORT_FILES: usize = 100_000;
-const MAX_IMPORT_FILE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_IMPORT_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// NazoAuth's fixed non-root identity in the official rootful container.
-/// Imported material is allowed to be owned by this UID in addition to the
-/// controller and root; no arbitrary service account is accepted.
 #[cfg(unix)]
 const NAZOAUTH_RUNTIME_UID: u32 = 10_001;
-const IMPORT_APP_SECRETS: &[&str] = &[
-    "client-secret-pepper",
-    "dynamic-client-registration-initial-access-token",
-    "token-issuance-response-encryption-key",
-];
-
-fn import_current_data(source: &Path, destination: &Path) -> Result<(), Failure> {
-    let source_metadata = fs::symlink_metadata(source)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    if !source_metadata.is_dir() || source_metadata.file_type().is_symlink() {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            "--import-data-root must be a real target-local directory",
-        ));
-    }
-    let source = fs::canonicalize(source)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    let destination = fs::canonicalize(destination)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    if source == destination || source.starts_with(&destination) || destination.starts_with(&source)
-    {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            "current data import source and managed data root must be disjoint",
-        ));
-    }
-
-    let mut file_count = 0usize;
-    let mut total_bytes = 0u64;
-    let source_keys = source.join("keys");
-    if !source_keys.exists() {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            "current data import requires the source keys directory",
-        ));
-    }
-    copy_import_tree(
-        &source_keys,
-        &destination.join("keys"),
-        &mut file_count,
-        &mut total_bytes,
-    )?;
-    let source_avatars = source.join("avatars");
-    if source_avatars.exists() {
-        copy_import_tree(
-            &source_avatars,
-            &destination.join("avatars"),
-            &mut file_count,
-            &mut total_bytes,
-        )?;
-    }
-    for name in IMPORT_APP_SECRETS {
-        let source_file = source.join("secrets").join(name);
-        let destination_file = destination.join("secrets").join(name);
-        copy_import_regular(
-            &source_file,
-            &destination_file,
-            &mut file_count,
-            &mut total_bytes,
-            0o600,
-        )?;
-    }
-    Ok(())
-}
-
-fn copy_import_tree(
-    source: &Path,
-    destination: &Path,
-    file_count: &mut usize,
-    total_bytes: &mut u64,
-) -> Result<(), Failure> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            format!("{} must be a real directory", source.display()),
-        ));
-    }
-    if destination.exists() {
-        let destination_metadata = fs::symlink_metadata(destination)
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-        if !destination_metadata.is_dir() || destination_metadata.file_type().is_symlink() {
-            return Err(Failure::new(
-                SECRET_PROVISION_FAILED,
-                format!(
-                    "{} is not a real destination directory",
-                    destination.display()
-                ),
-            ));
-        }
-    } else {
-        fs::create_dir(destination)
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    }
-
-    let mut source_names = std::collections::BTreeSet::new();
-    let entries = fs::read_dir(source)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    for entry in entries {
-        let entry = entry
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-        let name = entry.file_name();
-        source_names.insert(name.clone());
-        let source_path = entry.path();
-        let destination_path = destination.join(name);
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-        if metadata.file_type().is_symlink() {
-            return Err(Failure::new(
-                SECRET_PROVISION_FAILED,
-                format!(
-                    "current data import rejects symlink {}",
-                    source_path.display()
-                ),
-            ));
-        }
-        if metadata.is_dir() {
-            copy_import_tree(&source_path, &destination_path, file_count, total_bytes)?;
-        } else if metadata.is_file() {
-            copy_import_regular(
-                &source_path,
-                &destination_path,
-                file_count,
-                total_bytes,
-                0o600,
-            )?;
-        } else {
-            return Err(Failure::new(
-                SECRET_PROVISION_FAILED,
-                format!(
-                    "current data import rejects special file {}",
-                    source_path.display()
-                ),
-            ));
-        }
-    }
-    let destination_entries = fs::read_dir(destination)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    for entry in destination_entries {
-        let entry = entry
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-        if !source_names.contains(&entry.file_name()) {
-            return Err(Failure::new(
-                SECRET_PROVISION_FAILED,
-                format!(
-                    "current data import destination contains material absent from the source: {}",
-                    entry.path().display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn copy_import_regular(
-    source: &Path,
-    destination: &Path,
-    file_count: &mut usize,
-    total_bytes: &mut u64,
-    mode: u32,
-) -> Result<(), Failure> {
-    let metadata = fs::symlink_metadata(source)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            format!("{} must be a real regular file", source.display()),
-        ));
-    }
-    if metadata.len() > MAX_IMPORT_FILE_BYTES {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            format!(
-                "current data import file exceeds 256 MiB: {}",
-                source.display()
-            ),
-        ));
-    }
-    *file_count += 1;
-    *total_bytes = total_bytes.saturating_add(metadata.len());
-    if *file_count > MAX_IMPORT_FILES || *total_bytes > MAX_IMPORT_TOTAL_BYTES {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            "current data import exceeds its 100000-file/4-GiB bound",
-        ));
-    }
-    if let Some(parent) = destination.parent() {
-        filesystem::ensure_directory_chain(parent)
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    }
-    // The source may be owned by NazoAuth's fixed container UID.  Open it
-    // through the descriptor primitive before comparing or copying so the
-    // owner, ancestor, link-count, mode, and no-follow checks apply to every
-    // imported file.
-    let mut source_file = open_import_source(source)?;
-
-    if destination.exists() {
-        let destination_metadata = fs::symlink_metadata(destination)
-            .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-        if !destination_metadata.is_file()
-            || destination_metadata.file_type().is_symlink()
-            || destination_metadata.len() != metadata.len()
-            || {
-                let mut destination_file =
-                    open_import_file(destination, "current data import destination")?;
-                filesystem::sha256_file(&mut destination_file, "current data import destination")
-                    .map_err(|error| {
-                        Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
-                    })?
-                    != filesystem::sha256_file(&mut source_file, "current data import").map_err(
-                        |error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())),
-                    )?
-            }
-        {
-            return Err(Failure::new(
-                SECRET_PROVISION_FAILED,
-                format!(
-                    "current data import destination differs from source: {}",
-                    destination.display()
-                ),
-            ));
-        }
-        return Ok(());
-    }
-    filesystem::copy_atomic_from_file(&mut source_file, destination, mode)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))
-}
-
-fn open_import_file(path: &Path, label: &str) -> Result<std::fs::File, Failure> {
-    #[cfg(unix)]
-    let opened =
-        filesystem::open_secure_regular_file_for_uid(path, label, false, NAZOAUTH_RUNTIME_UID);
-    #[cfg(not(unix))]
-    let opened = filesystem::open_secure_regular_file(path, label, false);
-    opened.map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))
-}
-
-fn open_import_source(source: &Path) -> Result<std::fs::File, Failure> {
-    open_import_file(source, "current data import")
-}
-
-fn copy_import_file(source: &Path, destination: &Path, label: &str) -> Result<(), Failure> {
-    let mut source_file = open_import_source(source)?;
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
-    (&mut source_file)
-        .take(129)
-        .read_to_end(&mut bytes)
-        .map_err(|error| Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string())))?;
-    if bytes.len() > 128 {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            format!("{label} exceeds the 128-byte limit"),
-        ));
-    }
-    let mut end = bytes.len();
-    while end > 0 && matches!(bytes[end - 1], b'\r' | b'\n') {
-        end -= 1;
-    }
-    use base64::Engine as _;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(&bytes[..end])
-        .map_err(|_| Failure::new(SECRET_PROVISION_FAILED, "imported MFA key is not base64url"))?;
-    if decoded.len() != 32 {
-        return Err(Failure::new(
-            SECRET_PROVISION_FAILED,
-            "imported MFA key must decode to exactly 32 bytes",
-        ));
-    }
-    let mut count = 0;
-    let mut bytes = 0;
-    copy_import_regular(source, destination, &mut count, &mut bytes, 0o440)
-        .map_err(|failure| Failure::new(failure.code, format!("{label}: {}", failure.detail)))
-}
-
 /// Everything the executor needs besides the order itself. Built by dispatch
 /// from the accepted operation; never serialized.
 pub(crate) struct InstallJob<'a> {
@@ -1087,13 +785,7 @@ impl HostInstallExecutor {
                 // requires exactly 32 bytes (settings.rs
                 // parse_required_32_byte_key); hex would fail that contract.
                 "mfa-totp-key" => {
-                    if let Some(import) = &job.order.current_data_import {
-                        copy_import_file(
-                            Path::new(&import.source_mfa_key_file),
-                            &path,
-                            "imported MFA key",
-                        )?;
-                    } else if !existed {
+                    if !existed {
                         use base64::Engine as _;
                         let value = base64::engine::general_purpose::URL_SAFE_NO_PAD
                             .encode(rand::random::<[u8; 32]>());
@@ -1199,9 +891,6 @@ impl HostInstallExecutor {
                     data_root.display()
                 )),
             ));
-        }
-        if let Some(import) = &job.order.current_data_import {
-            import_current_data(Path::new(&import.source_data_root), &data_root)?;
         }
         if kind.is_container() {
             set_runtime_identity_directory_data(&data_root, rootless_podman)?;
@@ -2524,79 +2213,8 @@ mod local_readiness_tests {
 }
 
 #[cfg(test)]
-mod current_data_import_tests {
+mod install_exec_tests {
     use super::*;
-
-    fn write_fixture(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> anyhow::Result<()> {
-        crate::filesystem::atomic_write(path.as_ref(), bytes.as_ref(), 0o600)
-    }
-
-    fn source_fixture(root: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(root.join("keys"))?;
-        fs::create_dir_all(root.join("avatars"))?;
-        fs::create_dir_all(root.join("secrets"))?;
-        fs::create_dir_all(root.join("instance"))?;
-        fs::create_dir_all(root.join("bootstrap"))?;
-        fs::create_dir_all(root.join("ui-releases"))?;
-        write_fixture(root.join("keys/signing.pem"), b"key")?;
-        write_fixture(root.join("avatars/user.jpg"), b"avatar")?;
-        for name in IMPORT_APP_SECRETS {
-            write_fixture(root.join("secrets").join(name), name.as_bytes())?;
-        }
-        write_fixture(root.join("secrets/unknown"), b"excluded")?;
-        write_fixture(root.join("instance/state"), b"excluded")?;
-        write_fixture(root.join("bootstrap/token"), b"excluded")?;
-        write_fixture(root.join("ui-releases/bundle"), b"excluded")?;
-        write_fixture(root.join("unknown"), b"excluded")?;
-        Ok(())
-    }
-
-    #[test]
-    fn import_copies_only_current_material_and_resumes_exactly() -> anyhow::Result<()> {
-        let temp = crate::filesystem::PrivateTempDir::new("current-data-import")?;
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        fs::create_dir(&source)?;
-        fs::create_dir(&destination)?;
-        source_fixture(&source)?;
-
-        import_current_data(&source, &destination)
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        import_current_data(&source, &destination)
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        assert_eq!(fs::read(destination.join("keys/signing.pem"))?, b"key");
-        assert_eq!(fs::read(destination.join("avatars/user.jpg"))?, b"avatar");
-        for name in IMPORT_APP_SECRETS {
-            assert!(destination.join("secrets").join(name).is_file());
-        }
-        for excluded in [
-            "instance",
-            "bootstrap",
-            "ui-releases",
-            "unknown",
-            "secrets/unknown",
-        ] {
-            assert!(!destination.join(excluded).exists(), "copied {excluded}");
-        }
-
-        write_fixture(destination.join("keys/signing.pem"), b"drift")?;
-        assert!(import_current_data(&source, &destination).is_err());
-
-        let mfa_source = temp.path().join("mfa-source");
-        let mfa_destination = temp.path().join("mfa-destination");
-        use base64::Engine as _;
-        write_fixture(
-            &mfa_source,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
-        )?;
-        copy_import_file(&mfa_source, &mfa_destination, "MFA")
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        copy_import_file(&mfa_source, &mfa_destination, "MFA")
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        write_fixture(&mfa_source, b"invalid")?;
-        assert!(copy_import_file(&mfa_source, &mfa_destination, "MFA").is_err());
-        Ok(())
-    }
 
     #[cfg(unix)]
     #[test]
@@ -2625,102 +2243,6 @@ mod current_data_import_tests {
         fs::write(&outside, b"deploy-test")?;
         symlink(&outside, &marker)?;
         assert!(!matches("deploy-test"));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn import_reads_runtime_uid_owned_material_without_staging() -> anyhow::Result<()> {
-        use std::os::unix::fs::chown;
-
-        let temp = crate::filesystem::PrivateTempDir::new("current-data-import-runtime-uid")?;
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        fs::create_dir(&source)?;
-        fs::create_dir(&destination)?;
-        source_fixture(&source)?;
-
-        let runtime_material = [
-            source.join("keys"),
-            source.join("keys/signing.pem"),
-            source.join("avatars"),
-            source.join("avatars/user.jpg"),
-            source.join("secrets"),
-            source.join("secrets/client-secret-pepper"),
-            source.join("secrets/dynamic-client-registration-initial-access-token"),
-            source.join("secrets/token-issuance-response-encryption-key"),
-        ];
-        for path in runtime_material {
-            match chown(
-                &path,
-                Some(NAZOAUTH_RUNTIME_UID),
-                Some(NAZOAUTH_RUNTIME_UID),
-            ) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        let mfa_source = temp.path().join("mfa-source");
-        let mfa_destination = temp.path().join("mfa-destination");
-        use base64::Engine as _;
-        fs::write(
-            &mfa_source,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]),
-        )?;
-        match chown(
-            &mfa_source,
-            Some(NAZOAUTH_RUNTIME_UID),
-            Some(NAZOAUTH_RUNTIME_UID),
-        ) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
-            Err(error) => return Err(error.into()),
-        }
-
-        import_current_data(&source, &destination)
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        copy_import_file(&mfa_source, &mfa_destination, "MFA")
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        assert_eq!(fs::read(destination.join("keys/signing.pem"))?, b"key");
-        assert_eq!(fs::read(destination.join("avatars/user.jpg"))?, b"avatar");
-        assert_eq!(fs::read(mfa_destination)?, fs::read(mfa_source)?);
-        Ok(())
-    }
-
-    #[test]
-    fn mfa_import_accepts_terminal_line_endings_but_rejects_other_whitespace() -> anyhow::Result<()>
-    {
-        let temp = crate::filesystem::PrivateTempDir::new("mfa-import-format")?;
-        use base64::Engine as _;
-        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
-
-        for (suffix, name) in [("\n", "lf"), ("\r\n", "crlf")] {
-            let source = temp.path().join(format!("source-{name}"));
-            let destination = temp.path().join(format!("destination-{name}"));
-            write_fixture(&source, format!("{key}{suffix}"))?;
-            copy_import_file(&source, &destination, "MFA")
-                .map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        }
-
-        for (value, name) in [
-            (format!(" {key}"), "leading-space"),
-            (format!("\n{key}"), "leading-lf"),
-            (format!("{}\n{}", &key[..20], &key[20..]), "internal-lf"),
-            (format!("{key} "), "trailing-space"),
-            (format!("{key}="), "padding"),
-            ("0123456789abcdef".repeat(4), "hex"),
-        ] {
-            let source = temp.path().join(format!("invalid-source-{name}"));
-            let destination = temp.path().join(format!("invalid-destination-{name}"));
-            write_fixture(&source, value)?;
-            assert!(
-                copy_import_file(&source, &destination, "MFA").is_err(),
-                "{name}"
-            );
-        }
-
         Ok(())
     }
 
@@ -2800,21 +2322,6 @@ mod current_data_import_tests {
         assert_eq!(outside_after.uid(), outside_before.uid());
         assert_eq!(outside_after.gid(), outside_before.gid());
         assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn import_rejects_symlinks_in_selected_trees() -> anyhow::Result<()> {
-        use std::os::unix::fs::symlink;
-        let temp = crate::filesystem::PrivateTempDir::new("current-data-import-link")?;
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        fs::create_dir(&source)?;
-        fs::create_dir(&destination)?;
-        source_fixture(&source)?;
-        symlink(source.join("keys/signing.pem"), source.join("keys/link"))?;
-        assert!(import_current_data(&source, &destination).is_err());
         Ok(())
     }
 }

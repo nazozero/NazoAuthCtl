@@ -31,7 +31,7 @@ use nazo_operator_protocol::{
 use crate::controller_identity::journal::{JournalState, OperationJournal, OperationJournalEntry};
 use crate::controller_identity::operation::{
     ControlOperationInput, SignedControlOperation, build_control_operation_with_id_and_kid,
-    build_signed_control_operation_with_id,
+    build_signed_control_operation_for_record,
 };
 use crate::registry::{InstanceRecord, RegistryStore};
 use crate::target::{
@@ -153,7 +153,7 @@ pub fn prepare_control_operation(
 
     let journaled = journal.load()?;
     if let Some(entry) = &journaled {
-        if let Some(prepared) = prepare_entry_resume(keys, journal, entry, &record, input)? {
+        if let Some(prepared) = prepare_entry_resume(entry, &record, input)? {
             return Ok(prepared);
         }
         // P1-2: the journal slot is single-occupancy. A changed payload under
@@ -174,7 +174,7 @@ pub fn prepare_control_operation(
 
     // Display observations are deliberately absent here. The live server's
     // admission response is the sole controller-validity/expiry decision.
-    let signed = build_signed_control_operation_with_id(keys, &record, input, None)?;
+    let signed = build_signed_control_operation_for_record(keys, &record, input)?;
     let prepared = PreparedOperation {
         signed,
         kind: AttemptKind::Fresh,
@@ -188,7 +188,6 @@ pub fn prepare_control_operation(
 /// different journal never mints a new operation id.
 pub fn prepare_pending_control_operation(
     registry: &RegistryStore,
-    keys: &ControllerKeyStore,
     journal: &OperationJournal,
     expected: &OperationJournalEntry,
     instance_selector: &str,
@@ -204,58 +203,19 @@ pub fn prepare_pending_control_operation(
             expected.operation_id
         );
     }
-    prepare_entry_resume(keys, journal, &entry, &record, input)
+    prepare_entry_resume(&entry, &record, input)
 }
 
 /// Prove current command mapping against an existing journal record, then
-/// construct the exact request that may be
-/// resent. Schema 2 never loads a signing key: the signed JWS is immutable
-/// recovery data. Schema 1 is a narrow migration path only while the original
-/// key still rebuilds exactly the same deterministic signature.
+/// construct the exact request that may be resent. The stored JWS is immutable
+/// recovery data, so resuming never loads a signing key.
 fn prepare_entry_resume(
-    keys: &ControllerKeyStore,
-    journal: &OperationJournal,
     entry: &OperationJournalEntry,
     record: &InstanceRecord,
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
-    if entry.is_legacy() {
-        let signed = build_signed_control_operation_with_id(
-            keys,
-            record,
-            input,
-            Some(&entry.operation_id),
-        )
-        .with_context(|| {
-            format!(
-                "legacy operation journal '{}' can resume only while its original signing key remains locally available; inspect the target outcome before clearing this entry",
-                entry.operation_id
-            )
-        })?;
-        if signed.kid != entry.kid {
-            bail!(
-                "legacy operation journal '{}' was signed by retired key '{}'; it cannot be safely migrated or replayed. Inspect the target outcome before clearing this entry",
-                entry.operation_id,
-                entry.kid
-            );
-        }
-        if signed.request_hash != entry.request_hash {
-            return Ok(None);
-        }
-        let prepared = PreparedOperation {
-            signed,
-            kind: AttemptKind::Resumed,
-        };
-        journal.upgrade_legacy_if_matches(entry, &prepared.journal_entry())?;
-        return Ok(Some(prepared));
-    }
-
-    let operation = build_control_operation_with_id_and_kid(
-        record,
-        input,
-        Some(&entry.operation_id),
-        &entry.kid,
-    );
+    let operation =
+        build_control_operation_with_id_and_kid(record, input, &entry.operation_id, &entry.kid);
     let request_hash = control_operation_request_hash(&operation)?;
     if request_hash != entry.request_hash {
         return Ok(None);
@@ -265,17 +225,13 @@ fn prepare_entry_resume(
             "journaled compact JWS payload does not match the stored operation identity; refusing to replay it"
         );
     }
-    let compact_jws = entry
-        .compact_jws
-        .as_deref()
-        .context("current operation journal schema lacks the original compact JWS")?;
     Ok(Some(PreparedOperation {
         signed: SignedControlOperation {
             operation_id: entry.operation_id.clone(),
             kid: entry.kid.clone(),
             deployment_id: record.deployment_id.clone(),
             request_hash,
-            compact_jws: compact_jws.to_owned(),
+            compact_jws: entry.compact_jws.clone(),
             operation,
         },
         kind: AttemptKind::Resumed,
@@ -291,11 +247,8 @@ fn journaled_payload_matches(
     entry: &OperationJournalEntry,
     operation: &nazo_operator_protocol::ControlOperation,
 ) -> anyhow::Result<bool> {
-    let compact_jws = entry
+    let payload = entry
         .compact_jws
-        .as_deref()
-        .context("current operation journal schema lacks the original compact JWS")?;
-    let payload = compact_jws
         .split('.')
         .nth(1)
         .context("journaled compact JWS has no payload segment")?;
@@ -507,7 +460,7 @@ mod tests {
     use super::*;
     use crate::controller_identity::admin_api::SlotsSnapshot;
     use crate::controller_identity::expiry;
-    use crate::controller_identity::journal::{JournalState, OPERATION_JOURNAL_SCHEMA};
+    use crate::controller_identity::journal::JournalState;
     use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
     use crate::filesystem;
     use crate::registry::{InstanceRecord, ObservationCache};
@@ -1007,7 +960,7 @@ mod tests {
         let protected = parts.next().context("test JWS header")?;
         let _original_payload = parts.next().context("test JWS payload")?;
         let signature = parts.next().context("test JWS signature")?;
-        tampered.compact_jws = Some(format!("{protected}.{replacement_payload}.{signature}"));
+        tampered.compact_jws = format!("{protected}.{replacement_payload}.{signature}");
         filesystem::atomic_write(
             journal.path(),
             &serde_json::to_vec_pretty(&tampered)?,
@@ -1022,86 +975,6 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(journal.load()?.context("retained journal")?, tampered);
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_journal_migrates_only_while_the_original_identity_is_still_active()
-    -> anyhow::Result<()> {
-        let f = fixture()?;
-        let old_key = f.keys.get_or_create_active("deploy-alpha")?;
-        let journal = f.journal()?;
-        let record = f.registry.instance_by_alias("production")?.unwrap();
-        let signed = build_signed_control_operation_with_id(
-            &f.keys,
-            &record,
-            input("rev-1"),
-            Some("01900000-0000-7000-8000-0000000000aa"),
-        )?;
-        let legacy = OperationJournalEntry {
-            schema: 1,
-            operation_id: signed.operation_id.clone(),
-            request_hash: signed.request_hash.clone(),
-            kid: signed.kid.clone(),
-            compact_jws: None,
-            created_at: chrono::Utc::now(),
-            state: JournalState::Dispatched,
-        };
-        journal.record_dispatched(&legacy)?;
-
-        let resumed = prepare_control_operation(
-            &f.registry,
-            &f.keys,
-            &journal,
-            "production",
-            input("rev-1"),
-        )?;
-        assert_eq!(resumed.kind, AttemptKind::Resumed);
-        assert_eq!(resumed.signed.compact_jws, signed.compact_jws);
-        let upgraded = journal.load()?.context("upgraded legacy journal")?;
-        assert_eq!(upgraded.schema, OPERATION_JOURNAL_SCHEMA);
-        assert_eq!(
-            upgraded.compact_jws.as_deref(),
-            Some(signed.compact_jws.as_str())
-        );
-        assert_eq!(upgraded.created_at, legacy.created_at);
-        drop(old_key);
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_journal_refuses_replay_after_its_key_is_retired() -> anyhow::Result<()> {
-        let f = fixture()?;
-        let old_key = f.keys.get_or_create_active("deploy-alpha")?;
-        let old_kid = old_key.kid().to_owned();
-        let journal = f.journal()?;
-        let record = f.registry.instance_by_alias("production")?.unwrap();
-        let signed = build_signed_control_operation_with_id(
-            &f.keys,
-            &record,
-            input("rev-1"),
-            Some("01900000-0000-7000-8000-0000000000bb"),
-        )?;
-        let legacy = OperationJournalEntry {
-            schema: 1,
-            operation_id: signed.operation_id,
-            request_hash: signed.request_hash,
-            kid: signed.kid,
-            compact_jws: None,
-            created_at: chrono::Utc::now(),
-            state: JournalState::Dispatched,
-        };
-        journal.record_dispatched(&legacy)?;
-        let replacement = f.keys.generate_candidate("deploy-alpha")?;
-        f.keys.set_active_kid("deploy-alpha", &replacement.kid)?;
-        f.keys.retire_kid("deploy-alpha", &old_kid)?;
-        drop(old_key);
-
-        let error =
-            prepare_control_operation(&f.registry, &f.keys, &journal, "production", input("rev-1"))
-                .expect_err("an unupgradeable legacy record must not be resigned by the new key");
-        assert!(format!("{error:#}").contains("retired key"), "{error:#}");
-        assert_eq!(journal.load()?.unwrap().schema, 1);
         Ok(())
     }
 
@@ -1323,7 +1196,6 @@ mod tests {
         assert!(
             prepare_pending_control_operation(
                 &f.registry,
-                &f.keys,
                 &journal,
                 &absent,
                 "production",
@@ -1344,7 +1216,6 @@ mod tests {
         assert!(
             prepare_pending_control_operation(
                 &f.registry,
-                &f.keys,
                 &journal,
                 &expected,
                 "production",
@@ -1359,7 +1230,6 @@ mod tests {
 
         let resumed = prepare_pending_control_operation(
             &f.registry,
-            &f.keys,
             &journal,
             &expected,
             "production",

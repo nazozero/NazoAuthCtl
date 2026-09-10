@@ -155,8 +155,6 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "--valkey-host",
             "--valkey-port",
             "--valkey-password-file",
-            "--import-data-root",
-            "--import-mfa-key-file",
         ],
         &[],
         "install",
@@ -276,17 +274,10 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         }
         Ok(Some(PathBuf::from(value)))
     };
-    let import_data_root = target_path("--import-data-root")?;
     let direct_tls_config = parsed.values.get("--direct-tls-config").map(PathBuf::from);
     let tls_material_root = target_path("--tls-material-root")?;
     if direct_tls_config.is_some() != tls_material_root.is_some() {
         bail!("--direct-tls-config and --tls-material-root must be supplied together");
-    }
-    let import_mfa_key_file = target_path("--import-mfa-key-file")?;
-    if import_data_root.is_some() != import_mfa_key_file.is_some() {
-        bail!(
-            "--import-data-root and --import-mfa-key-file must be supplied together for one current-format import"
-        );
     }
     Ok(InstallArgs {
         host: parsed.values.get("--host").cloned(),
@@ -307,8 +298,6 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         valkey_host,
         valkey_port,
         valkey_password_file,
-        import_data_root,
-        import_mfa_key_file,
     })
 }
 
@@ -555,36 +544,6 @@ mod install_tests {
         let parsed = parse_install_args(args)?;
         assert_eq!(parsed.direct_tls_config, Some("tls.yaml".into()));
         assert_eq!(parsed.tls_material_root, Some("/etc/nazo-tls".into()));
-        Ok(())
-    }
-
-    #[test]
-    fn current_data_import_paths_are_an_exact_pair() -> anyhow::Result<()> {
-        let mut paired = current_args();
-        paired.extend([
-            "--import-data-root".to_owned(),
-            "/srv/current-data".to_owned(),
-            "--import-mfa-key-file".to_owned(),
-            "/run/current-mfa".to_owned(),
-        ]);
-        let parsed = parse_install_args(paired)?;
-        assert!(parsed.import_data_root.is_some());
-        assert!(parsed.import_mfa_key_file.is_some());
-
-        let mut incomplete = current_args();
-        incomplete.extend([
-            "--import-data-root".to_owned(),
-            "/srv/current-data".to_owned(),
-        ]);
-        assert!(parse_install_args(incomplete).is_err());
-        let mut relative = current_args();
-        relative.extend([
-            "--import-data-root".to_owned(),
-            "relative/data".to_owned(),
-            "--import-mfa-key-file".to_owned(),
-            "/run/current-mfa".to_owned(),
-        ]);
-        assert!(parse_install_args(relative).is_err());
         Ok(())
     }
 

@@ -59,8 +59,8 @@ pub const ROLLBACK_ARTIFACT_MISSING: &str = "ROLLBACK_ARTIFACT_MISSING";
 /// Stable refusal code when the controller-required backup evidence changed
 /// between inspection and execution or aged out before the target lock gate.
 pub const BACKUP_UPDATE_PRECONDITION_FAILED: &str = "BACKUP_UPDATE_PRECONDITION_FAILED";
-/// Stable refusal code for a legacy deployment that has not imported its
-/// file-backed signing keys under a deployment-owned wrapping root.
+/// Stable refusal code when the deployment signing-key root is absent,
+/// malformed, or inaccessible to its runtime.
 pub const SIGNING_KEY_MIGRATION_REQUIRED: &str = "SIGNING_KEY_MIGRATION_REQUIRED";
 
 /// Validate the controller-inspected backup facts against the target-owned
@@ -99,7 +99,7 @@ fn require_shared_signing_key_root(
     let refusal = || {
         Failure::new(
             SIGNING_KEY_MIGRATION_REQUIRED,
-            "provision the deployment signing-key root, import existing keys, and configure its runtime access before updating; no runtime or database change was made",
+            "provision a valid deployment signing-key root and configure its runtime access before updating; no runtime or database change was made",
         )
     };
     let configured = super::backup_exec::parse_signing_key_encryption_config(config)
@@ -1045,7 +1045,7 @@ mod tests {
         .to_string();
         let refusal =
             require_shared_signing_key_root(directory, &config, RuntimeBackendKind::Host, &[])
-                .expect_err("old deployment requires explicit key migration");
+                .expect_err("missing signing-key root must refuse update");
         assert_eq!(refusal.code, SIGNING_KEY_MIGRATION_REQUIRED);
         assert!(!path.exists());
         filesystem::atomic_write(&path, URL_SAFE_NO_PAD.encode([42_u8; 32]).as_bytes(), 0o600)?;
@@ -1274,20 +1274,17 @@ mod tests {
             ports: vec!["127.0.0.1:29892->8000/tcp".to_owned()],
             networks: Vec::new(),
             mounts: vec![
-                mount("/run/secrets/database-runtime-url"),
-                mount("/run/secrets/valkey-url"),
-                mount("/run/secrets/mfa-key"),
+                mount("/app/.env.yaml"),
+                mount("/var/lib/nazo_oauth"),
+                mount("/run/secrets/mfa-totp-key"),
             ],
             safe_environment: BTreeMap::from([
                 (
-                    "DATABASE_URL_FILE".to_owned(),
-                    "/run/secrets/database-runtime-url".to_owned(),
+                    "NAZOAUTH_SERVER_CONFIG_FILE".to_owned(),
+                    "/app/.env.yaml".to_owned(),
                 ),
-                (
-                    "VALKEY_URL_FILE".to_owned(),
-                    "/run/secrets/valkey-url".to_owned(),
-                ),
-                ("DATA_DIR".to_owned(), "/var/lib/nazoauth".to_owned()),
+                ("DATA_DIR".to_owned(), "/var/lib/nazo_oauth".to_owned()),
+                ("DEPLOYMENT_ID".to_owned(), "deploy-test".to_owned()),
             ]),
             labels: BTreeMap::new(),
             evidence: Vec::new(),
@@ -1298,15 +1295,8 @@ mod tests {
             .expect("same artifact replacement");
         assert_eq!(unchanged.local_artifact_id, observation.local_artifact_id);
         assert_eq!(unchanged.ports, ["127.0.0.1:29892:8000/tcp"]);
-        assert_eq!(unchanged.mounts.len(), 1);
-        assert_eq!(
-            unchanged.mounts[0].destination,
-            PathBuf::from("/run/secrets/mfa-key")
-        );
-        assert_eq!(
-            unchanged.environment,
-            BTreeMap::from([("DATA_DIR".to_owned(), "/var/lib/nazoauth".to_owned())])
-        );
+        assert_eq!(unchanged.mounts, observation.mounts);
+        assert_eq!(unchanged.environment, observation.safe_environment);
 
         let changed = replacement_from_observation(&observation, "nazoauth", &next)
             .expect("changed artifact replacement");
@@ -1455,12 +1445,12 @@ mod tests {
     fn failed_activation_snapshot_retains_the_exact_live_surface() {
         let mut observation = owned_observation(RuntimeBackendKind::Podman);
         observation.safe_environment.insert(
-            "DATABASE_URL_FILE".to_owned(),
-            "/run/secrets/database-runtime-url".to_owned(),
+            "NAZOAUTH_SERVER_CONFIG_FILE".to_owned(),
+            "/app/.env.yaml".to_owned(),
         );
         observation.mounts.push(runtime_backend::NeutralMount {
-            source: PathBuf::from("/srv/nazoauth/database-runtime-url"),
-            destination: PathBuf::from("/run/secrets/database-runtime-url"),
+            source: PathBuf::from("/srv/nazoauth/config.yaml"),
+            destination: PathBuf::from("/app/.env.yaml"),
             read_only: true,
             selinux_relabel: false,
             ownership: runtime_backend::Responsibility::Managed,
@@ -1917,25 +1907,6 @@ pub(crate) fn replacement_from_observation(
         })
         .collect::<Result<Vec<_>, Failure>>()?;
 
-    let legacy_url_mounts = [
-        Path::new(super::install_exec::CONTAINER_SECRETS_DIR).join("database-runtime-url"),
-        Path::new(super::install_exec::CONTAINER_SECRETS_DIR).join("valkey-url"),
-    ];
-    let mounts = observation
-        .mounts
-        .iter()
-        .filter(|mount| !legacy_url_mounts.contains(&mount.destination))
-        .cloned()
-        .collect();
-    let environment = observation
-        .safe_environment
-        .iter()
-        .filter(|(name, _)| {
-            name.as_str() != "DATABASE_URL_FILE" && name.as_str() != "VALKEY_URL_FILE"
-        })
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-
     Ok(runtime_backend::RuntimeReplacement {
         object_reference: object.to_owned(),
         artifact: artifact.clone(),
@@ -1945,8 +1916,8 @@ pub(crate) fn replacement_from_observation(
             None
         },
         command,
-        mounts,
-        environment,
+        mounts: observation.mounts.clone(),
+        environment: observation.safe_environment.clone(),
         networks: observation.networks.clone(),
         ip_address: None,
         ports,
@@ -1955,10 +1926,8 @@ pub(crate) fn replacement_from_observation(
     })
 }
 
-/// Capture the live runtime surface used to undo a failed activation. Unlike
-/// a forward replacement this retains every observed mount and safe
-/// environment value because failure recovery must restore the object that
-/// was actually running, not reconstruct it from stale deployment state.
+/// Capture the live container runtime surface used to undo a failed activation.
+/// The shared replacement builder preserves the observed runtime surface.
 fn exact_replacement_from_observation(
     observation: &runtime_backend::RuntimeObservation,
     object: &str,
@@ -1969,10 +1938,7 @@ fn exact_replacement_from_observation(
             "a live systemd executable path is not a recoverable artifact source",
         ));
     }
-    let mut replacement = replacement_from_observation(observation, object, &observation.artifact)?;
-    replacement.mounts = observation.mounts.clone();
-    replacement.environment = observation.safe_environment.clone();
-    Ok(replacement)
+    replacement_from_observation(observation, object, &observation.artifact)
 }
 
 fn image_exists_locally(kind: RuntimeBackendKind, image: &str) -> Result<bool, Failure> {
