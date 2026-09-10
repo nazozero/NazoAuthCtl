@@ -1303,8 +1303,6 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         database_runtime_password: Some(database_runtime_password),
         database_lifecycle_password: Some(database_lifecycle_password),
         valkey_password: Some(valkey_password),
-        import_data_root: args.import_data_root,
-        import_mfa_key_file: args.import_mfa_key_file,
     };
     let report = crate::clean_install::run_clean_install(&context, request)?;
     println!("{report}");

@@ -29,7 +29,7 @@ use uuid::Uuid;
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
 
 /// Wire schema discriminator for HostOperation and HostResult messages.
-pub const HOST_PROTOCOL_SCHEMA: u32 = 10;
+pub const HOST_PROTOCOL_SCHEMA: u32 = 11;
 
 /// Maximum serialized HostOperation accepted from stdin or a local caller.
 /// A tenant-resource Apply may carry one 4 MiB change set encoded as base64,
@@ -2095,7 +2095,6 @@ mod tests {
                 },
             )
             .collect(),
-            current_data_import: None,
             database_runtime_endpoint: crate::target::install_exec::ExternalEndpoint {
                 host: "db.internal".to_owned(),
                 port: 5432,

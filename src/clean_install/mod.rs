@@ -92,8 +92,6 @@ pub(crate) struct CleanInstallRequest {
     pub(crate) database_runtime_password: Option<SecretMaterial>,
     pub(crate) database_lifecycle_password: Option<SecretMaterial>,
     pub(crate) valkey_password: Option<SecretMaterial>,
-    pub(crate) import_data_root: Option<std::path::PathBuf>,
-    pub(crate) import_mfa_key_file: Option<std::path::PathBuf>,
 }
 
 /// Injectable context mirroring the fleet command context: the user-scoped
@@ -657,15 +655,6 @@ fn build_install_order(
     let config_content = render_config_yaml(&request.issuer, deployment_id, state_epoch, &runtime)?;
     let config_sha256 = hex_digest(config_content.as_bytes());
 
-    let current_data_import = match (&request.import_data_root, &request.import_mfa_key_file) {
-        (Some(data), Some(mfa)) => Some(crate::target::install_exec::CurrentDataImport {
-            source_data_root: target_path(data, "--import-data-root")?,
-            source_mfa_key_file: target_path(mfa, "--import-mfa-key-file")?,
-        }),
-        (None, None) => None,
-        _ => bail!("current data import requires both target-local source paths"),
-    };
-
     let order = InstallOrder {
         artifact: OfficialArtifactRef {
             repository: SERVER_REPOSITORY.to_owned(),
@@ -754,7 +743,6 @@ fn build_install_order(
                 )?),
             },
         ],
-        current_data_import,
         database_runtime_endpoint: request.database_runtime_endpoint.clone(),
         database_lifecycle_endpoint: request.database_lifecycle_endpoint.clone(),
         valkey_endpoint: request.valkey_endpoint.clone(),
@@ -790,8 +778,6 @@ struct CanonicalInstallRequest<'a> {
     database_runtime_endpoint: &'a crate::target::install_exec::ExternalEndpoint,
     database_lifecycle_endpoint: &'a crate::target::install_exec::ExternalEndpoint,
     valkey_endpoint: &'a crate::target::install_exec::ExternalEndpoint,
-    import_data_root: Option<&'a str>,
-    import_mfa_key_file: Option<&'a str>,
 }
 
 /// Hash the exact non-secret target facts that identify an unfinished clean
@@ -808,22 +794,6 @@ fn canonical_install_request_hash(
         .as_ref()
         .map(|path| path.to_str().context("--install-root must be valid UTF-8"))
         .transpose()?;
-    let import_data_root = request
-        .import_data_root
-        .as_ref()
-        .map(|path| {
-            path.to_str()
-                .context("--import-data-root must be valid UTF-8")
-        })
-        .transpose()?;
-    let import_mfa_key_file = request
-        .import_mfa_key_file
-        .as_ref()
-        .map(|path| {
-            path.to_str()
-                .context("--import-mfa-key-file must be valid UTF-8")
-        })
-        .transpose()?;
     let canonical = CanonicalInstallRequest {
         schema: 1,
         host_id: host_id.to_string(),
@@ -836,8 +806,6 @@ fn canonical_install_request_hash(
         database_runtime_endpoint: &request.database_runtime_endpoint,
         database_lifecycle_endpoint: &request.database_lifecycle_endpoint,
         valkey_endpoint: &request.valkey_endpoint,
-        import_data_root,
-        import_mfa_key_file,
     };
     Ok(hex_digest(&serde_json::to_vec(&canonical)?))
 }

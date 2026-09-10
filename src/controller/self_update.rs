@@ -93,7 +93,6 @@ struct SelfUpdateJournal {
     to_sha256: String,
     rollback_artifact: PathBuf,
     rollback_sha256: String,
-    #[serde(default)]
     staged_artifact: Option<PathBuf>,
 }
 

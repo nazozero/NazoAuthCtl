@@ -151,7 +151,9 @@ Usage:
 
 Start here:
   nazoauthctl host add server-a --ssh prod-a --privilege sudo
-  nazoauthctl install --host server-a --name production --public-url https://auth.example.com
+  nazoauthctl install --help
+  nazoauthctl admin create --instance production
+  # bind authenticates that administrator and completes MFA before enrollment.
   nazoauthctl bind --instance production --label operations
   nazoauthctl status
   nazoauthctl update
@@ -255,8 +257,6 @@ re-establishes the Controller Key from the offline Recovery Secret (or, with
                      --database-lifecycle-password-file PATH
                      --valkey-host HOST --valkey-port PORT
                      --valkey-password-file PATH
-                     [--import-data-root TARGET_PATH
-                      --import-mfa-key-file TARGET_PATH]
                      [--to VERSION]
                      [--runtime podman|docker|host] [--install-root PATH]
                      [--direct-tls-config FILE --tls-material-root TARGET_DIR]

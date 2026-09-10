@@ -12,33 +12,20 @@ deployment must receive the same current and, during rotation, previous key
 ring. Include that root in deployment backups: the database ciphertext alone
 cannot recover private signing material.
 
-The controller and target helper use host protocol schema 10 for the expanded
+The controller and target helper use host protocol schema 11 for the expanded
 install secret contract. Upgrade both together; older helpers are rejected at
 the handshake before receiving an install order.
 
-## Existing deployments
+## Compatibility
 
-`--import-data-root` and `--import-mfa-key-file` are refused for database-backed
-installs. Copying a legacy `keys/` directory cannot seed the PostgreSQL signing
-keyset, so the controller never treats this as an implicit key migration. For a
-stopped file-backed deployment, first run the server's offline import with the
-deployment wrapping-key configuration and an active tenant:
-
-```
-nazoauth keys-import --tenant <tenant-uuid> --from <legacy-jwk-keys-directory>
-```
-
-Run the command with the same deployment wrapping key used by the existing
-deployment, while the old service is stopped. Keep the original key directory
-and a verified database backup, then continue with a managed artifact update
-for that deployment. Do not rerun clean install after importing: a fresh clean
-install mints a different deployment root and cannot decrypt the imported row.
+Before 0.5.0, the project iterates rapidly and does not preserve compatibility
+with historical releases. Only current formats are supported. The controller
+accepts only the current host protocol and local formats; it rejects a mismatch
+without converting historical key material, state, backups, or operation
+records.
 
 Artifact update does not generate a missing root or replace existing signing
-keys. Before upgrading a file-backed deployment, use the server's explicit
-key-import procedure with the chosen shared wrapping key and original key
-directory. Preserve the source files and a verified backup until migration is
-accepted. Configure the current key ID and key file on every runtime instance;
+keys. Configure the current key ID and key file on every runtime instance;
 container deployments must mount the canonical target secret file at
 `/run/secrets/signing-key-encryption-key`.
 

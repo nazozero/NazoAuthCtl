@@ -5,7 +5,8 @@
 //! recent top-level ControlOperation this ctl prepared:
 //!
 //! ```text
-//! { "schema": 1, "operation_id": …, "request_hash": …, "kid": …,
+//! { "schema": 2, "operation_id": …, "request_hash": …, "kid": …,
+//!   "compact_jws": …,
 //!   "created_at": …, "state": "dispatched" | "accepted" }
 //! ```
 //!
@@ -17,8 +18,8 @@
 //! directory per immutable deployment id — while the Registry is inventory
 //! only and must never become a second authority for operation state. The
 //! server-side operation journal (E03) remains the sole authority for
-//! acceptance; this file only lets ctl reuse `operation_id + request_hash`
-//! instead of minting a new identity.
+//! acceptance; this file retains the exact accepted-or-pending signed request
+//! so recovery does not depend on the current active key or configuration.
 //!
 //! Operational-log convergence (H04): this journal and the target-side
 //! `operations.jsonl` tell ONE plain-record story. Neither carries signing
@@ -32,9 +33,9 @@
 //!
 //! * Write-ahead: the entry is durable before the signed operation leaves ctl,
 //!   so a crash between signing and dispatch still resumes with the same id.
-//! * Same content ⇒ same id: resume rebuilds the envelope with the stored
-//!   operation id and re-signs; Ed25519 determinism yields byte-identical JWS,
-//!   so the server sees one operation, never duplicate side effects.
+//! * Same content ⇒ same id: resume proves the current command maps to the
+//!   stored request hash, then resends the original compact JWS. A key rotation
+//!   or retirement cannot turn an already accepted operation into a new one.
 //! * A definitively rejected (unaccepted) operation clears its entry; the next
 //!   attempt after fixing the cause mints a fresh operation_id.
 //! * Any drift in the journal file fails closed instead of being repaired.
@@ -74,10 +75,12 @@ impl Drop for InstanceJournalLock {
 }
 
 /// Schema discriminator for the operation journal file.
-pub const OPERATION_JOURNAL_SCHEMA: u32 = 1;
+pub const OPERATION_JOURNAL_SCHEMA: u32 = 2;
 
-/// Upper bound for the journal file (~1 KiB); real entries are ~300 bytes.
-const MAX_JOURNAL_BYTES: u64 = 1024;
+/// The compact JWS is bounded by the shared protocol. The remaining envelope
+/// fields are deliberately capped tightly enough to reject accidental files
+/// that are not one journal entry.
+const MAX_JOURNAL_BYTES: u64 = nazo_operator_protocol::MAX_COMPACT_JWS_BYTES as u64 + 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -96,17 +99,27 @@ pub struct OperationJournalEntry {
     pub operation_id: String,
     pub request_hash: String,
     pub kid: String,
+    /// The exact original request. This is public protocol data, never
+    /// change-set material; it lets accepted-operation recovery survive key
+    /// rotation and local retirement.
+    pub compact_jws: String,
     pub created_at: DateTime<Utc>,
     pub state: JournalState,
 }
 
 impl OperationJournalEntry {
-    pub fn new(operation_id: String, request_hash: String, kid: String) -> Self {
+    pub fn new(
+        operation_id: String,
+        request_hash: String,
+        kid: String,
+        compact_jws: String,
+    ) -> Self {
         Self {
             schema: OPERATION_JOURNAL_SCHEMA,
             operation_id,
             request_hash,
             kid,
+            compact_jws,
             created_at: Utc::now(),
             state: JournalState::Dispatched,
         }
@@ -116,6 +129,7 @@ impl OperationJournalEntry {
         self.operation_id == other.operation_id
             && self.request_hash == other.request_hash
             && self.kid == other.kid
+            && self.compact_jws == other.compact_jws
     }
 }
 
@@ -147,6 +161,20 @@ impl OperationJournal {
         {
             bail!(
                 "{STATE_RESET_REQUIRED}: operation journal entry does not conform ({})",
+                path.display()
+            );
+        }
+        let header = nazo_operator_protocol::protected_header(&entry.compact_jws).map_err(|error| {
+            anyhow::anyhow!(
+                "{STATE_RESET_REQUIRED}: operation journal compact JWS is malformed ({error}) ({})",
+                path.display()
+            )
+        })?;
+        if header.kid != entry.kid
+            || header.typ != nazo_operator_protocol::CONTROL_OPERATION_JWS_TYPE
+        {
+            bail!(
+                "{STATE_RESET_REQUIRED}: operation journal recovery fields do not conform ({})",
                 path.display()
             );
         }
@@ -347,6 +375,7 @@ mod tests {
     use super::*;
     use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
     use crate::filesystem;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     struct Fixture {
         _temp: filesystem::PrivateTempDir,
@@ -369,7 +398,19 @@ mod tests {
     }
 
     fn sample_entry(operation_id: &str) -> OperationJournalEntry {
-        OperationJournalEntry::new(operation_id.to_owned(), "ab".repeat(32), "a".repeat(43))
+        let kid = "a".repeat(43);
+        let header = serde_json::json!({
+            "alg": "EdDSA",
+            "kid": kid,
+            "typ": nazo_operator_protocol::CONTROL_OPERATION_JWS_TYPE,
+        });
+        let compact_jws = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("test header serializes")),
+            URL_SAFE_NO_PAD.encode(b"{}"),
+            URL_SAFE_NO_PAD.encode([0u8; 64]),
+        );
+        OperationJournalEntry::new(operation_id.to_owned(), "ab".repeat(32), kid, compact_jws)
     }
 
     #[test]
@@ -473,6 +514,28 @@ mod tests {
             .load()
             .expect_err("malformed controller kid");
         assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_journal_format_is_rejected_without_rewriting() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let journal = journal(&f)?;
+        for (schema, include_original_jws) in [(1, false), (1, true), (2, false)] {
+            let mut value =
+                serde_json::to_value(sample_entry("01900000-0000-7000-8000-000000000022"))?;
+            value["schema"] = serde_json::json!(schema);
+            if !include_original_jws {
+                value.as_object_mut().unwrap().remove("compact_jws");
+            }
+            let bytes = serde_json::to_vec(&value)?;
+            filesystem::atomic_write(journal.path(), &bytes, 0o600)?;
+            let error = journal
+                .load()
+                .expect_err("unsupported journal format accepted");
+            assert!(format!("{error:#}").contains(STATE_RESET_REQUIRED));
+            assert_eq!(fs::read(journal.path())?, bytes);
+        }
         Ok(())
     }
 

@@ -261,7 +261,6 @@ impl ConformanceSession {
             OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
         Ok(prepare_pending_control_operation(
             &self.registry,
-            &self.controller_keys,
             &journal,
             expected,
             &self.deployment_id,
@@ -289,7 +288,6 @@ impl ConformanceSession {
             OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
         let Some(prepared) = prepare_pending_control_operation(
             &self.registry,
-            &self.controller_keys,
             &journal,
             expected,
             &self.deployment_id,
