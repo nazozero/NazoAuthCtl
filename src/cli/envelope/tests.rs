@@ -34,6 +34,13 @@ fn render(code_line: &str, json_mode: bool) -> String {
 }
 
 #[test]
+fn artifact_failure_text_preserves_the_specific_reason() {
+    let error = anyhow::anyhow!("ARTIFACT_UNVERIFIED: Release provenance verification failed");
+    let rendered = render_failure("update", &EnvelopeContext::default(), &error, false);
+    assert!(rendered.contains("Release provenance verification failed"));
+}
+
+#[test]
 fn text_envelope_covers_the_stable_codes() {
     for code in [
         crate::error_codes::HOST_NOT_REGISTERED,

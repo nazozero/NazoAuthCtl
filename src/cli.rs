@@ -6,6 +6,7 @@
 
 pub(crate) mod envelope;
 mod help;
+pub(crate) mod language;
 mod parser;
 mod types;
 

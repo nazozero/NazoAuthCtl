@@ -731,12 +731,11 @@ fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> any
 }
 
 fn output_language() -> OutputLanguage {
-    OutputLanguage::from_locale(
-        ["LC_ALL", "LC_MESSAGES", "LANG"]
-            .into_iter()
-            .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
-            .as_deref(),
-    )
+    if nazoauthctl_core::chinese_output() {
+        OutputLanguage::Chinese
+    } else {
+        OutputLanguage::English
+    }
 }
 
 fn run_help(language: OutputLanguage) -> &'static str {

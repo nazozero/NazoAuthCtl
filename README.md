@@ -42,6 +42,20 @@ when the active NazoAuth process is unavailable.
 | Maintain the controller | self check, self update, self rollback |
 | Manage deployment TLS | tls certificate, tls acme |
 
+`nazoauthctl status` and `nazoauthctl status --all` display one row per instance:
+instance, host, verified release version, health, and latest backup time (UTC).
+Unrecorded versions display as unknown; artifact digests and internal identifiers
+are omitted. Use
+`nazoauthctl --json status` or `nazoauthctl --json status --all` for structured
+output; existing fields are preserved and `version` is added (null when unknown).
+Core help, status tables, and error headings/labels select Chinese for a `zh`
+locale, otherwise English, using the first nonempty `LC_ALL`, `LC_MESSAGES`, or
+`LANG`, as OIDF output does. Error details retain their diagnostic text and stable
+codes. For example, `LANG=zh_CN.UTF-8 nazoauthctl status --all` selects Chinese
+unless an `LC_*` override takes precedence. Text failures include the underlying
+reason; JSON field names and codes do not change with locale.
+See [v0.2.28 release notes](docs/release-notes-0.2.28.md).
+
 Read-only inspection works before controller binding. Mutations use signed
 control operations, with the first administrator created through the target's
 local deployment authority. Binding a Controller Key requires administrator

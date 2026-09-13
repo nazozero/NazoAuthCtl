@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-conformance"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-core"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1361,6 +1361,7 @@ dependencies = [
  "sha2",
  "tar",
  "tokio",
+ "unicode-width",
  "url",
  "urlencoding",
  "uuid",
@@ -1371,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-runtime"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "atomic-write-file",

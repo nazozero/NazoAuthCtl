@@ -97,6 +97,51 @@ struct Fixture {
 }
 
 #[test]
+fn status_summary_uses_release_facts_and_keeps_failed_instances() -> anyhow::Result<()> {
+    let record = InstanceRecord::new(
+        "deploy-alpha",
+        "production",
+        Uuid::now_v7(),
+        "https://auth.example.com",
+    )?;
+    let target = ScriptedTarget {
+        scenario: Scenario::Online,
+        target_id: record.host_id,
+    };
+    let mut inspection = target.inspection(&record.deployment_id)?;
+    inspection.current_release = Some(crate::target::ReleaseVersion::new("0.2.27")?);
+    let payload = status_document(&record, "helper", &inspection);
+    assert_eq!(payload["version"], "0.2.27");
+    assert!(payload.get("artifact").is_some());
+    let mut outcomes = vec![FleetItemOutcome {
+        instance: record.clone(),
+        host_alias: "local".into(),
+        result: Ok(payload),
+    }];
+    for chinese in [false, true] {
+        let table = status_table(&outcomes, chinese);
+        assert!(table.contains("production") && table.contains("0.2.27"));
+        assert!(!table.contains("deploy-alpha") && !table.contains("sha256"));
+        assert!(!table.contains("helper") && !table.contains("Controller"));
+        assert_eq!(table.lines().count(), 3);
+    }
+    inspection.current_release = None;
+    let payload = status_document(&record, "helper", &inspection);
+    assert!(payload["version"].is_null());
+    outcomes[0].result = Ok(payload);
+    assert!(status_table(&outcomes, true).contains("未知"));
+    outcomes.push(FleetItemOutcome {
+        instance: record,
+        host_alias: "offline".into(),
+        result: Err(("HOST_UNREACHABLE".into(), "connection refused".into())),
+    });
+    let table = status_table(&outcomes, true);
+    assert!(table.contains("查询失败") && table.contains("connection refused"));
+    println!("{table}");
+    Ok(())
+}
+
+#[test]
 fn controller_status_never_recovers_expiry_from_observation_text() -> anyhow::Result<()> {
     let host = crate::registry::HostRecord::new_ssh(
         "server-a",
