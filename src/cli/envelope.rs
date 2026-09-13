@@ -168,12 +168,36 @@ pub(crate) fn render_failure(
     pairs.push(("side_effects", side_effects_hint(&code).to_owned()));
     let next = next_command(&code);
     pairs.push(("code", code));
+    pairs.push(("detail", rendered));
     if let Some(next) = next {
         pairs.push(("next_command", next.to_owned()));
     }
     pairs
         .into_iter()
-        .map(|(label, value)| format!("{label}:{:<15}{value}", ""))
+        .map(|(label, value)| {
+            let label = if crate::chinese_output() {
+                match label {
+                    "action" => "操作",
+                    "host" => "主机",
+                    "instance" => "实例",
+                    "operation_id" => "操作 ID",
+                    "checkpoint" => "检查点",
+                    "side_effects" => "副作用",
+                    "code" => "错误码",
+                    "detail" => "原因",
+                    "next_command" => "下一步",
+                    _ => label,
+                }
+            } else {
+                label
+            };
+            let value = if crate::chinese_output() && value == "none" {
+                "无".to_owned()
+            } else {
+                value
+            };
+            format!("{label}: {value}")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

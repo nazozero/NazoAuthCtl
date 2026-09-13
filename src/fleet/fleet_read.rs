@@ -227,6 +227,7 @@ pub(crate) fn status_document(
         "issuer": inspection.issuer,
         "helper": helper,
         "revision": inspection.revision,
+        "version": inspection.current_release.as_ref().map(|release| &release.version),
         "runtime": {
             "kind": inspection.runtime.kind,
             "object": inspection.runtime.object,
@@ -292,6 +293,8 @@ pub(crate) fn render_fleet_report(
             }))
             .expect("fleet report is valid JSON")
         );
+    } else if title == "status" {
+        println!("{}", status_table(outcomes, crate::chinese_output()));
     } else {
         println!("{title}: {} instance(s)", outcomes.len());
         for item in outcomes {
@@ -329,6 +332,91 @@ fn compact_summary(payload: &Value) -> String {
 
 fn value_str(value: Option<&Value>) -> String {
     value.and_then(Value::as_str).unwrap_or("-").to_owned()
+}
+
+fn status_table(outcomes: &[FleetItemOutcome], chinese: bool) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let headers = if chinese {
+        ["实例", "主机", "版本", "健康", "最近备份 (UTC)"]
+    } else {
+        ["Instance", "Host", "Version", "Health", "Last backup (UTC)"]
+    };
+    let mut rows = vec![headers.map(str::to_owned)];
+    for item in outcomes {
+        let (version, health, backup) = match &item.result {
+            Ok(payload) => (
+                payload
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or(if chinese { "未知" } else { "unknown" })
+                    .to_owned(),
+                match payload.pointer("/health/state").and_then(Value::as_str) {
+                    Some("ok") => if chinese { "正常" } else { "ok" }.to_owned(),
+                    Some("down") => if chinese { "异常" } else { "down" }.to_owned(),
+                    _ => if chinese { "未知" } else { "unknown" }.to_owned(),
+                },
+                payload
+                    .pointer("/backup/snapshot/created_at")
+                    .and_then(Value::as_str)
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .map(|date| {
+                        date.with_timezone(&chrono::Utc)
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
+            Err(_) => (
+                "-".to_owned(),
+                if chinese { "查询失败" } else { "FAILED" }.to_owned(),
+                "-".to_owned(),
+            ),
+        };
+        rows.push([
+            item.instance.alias.clone(),
+            item.host_alias.clone(),
+            version,
+            health,
+            backup,
+        ]);
+    }
+    let widths: [usize; 5] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].width())
+            .max()
+            .unwrap_or(0)
+    });
+    let separator = widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>()
+        .join("-+-");
+    let mut lines = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        lines.push(
+            row.iter()
+                .enumerate()
+                .map(|(column, value)| {
+                    format!("{value}{}", " ".repeat(widths[column] - value.width()))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+                .trim_end()
+                .to_owned(),
+        );
+        if index == 0 {
+            lines.push(separator.clone());
+        }
+    }
+    for item in outcomes {
+        if let Err((code, detail)) = &item.result {
+            lines.push(format!(
+                "\n{} @ {}: {code}\n{detail}",
+                item.instance.alias, item.host_alias
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Marker error distinguishing "some fleet members failed" (full report
@@ -370,7 +458,10 @@ pub(crate) fn run_status_like(
         }
         let instances = store.list_instances()?;
         if instances.is_empty() {
-            println!("{command}: no instances are registered");
+            println!(
+                "{}",
+                crate::cli::language::text("No instances are registered", "尚未注册实例")
+            );
             return Ok(());
         }
         let mut items = Vec::with_capacity(instances.len());
@@ -407,15 +498,20 @@ pub(crate) fn run_status_like(
     let job: Arc<ReadJob> = Arc::new(if doctor { doctor_job } else { status_job });
     let outcomes = runner.run(vec![(record.clone(), host.clone())], job);
     let outcome = outcomes.into_iter().next().expect("one input, one outcome");
-    match outcome.result {
+    match &outcome.result {
         Ok(payload) => {
             if json_mode {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&payload).expect("status doc is valid JSON")
                 );
+            } else if doctor {
+                print_single_status(&record, &host.alias, payload, doctor);
             } else {
-                print_single_status(&record, &host.alias, &payload, doctor);
+                println!(
+                    "{}",
+                    status_table(std::slice::from_ref(&outcome), crate::chinese_output())
+                );
             }
             Ok(())
         }

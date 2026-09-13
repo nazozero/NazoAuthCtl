@@ -20,6 +20,7 @@ mod tls;
 pub(crate) use nazoauthctl_runtime::filesystem;
 pub(crate) use nazoauthctl_runtime::process;
 
+pub use cli::language::chinese_output;
 pub use cli::{GlobalOptions, parse_global_options};
 pub use conformance::{
     ConformanceControlCompletion, ConformanceControlOutcome, ConformanceDeploymentEvidence,
@@ -75,7 +76,8 @@ pub fn main_entry() {
             let envelope =
                 cli::envelope::render_failure(&action, &envelope_context, &error, json_mode);
             if !json_mode && std::io::stderr().is_terminal() {
-                let _ = cliclack::log::error(format!("Command failed\n\n{envelope}"));
+                let title = cli::language::text("Command failed", "命令执行失败");
+                let _ = cliclack::log::error(format!("{title}\n\n{envelope}"));
             } else {
                 eprintln!("{envelope}");
             }
@@ -88,6 +90,16 @@ pub fn main_entry() {
 
 fn print_entry_error(title: &str, detail: &str) {
     use std::io::IsTerminal as _;
+
+    let title = if chinese_output() {
+        match title {
+            "Invalid command" => "命令无效",
+            "Argument parsing failed" => "参数解析失败",
+            _ => title,
+        }
+    } else {
+        title
+    };
 
     if std::io::stderr().is_terminal() {
         let _ = cliclack::log::error(format!("{title}\n\n{detail}"));
@@ -128,7 +140,11 @@ fn command_action(command: &cli::Command) -> &'static str {
 fn print_help(topic: cli::HelpTopic) {
     use std::io::IsTerminal as _;
 
-    let help = help_text(topic);
+    let help = if chinese_output() {
+        cli::language::chinese_help(topic)
+    } else {
+        help_text(topic).to_owned()
+    };
     if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
         let _ = cliclack::note("NazoAuthCtl", help);
     } else {
