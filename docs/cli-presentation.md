@@ -13,12 +13,16 @@ nazoauthctl --json status --all
 nazoauthctl --json self verify-state
 ```
 
-Default output presents results, relevant fields, and next steps. Host, instance,
+Default output presents results, relevant fields, and next steps. Failed host or
+instance observations retain their diagnostics beneath the table. Controller
+expiry notices retain server warnings even when the local clock disagrees. Host, instance,
 status and operation listings use tables that account for Chinese character width.
 Update and rollback show the release version, health and configuration revision;
 the update report derives rollback availability from the resulting target state.
 Internal SHA digests are omitted from ordinary summaries. They remain part of
-artifact verification and structured metadata.
+artifact verification and structured metadata. Cached success prose and full
+OIDF configuration templates are available through `--json`, rather than
+duplicated in the human summary.
 
 Every command family has English and Chinese help. TLS and OIDF artifact commands
 default to readable fields rather than a JSON dump. `--json`, placed before the
@@ -33,7 +37,9 @@ failure codes in Chinese and retain the original diagnostic separately.
 Uninstall shows its concrete deletion plan before asking for confirmation, with
 No selected initially. A pipe cannot answer this prompt: use `--yes` explicitly
 for scripted deletion, or omit it to inspect the plan. Required interactive inputs
-reject blank answers without restarting the operation. Recovery-secret delivery
+reject blank answers without restarting the operation. Administrator email and
+password prompts reuse the same validation as credential files and retry invalid
+input in place. Recovery-secret delivery
 requires an interactive input and output terminal; JSON and pipeline callers must
 use `--output-secret-file`. No secret is printed before that check. The terminal
 asks the operator to type `STORED` after saving the displayed secret.

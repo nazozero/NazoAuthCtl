@@ -177,8 +177,26 @@ fn instance_names_are_not_translated_as_status_tokens() {
         0o600,
     )
     .unwrap();
+    store
+        .set_instance_observation(
+            "deploy-presentation",
+            nazoauthctl_core::registry::ObservationCache::now(
+                true,
+                "rev=8 artifact=sha256:internal-digest",
+            ),
+        )
+        .unwrap();
     let output = sandbox.run(&["instance", "show", "healthy"], "zh_CN.UTF-8");
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("healthy"), "{}", stdout(&output));
     assert!(!stdout(&output).trim_start().starts_with('{'));
+    assert!(!stdout(&output).contains("internal-digest"));
+    let machine = sandbox.run(&["--json", "instance", "show", "healthy"], "zh_CN.UTF-8");
+    let value: serde_json::Value = serde_json::from_slice(&machine.stdout).unwrap();
+    assert!(
+        value["observation"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("internal-digest")
+    );
 }

@@ -964,6 +964,13 @@ pub fn slots_flow<A: ControllerRegistryApi>(
         if !matches!(expiry, expiry::ExpiryStatus::Ok { .. }) {
             report.push_str(&format!("\n{}: {}", slot.label, expiry.render()));
         }
+        if slot.warning.is_some() {
+            report.push_str(&format!(
+                "\n{}:{}",
+                slot.label,
+                expiry::server_warning(slot)
+            ));
+        }
     }
     Ok(report)
 }
@@ -2236,6 +2243,16 @@ mod tests {
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 0)]);
         let report = slots_flow(&api, &f.registry, &f.keys, None)?;
         assert!(report.contains("EXPIRED"), "{report}");
+
+        let mut server_warned = slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 20);
+        server_warned.warning =
+            Some(crate::controller_identity::admin_api::ExpiryWarningKind::Urgent24h);
+        api.push_snapshot(vec![server_warned]);
+        let report = slots_flow(&api, &f.registry, &f.keys, None)?;
+        assert!(
+            report.contains("server-warning=urgent_24h"),
+            "server warning must survive local clock disagreement: {report}"
+        );
 
         let record = f.registry.instance_by_deployment("deploy-alpha")?.unwrap();
         assert!(

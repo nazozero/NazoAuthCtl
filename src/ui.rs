@@ -408,8 +408,28 @@ pub(crate) fn render_value(value: &serde_json::Value) -> String {
                     {
                         continue;
                     }
-                    let name = label(key);
-                    if value.is_object() || value.is_array() {
+                    // Cached success prose duplicates the visible status and can contain
+                    // internal digests. Failed observations retain their original diagnostic.
+                    if key_context == "observation"
+                        && key == "summary"
+                        && map.get("reachable").and_then(serde_json::Value::as_bool) == Some(true)
+                    {
+                        continue;
+                    }
+                    let name = if key_context == "observation" && key == "summary" {
+                        text("Original diagnostic", "诊断详情（原文）").to_owned()
+                    } else {
+                        label(key)
+                    };
+                    if key == "config_template" {
+                        lines.push(format!(
+                            "{indent}{name}: {}",
+                            text(
+                                "Use --json for the full template",
+                                "使用 --json 查看完整模板"
+                            )
+                        ));
+                    } else if value.is_object() || value.is_array() {
                         lines.push(format!("{indent}{name}:"));
                         append(value, depth + 1, key, lines);
                     } else {

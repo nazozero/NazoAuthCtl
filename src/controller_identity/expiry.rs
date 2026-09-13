@@ -101,11 +101,8 @@ pub fn human_duration(seconds: i64) -> String {
     }
 }
 
-/// Render one slot row for `controller slots` output including the live
-/// classification against `now`.
-pub fn render_slot_line(slot: &ControllerSlotView, now: DateTime<Utc>) -> String {
-    let status = ExpiryStatus::classify(now, slot.expires_at);
-    let warning = match slot.warning {
+pub(super) fn server_warning(slot: &ControllerSlotView) -> &'static str {
+    match slot.warning {
         Some(kind) => match kind {
             crate::controller_identity::admin_api::ExpiryWarningKind::Expiring7d => {
                 crate::ui::text(" server-warning=expiring_7d", " 服务端提醒：7 天内到期")
@@ -115,7 +112,14 @@ pub fn render_slot_line(slot: &ControllerSlotView, now: DateTime<Utc>) -> String
             }
         },
         None => "",
-    };
+    }
+}
+
+/// Render one slot row for `controller slots` output including the live
+/// classification against `now`.
+pub fn render_slot_line(slot: &ControllerSlotView, now: DateTime<Utc>) -> String {
+    let status = ExpiryStatus::classify(now, slot.expires_at);
+    let warning = server_warning(slot);
     crate::ui::message!(
         "slot {} controller {} label '{}' {} [{}]{}\n",
         "槽位 {} | 控制器 {} | 名称“{}” | 密钥 {} | 状态 {}{}\n",

@@ -76,20 +76,29 @@ fn parse_credentials(bytes: &[u8], source: &str) -> anyhow::Result<AdminCredenti
 
 fn read_interactive(command: &str) -> anyhow::Result<AdminCredentials> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        bail!(
-            "{command} needs an interactive terminal or an explicit credentials input; passwords are never accepted on argv"
+        crate::ui::fail!(
+            "{command} needs an interactive terminal or an explicit credentials input; passwords are never accepted on argv",
+            "{command} 需要交互终端，或通过凭据文件／标准输入提供凭据；不接受命令行密码"
         );
     }
     let email: String = cliclack::input(crate::ui::text("Administrator email", "管理员邮箱"))
         .required(false)
-        .validate(crate::ui::required_input)
+        .validate(|value: &String| validate_admin_email(value).map_err(|error| error.to_string()))
         .interact()
-        .context("failed to read administrator email")?;
+        .context(crate::ui::text(
+            "failed to read administrator email",
+            "无法读取管理员邮箱",
+        ))?;
     let password = cliclack::password(crate::ui::text("Administrator password", "管理员密码"))
         .allow_empty()
-        .validate(crate::ui::required_input)
+        .validate(|value: &String| {
+            validate_admin_password(value).map_err(|error| error.to_string())
+        })
         .interact()
-        .context("failed to read administrator password")?;
+        .context(crate::ui::text(
+            "failed to read administrator password",
+            "无法读取管理员密码",
+        ))?;
     Ok(AdminCredentials {
         email: email.trim().to_owned(),
         password: Zeroizing::new(password),
@@ -97,16 +106,29 @@ fn read_interactive(command: &str) -> anyhow::Result<AdminCredentials> {
 }
 
 pub(crate) fn validate_admin_credentials(credentials: &AdminCredentials) -> anyhow::Result<()> {
-    let email = credentials.email.trim();
+    validate_admin_email(&credentials.email)?;
+    validate_admin_password(&credentials.password)
+}
+
+fn validate_admin_email(email: &str) -> anyhow::Result<()> {
+    let email = email.trim();
     if !(5..=254).contains(&email.len())
         || !email.contains('@')
         || email.contains(['\n', '\r', '\0', ' '])
     {
-        bail!("{INPUT_INVALID}: administrator email is invalid");
+        crate::ui::fail!(
+            "{INPUT_INVALID}: administrator email is invalid",
+            "{INPUT_INVALID}：管理员邮箱格式不正确"
+        );
     }
-    if !(12..=1024).contains(&credentials.password.len()) {
-        bail!(
-            "{INPUT_INVALID}: administrator password must contain between 12 and 1024 UTF-8 bytes"
+    Ok(())
+}
+
+fn validate_admin_password(password: &str) -> anyhow::Result<()> {
+    if !(12..=1024).contains(&password.len()) {
+        crate::ui::fail!(
+            "{INPUT_INVALID}: administrator password must contain between 12 and 1024 UTF-8 bytes",
+            "{INPUT_INVALID}：管理员密码的 UTF-8 长度须为 12 到 1024 字节"
         );
     }
     Ok(())

@@ -426,7 +426,7 @@ fn host_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String> {
             ]
         })
         .collect::<Vec<_>>();
-    let report = crate::ui::table(
+    let mut report = crate::ui::table(
         &[
             crate::ui::text("Host", "主机"),
             crate::ui::text("Connection", "连接"),
@@ -436,6 +436,19 @@ fn host_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String> {
         ],
         &rows,
     );
+    for host in &hosts {
+        if host
+            .last_observation
+            .as_ref()
+            .is_some_and(|entry| !entry.reachable)
+        {
+            report.push_str(&format!(
+                "\n{}: {}",
+                host.alias,
+                observation_summary_line(host.last_observation.as_ref()).trim()
+            ));
+        }
+    }
     Ok(report)
 }
 
@@ -700,7 +713,7 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
             observation_marker(instance.last_observation.as_ref()),
         ]);
     }
-    let report = crate::ui::table(
+    let mut report = crate::ui::table(
         &[
             crate::ui::text("Instance", "实例"),
             crate::ui::text("Host", "主机"),
@@ -709,6 +722,19 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
         ],
         &rows,
     );
+    for instance in &instances {
+        if instance
+            .last_observation
+            .as_ref()
+            .is_some_and(|entry| !entry.reachable)
+        {
+            report.push_str(&format!(
+                "\n{}: {}",
+                instance.alias,
+                observation_summary_line(instance.last_observation.as_ref()).trim()
+            ));
+        }
+    }
     Ok(report)
 }
 
@@ -1219,6 +1245,7 @@ mod tests {
         let report = host_list(&fixture.context, true)?;
         assert!(report.contains("server-dead"), "row must survive: {report}");
         assert!(report.contains("error ("), "{report}");
+        assert!(report.contains("timed out"), "{report}");
         assert!(
             report
                 .lines()

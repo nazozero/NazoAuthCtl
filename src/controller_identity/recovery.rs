@@ -417,14 +417,14 @@ pub(crate) fn rotate_root_with_new_secret(
              command issues a fresh one safely",
         )?;
     let generation = root.generation.unwrap_or_default();
-    Ok(format!(
-        "recovery root ready for deployment '{deployment_id}' (generation {generation}, kdf {})\n\
-         replaced generation: {}\n\
-         \n\
-         the replacement secret was delivered and acknowledged BEFORE this commit ran; the old \
-         generation stopped verifying when the commit landed.\n",
+    Ok(crate::ui::message!(
+        "recovery root ready for deployment '{deployment_id}' (generation {generation}, kdf {})\nreplaced generation: {}\n\nThe replacement secret was delivered before commit; the old generation is no longer valid.\n",
+        "部署“{deployment_id}”的恢复密钥已更新\n\n当前代次：{generation}\n派生算法：{}\n上一代次：{}\n\n新密钥已在提交前交付保存；旧密钥现已失效。\n",
         root.kdf.as_deref().unwrap_or("-"),
-        previous.map_or("none (first enrollment)".to_owned(), |g| g.to_string()),
+        previous.map_or_else(
+            || crate::ui::text("none (first enrollment)", "无（首次配置）").to_owned(),
+            |g| g.to_string()
+        ),
     ))
 }
 
