@@ -1158,7 +1158,10 @@ fn approval_callback<'a, A: ControllerRegistryApi>(
     issue_with_admin_access: bool,
 ) -> impl FnOnce(&ProposalPresentation) -> anyhow::Result<String> + 'a {
     move |presentation| {
-        crate::ui::print_report(&presentation.render());
+        // Keep JSON stdout to the terminal result; this is a human approval preview.
+        if !crate::ui::json_mode() {
+            crate::ui::print_report(&presentation.render());
+        }
         if token.is_some() || !issue_with_admin_access {
             return obtain_approval_token(token, presentation.action);
         }

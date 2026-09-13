@@ -24,7 +24,8 @@ Every command family has English and Chinese help. TLS and OIDF artifact command
 default to readable fields rather than a JSON dump. `--json`, placed before the
 command, retains structured metadata without localized keys or values. Commands
 whose result was previously only prose return a `schema: 1, message: ...` object
-in JSON mode. Help remains text. Core errors are JSON on stderr; OIDF errors retain
+in JSON mode. Intermediate approval previews are omitted from JSON stdout,
+so the terminal result remains one document. Help remains text. Core errors are JSON on stderr; OIDF errors retain
 their existing JSON stdout contract. Raw service logs, external diagnostics and
 protocol payloads keep their original text. Human error envelopes explain known
 failure codes in Chinese and retain the original diagnostic separately.
