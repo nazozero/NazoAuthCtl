@@ -90,7 +90,18 @@ impl RecoveryJournal {
             true,
             MAX_BYTES,
         )?;
-        let plan: RecoveryPlan = serde_json::from_slice(&bytes)
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("schema").and_then(serde_json::Value::as_u64) == Some(1) {
+            // Schema 1 explicitly defaulted absent transport flags to HTTP.
+            if let Some(candidate) = value
+                .get_mut("candidate")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                candidate.entry("https").or_insert(false.into());
+            }
+            value["schema"] = SCHEMA.into();
+        }
+        let plan: RecoveryPlan = serde_json::from_value(value)
             .with_context(|| format!("{} is not a valid recovery plan", self.path.display()))?;
         validate(&plan)?;
         Ok(Some(plan))
@@ -255,6 +266,29 @@ mod tests {
             value.as_object_mut().unwrap().remove("https");
             assert!(serde_json::from_value::<CandidatePointer>(value).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn published_recovery_plan_keeps_operation_ids_and_http_default() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("ctl-recovery-compat")?;
+        let journal = RecoveryJournal::open(temp.path())?;
+        let original = staged_plan();
+        let mut value = serde_json::to_value(&original)?;
+        value["schema"] = 1.into();
+        value["candidate"].as_object_mut().unwrap().remove("https");
+        let bytes = serde_json::to_vec(&value)?;
+        filesystem::atomic_write(&journal.path, &bytes, 0o600)?;
+        let loaded = journal.load()?.unwrap();
+        assert_eq!(loaded.recover_operation_id, original.recover_operation_id);
+        assert_eq!(
+            loaded.candidate_stage_operation_id,
+            original.candidate_stage_operation_id
+        );
+        assert!(!loaded.candidate.as_ref().unwrap().https);
+        assert_eq!(std::fs::read(&journal.path)?, bytes);
+        journal.store(&loaded)?;
+        assert_eq!(journal.load()?.unwrap().schema, SCHEMA);
         Ok(())
     }
 }

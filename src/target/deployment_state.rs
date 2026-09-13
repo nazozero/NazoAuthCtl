@@ -53,9 +53,10 @@
 //! Store conventions match every other ctl store: atomic writes, secure
 //! regular-file reads with size caps, `deny_unknown_fields` plus an explicit
 //! schema discriminator, exclusive fs2 locking for read-modify-write, and
-//! fail-closed errors. A document that does not parse as the current schema
-//! fails with the stable [`crate::error_codes::STATE_RESET_REQUIRED`] code
-//! naming the file; there is no lenient reader and no conversion.
+//! explicit historical readers. Known older formats normalize without changing
+//! source bytes on reads; locked mutations save the current format. Unknown or
+//! corrupt documents are preserved and reported with
+//! [`crate::error_codes::STATE_RESET_REQUIRED`].
 
 use std::path::{Path, PathBuf};
 
@@ -410,7 +411,7 @@ impl DeploymentState {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.schema != DEPLOYMENT_STATE_SCHEMA {
             bail!(
-                "STATE_RESET_REQUIRED: unsupported DeploymentState schema {} (expected {DEPLOYMENT_STATE_SCHEMA}); please clean up obsolete ctl state and run adopt/clean-install",
+                "STATE_RESET_REQUIRED: unsupported DeploymentState schema {} (expected {DEPLOYMENT_STATE_SCHEMA}); preserve the state and use a controller supporting this format",
                 self.schema
             );
         }
@@ -653,12 +654,8 @@ impl TargetStateStore {
             MAX_STATE_BYTES,
         )
         .map_err(|error| unreadable_state(deployment_id, &path, &error))?;
-        let state: DeploymentState =
-            serde_json::from_slice(&bytes).map_err(|error| invalid_state(&path, &error))?;
-        state
-            .validate()
-            .map_err(|error| invalid_state(&path, &error))?;
-        Ok(state)
+        super::persistence::read_deployment_state(&bytes)
+            .map_err(|error| invalid_state(&path, &error))
     }
 
     /// Enumerate every deployment whose state document exists under this root
@@ -1501,8 +1498,8 @@ fn unreadable_state(deployment_id: &str, path: &Path, error: &dyn std::fmt::Disp
         STATE_RESET_REQUIRED,
         format!(
             "target DeploymentState is missing, unsafe to read, or \
-             oversized ({path_display}): {error}; back the file up, remove the deployment \
-             directory, then re-register/bootstrap the instance",
+             oversized ({path_display}): {error}; preserve the deployment state and \
+             use a controller supporting its format",
             path_display = path.display()
         ),
     )
@@ -1513,8 +1510,8 @@ fn invalid_state(path: &Path, error: &dyn std::fmt::Display) -> Failure {
         STATE_RESET_REQUIRED,
         format!(
             "target DeploymentState does not conform to the current \
-             schema ({path_display}): {error}; back the file up, remove the deployment \
-             directory, then re-register/bootstrap the instance",
+             schema ({path_display}): {error}; preserve the deployment state and \
+             use a controller supporting its format",
             path_display = path.display()
         ),
     )
@@ -1748,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_deployment_state_schema_requires_explicit_reset() -> anyhow::Result<()> {
+    fn historical_state_without_required_recovery_facts_is_rejected() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("nazoauthctl-schema-cutover")?;
         let store = TargetStateStore::open(temp.path().join("state"))?;
         let state = store.bootstrap(
@@ -1757,7 +1754,7 @@ mod tests {
             "bootstrap",
         )?;
         let mut value = serde_json::to_value(state)?;
-        value["schema"] = serde_json::Value::from(DEPLOYMENT_STATE_SCHEMA - 1);
+        value["schema"] = serde_json::Value::from(7);
         let scope = journal::deployment_scope("deploy-schema-cutover")?;
         crate::filesystem::atomic_write(
             &store.state_path(&scope),
@@ -1767,7 +1764,7 @@ mod tests {
 
         let failure = store
             .load_existing("deploy-schema-cutover")
-            .expect_err("previous state schema accepted");
+            .expect_err("missing historical recovery policy accepted");
         assert_eq!(failure.code, STATE_RESET_REQUIRED);
         Ok(())
     }

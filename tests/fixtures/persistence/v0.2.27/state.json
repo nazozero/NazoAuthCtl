@@ -1,0 +1,15 @@
+{
+  "schema": 7,
+  "deployment_id": "deploy-upgrade",
+  "issuer": "https://auth.example.com",
+  "runtime": {"kind":"podman","object":"nazoauth-upgrade","loopback_port":8000},
+  "artifact": {"current":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","previous":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+  "config": {"reference":"/etc/nazoauth/config.json","schema":"nazoauth-config-v1","revision":8},
+  "resources": [],
+  "local_health": {"healthy":true,"summary":"ready","checked_at":"2026-09-05T15:00:00Z"},
+  "current_rollback_policy": {"artifact":true,"schema_compatible":false,"database_restore":"backup","irreversible_migration":true,"minimum_supported_version":"0.2.11","migration_floor":"20260905000100","rationale":"Database recovery requires the pre-update snapshot."},
+  "previous_rollback_policy": {"artifact":true,"schema_compatible":true,"database_restore":"backup","irreversible_migration":false,"minimum_supported_version":"0.2.0","migration_floor":"20260828000600","rationale":"Previous release permits artifact rollback."},
+  "active_host_operation": {"operation_id":"01900000-0000-7000-8000-000000000001","applied_at":"2026-09-05T15:00:00Z"},
+  "current_release": {"version":"0.2.11"},
+  "previous_release": {"version":"0.2.10"}
+}

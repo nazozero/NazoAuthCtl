@@ -286,6 +286,7 @@ fn create_snapshot(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut manifest = SnapshotManifest {
         schema: backup::BACKUP_MANIFEST_SCHEMA,
+        rollback_policy: None,
         deployment_id: state.deployment_id.clone(),
         snapshot_id: snapshot_id.to_string(),
         created_at: Utc::now(),
@@ -3129,6 +3130,7 @@ mod tests {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut manifest = SnapshotManifest {
             schema: backup::BACKUP_MANIFEST_SCHEMA,
+            rollback_policy: None,
             deployment_id: deployment_id.to_owned(),
             snapshot_id: operation_id.clone(),
             created_at: Utc::now(),

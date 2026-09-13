@@ -27,6 +27,16 @@ use crate::instance_lifecycle::{LifecycleContext, UpdateRequest};
 use crate::registry::{HostTransport, RegistryStore};
 
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
+    if !matches!(
+        cli.command,
+        Command::SelfVerifyState
+            | Command::RemoteExec
+            | Command::SelfUpdate { .. }
+            | Command::SelfRollback
+            | Command::SelfCheck(_)
+    ) {
+        super::self_update::repair_interrupted_update()?;
+    }
     // Copied out before the command is moved; selector helpers close over these.
     let global_instance = cli.instance.clone();
     let json_mode = cli.json;
@@ -139,6 +149,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Tls(command) => crate::tls::run(instance_flag, command, super::require_root),
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
         Command::SelfCheck(version) => super::self_update::controller_check(version.as_deref()),
+        Command::SelfVerifyState => super::state_check::run(),
         Command::SelfUpdate { version } => {
             super::require_self_update_privilege()?;
             super::self_update::controller_update(version.as_deref())

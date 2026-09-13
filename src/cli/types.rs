@@ -127,6 +127,7 @@ pub(crate) enum Command {
         version: Option<String>,
     },
     SelfRollback,
+    SelfVerifyState,
 }
 
 /// Deployment-root administrator management. The current surface exposes one

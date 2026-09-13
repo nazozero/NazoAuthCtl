@@ -107,6 +107,11 @@ impl Cli {
                 values.remove(0);
                 Command::SelfCheck(parse_version_option(values)?)
             }
+            "self" if values.first().is_some_and(|value| value == "verify-state") => {
+                values.remove(0);
+                no_arguments(&values, "self verify-state")?;
+                Command::SelfVerifyState
+            }
             "self" if values.first().is_some_and(|value| value == "update") => {
                 values.remove(0);
                 Command::SelfUpdate {

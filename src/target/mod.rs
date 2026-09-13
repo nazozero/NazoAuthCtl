@@ -18,6 +18,7 @@ pub(crate) mod control_exec;
 pub mod deployment_state;
 pub(crate) mod install_exec;
 pub mod journal;
+pub mod persistence;
 pub(crate) mod remote_exec;
 pub mod ssh;
 pub(crate) mod uninstall_exec;
@@ -2447,7 +2448,10 @@ mod tests {
         let failure = store.load_existing("deploy-beta").expect_err("corrupt");
         let rendered = format!("{failure:?}");
         assert!(rendered.contains(STATE_RESET_REQUIRED), "{rendered}");
-        assert!(rendered.contains("back the file up"), "{rendered}");
+        assert!(
+            rendered.contains("preserve the deployment state"),
+            "{rendered}"
+        );
         assert!(rendered.contains("state.json"), "{rendered}");
 
         // Wire level: diagnostics are bounded, but the stable codes survive
