@@ -97,7 +97,7 @@ gh attestation verify "$work/$artifact" \
   --source-ref "refs/tags/$version" \
   --deny-self-hosted-runners
 chmod 0755 "$work/$artifact"
-"$work/$artifact" --help >/dev/null
+"$work/$artifact" --json self verify-state >/dev/null
 
 staged=$(mktemp "$parent/.nazoauthctl.XXXXXX")
 install -o root -g root -m 0755 "$work/$artifact" "$staged"

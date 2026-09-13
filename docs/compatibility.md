@@ -35,7 +35,8 @@ pending control/recovery journals, plus local deployment states, backup metadata
 and target operation logs. It does not contact a running service or remote host.
 The candidate executable must pass this check before `self update` replaces the
 installed controller and again before committing the installation. It inherits
-the same configured state roots. A rejected candidate leaves the old executable
+the same configured state roots. The Linux installer also runs the offline check
+before replacing an existing executable. A rejected candidate leaves the old executable
 in place; failed post-install verification restores it using the existing
 self-update journal. Normal commands recover interrupted replacement journals.
 The check proves local readability, not live server health or remote-helper
