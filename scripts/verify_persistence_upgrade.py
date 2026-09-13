@@ -13,7 +13,8 @@ for version in sorted(fixtures.iterdir()):
     if not version.is_dir():
         continue
     with tempfile.TemporaryDirectory(prefix="ctl-upgrade-") as temporary:
-        root = Path(temporary)
+        # Match PrivateTempDir: macOS /var is a symlink to /private/var.
+        root = Path(temporary).resolve()
         scope = root / "target/deployments/deploy-upgrade"
         backup = scope / "backup"
         backup.mkdir(parents=True, mode=0o700)
@@ -27,7 +28,9 @@ for version in sorted(fixtures.iterdir()):
         environment = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"),
                            APPDATA=str(root / "config"), NAZOAUTHCTL_TARGET_STATE_ROOT=str(root / "target"))
         result = subprocess.run([binary, "--json", "self", "verify-state"], env=environment,
-                                capture_output=True, text=True, timeout=30, check=True)
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise SystemExit(f"{version.name}: state verification failed\n{result.stdout}\n{result.stderr}")
         report = json.loads(result.stdout)
         assert report == {"schema": 1, "compatible": True, "deployments": 1}, report
         assert all(hashlib.sha256(path.read_bytes()).digest() == digest for path, digest in before.items())
