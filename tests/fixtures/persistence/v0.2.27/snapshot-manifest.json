@@ -1,0 +1,50 @@
+{
+  "schema": 4,
+  "deployment_id": "deploy-upgrade",
+  "snapshot_id": "01900000-0000-7000-8000-000000000003",
+  "created_at": "2026-09-05T15:00:00Z",
+  "runtime_artifact": {
+    "kind": "oci",
+    "image_reference": "ghcr.io/example/nazoauth@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "release": {
+    "version": "0.2.11"
+  },
+  "rollback_policy": {
+    "artifact": true,
+    "schema_compatible": false,
+    "database_restore": "backup",
+    "irreversible_migration": true,
+    "minimum_supported_version": "0.2.11",
+    "migration_floor": "20260905000100",
+    "rationale": "Database recovery requires the pre-update snapshot."
+  },
+  "config_schema": "nazoauth-config-v1",
+  "files": [
+    {
+      "path": "database.dump",
+      "size": 12,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "path": "deployment.tar",
+      "size": 34,
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
+  "archive_files": [
+    {
+      "path": "snapshot-sentinel.json",
+      "size": 1,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "database_sentinel_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "mfa_key_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "runtime_instance_key_id": "instance-test",
+  "oidc_signing_key_ids": [
+    "signing-test"
+  ],
+  "manifest_sha256": "a5d0af7d6afd382d25ac6b5009d4a8d3e5cc05b57b283f0f597be0403c7a8863"
+}

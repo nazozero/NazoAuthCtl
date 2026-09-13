@@ -96,7 +96,7 @@ status 默认显示汇总表；--json 输出完整结构化数据。"
             "update 验证官方制品后迁移并更新；中断后重试会继续原操作。rollback 恢复制品和配置引用，数据恢复使用 recover。uninstall 未指定 --yes 时只显示删除计划；外部和共享资源不删除。"
         }
         HelpTopic::SelfUpdate => {
-            "检查、更新或回滚控制器自身。更新仅使用已签名的 NazoAuthCtl 发行制品，不修改 NazoAuth 实例的密钥或状态。"
+            "检查、更新或回滚控制器自身。更新前验证新程序能读取现有状态，安装后检查失败时自动恢复旧程序。verify-state 离线检查本机状态和备份元数据，不修改部署。"
         }
         HelpTopic::Tls => {
             "通过外部文件提供器配置部署的 TLS 证书：验证证书链、域名与私钥，切换证书并重新加载提供器，再执行公网验证。recover 恢复之前或已提交的证书代次。ACME issue 需要 --agree-terms。"

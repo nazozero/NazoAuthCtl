@@ -172,7 +172,10 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     ensure_digest(&staged, &release.sha256, "staged controller candidate")?;
     journal.phase = SelfUpdatePhase::CandidatePrepared;
     persist_self_update_journal(&directory, &journal)?;
-    Process::new(&staged).arg("--help").run_quiet()?;
+    if let Err(error) = verify_candidate_state(&staged) {
+        discard_unstarted_self_update_journal(&directory, &journal)?;
+        return Err(error);
+    }
     journal.phase = SelfUpdatePhase::CandidateVerified;
     persist_self_update_journal(&directory, &journal)?;
 
@@ -181,6 +184,10 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     ensure_digest(&install_path, &release.sha256, "installed controller")?;
     journal.phase = SelfUpdatePhase::Installed;
     persist_self_update_journal(&directory, &journal)?;
+    if let Err(error) = verify_candidate_state(&install_path) {
+        restore_rejected_update(&directory, &mut journal)?;
+        return Err(error.context("previous controller automatically restored"));
+    }
     commit_controller_rollback_state(
         &directory,
         &previous_version,
@@ -189,7 +196,7 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     )?;
     journal.phase = SelfUpdatePhase::RollbackStateCommitted;
     persist_self_update_journal(&directory, &journal)?;
-    write_controller_trust(&release.version, &release.sha256)?;
+    write_controller_trust(&directory, &release.version, &release.sha256)?;
     journal.phase = SelfUpdatePhase::TrustCommitted;
     persist_self_update_journal(&directory, &journal)?;
     finish_self_update_journal(&directory, &journal)?;
@@ -246,7 +253,7 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
     ensure_digest(&install_path, &state.sha256, "restored controller")?;
     journal.phase = SelfUpdatePhase::Installed;
     persist_self_update_journal(&directory, &journal)?;
-    write_controller_trust(&state.version, &state.sha256)?;
+    write_controller_trust(&directory, &state.version, &state.sha256)?;
     journal.phase = SelfUpdatePhase::TrustCommitted;
     persist_self_update_journal(&directory, &journal)?;
     finish_self_update_journal(&directory, &journal)?;
@@ -297,10 +304,9 @@ pub(super) fn enforce_controller_trust(version: &str, sha256: &str) -> anyhow::R
     }
 }
 
-pub(super) fn write_controller_trust(version: &str, sha256: &str) -> anyhow::Result<()> {
+fn write_controller_trust(directory: &Path, version: &str, sha256: &str) -> anyhow::Result<()> {
     validate_digest(sha256, "controller trust digest")?;
-    let directory = controller_state_directory()?;
-    ensure_private_directory(&directory, "controller self-update state")?;
+    ensure_private_directory(directory, "controller self-update state")?;
     atomic_write(
         &directory.join("trust.json"),
         &serde_json::to_vec_pretty(&ControllerTrustState {
@@ -375,6 +381,89 @@ fn recover_controller_self_operation() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Normal commands repair an interrupted replacement before touching instance state.
+pub(super) fn repair_interrupted_update() -> anyhow::Result<()> {
+    let directory = crate::registry::RegistryStore::default_root()?.join("controller-self");
+    if !directory.join("update-transaction.json").exists() {
+        return Ok(());
+    }
+    let _lock = FileLock::acquire(&directory.join(".lock"))?;
+    recover_controller_self_operation()
+}
+
+/// Parse only: the candidate runs while its parent holds the self-update lock.
+pub(super) fn validate_self_state(directory: &Path) -> anyhow::Result<()> {
+    let trust = directory.join("trust.json");
+    if current_self_state_is_present(&trust, "controller trust state")? {
+        let state: ControllerTrustState =
+            read_current_self_state(&trust, "controller trust state")?;
+        validate_digest(&state.sha256, "controller trust digest")?;
+        compare_versions(&state.version, &state.version)?;
+    }
+    let rollback = directory.join("rollback.json");
+    if current_self_state_is_present(&rollback, "controller rollback state")? {
+        let state: ControllerRollbackState =
+            read_current_self_state(&rollback, "controller rollback state")?;
+        validate_digest(&state.sha256, "controller rollback digest")?;
+        validate_bound_path(&state.artifact, "controller rollback artifact")?;
+    }
+    let journal = directory.join("update-transaction.json");
+    if current_self_state_is_present(&journal, "controller self-update journal")? {
+        load_self_update_journal(&journal)?;
+    }
+    Ok(())
+}
+
+fn verify_candidate_state(candidate: &Path) -> anyhow::Result<()> {
+    let mut process = Process::new(candidate).args(["--json", "self", "verify-state"]);
+    // Process deliberately starts with a minimal environment. The candidate must
+    // inspect the same user registry and target root as its parent, not defaults.
+    for key in [
+        "APPDATA",
+        "XDG_CONFIG_HOME",
+        "NAZOAUTHCTL_TARGET_STATE_ROOT",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            process = process.env(key, value);
+        }
+    }
+    let output = process.stdout().context("STATE_RESET_REQUIRED: candidate cannot read existing state; controller replacement refused")?;
+    let report: serde_json::Value = serde_json::from_str(&output)
+        .context("candidate did not return a state compatibility report")?;
+    if report.get("schema").and_then(serde_json::Value::as_u64) != Some(1)
+        || report
+            .get("compatible")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        bail!("candidate did not confirm state compatibility");
+    }
+    Ok(())
+}
+
+fn restore_rejected_update(
+    directory: &Path,
+    journal: &mut SelfUpdateJournal,
+) -> anyhow::Result<()> {
+    ensure_digest(
+        &journal.rollback_artifact,
+        &journal.from_sha256,
+        "previous controller",
+    )?;
+    if let Some(staged) = journal.staged_artifact.take()
+        && staged.try_exists()?
+    {
+        ensure_digest(&staged, &journal.to_sha256, "rejected candidate")?;
+        remove_file_durable(&staged)?;
+    }
+    std::mem::swap(&mut journal.from_version, &mut journal.to_version);
+    std::mem::swap(&mut journal.from_sha256, &mut journal.to_sha256);
+    journal.operation = SelfUpdateOperation::Rollback;
+    journal.phase = SelfUpdatePhase::Intent;
+    persist_self_update_journal(directory, journal)?;
+    recover_rollback_journal(directory, journal)
+}
+
 fn load_self_update_journal(path: &Path) -> anyhow::Result<SelfUpdateJournal> {
     read_current_self_state(path, "controller self-update journal")
 }
@@ -405,13 +494,27 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
             bail!("controller install digest is neither the journal source nor candidate");
         }
         if staged_digest.as_deref() == Some(journal.to_sha256.as_str()) {
-            if journal.phase != SelfUpdatePhase::CandidateVerified {
-                Process::new(staged.context("controller candidate journal path is missing")?)
-                    .arg("--help")
-                    .run_quiet()?;
-                journal.phase = SelfUpdatePhase::CandidateVerified;
-                persist_self_update_journal(directory, journal)?;
+            if let Err(error) = verify_candidate_state(
+                staged.context("controller candidate journal path is missing")?,
+            ) {
+                if current_digest.is_none() {
+                    let mut previous = open_secure_regular_file(
+                        &journal.rollback_artifact,
+                        "previous controller",
+                        false,
+                    )?;
+                    ensure_digest(
+                        &journal.rollback_artifact,
+                        &journal.from_sha256,
+                        "previous controller",
+                    )?;
+                    copy_atomic_from_file(&mut previous, &journal.install_path, 0o755)?;
+                }
+                discard_unstarted_self_update_journal(directory, journal)?;
+                return Err(error);
             }
+            journal.phase = SelfUpdatePhase::CandidateVerified;
+            persist_self_update_journal(directory, journal)?;
             let mut staged_file = open_secure_regular_file(
                 staged.context("controller candidate journal path is missing")?,
                 "staged controller candidate",
@@ -444,6 +547,10 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
     if !installed {
         bail!("controller self-update did not reach an installed candidate");
     }
+    if let Err(error) = verify_candidate_state(&journal.install_path) {
+        restore_rejected_update(directory, journal)?;
+        return Err(error.context("previous controller automatically restored"));
+    }
     if matches!(
         journal.phase,
         SelfUpdatePhase::Intent
@@ -464,7 +571,7 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
         journal.phase = SelfUpdatePhase::RollbackStateCommitted;
         persist_self_update_journal(directory, journal)?;
     }
-    write_controller_trust(&journal.to_version, &journal.to_sha256)?;
+    write_controller_trust(directory, &journal.to_version, &journal.to_sha256)?;
     if journal.phase == SelfUpdatePhase::RollbackStateCommitted {
         journal.phase = SelfUpdatePhase::TrustCommitted;
         persist_self_update_journal(directory, journal)?;
@@ -508,7 +615,7 @@ fn recover_rollback_journal(
         journal.phase = SelfUpdatePhase::Installed;
         persist_self_update_journal(directory, journal)?;
     }
-    write_controller_trust(&journal.to_version, &journal.to_sha256)?;
+    write_controller_trust(directory, &journal.to_version, &journal.to_sha256)?;
     if journal.phase == SelfUpdatePhase::Installed {
         journal.phase = SelfUpdatePhase::TrustCommitted;
         persist_self_update_journal(directory, journal)?;
@@ -548,10 +655,18 @@ fn discard_unstarted_self_update_journal(
 ) -> anyhow::Result<()> {
     if !matches!(
         journal.phase,
-        SelfUpdatePhase::Intent | SelfUpdatePhase::RollbackPrepared
+        SelfUpdatePhase::Intent
+            | SelfUpdatePhase::RollbackPrepared
+            | SelfUpdatePhase::CandidatePrepared
+            | SelfUpdatePhase::CandidateVerified
     ) {
         bail!("controller self-update journal is no longer unstarted");
     }
+    ensure_digest(
+        &journal.install_path,
+        &journal.from_sha256,
+        "preserved controller",
+    )?;
     if let Some(staged) = journal.staged_artifact.as_ref()
         && let Some(digest) = optional_secure_digest(staged, "staged controller candidate")?
     {
@@ -614,7 +729,7 @@ fn read_current_self_state<T: CurrentSelfState + DeserializeOwned>(
 
 fn state_reset_required(path: &Path, label: &str, reason: String) -> anyhow::Error {
     anyhow!(
-        "{}: {label} at {} is not safe for the current controller: {reason}. Back up this file first, then delete it and reinstall the current nazoauthctl release before retrying. Do not migrate, reinterpret, or reuse this state.",
+        "{}: {label} at {} is not safe for the current controller: {reason}. Preserve this file and use a controller supporting its format; do not delete trust or recovery state.",
         crate::error_codes::STATE_RESET_REQUIRED,
         path.display(),
     )
@@ -681,13 +796,105 @@ fn validate_bound_path(path: &Path, label: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn interrupted_update_fixture(
+        directory: &Path,
+        compatible: bool,
+        installed: bool,
+    ) -> anyhow::Result<SelfUpdateJournal> {
+        let old = b"#!/bin/sh\nexit 0\n";
+        let candidate: &[u8] = if compatible {
+            b"#!/bin/sh\n[ \"$*\" = '--json self verify-state' ] || exit 9\nprintf '%s\\n' '{\"schema\":1,\"compatible\":true,\"deployments\":1}'\n"
+        } else {
+            b"#!/bin/sh\necho 'unsupported deployment state' >&2\nexit 42\n"
+        };
+        let install_path = directory.join("nazoauthctl");
+        let rollback = directory.join("rollback");
+        let staged = directory.join("candidate");
+        atomic_write(
+            &install_path,
+            if installed { candidate } else { old },
+            0o755,
+        )?;
+        atomic_write(&rollback, old, 0o500)?;
+        atomic_write(&staged, candidate, 0o500)?;
+        let from_sha256 = secure_digest(&rollback, "fixture rollback")?;
+        let journal = SelfUpdateJournal {
+            schema: SELF_UPDATE_JOURNAL_SCHEMA,
+            transaction_id: uuid::Uuid::now_v7().to_string(),
+            operation: SelfUpdateOperation::Update,
+            // A saved verification checkpoint must never bypass a fresh state check.
+            phase: if installed {
+                SelfUpdatePhase::Installed
+            } else {
+                SelfUpdatePhase::CandidateVerified
+            },
+            install_path,
+            from_version: "v0.2.28".into(),
+            from_sha256: from_sha256.clone(),
+            to_version: "v0.2.29".into(),
+            to_sha256: secure_digest(&staged, "fixture candidate")?,
+            rollback_artifact: rollback,
+            rollback_sha256: from_sha256,
+            staged_artifact: Some(staged),
+        };
+        persist_self_update_journal(directory, &journal)?;
+        Ok(journal)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incompatible_candidate_preserves_or_restores_the_previous_controller() -> anyhow::Result<()>
+    {
+        for installed in [false, true] {
+            let temp = crate::filesystem::PrivateTempDir::new("ctl-self-repair")?;
+            let mut journal = interrupted_update_fixture(temp.path(), false, installed)?;
+            let original_digest = journal.from_sha256.clone();
+            assert!(recover_update_journal(temp.path(), &mut journal).is_err());
+            assert_eq!(
+                secure_digest(&journal.install_path, "preserved controller")?,
+                original_digest
+            );
+            assert!(!temp.path().join("update-transaction.json").exists());
+            assert!(!temp.path().join("candidate").exists());
+            if installed {
+                let trust: ControllerTrustState =
+                    read_current_self_state(&temp.path().join("trust.json"), "trust")?;
+                assert_eq!(trust.version, "v0.2.28");
+                assert_eq!(trust.sha256, original_digest);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatible_interrupted_update_finishes_and_keeps_rollback() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("ctl-self-repair")?;
+        let mut journal = interrupted_update_fixture(temp.path(), true, false)?;
+        recover_update_journal(temp.path(), &mut journal)?;
+        assert_eq!(
+            secure_digest(&journal.install_path, "installed")?,
+            journal.to_sha256
+        );
+        assert_eq!(
+            secure_digest(&journal.rollback_artifact, "rollback")?,
+            journal.from_sha256
+        );
+        assert!(!temp.path().join("update-transaction.json").exists());
+        let trust: ControllerTrustState =
+            read_current_self_state(&temp.path().join("trust.json"), "trust")?;
+        assert_eq!(trust.version, "v0.2.29");
+        Ok(())
+    }
+
     fn assert_state_reset_required(error: anyhow::Error, path: &Path) {
         let rendered = format!("{error:#}");
         assert!(rendered.contains(crate::error_codes::STATE_RESET_REQUIRED));
         assert!(rendered.contains(&path.display().to_string()));
-        assert!(rendered.contains("Back up this file first, then delete it"));
-        assert!(rendered.contains("reinstall the current nazoauthctl release"));
-        assert!(rendered.contains("Do not migrate, reinterpret, or reuse this state"));
+        assert!(rendered.contains("Preserve this file"));
+        assert!(rendered.contains("supporting its format"));
+        assert!(rendered.contains("do not delete trust or recovery state"));
     }
 
     #[test]

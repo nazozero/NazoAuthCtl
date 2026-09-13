@@ -23,12 +23,10 @@ binaries.
 The controller ships separately from the server. Its recovery path can run
 when the active NazoAuth process is unavailable.
 
-> [!WARNING]
-> **Before 0.5.0, this project iterates rapidly. Version updates do not preserve
-> compatibility with historical releases.** Only current local state, journal,
-> configuration, and control-message formats are supported. Older formats are
-> not converted. Retain verified backups and their matching recovery tools
-> before changing a deployment.
+Persisted deployment state and verified backups are upgrade contracts, including
+before 0.5.0. Known older formats are read automatically; ordinary locked writes
+save the current format. Read-only commands preserve source files and backup
+checksums. See [supported formats and upgrade checks](docs/compatibility.md).
 
 ## Operations
 
@@ -40,6 +38,7 @@ when the active NazoAuth process is unavailable.
 | Change a running instance | update, rollback, operation |
 | Prove recovery | backup snapshot, backup restore-test, backup copy, recover |
 | Maintain the controller | self check, self update, self rollback |
+| Check local state compatibility without contacting services | self verify-state |
 | Manage deployment TLS | tls certificate, tls acme |
 
 `nazoauthctl status` and `nazoauthctl status --all` display one row per instance:
@@ -54,7 +53,7 @@ locale, otherwise English, using the first nonempty `LC_ALL`, `LC_MESSAGES`, or
 codes. For example, `LANG=zh_CN.UTF-8 nazoauthctl status --all` selects Chinese
 unless an `LC_*` override takes precedence. Text failures include the underlying
 reason; JSON field names and codes do not change with locale.
-See [v0.2.28 release notes](docs/release-notes-0.2.28.md).
+See [v0.2.29 release notes](docs/release-notes-0.2.29.md).
 
 Read-only inspection works before controller binding. Mutations use signed
 control operations, with the first administrator created through the target's

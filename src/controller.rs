@@ -9,6 +9,7 @@ use crate::error_codes::PRIVILEGE_REQUIRED;
 mod recovery_journal;
 mod recovery_transport;
 mod self_update;
+mod state_check;
 mod surface_run;
 mod transfer_journal;
 

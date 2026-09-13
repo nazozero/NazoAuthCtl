@@ -134,6 +134,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::SelfCheck(_) => "self check",
         cli::Command::SelfUpdate { .. } => "self update",
         cli::Command::SelfRollback => "self rollback",
+        cli::Command::SelfVerifyState => "self verify-state",
     }
 }
 
@@ -306,9 +307,12 @@ changes nothing; external/shared resources always have zero-delete protection."
   nazoauthctl self check [--to VERSION]
   nazoauthctl self update [--to VERSION]
   nazoauthctl self rollback
+  nazoauthctl self verify-state
 
 Controller updates consume only signed NazoAuthCtl Release binaries and
-provenance. They never select keys or state from a NazoAuth deployment."
+provenance. Candidate state checks run before replacement; failed installation
+verification restores the previous controller. verify-state checks local state
+and backup metadata offline without changing deployments."
         }
         cli::HelpTopic::Tls => {
             "Usage:

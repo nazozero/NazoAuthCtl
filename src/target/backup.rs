@@ -69,6 +69,9 @@ pub struct SnapshotManifest {
     pub runtime_artifact: ArtifactReference,
     /// Verified release version paired with the current artifact.
     pub release: ReleaseVersion,
+    /// Schema 4 includes this field in its immutable checksum. Never discard or rehash it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_policy: Option<super::persistence::LegacyRollbackPolicy>,
     /// Configuration schema paired with the archived config bytes. Recovery
     /// advances the live revision monotonically; it never restores a revision.
     pub config_schema: String,
@@ -95,8 +98,13 @@ pub struct SnapshotManifest {
 
 impl SnapshotManifest {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.schema != BACKUP_MANIFEST_SCHEMA {
+        if self.schema != BACKUP_MANIFEST_SCHEMA && self.schema != 4 {
             bail!("unsupported backup manifest schema {}", self.schema);
+        }
+        match (self.schema, &self.rollback_policy) {
+            (4, Some(policy)) => policy.validate()?,
+            (BACKUP_MANIFEST_SCHEMA, None) => {}
+            _ => bail!("backup manifest rollback policy does not match its schema"),
         }
         crate::registry::validate_identifier(&self.deployment_id, 128, "backup deployment id")?;
         Uuid::parse_str(&self.snapshot_id).context("backup snapshot id is not a UUID")?;

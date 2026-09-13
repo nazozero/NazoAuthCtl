@@ -66,9 +66,7 @@ fn next_command(code: &str) -> Option<&'static str> {
             "nazoauthctl instance list; then retry with an exact alias or deployment id"
         }
         error_codes::INSTANCE_AMBIGUOUS => "re-run with --instance <alias>",
-        error_codes::STATE_RESET_REQUIRED => {
-            "back up salvageable files, clear the named state, then re-register"
-        }
+        error_codes::STATE_RESET_REQUIRED => "nazoauthctl self verify-state",
         error_codes::CONTROL_BINDING_REQUIRED => {
             "nazoauthctl bind --instance <alias> --label <name>"
         }
