@@ -8,22 +8,28 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 
 use super::super::types::{ControllerCommand, InstanceSelector};
 use super::fleet::{checked_name, parse_options, selector_parts};
 
 pub(super) fn parse_controller(values: Vec<String>) -> anyhow::Result<ControllerCommand> {
-    let (subcommand, rest) = values
-        .split_first()
-        .with_context(|| "expected controller list|add|rotate|revoke|recover")?;
+    let (subcommand, rest) = values.split_first().with_context(|| {
+        crate::ui::text(
+            "expected controller list|add|rotate|revoke|recover",
+            "请指定 controller list、add、rotate、revoke 或 recover",
+        )
+    })?;
     match subcommand.as_str() {
         "list" => parse_list(rest),
         "add" => parse_add(rest),
         "rotate" => parse_rotate(rest),
         "revoke" => parse_revoke(rest),
         "recover" => parse_recover(rest),
-        other => bail!("unknown controller subcommand '{other}'"),
+        other => crate::ui::fail!(
+            "unknown controller subcommand '{other}'",
+            "未知的 controller 子命令：{other}"
+        ),
     }
 }
 
@@ -46,7 +52,10 @@ fn parse_common(
     value_flags.extend(["--instance", "--approval-token", "--credentials-file"]);
     let parsed = parse_options(values, &value_flags, extra_bool_flags, command)?;
     if parsed.positionals.len() > 1 {
-        bail!("{command} accepts at most one selector argument");
+        crate::ui::fail!(
+            "{command} accepts at most one selector argument",
+            "{command} 最多接受一个实例选择参数"
+        );
     }
     let named = match parsed.values.get("--instance") {
         Some(instance) => {
@@ -58,7 +67,10 @@ fn parse_common(
     let approval_token = match parsed.values.get("--approval-token") {
         Some(token) => {
             if token.trim().is_empty() || token.chars().any(char::is_control) || token.len() > 512 {
-                bail!("--approval-token must be a single-line bounded token");
+                crate::ui::fail!(
+                    "--approval-token must be a single-line bounded token",
+                    "--approval-token 必须是长度符合限制的单行令牌"
+                );
             }
             // The raw value is kept; trimming happens again at use time so an
             // accidental trailing newline in scripted input stays harmless.
@@ -68,11 +80,17 @@ fn parse_common(
     };
     let credentials_file = match parsed.values.get("--credentials-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Some(_) => bail!("--credentials-file requires a file path"),
+        Some(_) => crate::ui::fail!(
+            "--credentials-file requires a file path",
+            "--credentials-file 需要文件路径"
+        ),
         None => None,
     };
     if approval_token.is_some() && credentials_file.is_some() {
-        bail!("--approval-token and --credentials-file are alternative approval sources");
+        crate::ui::fail!(
+            "--approval-token and --credentials-file are alternative approval sources",
+            "--approval-token 和 --credentials-file 只能选择一种"
+        );
     }
     Ok(Common {
         selector: InstanceSelector {
@@ -96,7 +114,10 @@ fn require_label(
             Ok(Some(label.clone()))
         }
         None if optional => Ok(None),
-        None => bail!("--label NAME is required so administrators can recognize this key"),
+        None => crate::ui::fail!(
+            "--label NAME is required so administrators can recognize this key",
+            "必须提供 --label NAME，便于管理员识别此密钥"
+        ),
     }
 }
 
@@ -140,10 +161,12 @@ fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
         &[],
         "controller revoke",
     )?;
-    let controller_id = parts
-        .positional
-        .clone()
-        .with_context(|| "controller revoke requires the exact <controller-id>")?;
+    let controller_id = parts.positional.clone().with_context(|| {
+        crate::ui::text(
+            "controller revoke requires the exact <controller-id>",
+            "controller revoke 需要准确的 <controller-id>",
+        )
+    })?;
     checked_name("--controller-id", &controller_id)?;
     Ok(ControllerCommand::Revoke {
         selector: InstanceSelector {
@@ -166,34 +189,46 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
     let rotate_secret = common.flags.contains("--rotate-secret");
     let secret_file = match common.values.get("--secret-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Some(_) => bail!("--secret-file requires a file path"),
+        Some(_) => crate::ui::fail!(
+            "--secret-file requires a file path",
+            "--secret-file 需要文件路径"
+        ),
         None => None,
     };
     let output_secret_file = match common.values.get("--output-secret-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Some(_) => bail!("--output-secret-file requires a file path"),
+        Some(_) => crate::ui::fail!(
+            "--output-secret-file requires a file path",
+            "--output-secret-file 需要文件路径"
+        ),
         None => None,
     };
     if rotate_secret && secret_file.is_some() {
-        bail!(
-            "--secret-file belongs to the recovery flow and cannot be combined with --rotate-secret"
+        crate::ui::fail!(
+            "--secret-file belongs to the recovery flow and cannot be combined with --rotate-secret",
+            "--secret-file 用于恢复，不能与 --rotate-secret 同时使用"
         );
     }
     if let (Some(input), Some(output)) = (&secret_file, &output_secret_file)
         && input == output
     {
-        bail!(
+        crate::ui::fail!(
             "--output-secret-file must differ from --secret-file; the commit invalidates the \
-             old secret and the new one must never overwrite it"
+             old secret and the new one must never overwrite it",
+            "新旧密钥文件必须使用不同路径：--output-secret-file 不能与 --secret-file 相同"
         );
     }
     if common.approval_token.is_some() {
-        bail!(
-            "--approval-token is not accepted on controller recover; break-glass recovery authenticates with the recovery secret, and --rotate-secret issues approval directly through the admin API"
+        crate::ui::fail!(
+            "--approval-token is not accepted on controller recover; break-glass recovery authenticates with the recovery secret, and --rotate-secret issues approval directly through the admin API",
+            "controller recover 使用恢复密钥认证，不接受 --approval-token；--rotate-secret 会直接向管理员接口申请批准"
         );
     }
     if !rotate_secret && common.credentials_file.is_some() {
-        bail!("--credentials-file is used only with controller recover --rotate-secret");
+        crate::ui::fail!(
+            "--credentials-file is used only with controller recover --rotate-secret",
+            "--credentials-file 仅用于 controller recover --rotate-secret"
+        );
     }
     let label = require_label(&common.values, rotate_secret)?;
     Ok(ControllerCommand::Recover {

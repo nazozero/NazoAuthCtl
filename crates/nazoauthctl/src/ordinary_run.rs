@@ -900,13 +900,17 @@ fn execute_with_progress<S: ProgressSink>(
             recovery.commit_suite_plan_retention()?;
             let manifest_path = recovery.publish_committed_suite_retention_manifest()?;
             eprintln!(
-                "Suite plans retained for review: suite={} plans={} manifest={}",
-                suite_origin,
-                report
-                    .as_ref()
-                    .map(|report| report.retained_suite_plan_ids.join(","))
-                    .unwrap_or_default(),
-                manifest_path.display(),
+                "{}",
+                localized_message!(
+                    "Suite plans retained for review: suite={} plans={} manifest={}",
+                    "测试记录已保留\n\n测试服务：{}\n计划：{}\n证据清单：{}",
+                    suite_origin,
+                    report
+                        .as_ref()
+                        .map(|report| report.retained_suite_plan_ids.join(","))
+                        .unwrap_or_default(),
+                    manifest_path.display(),
+                )
             );
             Ok(())
         })() {
@@ -942,13 +946,17 @@ fn execute_with_progress<S: ProgressSink>(
                 retention_committed = true;
                 errors.retain(|error| !error.starts_with("suite-retention="));
                 eprintln!(
-                    "Suite plans retained for review: suite={} plans={} manifest={}",
-                    suite_origin,
-                    report
-                        .as_ref()
-                        .map(|report| report.retained_suite_plan_ids.join(","))
-                        .unwrap_or_default(),
-                    manifest_path.display(),
+                    "{}",
+                    localized_message!(
+                        "Suite plans retained for review: suite={} plans={} manifest={}",
+                        "测试记录已保留\n\n测试服务：{}\n计划：{}\n证据清单：{}",
+                        suite_origin,
+                        report
+                            .as_ref()
+                            .map(|report| report.retained_suite_plan_ids.join(","))
+                            .unwrap_or_default(),
+                        manifest_path.display(),
+                    )
                 );
             }
             Err(error) => errors.push(format!("suite-retention-retry={error:#}")),

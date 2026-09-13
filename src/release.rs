@@ -437,8 +437,9 @@ fn verified_release_candidate(
         // shared atomic-copy primitive creates only the parent chain and
         // commits the blob as one complete regular file.
         if let Err(error) = crate::filesystem::copy_atomic(&work.join(blob), &destination, 0o600) {
-            eprintln!(
+            crate::ui::warning!(
                 "warning: verified release cache write failed at {}: {error:#}",
+                "注意：无法保存已验证的发布缓存 {}。诊断详情（原文）：{error:#}",
                 destination.display()
             );
         }

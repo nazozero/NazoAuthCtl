@@ -97,6 +97,69 @@ fn next_command(code: &str) -> Option<&'static str> {
     })
 }
 
+/// A localized explanation accompanies the original diagnostic; protocol codes remain stable.
+pub(crate) fn chinese_reason(code: &str) -> &'static str {
+    match code {
+        "INPUT_INVALID" => "参数或输入文件不符合要求。",
+        "HOST_NOT_REGISTERED" => "此主机尚未注册。",
+        "HOST_UNREACHABLE" => "无法连接目标主机，请检查网络和 SSH 配置。",
+        "SSH_AUTH_FAILED" => "SSH 身份验证失败，请检查登录凭据。",
+        "SSH_HOST_KEY_FAILED" => "SSH 主机密钥验证失败，请核实主机身份及密钥变更。",
+        "REMOTE_HELPER_MISMATCH" => "目标主机上的 ctl 版本或协议不匹配。",
+        "PRIVILEGE_REQUIRED" => "当前操作需要目标主机上的管理权限。",
+        "INSTANCE_NOT_REGISTERED" => "没有找到所选实例。",
+        "INSTANCE_AMBIGUOUS" => "存在多个实例，请使用 --instance 指定一个实例。",
+        "STATE_RESET_REQUIRED" => {
+            "本地状态无法读取或自动修复，请先运行 nazoauthctl self verify-state 查看具体问题。"
+        }
+        "CONTROL_BINDING_REQUIRED" => "此实例尚未绑定控制器，请先运行 bind。",
+        "CONTROLLER_KEY_UNAUTHORIZED" => "控制器密钥未获授权，可能已到期或被撤销。",
+        "CONTROLLER_SLOT_LIMIT" => "控制器授权数量已达到上限，请撤销不再使用的授权。",
+        "ADMIN_ACCESS_REQUIRED" => "此操作需要管理员身份验证。",
+        "ADMIN_EMAIL_CONFLICT" => "此管理员邮箱已存在，请使用其他邮箱。",
+        "OPERATION_ID_CONFLICT" => "操作编号对应的请求内容发生冲突，请先检查操作记录。",
+        "CONFIG_REVISION_MISMATCH" => "配置已被其他操作更新，请重新读取实例状态后重试。",
+        "TARGET_IDENTITY_MISMATCH" => "目标实例与记录的发布版本不一致，请先验证实例及发布来源。",
+        "CONTROL_OPERATION_FAILED" => "服务端操作失败，请根据诊断详情处理后重试。",
+        "RELEASE_NOT_FOUND" => "未找到所选版本或当前平台的发布文件。",
+        "RELEASE_DOWNLOAD_FAILED" => "发布文件下载失败，请检查网络后重试。",
+        "ARTIFACT_UNVERIFIED" => "发布文件验证未通过，请检查文件来源与完整性。",
+        "TLS_RECOVERY_REQUIRED" => {
+            "证书操作尚未完成，请对同一实例、租户和域名运行 tls certificate recover。"
+        }
+        "INSTALL_OUTCOME_UNKNOWN" => "尚未确认安装结果，请使用相同参数重新执行以继续原操作。",
+        _ => "命令未能完成，具体原因见下方诊断详情。",
+    }
+}
+
+fn chinese_next(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "HOST_UNREACHABLE" => "nazoauthctl host check <alias>；连接恢复后重试",
+        "SSH_AUTH_FAILED" => "修正 SSH 登录凭据后重试",
+        "SSH_HOST_KEY_FAILED" => "核实主机密钥变更后重试",
+        "REMOTE_HELPER_MISMATCH" => "在目标主机运行 nazoauthctl self update 后重试",
+        "PRIVILEGE_REQUIRED" => "以管理员身份执行；SSH 主机可先运行 ssh -t <profile> sudo -v",
+        "INSTANCE_NOT_REGISTERED" => "运行 nazoauthctl instance list，然后使用准确的实例名称",
+        "INSTANCE_AMBIGUOUS" => "追加 --instance <alias> 后重试",
+        "CONTROLLER_KEY_UNAUTHORIZED" => {
+            "运行 nazoauthctl controller list --instance <alias>，检查授权并轮换或恢复密钥"
+        }
+        "CONTROLLER_SLOT_LIMIT" => {
+            "运行 nazoauthctl controller list --instance <alias>，撤销不再使用的授权"
+        }
+        "ADMIN_ACCESS_REQUIRED" => "在终端登录管理员账户，或使用 --credentials-file 提供凭据",
+        "ADMIN_EMAIL_CONFLICT" => "使用其他管理员邮箱后重试",
+        "OPERATION_ID_CONFLICT" => {
+            "运行 nazoauthctl operation --instance <alias> 检查原操作，再继续原命令"
+        }
+        "CONFIG_REVISION_MISMATCH" => {
+            "运行 nazoauthctl status --instance <alias> 重新读取状态后重试"
+        }
+        "TARGET_IDENTITY_MISMATCH" => "运行 nazoauthctl verify --instance <alias>，并检查发布来源",
+        _ => return next_command(code),
+    })
+}
+
 /// Extract a plausible UUIDv7 operation id from the rendered chain without a
 /// regex dependency.
 fn extract_operation_id(rendered: &str) -> Option<String> {
@@ -161,10 +224,35 @@ pub(crate) fn render_failure(
         pairs.push(("operation_id", operation_id));
     }
     if let Some(checkpoint) = checkpoint {
-        pairs.push(("checkpoint", checkpoint));
+        pairs.push((
+            "checkpoint",
+            if crate::chinese_output() {
+                "此部署有待完成的操作记录".to_owned()
+            } else {
+                checkpoint
+            },
+        ));
     }
-    pairs.push(("side_effects", side_effects_hint(&code).to_owned()));
-    let next = next_command(&code);
+    let side_effects = if crate::chinese_output() {
+        match side_effects_hint(&code) {
+            "none" => "无",
+            _ if code == error_codes::TLS_RECOVERY_REQUIRED => {
+                "证书可能已启用；请先恢复待完成的证书操作"
+            }
+            _ => "此前的尝试可能已产生变更；使用相同命令继续原操作",
+        }
+    } else {
+        side_effects_hint(&code)
+    };
+    pairs.push(("side_effects", side_effects.to_owned()));
+    if crate::chinese_output() {
+        pairs.push(("reason", chinese_reason(&code).to_owned()));
+    }
+    let next = if crate::chinese_output() {
+        chinese_next(&code)
+    } else {
+        next_command(&code)
+    };
     pairs.push(("code", code));
     pairs.push(("detail", rendered));
     if let Some(next) = next {
@@ -182,7 +270,8 @@ pub(crate) fn render_failure(
                     "checkpoint" => "检查点",
                     "side_effects" => "副作用",
                     "code" => "错误码",
-                    "detail" => "原因",
+                    "reason" => "原因",
+                    "detail" => "诊断详情（原文）",
                     "next_command" => "下一步",
                     _ => label,
                 }

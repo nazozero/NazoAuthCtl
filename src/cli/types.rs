@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 
 use crate::registry::HostPrivilege;
 
@@ -22,6 +22,13 @@ pub(crate) enum HelpTopic {
     Tls,
     SelfUpdate,
     Admin,
+    Read,
+    Backup,
+    Recover,
+    Policy,
+    Bind,
+    Discover,
+    Remote,
 }
 
 /// Global options shared by every invocation (I02). `--instance` is accepted
@@ -234,8 +241,9 @@ impl InstanceSelector {
     pub(crate) fn explicit(&self) -> anyhow::Result<Option<String>> {
         match (&self.positional, &self.named) {
             (Some(_), Some(_)) => {
-                bail!(
-                    "select the instance with either --instance or the positional selector, not both"
+                crate::ui::fail!(
+                    "select the instance with either --instance or the positional selector, not both",
+                    "请通过 --instance 或位置参数选择实例，不能同时使用"
                 )
             }
             (Some(value), None) | (None, Some(value)) => Ok(Some(value.clone())),
@@ -251,14 +259,18 @@ impl InstanceSelector {
         global: Option<&str>,
         action: &str,
     ) -> anyhow::Result<Option<String>> {
-        let local = self
-            .explicit()
-            .with_context(|| format!("{action}: conflicting selectors"))?;
+        let local = self.explicit().with_context(|| {
+            crate::ui::message!(
+                "{action}: conflicting selectors",
+                "{action}：实例选择参数冲突"
+            )
+        })?;
         match (global, local) {
-            (Some(global_value), Some(local_value)) => bail!(
+            (Some(global_value), Some(local_value)) => crate::ui::fail!(
                 "{action}: select the instance once — either the global \
                  --instance {global_value} or the command-level selector \
-                 '{local_value}', not both"
+                 '{local_value}', not both",
+                "{action}：全局 --instance {global_value} 与命令内的实例选择参数“{local_value}”不能同时使用"
             ),
             (Some(global_value), None) => Ok(Some(global_value.to_owned())),
             (None, local) => Ok(local),

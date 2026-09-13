@@ -101,8 +101,9 @@ pub(crate) fn run_update(
         BackupBeforeUpdatePolicy::Off => UpdateBackupPrecondition::NotRequired,
         BackupBeforeUpdatePolicy::Warn => {
             if restore_test_age_seconds(&inspection).is_none() {
-                eprintln!(
+                crate::ui::warning!(
                     "nazoauthctl: warning: update proceeds without a current restore-tested snapshot for '{}'",
+                    "注意：实例“{}”没有经过恢复验证的当前备份；按现有策略继续更新。",
                     record.alias
                 );
             }
@@ -207,9 +208,11 @@ pub(crate) fn run_update(
             // no-op.
             journal.clear()?;
             record_observation(context, &deployment_id, &inspection);
-            return Ok(format!(
+            return Ok(crate::ui::message!(
                 "instance '{}' already runs the target-verified artifact; no migration or target mutation was needed (revision {})\n",
-                record.alias, revision
+                "实例“{}”已是所选版本，无需更新或迁移（配置修订 {}）。\n",
+                record.alias,
+                revision
             ));
         }
         HostOutcome::Completed { body } => match body {
@@ -296,25 +299,54 @@ pub(crate) fn run_update(
     let fresh = target.inspect_instance(&deployment_id)?;
     record_observation(context, &deployment_id, &fresh);
 
-    Ok(format!(
-        "updated instance '{}' (deployment {deployment_id}) to artifact {}\n\
-         {}\n\
-         migration: migrate-apply via ControlOperation {lifecycle_id} (accepted once)\n\
-         state committed at revision {applied_revision}; local health verified\n\
-         \n\
-         data boundary: database or other external mutations performed by the migration are NOT \
-         rolled back automatically — consult the release operation contract for irreversible \
-         steps before discarding the previous artifact\n\
-         next: nazoauthctl verify --instance {}\n",
-        record.alias,
-        fresh
-            .artifact
-            .current
-            .clone()
-            .unwrap_or_else(|| "-".to_owned()),
-        "previous artifact preserved; the target's verified Release policy governs explicit rollback",
-        record.alias,
-    ))
+    let title = crate::ui::message!("Updated instance '{}'", "实例“{}”更新完成", record.alias);
+    let mut report = crate::ui::fields(
+        &title,
+        &[
+            (
+                crate::ui::text("Version", "版本"),
+                fresh
+                    .current_release
+                    .as_ref()
+                    .map(|release| release.version.clone())
+                    .unwrap_or_else(|| "-".into()),
+            ),
+            (
+                crate::ui::text("Health", "健康"),
+                crate::ui::text("Local health verified", "本机健康检查通过").into(),
+            ),
+            (
+                crate::ui::text("Migration", "数据迁移"),
+                crate::ui::text("Completed (accepted once)", "已完成").into(),
+            ),
+            (
+                crate::ui::text("Configuration revision", "配置修订"),
+                applied_revision.to_string(),
+            ),
+            (
+                crate::ui::text("Artifact rollback", "程序回滚"),
+                if fresh.artifact.previous.is_some() {
+                    crate::ui::text("Previous version available", "可回滚至上一版本")
+                } else {
+                    crate::ui::text(
+                        "Unavailable; use backup recovery if needed",
+                        "不可直接回滚，需要时从备份恢复",
+                    )
+                }
+                .into(),
+            ),
+        ],
+    );
+    report.push_str(crate::ui::text(
+        "\n\nDatabase changes are not undone by an artifact rollback.",
+        "\n\n程序回滚不会撤销已执行的数据库迁移。",
+    ));
+    report.push_str(&crate::ui::message!(
+        "\nNext: nazoauthctl verify --instance {}\n",
+        "\n下一步：nazoauthctl verify --instance {}\n",
+        record.alias
+    ));
+    Ok(report)
 }
 
 fn restore_test_age_seconds(inspection: &crate::target::InstanceInspection) -> Option<u64> {

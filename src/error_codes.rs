@@ -53,8 +53,8 @@ pub const INSTANCE_NOT_REGISTERED: &str = "INSTANCE_NOT_REGISTERED";
 /// selector; fuzzy selection does not exist.
 pub const INSTANCE_AMBIGUOUS: &str = "INSTANCE_AMBIGUOUS";
 
-/// Persisted ctl state does not conform to the current schema; the only
-/// supported path is the documented STATE_RESET procedure.
+/// Persisted ctl state could not be read after supported automatic migrations.
+/// Diagnose with self verify-state before considering manual recovery.
 pub const STATE_RESET_REQUIRED: &str = "STATE_RESET_REQUIRED";
 
 /// An application-level operation requires a controller binding that the

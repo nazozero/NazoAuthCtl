@@ -1194,29 +1194,43 @@ fn interpret_result(result: &HostResult) -> anyhow::Result<&crate::target::Insta
 }
 
 fn render_success_report(alias: &str, inspection: &crate::target::InstanceInspection) -> String {
-    let artifact = inspection
-        .artifact
-        .current
-        .clone()
-        .unwrap_or_else(|| "-".to_owned());
-    let next_steps = format!(
-        "next steps:\n\
-         1. create an administrator through the deployed instance:\n\
-            nazoauthctl admin create --instance {alias}\n\
-            then enroll MFA at {}/ui/auth — ctl never receives TOTP secrets\n\
-         2. establish the controller binding after MFA enrollment:\n\
-            nazoauthctl bind --instance {alias} --label production\n\
-         3. public DNS/TLS/OIDC checks are independent of this install; verify separately:\n\
-            nazoauthctl verify --instance {alias}\n",
-        inspection.issuer.trim_end_matches('/'),
+    let title = crate::ui::message!(
+        "Installed NazoAuth instance '{alias}'",
+        "NazoAuth 实例“{alias}”安装完成"
     );
-    format!(
-        "installed NazoAuth instance '{alias}' (deployment {}) on the target\n\
-         issuer: {}\nartifact: {artifact}\nstate committed: local=healthy control_binding=unbound public=unknown\n\
-         InstanceRecord written to the registry (`nazoauthctl instance list`)\n\
-         \n\
-         {next_steps}",
-        inspection.deployment_id, inspection.issuer,
+    let summary = crate::ui::fields(
+        &title,
+        &[
+            (
+                crate::ui::text("Service URL", "服务地址"),
+                inspection.issuer.clone(),
+            ),
+            (
+                crate::ui::text("Version", "版本"),
+                inspection
+                    .current_release
+                    .as_ref()
+                    .map(|release| release.version.clone())
+                    .unwrap_or_else(|| "-".into()),
+            ),
+            (
+                crate::ui::text("Health", "健康"),
+                crate::ui::text("Local health verified", "本机健康检查通过").into(),
+            ),
+            (
+                crate::ui::text("Public access", "公网访问"),
+                crate::ui::text("Not checked", "尚未验证").into(),
+            ),
+            (
+                crate::ui::text("Controller", "控制器"),
+                crate::ui::text("Not bound", "未绑定").into(),
+            ),
+        ],
+    );
+    crate::ui::message!(
+        "{summary}\n\nNext steps:\n1. Create an administrator: nazoauthctl admin create --instance {alias}\n2. Set up MFA at {}/ui/auth\n3. Bind: nazoauthctl bind --instance {alias} --label production\n4. Verify public access: nazoauthctl verify --instance {alias}\n",
+        "{summary}\n\n下一步：\n1. 创建管理员：nazoauthctl admin create --instance {alias}\n2. 在 {}/ui/auth 设置双重验证\n3. 绑定控制器：nazoauthctl bind --instance {alias} --label production\n4. 验证公网访问：nazoauthctl verify --instance {alias}\n",
+        inspection.issuer.trim_end_matches('/')
     )
 }
 

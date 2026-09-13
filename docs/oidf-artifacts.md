@@ -1,5 +1,9 @@
 # OIDF driver and matrix artifacts
 
+Human output follows the CLI locale and uses readable fields. Place `--json`
+before the command to obtain the complete structured result. See
+[language and presentation](cli-presentation.md).
+
 The normal user workflow has no artifact configuration:
 
 ```text

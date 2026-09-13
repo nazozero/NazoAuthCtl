@@ -152,34 +152,27 @@ fn discover_reports_every_declared_fact_per_deployment() -> anyhow::Result<()> {
 
     // Per-deployment authoritative facts (G05 item 1), sorted deterministically.
     assert!(report.contains("[1] deploy-alpha"), "{report}");
+    assert!(report.contains("https://alpha.example.com"), "{report}");
+    assert!(report.contains("podman"), "{report}");
+    assert!(report.contains("0.2.0"), "{report}");
+    assert!(report.contains("not recorded"), "{report}");
     assert!(
-        report.contains("issuer: https://alpha.example.com"),
-        "{report}"
-    );
-    assert!(report.contains("runtime: podman/nz-alpha"), "{report}");
-    assert!(report.contains("revision 1"), "{report}");
-    assert!(report.contains(CONFIG_SCHEMA), "{report}");
-    assert!(report.contains(ARTIFACT), "{report}");
-    assert!(report.contains("release version: 0.2.0"), "{report}");
-    assert!(
-        report.contains("release version: not recorded"),
-        "deploy-beta has no release version: {report}"
+        !report.contains(ARTIFACT),
+        "human output omits digest: {report}"
     );
     assert!(
-        report.contains(
-            "resources: 3 declared (managed+deletable: 1, external/shared zero-delete: 2)"
-        ),
+        report
+            .lines()
+            .any(|line| line.contains("nz-alpha") && line.contains("managed+deployment")),
         "{report}"
     );
     assert!(
-        report.contains("- shared-postgres [postgres] pg-main.example.internal:5432/oauth — external/shared (zero-delete protection)"),
+        report
+            .lines()
+            .any(|line| line.contains("pg-main.example.internal:5432/oauth")
+                && line.contains("external/shared")),
         "{report}"
     );
-    assert!(
-        report.contains("- app-runtime [container] nz-alpha — managed+deployment"),
-        "{report}"
-    );
-
     // Multi-target display demands an exact id for follow-ups; registration
     // candidates are named per deployment.
     assert_eq!(
@@ -311,30 +304,43 @@ fn adopt_registers_with_target_derived_evidence_and_classification() -> anyhow::
     // Conservative classification per §6: external/shared stays zero-delete;
     // only declared managed+deployment is reported deletable. Never guessed.
     assert!(
-        report.contains("- app-runtime [container] nz-alpha — managed+deployment"),
+        report
+            .lines()
+            .any(|line| line.contains("nz-alpha") && line.contains("managed+deployment")),
         "{report}"
     );
     assert!(
-        report.contains("- shared-postgres [postgres] pg-main.example.internal:5432/oauth — external/shared: zero-delete protection"),
+        report
+            .lines()
+            .any(|line| line.contains("pg-main.example.internal:5432/oauth")
+                && line.contains("external/shared")),
         "{report}"
     );
     assert!(
-        report.contains("- backup-volume [volume] /srv/backups/deploy-alpha — external/shared: zero-delete protection"),
+        report
+            .lines()
+            .any(|line| line.contains("/srv/backups/deploy-alpha")
+                && line.contains("external/shared")),
         "{report}"
+    );
+    assert_eq!(
+        report
+            .lines()
+            .filter(|line| line.contains("managed+deployment"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        report
+            .lines()
+            .filter(|line| line.contains("external/shared"))
+            .count(),
+        2
     );
     assert!(
-        report.contains("managed+deletable: 1; external/shared zero-delete: 2"),
+        report.contains("nazoauthctl bind --instance production"),
         "{report}"
     );
-    assert!(
-        report.contains("resource classification (from the authoritative target state; nothing upgraded to managed):"),
-        "{report}"
-    );
-    assert!(
-        report.contains("nazoauthctl bind --instance <alias>"),
-        "{report}"
-    );
-    assert!(report.contains("signed nothing"), "{report}");
 
     // Zero target-side mutation: the authoritative document is byte-stable.
     let after = std::fs::read(&state_path)?;

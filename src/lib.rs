@@ -16,6 +16,7 @@ mod release;
 mod runtime_backend;
 pub mod target;
 mod tls;
+mod ui;
 
 pub(crate) use nazoauthctl_runtime::filesystem;
 pub(crate) use nazoauthctl_runtime::process;
@@ -26,6 +27,10 @@ pub use conformance::{
     ConformanceControlCompletion, ConformanceControlOutcome, ConformanceDeploymentEvidence,
     ConformanceRuntimeEvidence, ConformanceSession, ControlOperationIdentity,
     OpenId4VpEvidenceVerifierInputs, configure_oidf,
+};
+pub use ui::{
+    configure as configure_presentation, print_value as print_presentation_value,
+    text as presentation_text,
 };
 
 pub fn main_entry() {
@@ -62,6 +67,7 @@ pub fn main_entry() {
     };
     let action = command_action(&cli.command).to_owned();
     let json_mode = cli.json;
+    ui::configure(json_mode);
     let envelope_context = cli::envelope::EnvelopeContext {
         host: None,
         instance: cli.instance.clone(),
@@ -91,6 +97,13 @@ pub fn main_entry() {
 fn print_entry_error(title: &str, detail: &str) {
     use std::io::IsTerminal as _;
 
+    if ui::json_mode() {
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema": 1, "success": false, "code": "INPUT_INVALID", "detail": detail})
+        );
+        return;
+    }
     let title = if chinese_output() {
         match title {
             "Invalid command" => "命令无效",
@@ -155,6 +168,13 @@ fn print_help(topic: cli::HelpTopic) {
 
 fn help_text(topic: cli::HelpTopic) -> &'static str {
     match topic {
+        cli::HelpTopic::Read => "Usage:\n  nazoauthctl status [SELECTOR] [--all]\n  nazoauthctl doctor [SELECTOR] [--all]\n  nazoauthctl logs [SELECTOR] [--limit 1-500]\n  nazoauthctl operation [SELECTOR] [--limit 1-1000]\n\nStatus shows a compact table. Doctor adds diagnostics. Logs retain the service's original text; operation shows pending and completed work. Use the global --json option for structured details.",
+        cli::HelpTopic::Backup => "Usage:\n  nazoauthctl [--instance SELECTOR] backup [show]\n  nazoauthctl [--instance SELECTOR] backup snapshot\n  nazoauthctl [--instance SELECTOR] backup restore-test\n  nazoauthctl [--instance SELECTOR] backup copy --to-host HOST\n\nSnapshot creates a backup. Restore-test checks it by restoring into an isolated database. Copy transfers the verified snapshot to a different registered host.",
+        cli::HelpTopic::Recover => "Usage:\n  nazoauthctl recover [SELECTOR] [--to VERSION] [--recovery-secret-file PATH]\n\nRestore data and keys from a recorded snapshot, then start the selected official release. Omitting --to selects the latest release. Interrupted recovery resumes its recorded operation. An offline recovery secret is needed only when the restored registry rejects the current controller.",
+        cli::HelpTopic::Policy => "Usage:\n  nazoauthctl [--instance SELECTOR] policy backup-before-update off\n  nazoauthctl [--instance SELECTOR] policy backup-before-update warn\n  nazoauthctl [--instance SELECTOR] policy backup-before-update require --max-age-seconds N\n\nChoose whether updates ignore, warn about, or require a recent backup. The age limit is in seconds.",
+        cli::HelpTopic::Bind => "Usage:\n  nazoauthctl bind [SELECTOR] --label NAME [--credentials-file PATH]\n             [--approval-token TOKEN] [--output-secret-file PATH]\n\nAuthenticate an administrator, complete MFA and bind this controller. Save the displayed recovery secret offline, or use an owner-only output file. Credential files and approval tokens are alternative authentication inputs.",
+        cli::HelpTopic::Discover => "Usage:\n  nazoauthctl discover [--host HOST]\n\nInspect deployments on the selected host. Discovery does not register or change them. Use instance register to register a discovered deployment.",
+        cli::HelpTopic::Remote => "Usage:\n  nazoauthctl remote exec\n\nInternal SSH transport endpoint. Reads and writes the machine protocol on standard input/output; it has no interactive interface.",
         cli::HelpTopic::TopLevel => {
             "nazoauthctl — operate NazoAuth across local and SSH hosts
 
@@ -299,8 +319,9 @@ Next steps after install:
 Update drives ONE pre-signed migration plus ONE journaled stage/activate/
 health/commit HostOperation; retries resume the same operation id. Rollback
 restores only saved artifact/config references; data restore stays a separate
-command. Without --yes, `uninstall` prints the exact deletion plan and
-changes nothing; external/shared resources always have zero-delete protection."
+command. Without --yes, `uninstall` shows the deletion plan and asks for confirmation
+in an interactive terminal. Non-interactive runs only show the plan.
+External and shared resources are kept."
         }
         cli::HelpTopic::SelfUpdate => {
             "Usage:
@@ -318,13 +339,13 @@ and backup metadata offline without changing deployments."
             "Usage:
   nazoauthctl tls certificate check --provider-config PATH --tenant T --hostname H
                                     [--warning-window-seconds S]
-  nazoauthctl tls certificate plan   --provider-config PATH --tenant T --hostname H
+  nazoauthctl tls certificate plan|apply --provider-config PATH --tenant T --hostname H
                                      (--certificate F --private-key F | --from-acme-current)
                                      [--proxy-config COMPLETE_NATIVE_CONFIG]
-  nazoauthctl tls certificate apply  ...same inputs...
   nazoauthctl tls certificate recover --tenant T --hostname H
   nazoauthctl tls certificate show   --tenant T --hostname H
-  nazoauthctl tls acme plan|issue|recover|show ... (issue requires --agree-terms)
+  nazoauthctl tls acme plan|issue|recover|show --acme-config PATH --provider-config PATH --tenant T --hostname H
+                         [--agree-terms]
 
 Installs deployment-owned public TLS material through the external file-provider
 contract: offline chain/SAN/key validation, an atomic generation switch, a

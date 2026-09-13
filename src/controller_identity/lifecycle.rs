@@ -168,37 +168,43 @@ pub struct ProposalPresentation {
 
 impl ProposalPresentation {
     pub fn render(&self) -> String {
-        let mut text = format!(
+        let mut text = crate::ui::message!(
             "Controller identity change requires fresh administrator 2FA.\n\
              \x20 deployment: {dep}\n\
              \x20 issuer:     {issuer}\n\
              \x20 action:     {action}\n\
              \x20 label:      {label}\n",
+            "此控制器变更需要管理员重新完成双重验证。\n\n部署：{dep}\n服务地址：{issuer}\n操作：{action}\n名称：{label}\n",
             dep = self.deployment_id,
             issuer = self.issuer,
             action = self.action,
             label = self.label,
         );
         if let Some(controller_id) = &self.controller_id {
-            text.push_str(&format!("  controller: {controller_id}\n"));
+            text.push_str(&crate::ui::message!(
+                "  controller: {controller_id}\n",
+                "控制器：{controller_id}\n"
+            ));
         }
-        text.push_str(&format!(
+        text.push_str(&crate::ui::message!(
             "  new kid:    {}\n  public key: {}…\n",
+            "新密钥编号：{}\n公钥：{}…\n",
             short_kid(&self.kid),
             &self.public_key_b64[..self.public_key_b64.len().min(16)]
         ));
         if let (Some(recovery_kid), Some(recovery_public_key)) =
             (&self.recovery_kid, &self.recovery_public_key_b64)
         {
-            text.push_str(&format!(
+            text.push_str(&crate::ui::message!(
                 "  recovery kid: {}\n  recovery public key: {}…\n",
+                "恢复密钥编号：{}\n恢复公钥：{}…\n",
                 short_kid(recovery_kid),
                 &recovery_public_key[..recovery_public_key.len().min(16)]
             ));
         }
         text.push_str(
-            "\nApproval must cover this exact payload and a fresh administrator 2FA ceremony \
-             within 10 minutes; the key expires 30 days after enrollment.\n",
+            crate::ui::text("\nApproval must cover this exact payload and a fresh administrator 2FA ceremony \
+             within 10 minutes; the key expires 30 days after enrollment.\n", "\n本次批准仅适用于以上变更，需在双重验证后 10 分钟内使用。新密钥在注册后 30 天到期。\n"),
         );
         text
     }
@@ -332,9 +338,10 @@ fn reconcile_from_snapshot(
             if keys.retire_kid(deployment, kid).is_ok() {
                 retired.push(kid.clone());
             } else {
-                eprintln!(
+                crate::ui::warning!(
                     "nazauthctl: warning: superseded local controller key {kid} could not be \
-                     retired"
+                     retired",
+                    "注意：未能清理已被替换的本地控制器密钥 {kid}。"
                 );
             }
         }
@@ -344,16 +351,18 @@ fn reconcile_from_snapshot(
             return Ok(None);
         }
 
-        let mut report = format!(
+        let mut report = crate::ui::message!(
             "recovered controller binding for '{}' from the authoritative server list\n  \
              controller {} kid {} activated locally\n",
+            "已根据服务端记录恢复实例“{}”的控制器绑定\n控制器：{}\n已启用密钥：{}\n",
             record.alias,
             slot.controller_id,
             short_kid(&slot.kid)
         );
         if !retired.is_empty() {
-            report.push_str(&format!(
+            report.push_str(&crate::ui::message!(
                 "  superseded local keys retired: {}\n",
+                "已清理旧密钥：{}\n",
                 retired.join(", ")
             ));
         }
@@ -371,10 +380,11 @@ fn reconcile_from_snapshot(
         if !still_listed {
             persist_binding_fields(registry, deployment, None)?;
             keys.clear_active(deployment)?;
-            return Ok(Some(format!(
+            return Ok(Some(crate::ui::message!(
                 "controller identity {controller_id} of '{}' is no longer active at the \
                  server; the local binding was cleared. Enroll again with `nazoauthctl bind` \
                  once the cause is resolved\n",
+                "实例“{}”的控制器 {controller_id} 已在服务端失效，本地绑定已清除。解决原因后，请运行 nazoauthctl bind 重新绑定。\n",
                 record.alias
             )));
         }
@@ -447,9 +457,10 @@ fn finish_activation(
     persist_binding_fields(registry, deployment, Some(&committed_slot.controller_id))?;
     keys.set_active_kid(deployment, kid)?;
     let status = expiry::ExpiryStatus::classify(chrono::Utc::now(), committed_slot.expires_at);
-    Ok(format!(
+    Ok(crate::ui::message!(
         "controller identity committed for '{alias}' (deployment {deployment})\n  controller \
          {} kid {} slot {}\n  expiry: {}\n",
+        "实例“{alias}”的控制器绑定已保存\n\n部署：{deployment}\n控制器：{}\n密钥：{}\n槽位：{}\n有效期：{}\n",
         committed_slot.controller_id,
         short_kid(kid),
         committed_slot.slot_index,
@@ -486,7 +497,10 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     // D06: a previous run may have committed server-side already.
     if let Some(report) = reconcile_from_snapshot(registry, keys, &record, &snapshot)? {
         clear_pending_bind_recovery(keys, &deployment)?;
-        return Ok(format!("bind complete via crash recovery.\n{report}"));
+        return Ok(crate::ui::message!(
+            "bind complete via crash recovery.\n{report}",
+            "已继续上次中断的绑定操作。\n{report}"
+        ));
     }
 
     if !snapshot.active_slots().is_empty() || record.controller_id.is_some() {
@@ -606,7 +620,10 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
     // D07.3: an interrupted rotation finishes through reconciliation first —
     // never by proposing yet another key.
     if let Some(report) = reconcile_from_snapshot(registry, keys, &record, &snapshot)? {
-        return Ok(format!("rotation completed via crash recovery.\n{report}"));
+        return Ok(crate::ui::message!(
+            "rotation completed via crash recovery.\n{report}",
+            "已继续上次中断的密钥更换。\n{report}"
+        ));
     }
 
     // Expired keys may still start rotation (goal plan 04 §7 rule 3); the
@@ -678,9 +695,10 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
     if let Some(previous) = previous.filter(|previous| previous.as_str() != kid)
         && let Err(error) = keys.retire_kid(&deployment, &previous)
     {
-        eprintln!(
+        crate::ui::warning!(
             "nazauthctl: warning: old controller key {previous} could not be unlinked \
-             locally: {error:#}; the next reconciliation retires it"
+             locally: {error:#}; the next reconciliation retires it",
+            "注意：未能清理旧密钥 {previous}：{error:#}。下次同步时会再次清理。"
         );
     }
     Ok(report)
@@ -705,7 +723,10 @@ pub fn add_flow<A: ControllerRegistryApi>(
     let snapshot = api.list_slots(&deployment)?;
 
     if let Some(report) = reconcile_from_snapshot(registry, keys, &record, &snapshot)? {
-        return Ok(format!("identity recovered before adding.\n{report}"));
+        return Ok(crate::ui::message!(
+            "identity recovered before adding.\n{report}",
+            "添加前已恢复控制器绑定。\n{report}"
+        ));
     }
 
     // Max-3 awareness (D08): refuse BEFORE burning a single-use approval when
@@ -721,8 +742,9 @@ pub fn add_flow<A: ControllerRegistryApi>(
             record.alias
         );
         for slot in snapshot.active_slots() {
-            message.push_str(&format!(
+            message.push_str(&crate::ui::message!(
                 "\n  - controller {} label '{}' kid {} expires {}",
+                "\n  - 控制器 {} | 名称“{}” | 密钥 {} | 到期时间 {}",
                 slot.controller_id,
                 slot.label,
                 short_kid(&slot.kid),
@@ -767,9 +789,10 @@ pub fn add_flow<A: ControllerRegistryApi>(
     // This ctl adopts its NEW slot as the identity it signs with; the
     // previous key stays enrolled until its own expiry or explicit revocation.
     let report = finish_activation(registry, keys, &record.alias, &deployment, &kid, slot)?;
-    Ok(format!(
+    Ok(crate::ui::message!(
         "{report}note: the previous controller key remains enrolled and valid until its own \
-         expiry or explicit revocation\n"
+         expiry or explicit revocation\n",
+        "{report}原控制器密钥仍有效，直至到期或被主动撤销。\n"
     ))
 }
 
@@ -804,10 +827,11 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
 
     let self_revoked = record.controller_id.as_deref() == Some(controller_id);
     if self_revoked {
-        eprintln!(
+        crate::ui::warning!(
             "nazauthctl: warning: you are revoking THIS control machine's own controller \
              identity; application-level mutations will stop working afterwards until a new \
-             key is enrolled"
+             key is enrolled",
+            "注意：即将撤销本机的控制器授权。重新绑定密钥前，本机将无法执行需要授权的操作。"
         );
     }
 
@@ -838,8 +862,9 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
     }
 
     // Local cleanup strictly AFTER server confirmation (D08.5).
-    let mut report = format!(
+    let mut report = crate::ui::message!(
         "revoked controller {} (label '{}', kid {}) at deployment {}\n",
+        "控制器授权已撤销\n\n控制器：{}\n名称：{}\n密钥：{}\n部署：{}\n",
         revoked.controller_id,
         revoked.label,
         short_kid(&revoked.kid),
@@ -849,10 +874,11 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
     if self_revoked {
         persist_binding_fields(registry, &deployment, None)?;
         keys.clear_active(&deployment)?;
-        report.push_str(
+        report.push_str(crate::ui::text(
             "this machine's active pointer was cleared; remaining local key records stay on \
              disk for diagnostics\n",
-        );
+            "已清除本机的当前控制器绑定；其余本地密钥记录保留用于诊断。\n",
+        ));
     } else if keys
         .list_keys(&deployment)?
         .iter()
@@ -861,7 +887,10 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
         // Material for a REMOTE controller must not exist here under normal
         // operation; if it does, retire it now that the server confirmed.
         keys.retire_kid(&deployment, &revoked.kid)?;
-        report.push_str("matching stale local key record retired\n");
+        report.push_str(crate::ui::text(
+            "matching stale local key record retired\n",
+            "已清理匹配的旧本地密钥记录。\n",
+        ));
     }
     Ok(report)
 }
@@ -890,18 +919,50 @@ pub fn slots_flow<A: ControllerRegistryApi>(
         report.push_str(line.trim_end());
         report.push('\n');
     }
-    report.push_str(&format!(
+    report.push_str(&crate::ui::message!(
         "controller slots for '{}' (deployment {}, issuer {}): {} item(s), max {}\n",
-        record.alias, deployment, record.issuer, snapshot.total, snapshot.max_active_slots
+        "实例“{}”的控制器\n\n部署：{}\n服务地址：{}\n数量：{} / {}\n",
+        record.alias,
+        deployment,
+        record.issuer,
+        snapshot.total,
+        snapshot.max_active_slots
+    ));
+    let rows = snapshot
+        .items
+        .iter()
+        .map(|slot| {
+            vec![
+                slot.label.clone(),
+                slot.controller_id.clone(),
+                match slot.status {
+                    SlotStatus::Active => crate::ui::text("Active", "有效"),
+                    SlotStatus::Revoked => crate::ui::text("Revoked", "已撤销"),
+                }
+                .to_owned(),
+                slot.expires_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    report.push_str(&crate::ui::table(
+        &[
+            crate::ui::text("Name", "名称"),
+            crate::ui::text("Controller ID", "控制器编号"),
+            crate::ui::text("Status", "状态"),
+            crate::ui::text("Expires (UTC)", "到期时间（UTC）"),
+        ],
+        &rows,
     ));
     if snapshot.items.is_empty() {
-        report.push_str("  none enrolled; run `nazoauthctl bind`\n");
+        report.push_str(crate::ui::text(
+            "\nNext: nazoauthctl bind\n",
+            "\n下一步：nazoauthctl bind\n",
+        ));
     }
-    for slot in &snapshot.items {
-        for row in expiry::render_slot_line(slot, now).split('\n') {
-            report.push_str("  ");
-            report.push_str(row);
-            report.push('\n');
+    for slot in snapshot.active_slots() {
+        let expiry = expiry::ExpiryStatus::classify(now, slot.expires_at);
+        if !matches!(expiry, expiry::ExpiryStatus::Ok { .. }) {
+            report.push_str(&format!("\n{}: {}", slot.label, expiry.render()));
         }
     }
     Ok(report)
@@ -921,24 +982,37 @@ fn obtain_approval_token(flag: Option<&str>, action: &str) -> anyhow::Result<Str
     if let Some(flag) = flag {
         let trimmed = flag.trim();
         if !token_length_ok(trimmed) {
-            bail!("--approval-token has an unexpected length");
+            crate::ui::fail!(
+                "--approval-token has an unexpected length",
+                "--approval-token 的长度不正确"
+            );
         }
         return Ok(trimmed.to_owned());
     }
     use std::io::IsTerminal as _;
     if std::io::stdin().is_terminal() {
-        let prompt = format!("Paste the {action} approval token (input hidden): ");
+        let prompt = crate::ui::message!(
+            "Paste the {action} approval token (input hidden): ",
+            "请粘贴 {action} 操作的批准令牌（输入隐藏）："
+        );
         let token = cliclack::password(prompt)
             .allow_empty()
+            .validate(crate::ui::required_input)
             .interact()
-            .context("failed to read the approval token")?;
+            .context(crate::ui::text(
+                "failed to read the approval token",
+                "无法读取批准令牌",
+            ))?;
         let trimmed = token.trim().to_owned();
         if !token_length_ok(&trimmed) {
             bail!("the pasted approval token has an unexpected length");
         }
         Ok(trimmed)
     } else {
-        eprintln!("Paste the {action} approval token on one line:");
+        crate::ui::warning!(
+            "Paste the {action} approval token on one line:",
+            "请在一行内粘贴 {action} 操作的批准令牌："
+        );
         let mut line = String::new();
         std::io::stdin()
             .read_line(&mut line)
@@ -980,14 +1054,23 @@ fn make_authenticated_api(
     drop(credentials);
 
     if login.mfa_required {
-        let code = prompt_mfa_code("Administrator MFA code: ")?;
+        let code = prompt_mfa_code(crate::ui::text(
+            "Administrator MFA code: ",
+            "管理员动态验证码：",
+        ))?;
         session.verify_mfa(&code)?;
     } else {
         let enrollment = session.begin_totp()?;
         print_totp_enrollment(&enrollment)?;
-        let code = prompt_mfa_code("Enter the current code from your authenticator: ")?;
+        let code = prompt_mfa_code(crate::ui::text(
+            "Enter the current code from your authenticator: ",
+            "请输入验证器中当前显示的验证码：",
+        ))?;
         let confirmation = session.confirm_totp(&code)?;
-        eprintln!("MFA enabled. Store these one-time backup codes now:");
+        crate::ui::warning!(
+            "MFA enabled. Store these one-time backup codes now:",
+            "双重验证已启用。请妥善保存以下一次性备用码："
+        );
         for code in &confirmation.backup_codes {
             eprintln!("  {}", code.as_str());
         }
@@ -999,6 +1082,7 @@ fn prompt_mfa_code(prompt: &str) -> anyhow::Result<zeroize::Zeroizing<String>> {
     let code = zeroize::Zeroizing::new(
         cliclack::password(prompt)
             .allow_empty()
+            .validate(crate::ui::required_input)
             .interact()
             .context("failed to read administrator MFA code")?,
     );
@@ -1016,10 +1100,14 @@ fn print_totp_enrollment(enrollment: &admin_api::TotpEnrollment) -> anyhow::Resu
         .render::<qrcode::render::unicode::Dense1x2>()
         .quiet_zone(true)
         .build();
-    eprintln!("This administrator has no MFA yet. Scan this QR code:");
+    crate::ui::warning!(
+        "This administrator has no MFA yet. Scan this QR code:",
+        "此管理员尚未启用双重验证。请用验证器扫描二维码："
+    );
     eprintln!("{rendered}");
-    eprintln!(
+    crate::ui::warning!(
         "If scanning is unavailable, enter this secret manually: {}",
+        "无法扫码时，请在验证器中手动输入此密钥：{}",
         enrollment.secret_base32.as_str()
     );
     Ok(())
@@ -1070,7 +1158,7 @@ fn approval_callback<'a, A: ControllerRegistryApi>(
     issue_with_admin_access: bool,
 ) -> impl FnOnce(&ProposalPresentation) -> anyhow::Result<String> + 'a {
     move |presentation| {
-        println!("{}", presentation.render());
+        crate::ui::print_report(&presentation.render());
         if token.is_some() || !issue_with_admin_access {
             return obtain_approval_token(token, presentation.action);
         }
@@ -1096,7 +1184,7 @@ pub(crate) fn run_controller_command(
             let record = resolve_record(&registry, explicit.as_deref())?;
             let api = make_public_api(&record.issuer)?;
             let report = slots_flow(&api, &registry, &keys, explicit.as_deref())?;
-            println!("{report}");
+            crate::ui::print_report(&report);
         }
         ControllerCommand::Add {
             selector,
@@ -1120,7 +1208,7 @@ pub(crate) fn run_controller_command(
                 &label,
                 approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
-            println!("{report}");
+            crate::ui::print_report(&report);
         }
         ControllerCommand::Rotate {
             selector,
@@ -1144,7 +1232,7 @@ pub(crate) fn run_controller_command(
                 label.as_deref(),
                 approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
-            println!("{report}");
+            crate::ui::print_report(&report);
         }
         ControllerCommand::Revoke {
             selector,
@@ -1168,7 +1256,7 @@ pub(crate) fn run_controller_command(
                 &controller_id,
                 approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
-            println!("{report}");
+            crate::ui::print_report(&report);
         }
         ControllerCommand::Recover {
             selector,
@@ -1203,7 +1291,7 @@ pub(crate) fn run_controller_command(
                     &record.deployment_id,
                     delivery.as_ref(),
                 )?;
-                println!("{report}");
+                crate::ui::print_report(&report);
             } else {
                 let secret_text = read_recovery_secret(secret_file.as_deref())?;
                 let recovered = recovery::recover_controller_identity(
@@ -1215,7 +1303,7 @@ pub(crate) fn run_controller_command(
                     &label,
                     delivery.as_ref(),
                 )?;
-                println!("{}", render_recovered(&record.alias, &recovered));
+                crate::ui::print_report(&render_recovered(&record.alias, &recovered));
             }
         }
     }
@@ -1260,7 +1348,7 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
         approval_callback(&api, approval_token.as_deref(), issue_approval),
         delivery.as_ref(),
     )?;
-    println!("{report}");
+    crate::ui::print_report(&report);
     Ok(())
 }
 
@@ -1285,13 +1373,20 @@ fn read_recovery_secret(path: Option<&std::path::Path>) -> anyhow::Result<String
     }
     use std::io::IsTerminal as _;
     if std::io::stdin().is_terminal() {
-        let secret = cliclack::password("Paste the offline Recovery Secret (input hidden)")
-            .allow_empty()
-            .interact()
-            .context("failed to read the recovery secret")?;
+        let secret = cliclack::password(crate::ui::text(
+            "Paste the offline Recovery Secret (input hidden)",
+            "请粘贴离线恢复密钥（输入隐藏）",
+        ))
+        .allow_empty()
+        .validate(crate::ui::required_input)
+        .interact()
+        .context("failed to read the recovery secret")?;
         Ok(secret.trim().to_owned())
     } else {
-        eprintln!("Paste the offline Recovery Secret on one line:");
+        crate::ui::warning!(
+            "Paste the offline Recovery Secret on one line:",
+            "请在一行内粘贴离线恢复密钥："
+        );
         let mut line = String::new();
         std::io::stdin()
             .read_line(&mut line)
@@ -1301,7 +1396,7 @@ fn read_recovery_secret(path: Option<&std::path::Path>) -> anyhow::Result<String
 }
 
 fn render_recovered(alias: &str, recovered: &recovery::RecoveredIdentity) -> String {
-    format!(
+    crate::ui::message!(
         "controller identity recovered for instance '{alias}'\n\
          controller id: {}\n\
          kid: {}\n\
@@ -1312,6 +1407,7 @@ fn render_recovered(alias: &str, recovered: &recovery::RecoveredIdentity) -> Str
          the old secret stopped verifying when it landed. Verify your offline copy now — it is \
          the only way to run this recovery again.\n\
          next: nazoauthctl status --instance {alias}\n",
+        "实例“{alias}”的控制器已恢复\n\n控制器：{}\n密钥：{}\n到期时间：{}（按服务端时钟计算，30 天有效）\n恢复密钥代次：{}\n\n新的恢复密钥已交付并确认，旧密钥已失效。请确认已妥善保存新的离线副本。\n下一步：nazoauthctl status --instance {alias}\n",
         recovered.controller_id,
         short_kid(&recovered.kid),
         recovered.expires_at.to_rfc3339(),
@@ -2124,8 +2220,11 @@ mod tests {
         let api = FakeApi::default();
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 20)]);
         let report = slots_flow(&api, &f.registry, &f.keys, None)?;
-        assert!(report.contains("valid ("), "{report}");
-        assert!(report.contains(&KID_A[..12]), "{report}");
+        assert!(
+            report.contains("Active") && report.contains("Expires (UTC)"),
+            "{report}"
+        );
+        assert!(report.contains(CONTROLLER_A), "{report}");
 
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 3)]);
         let report = slots_flow(&api, &f.registry, &f.keys, None)?;

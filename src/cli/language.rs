@@ -80,6 +80,27 @@ status 默认显示汇总表；--json 输出完整结构化数据。"
         .next()
         .unwrap_or_default();
     let description = match topic {
+        HelpTopic::Read => {
+            "status 显示汇总表，doctor 补充诊断信息。logs 保留服务端日志原文，operation 查看待完成和已完成的操作。使用全局 --json 参数获取结构化详情。"
+        }
+        HelpTopic::Backup => {
+            "snapshot 创建备份；restore-test 将备份实际恢复到隔离数据库进行验证；copy 将已验证的快照复制到另一台已注册主机。"
+        }
+        HelpTopic::Recover => {
+            "从已有快照恢复数据和密钥，再启动所选官方版本。不指定 --to 时使用最新版本。中断后重试会继续原操作；仅当恢复后的注册信息不再接受当前控制器时，才需要离线恢复密钥。"
+        }
+        HelpTopic::Policy => {
+            "设置更新前备份策略：off 不检查，warn 在备份不满足要求时提示，require 要求存在符合时效的备份。--max-age-seconds 以秒为单位。"
+        }
+        HelpTopic::Bind => {
+            "登录管理员、完成双重验证后绑定本机控制器。请将显示的恢复密钥离线保存，或用 --output-secret-file 写入仅当前用户可读的文件。凭据文件和批准令牌是两种可选的认证输入。"
+        }
+        HelpTopic::Discover => {
+            "查看指定主机上的部署，不自动注册或修改部署。使用 instance register 注册发现的部署。"
+        }
+        HelpTopic::Remote => {
+            "供 SSH 使用的内部执行入口，通过标准输入和输出交换机器协议，不提供交互界面。"
+        }
         HelpTopic::Host => {
             "host add 会先验证目标执行器再保存记录。host check 重新检查主机。host forget 仅删除本地注册记录，不卸载目标或撤销控制器。"
         }
@@ -93,7 +114,7 @@ status 默认显示汇总表；--json 输出完整结构化数据。"
             "使用指定的外部 PostgreSQL 和 Valkey，以及已有的数据库运行与生命周期角色。密码从文件读取，不写入日志。安装完成后，依次运行 admin create、bind 和 verify；安装不自动生成备份或执行公网验证。"
         }
         HelpTopic::Update => {
-            "update 验证官方制品后迁移并更新；中断后重试会继续原操作。rollback 恢复制品和配置引用，数据恢复使用 recover。uninstall 未指定 --yes 时只显示删除计划；外部和共享资源不删除。"
+            "update 验证官方制品后迁移并更新；中断后重试会继续原操作。rollback 恢复程序和配置，数据恢复使用 recover。uninstall 先显示删除计划，在终端中询问确认；非交互环境需显式指定 --yes 才会执行。外部和共享资源不删除。"
         }
         HelpTopic::SelfUpdate => {
             "检查、更新或回滚控制器自身。更新前验证新程序能读取现有状态，安装后检查失败时自动恢复旧程序。verify-state 离线检查本机状态和备份元数据，不修改部署。"
@@ -128,6 +149,13 @@ mod tests {
             HelpTopic::SelfUpdate,
             HelpTopic::Tls,
             HelpTopic::Admin,
+            HelpTopic::Read,
+            HelpTopic::Backup,
+            HelpTopic::Recover,
+            HelpTopic::Policy,
+            HelpTopic::Bind,
+            HelpTopic::Discover,
+            HelpTopic::Remote,
         ] {
             let english = crate::help_text(topic);
             let syntax = english

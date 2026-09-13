@@ -19,6 +19,13 @@ pub(crate) fn help_topic(args: &[String]) -> Option<HelpTopic> {
         Some("tls") => HelpTopic::Tls,
         Some("self") => HelpTopic::SelfUpdate,
         Some("admin") => HelpTopic::Admin,
+        Some("status" | "doctor" | "logs" | "operation") => HelpTopic::Read,
+        Some("backup") => HelpTopic::Backup,
+        Some("recover") => HelpTopic::Recover,
+        Some("policy") => HelpTopic::Policy,
+        Some("bind") => HelpTopic::Bind,
+        Some("discover") => HelpTopic::Discover,
+        Some("remote") => HelpTopic::Remote,
         _ => HelpTopic::TopLevel,
     })
 }

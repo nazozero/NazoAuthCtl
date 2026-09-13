@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 
 use crate::runtime_backend::RuntimeBackendKind;
 
@@ -79,7 +79,10 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
         "bind",
     )?;
     if parsed.positionals.len() > 1 {
-        bail!("bind accepts at most one selector argument");
+        crate::ui::fail!(
+            "bind accepts at most one selector argument",
+            "bind 最多接受一个实例选择参数"
+        );
     }
     let named = match parsed.values.get("--instance") {
         Some(instance) => {
@@ -93,12 +96,18 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
             checked_name("--label", label)?;
             label.clone()
         }
-        None => bail!("--label NAME is required so administrators can recognize this key"),
+        None => crate::ui::fail!(
+            "--label NAME is required so administrators can recognize this key",
+            "必须提供 --label NAME，便于管理员识别此密钥"
+        ),
     };
     let approval_token = match parsed.values.get("--approval-token") {
         Some(token) => {
             if token.trim().is_empty() || token.chars().any(char::is_control) || token.len() > 512 {
-                bail!("--approval-token must be a single-line bounded token");
+                crate::ui::fail!(
+                    "--approval-token must be a single-line bounded token",
+                    "--approval-token 必须是长度符合限制的单行令牌"
+                );
             }
             Some(token.clone())
         }
@@ -106,15 +115,24 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
     };
     let credentials_file = match parsed.values.get("--credentials-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Some(_) => bail!("--credentials-file requires a file path"),
+        Some(_) => crate::ui::fail!(
+            "--credentials-file requires a file path",
+            "--credentials-file 需要文件路径"
+        ),
         None => None,
     };
     if approval_token.is_some() && credentials_file.is_some() {
-        bail!("--approval-token and --credentials-file are alternative approval sources");
+        crate::ui::fail!(
+            "--approval-token and --credentials-file are alternative approval sources",
+            "--approval-token 和 --credentials-file 只能选择一种"
+        );
     }
     let output_secret_file = match parsed.values.get("--output-secret-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
-        Some(_) => bail!("--output-secret-file requires a file path"),
+        Some(_) => crate::ui::fail!(
+            "--output-secret-file requires a file path",
+            "--output-secret-file 需要文件路径"
+        ),
         None => None,
     };
     Ok(BindOptions {
@@ -160,12 +178,18 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         "install",
     )?;
     if let Some(unexpected) = parsed.positionals.first() {
-        bail!("install does not accept the argument '{unexpected}'");
+        crate::ui::fail!(
+            "install does not accept the argument '{unexpected}'",
+            "install 不接受参数“{unexpected}”"
+        );
     }
     let public_url = parsed
         .values
         .get("--public-url")
-        .context("install requires --public-url URL (the public issuer origin)")?
+        .context(crate::ui::text(
+            "install requires --public-url URL (the public issuer origin)",
+            "安装需要 --public-url URL（公开服务地址）",
+        ))?
         .clone();
     if let Some(host) = parsed.values.get("--host") {
         checked_name("--host", host)?;
@@ -185,55 +209,88 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         .get("--runtime")
         .map(|class| class.parse::<RuntimeBackendKind>())
         .transpose()
-        .context("--runtime must be podman, docker, or host")?;
+        .context(crate::ui::text(
+            "--runtime must be podman, docker, or host",
+            "--runtime 必须为 podman、docker 或 host",
+        ))?;
     let install_root = parsed.values.get("--install-root").map(PathBuf::from);
     let database_host = parsed
         .values
         .get("--database-host")
-        .context("install requires --database-host HOST (external PostgreSQL endpoint)")?
+        .context(crate::ui::text(
+            "install requires --database-host HOST (external PostgreSQL endpoint)",
+            "安装需要 --database-host HOST（已有 PostgreSQL 地址）",
+        ))?
         .clone();
     let database_port = match parsed.values.get("--database-port") {
-        Some(port) => port
-            .parse::<u16>()
-            .context("--database-port must be 1-65535")?,
-        None => bail!("install requires --database-port PORT"),
+        Some(port) => port.parse::<u16>().context(crate::ui::text(
+            "--database-port must be 1-65535",
+            "--database-port 必须在 1 到 65535 之间",
+        ))?,
+        None => crate::ui::fail!(
+            "install requires --database-port PORT",
+            "安装需要 --database-port PORT"
+        ),
     };
     let database_name = parsed
         .values
         .get("--database-name")
-        .context("install requires --database-name DATABASE")?
+        .context(crate::ui::text(
+            "install requires --database-name DATABASE",
+            "安装需要 --database-name DATABASE",
+        ))?
         .clone();
     let database_runtime_user = parsed
         .values
         .get("--database-runtime-user")
-        .context("install requires --database-runtime-user ROLE")?
+        .context(crate::ui::text(
+            "install requires --database-runtime-user ROLE",
+            "安装需要 --database-runtime-user ROLE",
+        ))?
         .clone();
     let database_lifecycle_user = parsed
         .values
         .get("--database-lifecycle-user")
-        .context("install requires --database-lifecycle-user ROLE")?
+        .context(crate::ui::text(
+            "install requires --database-lifecycle-user ROLE",
+            "安装需要 --database-lifecycle-user ROLE",
+        ))?
         .clone();
     if database_runtime_user == database_lifecycle_user {
-        bail!("runtime and lifecycle PostgreSQL roles must be distinct");
+        crate::ui::fail!(
+            "runtime and lifecycle PostgreSQL roles must be distinct",
+            "PostgreSQL 的运行角色与迁移角色必须不同"
+        );
     }
     let valkey_host = parsed
         .values
         .get("--valkey-host")
-        .context("install requires --valkey-host HOST (external Valkey endpoint)")?
+        .context(crate::ui::text(
+            "install requires --valkey-host HOST (external Valkey endpoint)",
+            "安装需要 --valkey-host HOST（已有 Valkey 地址）",
+        ))?
         .clone();
     let valkey_port = match parsed.values.get("--valkey-port") {
-        Some(port) => port
-            .parse::<u16>()
-            .context("--valkey-port must be 1-65535")?,
-        None => bail!("install requires --valkey-port PORT"),
+        Some(port) => port.parse::<u16>().context(crate::ui::text(
+            "--valkey-port must be 1-65535",
+            "--valkey-port 必须在 1 到 65535 之间",
+        ))?,
+        None => crate::ui::fail!(
+            "install requires --valkey-port PORT",
+            "安装需要 --valkey-port PORT"
+        ),
     };
     let database_runtime_password_file = match parsed.values.get("--database-runtime-password-file")
     {
         Some(path) if !path.is_empty() => PathBuf::from(path),
-        Some(_) => bail!("--database-runtime-password-file requires a file path"),
-        None => bail!(
+        Some(_) => crate::ui::fail!(
+            "--database-runtime-password-file requires a file path",
+            "--database-runtime-password-file 需要文件路径"
+        ),
+        None => crate::ui::fail!(
             "install requires --database-runtime-password-file PATH (the EXISTING PostgreSQL runtime role \
-             password; ctl never invents credentials the external system does not know)"
+             password; ctl never invents credentials the external system does not know)",
+            "安装需要 --database-runtime-password-file PATH，文件中应为已有 PostgreSQL 运行角色的密码"
         ),
     };
     let database_lifecycle_password_file = match parsed
@@ -241,17 +298,25 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         .get("--database-lifecycle-password-file")
     {
         Some(path) if !path.is_empty() => PathBuf::from(path),
-        Some(_) => bail!("--database-lifecycle-password-file requires a file path"),
-        None => bail!(
-            "install requires --database-lifecycle-password-file PATH (the EXISTING PostgreSQL lifecycle role password)"
+        Some(_) => crate::ui::fail!(
+            "--database-lifecycle-password-file requires a file path",
+            "--database-lifecycle-password-file 需要文件路径"
+        ),
+        None => crate::ui::fail!(
+            "install requires --database-lifecycle-password-file PATH (the EXISTING PostgreSQL lifecycle role password)",
+            "安装需要 --database-lifecycle-password-file PATH，文件中应为已有 PostgreSQL 迁移角色的密码"
         ),
     };
     let valkey_password_file = match parsed.values.get("--valkey-password-file") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
-        Some(_) => bail!("--valkey-password-file requires a file path"),
-        None => bail!(
+        Some(_) => crate::ui::fail!(
+            "--valkey-password-file requires a file path",
+            "--valkey-password-file 需要文件路径"
+        ),
+        None => crate::ui::fail!(
             "install requires --valkey-password-file PATH (the EXISTING Valkey password; ctl \
-             never invents credentials the external system does not know)"
+             never invents credentials the external system does not know)",
+            "安装需要 --valkey-password-file PATH，文件中应为已有 Valkey 的密码"
         ),
     };
     let target_path = |flag: &str| -> anyhow::Result<Option<PathBuf>> {
@@ -270,14 +335,20 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
                 .any(|part| matches!(part, "." | ".."))
             || value.chars().any(char::is_control)
         {
-            bail!("{flag} must be a bounded absolute target-side path without traversal");
+            crate::ui::fail!(
+                "{flag} must be a bounded absolute target-side path without traversal",
+                "{flag} 必须为目标主机上的绝对路径，不能包含路径跳转或超长内容"
+            );
         }
         Ok(Some(PathBuf::from(value)))
     };
     let direct_tls_config = parsed.values.get("--direct-tls-config").map(PathBuf::from);
     let tls_material_root = target_path("--tls-material-root")?;
     if direct_tls_config.is_some() != tls_material_root.is_some() {
-        bail!("--direct-tls-config and --tls-material-root must be supplied together");
+        crate::ui::fail!(
+            "--direct-tls-config and --tls-material-root must be supplied together",
+            "--direct-tls-config 和 --tls-material-root 必须一起提供"
+        );
     }
     Ok(InstallArgs {
         host: parsed.values.get("--host").cloned(),
@@ -311,7 +382,10 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
         "update",
     )?;
     if parsed.positionals.len() > 1 {
-        bail!("update accepts at most one selector argument");
+        crate::ui::fail!(
+            "update accepts at most one selector argument",
+            "update 最多接受一个实例选择参数"
+        );
     }
     let named = match parsed.values.get("--instance") {
         Some(instance) => {
@@ -331,9 +405,10 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
     let config_schema = parsed.values.get("--config-schema").cloned();
     match (&config_file, &config_schema) {
         (Some(_), Some(_)) | (None, None) => {}
-        _ => bail!(
+        _ => crate::ui::fail!(
             "staging a configuration requires --config-file PATH together with \
-             --config-schema TOKEN"
+             --config-schema TOKEN",
+            "更新配置时，必须同时提供 --config-file PATH 和 --config-schema TOKEN"
         ),
     }
     Ok(UpdateArgs {
@@ -358,13 +433,19 @@ pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
             "copy" => {
                 let parts = selector_parts(rest, &["--to-host"], &[], "backup copy")?;
                 if parts.positional.is_some() {
-                    bail!("backup copy does not accept a positional selector; use --instance");
+                    crate::ui::fail!(
+                        "backup copy does not accept a positional selector; use --instance",
+                        "backup copy 请使用 --instance 选择实例，不接受位置参数"
+                    );
                 }
                 let to_host = parts
                     .values
                     .get("--to-host")
                     .cloned()
-                    .context("backup copy requires --to-host HOST")?;
+                    .context(crate::ui::text(
+                        "backup copy requires --to-host HOST",
+                        "backup copy 需要 --to-host HOST",
+                    ))?;
                 return Ok(BackupArgs {
                     selector: InstanceSelector {
                         positional: None,
@@ -373,12 +454,18 @@ pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
                     command: BackupCommand::Copy { to_host },
                 });
             }
-            _ => bail!("backup requires show, snapshot, restore-test, or copy"),
+            _ => crate::ui::fail!(
+                "backup requires show, snapshot, restore-test, or copy",
+                "backup 需要 show、snapshot、restore-test 或 copy 子命令"
+            ),
         },
     };
     let parts = selector_parts(rest, &[], &[], "backup")?;
     if parts.positional.is_some() {
-        bail!("backup does not accept a positional selector; use --instance");
+        crate::ui::fail!(
+            "backup does not accept a positional selector; use --instance",
+            "backup 请使用 --instance 选择实例，不接受位置参数"
+        );
     }
     Ok(BackupArgs {
         selector: InstanceSelector {
@@ -392,13 +479,22 @@ pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
 /// `nazoauthctl policy backup-before-update off|warn|require --max-age-seconds N`.
 pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
     let Some((subject, rest)) = values.split_first() else {
-        bail!("policy requires backup-before-update");
+        crate::ui::fail!(
+            "policy requires backup-before-update",
+            "policy 需要 backup-before-update 子命令"
+        );
     };
     if subject != "backup-before-update" {
-        bail!("policy only supports backup-before-update");
+        crate::ui::fail!(
+            "policy only supports backup-before-update",
+            "policy 仅支持 backup-before-update"
+        );
     }
     let Some((mode, rest)) = rest.split_first() else {
-        bail!("backup-before-update requires off, warn, or require");
+        crate::ui::fail!(
+            "backup-before-update requires off, warn, or require",
+            "备份策略必须为 off、warn 或 require"
+        );
     };
     let parts = selector_parts(
         rest,
@@ -409,13 +505,19 @@ pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
     let policy = match mode.as_str() {
         "off" => {
             if parts.values.contains_key("--max-age-seconds") {
-                bail!("off does not accept --max-age-seconds");
+                crate::ui::fail!(
+                    "off does not accept --max-age-seconds",
+                    "off 策略不接受 --max-age-seconds"
+                );
             }
             crate::registry::BackupBeforeUpdatePolicy::Off
         }
         "warn" => {
             if parts.values.contains_key("--max-age-seconds") {
-                bail!("warn does not accept --max-age-seconds");
+                crate::ui::fail!(
+                    "warn does not accept --max-age-seconds",
+                    "warn 策略不接受 --max-age-seconds"
+                );
             }
             crate::registry::BackupBeforeUpdatePolicy::Warn
         }
@@ -423,13 +525,20 @@ pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
             let value = parts
                 .values
                 .get("--max-age-seconds")
-                .context("require needs --max-age-seconds")?;
-            let max_age_seconds = value
-                .parse::<u64>()
-                .context("--max-age-seconds must be an integer")?;
+                .context(crate::ui::text(
+                    "require needs --max-age-seconds",
+                    "require 策略需要 --max-age-seconds",
+                ))?;
+            let max_age_seconds = value.parse::<u64>().context(crate::ui::text(
+                "--max-age-seconds must be an integer",
+                "--max-age-seconds 必须为整数",
+            ))?;
             crate::registry::BackupBeforeUpdatePolicy::Require { max_age_seconds }
         }
-        _ => bail!("backup-before-update requires off, warn, or require"),
+        _ => crate::ui::fail!(
+            "backup-before-update requires off, warn, or require",
+            "备份策略必须为 off、warn 或 require"
+        ),
     };
     policy.validate()?;
     Ok(PolicyArgs {
@@ -468,7 +577,10 @@ pub(super) fn parse_admin(values: Vec<String>) -> anyhow::Result<AdminCommand> {
         .split_first()
         .with_context(|| "expected admin create")?;
     if *subcommand != "create" {
-        bail!("unknown admin subcommand '{subcommand}'");
+        crate::ui::fail!(
+            "unknown admin subcommand '{subcommand}'",
+            "未知的 admin 子命令：{subcommand}"
+        );
     }
     let parts = selector_parts(rest, &[], &["--credentials-stdin"], "admin create")?;
     Ok(AdminCommand::Create(AdminCreateArgs {

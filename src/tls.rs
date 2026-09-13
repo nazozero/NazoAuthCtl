@@ -431,7 +431,7 @@ pub(crate) fn run(
                 &material,
                 receipt.as_ref(),
             )?;
-            println!("{}", serde_json::to_string_pretty(&plan)?);
+            crate::ui::print_value(&serde_json::to_value(&plan)?);
             Ok(())
         }
         TlsCommand::Apply(input) => {
@@ -446,16 +446,13 @@ pub(crate) fn run(
             require_root()?;
             let record = store.resolve(selector)?;
             let receipt = load_receipt(&store, &record, &tenant, &hostname)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "schema": 1,
-                    "deployment_id": record.deployment_id,
-                    "tenant": canonical_tenant(&tenant)?,
-                    "hostname": canonical_hostname(&hostname)?,
-                    "receipt": receipt,
-                }))?
-            );
+            crate::ui::print_value(&serde_json::json!({
+                "schema": 1,
+                "deployment_id": record.deployment_id,
+                "tenant": canonical_tenant(&tenant)?,
+                "hostname": canonical_hostname(&hostname)?,
+                "receipt": receipt,
+            }));
             Ok(())
         }
     }
@@ -569,7 +566,7 @@ fn check(
         public_endpoint_verified: true,
         ready: true,
     };
-    println!("{}", serde_json::to_string_pretty(&readiness)?);
+    crate::ui::print_value(&serde_json::to_value(&readiness)?);
     Ok(())
 }
 
@@ -756,7 +753,7 @@ fn apply(
             transaction.phase = TransactionPhase::Committed;
             persist_pending(store, &transaction)?;
             finalize_transaction(store, &transaction)?;
-            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            crate::ui::print_value(&serde_json::to_value(&receipt)?);
             Ok(())
         }
         Err(error) => {
@@ -835,7 +832,7 @@ fn recover(
         transaction.phase = TransactionPhase::Committed;
         persist_pending(store, &transaction)?;
         finalize_transaction(store, &transaction)?;
-        println!("{}", serde_json::to_string_pretty(&transaction)?);
+        crate::ui::print_value(&serde_json::to_value(&transaction)?);
         return Ok(());
     }
     let observed = active_generation(&transaction.provider)?;
@@ -849,7 +846,7 @@ fn recover(
         )
     })?;
     finalize_transaction(store, &transaction)?;
-    println!("{}", serde_json::to_string_pretty(&transaction)?);
+    crate::ui::print_value(&serde_json::to_value(&transaction)?);
     Ok(())
 }
 

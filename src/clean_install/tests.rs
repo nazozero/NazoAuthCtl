@@ -696,7 +696,9 @@ fn local_happy_path_commits_state_and_writes_instance_record() -> anyhow::Result
 
     // Report: committed facts plus exact next steps (G01/G08 wording).
     assert!(
-        text.contains("local=healthy control_binding=unbound public=unknown"),
+        text.contains("Local health verified")
+            && text.contains("Not bound")
+            && text.contains("Not checked"),
         "{text}"
     );
     assert!(
@@ -757,10 +759,10 @@ fn ssh_happy_path_registers_through_the_wire_contract() -> anyhow::Result<()> {
     let text = run_clean_install(&fixture.context, fixture.request(Some("production")))?;
 
     assert!(
-        text.contains("installed NazoAuth instance 'production'"),
+        text.contains("Installed NazoAuth instance 'production'"),
         "{text}"
     );
-    assert!(text.contains("local=healthy"), "{text}");
+    assert!(text.contains("Local health verified"), "{text}");
     assert!(
         text.contains("admin create --instance production"),
         "{text}"
@@ -1389,7 +1391,7 @@ fn lost_install_response_resumes_exact_identity_without_a_second_instance() -> a
         .to_owned();
 
     let report = run_clean_install(&context, request())?;
-    assert!(report.contains("deployment deploy-"), "{report}");
+    assert!(report.contains("Installed NazoAuth instance"), "{report}");
     assert_eq!(context.registry.list_instances()?.len(), 1);
     assert_eq!(
         executor.steps.lock().unwrap().clone(),
@@ -1463,7 +1465,7 @@ fn multi_host_registries_demand_an_explicit_host_selector() -> anyhow::Result<()
 fn public_verification_failure_never_touches_committed_local_state() -> anyhow::Result<()> {
     let fixture = LocalFixture::new(None)?;
     let text = run_clean_install(&fixture.context, fixture.request(Some("production")))?;
-    assert!(text.contains("public=unknown"), "{text}");
+    assert!(text.contains("Not checked"), "{text}");
 
     struct FailingProber;
     impl super::public_verify::PublicProber for FailingProber {

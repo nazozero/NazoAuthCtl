@@ -10,7 +10,7 @@ pub(crate) mod language;
 mod parser;
 mod types;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 
 pub(crate) use help::help_topic;
 pub(crate) use types::{
@@ -41,20 +41,26 @@ pub fn parse_global_options(values: &[String]) -> anyhow::Result<GlobalOptions> 
         match flag {
             "--instance" => {
                 if instance.is_some() {
-                    bail!("--instance may be specified only once");
+                    crate::ui::fail!(
+                        "--instance may be specified only once",
+                        "--instance 只能指定一次"
+                    );
                 }
-                let value = values
-                    .get(consumed + 1)
-                    .with_context(|| format!("{flag} requires a value"))?;
+                let value = values.get(consumed + 1).with_context(|| {
+                    crate::ui::message!("{flag} requires a value", "{flag} 需要一个值")
+                })?;
                 if value.is_empty() {
-                    bail!("--instance requires a non-empty selector");
+                    crate::ui::fail!(
+                        "--instance requires a non-empty selector",
+                        "--instance 需要非空的实例名称"
+                    );
                 }
                 instance = Some(value.clone());
                 consumed += 2;
             }
             "--json" => {
                 if json {
-                    bail!("--json may be specified only once");
+                    crate::ui::fail!("--json may be specified only once", "--json 只能指定一次");
                 }
                 json = true;
                 consumed += 1;

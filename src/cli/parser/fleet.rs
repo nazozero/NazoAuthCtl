@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 
 use super::super::types::{HostCommand, InstanceCommand, InstanceSelector};
 use crate::registry::HostPrivilege;
@@ -37,7 +37,10 @@ pub(super) fn parse_host(values: Vec<String>) -> anyhow::Result<HostCommand> {
                 cascade: parsed.flags.contains("--cascade"),
             })
         }
-        other => bail!("unknown host subcommand '{other}'"),
+        other => crate::ui::fail!(
+            "unknown host subcommand '{other}'",
+            "未知的 host 子命令：{other}"
+        ),
     }
 }
 
@@ -50,16 +53,19 @@ fn parse_host_add(values: &[String]) -> anyhow::Result<HostCommand> {
     )?;
     let alias = exactly_one(parsed.positionals, "host add <alias> --ssh PROFILE")?;
     checked_name("alias", &alias)?;
-    let ssh_profile = parsed
-        .values
-        .get("--ssh")
-        .context("host add requires --ssh PROFILE")?;
+    let ssh_profile = parsed.values.get("--ssh").context(crate::ui::text(
+        "host add requires --ssh PROFILE",
+        "host add 需要 --ssh PROFILE",
+    ))?;
     checked_name("--ssh", ssh_profile)?;
     let privilege = match parsed.values.get("--privilege").map(String::as_str) {
         None => HostPrivilege::Direct,
         Some("direct") => HostPrivilege::Direct,
         Some("sudo") => HostPrivilege::Sudo,
-        Some(other) => bail!("--privilege must be direct or sudo, not '{other}'"),
+        Some(other) => crate::ui::fail!(
+            "--privilege must be direct or sudo, not '{other}'",
+            "--privilege 必须为 direct 或 sudo，当前值为“{other}”"
+        ),
     };
     Ok(HostCommand::Add {
         alias,
@@ -99,10 +105,12 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
             )?;
             require_no_positionals(&parsed.positionals, "instance register")?;
             for flag in ["--host", "--deployment-id"] {
-                parsed
-                    .values
-                    .get(flag)
-                    .with_context(|| format!("instance register requires {flag}"))?;
+                parsed.values.get(flag).with_context(|| {
+                    crate::ui::message!(
+                        "instance register requires {flag}",
+                        "instance register 需要 {flag}"
+                    )
+                })?;
             }
             checked_name("--host", &parsed.values["--host"])?;
             checked_name("--deployment-id", &parsed.values["--deployment-id"])?;
@@ -139,8 +147,9 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
                 ),
                 [old, new_alias] => {
                     if named.is_some() {
-                        bail!(
-                            "instance rename takes either --instance OLD or the positional OLD, not both"
+                        crate::ui::fail!(
+                            "instance rename takes either --instance OLD or the positional OLD, not both",
+                            "旧实例名称只能通过 --instance OLD 或位置参数 OLD 指定一次"
                         );
                     }
                     checked_name("old selector", old)?;
@@ -152,8 +161,14 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
                         new_alias.clone(),
                     )
                 }
-                [] => bail!("instance rename requires the new alias"),
-                _ => bail!("instance rename takes at most OLD and NEW"),
+                [] => crate::ui::fail!(
+                    "instance rename requires the new alias",
+                    "instance rename 需要新名称"
+                ),
+                _ => crate::ui::fail!(
+                    "instance rename takes at most OLD and NEW",
+                    "instance rename 最多接受 OLD 和 NEW 两个参数"
+                ),
             };
             checked_name("new alias", &new_alias)?;
             Ok(InstanceCommand::Rename { source, new_alias })
@@ -170,7 +185,10 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
             let to_host = parts
                 .values
                 .get("--to-host")
-                .context("instance relocate requires --to-host HOST_ALIAS")?
+                .context(crate::ui::text(
+                    "instance relocate requires --to-host HOST_ALIAS",
+                    "instance relocate 需要 --to-host HOST_ALIAS",
+                ))?
                 .clone();
             checked_name("--to-host", &to_host)?;
             Ok(InstanceCommand::Relocate {
@@ -181,7 +199,10 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
                 to_host,
             })
         }
-        other => bail!("unknown instance subcommand '{other}'"),
+        other => crate::ui::fail!(
+            "unknown instance subcommand '{other}'",
+            "未知的 instance 子命令：{other}"
+        ),
     }
 }
 
@@ -197,7 +218,10 @@ pub(super) fn selector_parts(
     value_flags.push("--instance");
     let parsed = parse_options(values.to_vec(), &value_flags, bool_flags, command)?;
     if parsed.positionals.len() > 1 {
-        bail!("{command} accepts at most one selector argument");
+        crate::ui::fail!(
+            "{command} accepts at most one selector argument",
+            "{command} 最多接受一个实例选择参数"
+        );
     }
     let named = match parsed.values.get("--instance") {
         Some(instance) => {
@@ -251,18 +275,21 @@ pub(super) fn parse_options(
     let mut iter = values.into_iter();
     while let Some(token) = iter.next() {
         if value_flags.contains(&token.as_str()) {
-            let value = iter
-                .next()
-                .with_context(|| format!("{token} requires a value"))?;
+            let value = iter.next().with_context(|| {
+                crate::ui::message!("{token} requires a value", "{token} 需要一个值")
+            })?;
             if parsed.values.insert(token.clone(), value).is_some() {
-                bail!("{token} may be specified only once");
+                crate::ui::fail!("{token} may be specified only once", "{token} 只能指定一次");
             }
         } else if bool_flags.contains(&token.as_str()) {
             if !parsed.flags.insert(token.clone()) {
-                bail!("{token} may be specified only once");
+                crate::ui::fail!("{token} may be specified only once", "{token} 只能指定一次");
             }
         } else if token.starts_with('-') && token.len() > 1 {
-            bail!("unknown {command} option {token}");
+            crate::ui::fail!(
+                "unknown {command} option {token}",
+                "{command} 不支持选项 {token}"
+            );
         } else {
             parsed.positionals.push(token);
         }
@@ -276,14 +303,20 @@ fn exactly_one(values: Vec<String>, usage: &str) -> anyhow::Result<String> {
         .next()
         .with_context(|| format!("{usage} is required"))?;
     if let Some(extra) = iter.next() {
-        bail!("{usage} accepts exactly one argument, found an extra '{extra}'");
+        crate::ui::fail!(
+            "{usage} accepts exactly one argument, found an extra '{extra}'",
+            "{usage} 仅接受一个参数，多余参数为“{extra}”"
+        );
     }
     Ok(first)
 }
 
 fn require_no_positionals(positionals: &[String], command: &str) -> anyhow::Result<()> {
     if let Some(unexpected) = positionals.first() {
-        bail!("{command} does not accept the argument '{unexpected}'");
+        crate::ui::fail!(
+            "{command} does not accept the argument '{unexpected}'",
+            "{command} 不接受参数“{unexpected}”"
+        );
     }
     Ok(())
 }
@@ -293,7 +326,10 @@ pub(super) fn checked_name(flag: &str, value: &str) -> anyhow::Result<()> {
         || value.len() > 128
         || value.chars().any(|character| character.is_control())
     {
-        bail!("{flag} must be a non-empty bounded name without control characters");
+        crate::ui::fail!(
+            "{flag} must be a non-empty bounded name without control characters",
+            "{flag} 名称不能为空、超长或包含控制字符"
+        );
     }
     Ok(())
 }

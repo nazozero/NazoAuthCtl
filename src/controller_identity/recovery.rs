@@ -259,27 +259,48 @@ pub(crate) struct InteractiveSecretDelivery;
 impl ReplacementSecretDelivery for InteractiveSecretDelivery {
     fn deliver(&self, display: &str) -> anyhow::Result<()> {
         use std::io::Write as _;
-        println!(
-            "NEW RECOVERY SECRET — shown once, never stored by ctl or NazoAuth:\n \x20   {display}\n\
-             \nStore it offline NOW (password manager printout or paper in a safe place). \
-             Whoever holds it can recover the Controller Key when every slot is lost."
-        );
-        let _ = std::io::stdout().flush();
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            bail!(
-                "the replacement Recovery Secret was printed but stdin is not a terminal, so \
-                 the acknowledgement cannot be confirmed; rerun with --output-secret-file in \
-                 non-interactive environments"
+        if crate::ui::json_mode()
+            || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+            || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            crate::ui::fail!(
+                "Use --output-secret-file in non-interactive or JSON mode; no secret was displayed.",
+                "非交互或 JSON 模式请使用 --output-secret-file 保存恢复密钥；尚未显示密钥。"
             );
         }
-        let line: String = cliclack::input("Type STORED after the secret is saved offline")
-            .required(false)
-            .interact()
-            .context("failed to read the delivery acknowledgement")?;
+        crate::ui::human!(
+            "NEW RECOVERY SECRET — save offline:\n \x20   {display}\n\
+             \nStore it offline NOW (password manager printout or paper in a safe place). \
+             Whoever holds it can recover the Controller Key when every slot is lost.",
+            "新的恢复密钥，请离线保存：\n     {display}\n\n请立即离线保存。持有此密钥的人可以在所有控制器授权丢失后恢复管理权限。"
+        );
+        let _ = std::io::stdout().flush();
+        let line: String = cliclack::input(crate::ui::text(
+            "Type STORED after the secret is saved offline",
+            "将密钥离线保存后，请输入 STORED 确认",
+        ))
+        .required(false)
+        .validate(|value: &String| {
+            if value.trim() == "STORED" {
+                Ok(())
+            } else {
+                Err(crate::ui::text(
+                    "Save the secret, then type STORED.",
+                    "请先保存密钥，再输入 STORED。",
+                )
+                .to_owned())
+            }
+        })
+        .interact()
+        .context(crate::ui::text(
+            "failed to read the delivery acknowledgement",
+            "无法读取密钥保存确认",
+        ))?;
         if line.trim() != "STORED" {
-            bail!(
+            crate::ui::fail!(
                 "delivery not acknowledged; aborting BEFORE any server-side change — nothing \
-                 was rotated or recovered"
+                 was rotated or recovered",
+                "尚未确认保存密钥，操作已取消；未更换密钥或恢复控制器"
             );
         }
         Ok(())

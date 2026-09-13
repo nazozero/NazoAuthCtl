@@ -80,12 +80,14 @@ fn read_interactive(command: &str) -> anyhow::Result<AdminCredentials> {
             "{command} needs an interactive terminal or an explicit credentials input; passwords are never accepted on argv"
         );
     }
-    let email: String = cliclack::input("Administrator email")
+    let email: String = cliclack::input(crate::ui::text("Administrator email", "管理员邮箱"))
         .required(false)
+        .validate(crate::ui::required_input)
         .interact()
         .context("failed to read administrator email")?;
-    let password = cliclack::password("Administrator password")
+    let password = cliclack::password(crate::ui::text("Administrator password", "管理员密码"))
         .allow_empty()
+        .validate(crate::ui::required_input)
         .interact()
         .context("failed to read administrator password")?;
     Ok(AdminCredentials {

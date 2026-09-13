@@ -9,7 +9,7 @@ mod fleet;
 mod surface;
 mod tls;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 
 use super::types::{Cli, Command, InstanceSelector};
 use common::{no_arguments, parse_version_option};
@@ -68,7 +68,10 @@ impl Cli {
             "verify" => {
                 let (selector, all) = parse_read_view_selector(values, "verify")?;
                 if all {
-                    bail!("verify does not accept --all");
+                    crate::ui::fail!(
+                        "verify does not accept --all",
+                        "verify 不支持 --all，请指定实例"
+                    );
                 }
                 Command::Verify { selector }
             }
@@ -76,7 +79,10 @@ impl Cli {
             "rollback" => {
                 let (selector, all) = parse_read_view_selector(values, "rollback")?;
                 if all {
-                    bail!("rollback does not accept --all");
+                    crate::ui::fail!(
+                        "rollback does not accept --all",
+                        "rollback 不支持 --all，请指定实例"
+                    );
                 }
                 Command::Rollback { selector }
             }
@@ -123,8 +129,9 @@ impl Cli {
                 no_arguments(&values, "self rollback")?;
                 Command::SelfRollback
             }
-            other => bail!(
-                "unknown command {other}; run `nazoauthctl --help` to see the current surface"
+            other => crate::ui::fail!(
+                "unknown command {other}; run `nazoauthctl --help` to see the current surface",
+                "未知命令：{other}。运行 nazoauthctl --help 查看可用命令"
             ),
         };
         Ok(Some(Self {
@@ -144,13 +151,19 @@ fn parse_limited_selector(
     let parsed = fleet::parse_options(values, &["--limit"], &[], command)?;
     let selector = surface::selector_from_parsed(&parsed)?;
     let limit = match parsed.values.get("--limit") {
-        Some(raw) => raw
-            .parse::<usize>()
-            .with_context(|| format!("{command} --limit must be an integer"))?,
+        Some(raw) => raw.parse::<usize>().with_context(|| {
+            crate::ui::message!(
+                "{command} --limit must be an integer",
+                "{command} 的 --limit 必须是整数"
+            )
+        })?,
         None => default,
     };
     if !(1..=maximum).contains(&limit) {
-        bail!("{command} --limit must be between 1 and {maximum}");
+        crate::ui::fail!(
+            "{command} --limit must be between 1 and {maximum}",
+            "{command} 的 --limit 必须在 1 到 {maximum} 之间"
+        );
     }
     Ok((selector, limit))
 }

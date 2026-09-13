@@ -1,5 +1,9 @@
 # ACME HTTP-01 issuance contract
 
+Human output follows the CLI locale and uses readable fields. Place `--json`
+before the command to obtain the complete structured result. See
+[language and presentation](cli-presentation.md).
+
 This contract is the certificate-issuance part of NazoAuthCtl issue #31. It
 creates deployment-owned public-server certificate material without changing a
 TLS consumer. Installation, reload, public verification, and rollback remain the

@@ -1,5 +1,9 @@
 # TLS certificate provider contract
 
+Human output follows the CLI locale and uses readable fields. Place `--json`
+before the command to obtain the complete structured result. See
+[language and presentation](cli-presentation.md).
+
 This document defines the certificate transaction part of issue #31, including
 optional native Nginx/Angie configuration in the same atomic generation.
 It is a NazoAuthCtl provider protocol, not a NazoAuth server protocol and not a

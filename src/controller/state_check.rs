@@ -44,9 +44,8 @@ pub(super) fn run() -> anyhow::Result<()> {
             deployments += 1;
         }
     }
-    println!(
-        "{}",
-        serde_json::json!({"schema":1,"compatible":true,"deployments":deployments})
+    crate::ui::print_value(
+        &serde_json::json!({"schema":1,"compatible":true,"deployments":deployments}),
     );
     Ok(())
 }

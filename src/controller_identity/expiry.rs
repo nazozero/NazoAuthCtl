@@ -56,18 +56,25 @@ impl ExpiryStatus {
     pub fn render(self) -> String {
         match self {
             Self::Ok { seconds_remaining } => {
-                format!("valid ({} remaining)", human_duration(seconds_remaining))
+                crate::ui::message!(
+                    "valid ({} remaining)",
+                    "有效（剩余 {}）",
+                    human_duration(seconds_remaining)
+                )
             }
-            Self::Warning { seconds_remaining } => format!(
+            Self::Warning { seconds_remaining } => crate::ui::message!(
                 "WARNING: expires in {} — plan a rotation",
+                "将在 {} 后到期，请安排更换密钥",
                 human_duration(seconds_remaining)
             ),
-            Self::Urgent { seconds_remaining } => format!(
+            Self::Urgent { seconds_remaining } => crate::ui::message!(
                 "URGENT: expires in {} — rotate now",
+                "将在 {} 后到期，请立即更换密钥",
                 human_duration(seconds_remaining)
             ),
-            Self::Expired { seconds_overdue } => format!(
+            Self::Expired { seconds_overdue } => crate::ui::message!(
                 "EXPIRED {} ago — new operations require rotation",
+                "已过期 {}，执行新操作前需更换密钥",
                 human_duration(seconds_overdue)
             ),
         }
@@ -78,18 +85,18 @@ impl ExpiryStatus {
 pub fn human_duration(seconds: i64) -> String {
     let seconds = seconds.max(0);
     if seconds < 60 {
-        format!("{seconds}s")
+        crate::ui::message!("{seconds}s", "{seconds} 秒")
     } else if seconds < 3_600 {
-        format!("{}m", seconds / 60)
+        crate::ui::message!("{}m", "{} 分钟", seconds / 60)
     } else if seconds < 86_400 {
-        format!("{}h", seconds / 3_600)
+        crate::ui::message!("{}h", "{} 小时", seconds / 3_600)
     } else {
         let days = seconds / 86_400;
         let hours = (seconds % 86_400) / 3_600;
         if hours == 0 {
-            format!("{days}d")
+            crate::ui::message!("{days}d", "{days} 天")
         } else {
-            format!("{days}d{hours}h")
+            crate::ui::message!("{days}d{hours}h", "{days} 天 {hours} 小时")
         }
     }
 }
@@ -101,16 +108,17 @@ pub fn render_slot_line(slot: &ControllerSlotView, now: DateTime<Utc>) -> String
     let warning = match slot.warning {
         Some(kind) => match kind {
             crate::controller_identity::admin_api::ExpiryWarningKind::Expiring7d => {
-                " server-warning=expiring_7d"
+                crate::ui::text(" server-warning=expiring_7d", " 服务端提醒：7 天内到期")
             }
             crate::controller_identity::admin_api::ExpiryWarningKind::Urgent24h => {
-                " server-warning=urgent_24h"
+                crate::ui::text(" server-warning=urgent_24h", " 服务端提醒：24 小时内到期")
             }
         },
         None => "",
     };
-    format!(
+    crate::ui::message!(
         "slot {} controller {} label '{}' {} [{}]{}\n",
+        "槽位 {} | 控制器 {} | 名称“{}” | 密钥 {} | 状态 {}{}\n",
         slot.slot_index,
         slot.controller_id,
         slot.label,
@@ -120,7 +128,7 @@ pub fn render_slot_line(slot: &ControllerSlotView, now: DateTime<Utc>) -> String
     )
     .trim_end()
     .to_owned()
-        + &format!("\n  expiry: {}", status.render())
+        + &crate::ui::message!("\n  expiry: {}", "\n  有效期：{}", status.render())
 }
 
 /// Slots of one snapshot restricted to active entries (helper shared by

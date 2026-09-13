@@ -53,7 +53,8 @@ locale, otherwise English, using the first nonempty `LC_ALL`, `LC_MESSAGES`, or
 codes. For example, `LANG=zh_CN.UTF-8 nazoauthctl status --all` selects Chinese
 unless an `LC_*` override takes precedence. Text failures include the underlying
 reason; JSON field names and codes do not change with locale.
-See [v0.2.29 release notes](docs/release-notes-0.2.29.md).
+See [v0.2.30 release notes](docs/release-notes-0.2.30.md) and the
+[CLI presentation guide](docs/cli-presentation.md).
 
 Read-only inspection works before controller binding. Mutations use signed
 control operations, with the first administrator created through the target's
@@ -173,6 +174,7 @@ attestation inputs supplied by that workflow.
 <details>
 <summary><strong>Conformance and TLS references</strong></summary>
 
+- [CLI language, output and interaction](docs/cli-presentation.md)
 - [OIDF artifact workflow](docs/oidf-artifacts.md)
 - [Conformance run options](docs/conformance-run-options.md)
 - [Shared signing keys](docs/shared-signing-keys.md)

@@ -293,41 +293,17 @@ pub(crate) fn render_fleet_report(
             }))
             .expect("fleet report is valid JSON")
         );
-    } else if title == "status" {
-        println!("{}", status_table(outcomes, crate::chinese_output()));
     } else {
-        println!("{title}: {} instance(s)", outcomes.len());
-        for item in outcomes {
-            match &item.result {
-                Ok(payload) => println!(
-                    "[ok]     {} ({}) @ {} — {}",
-                    item.instance.alias,
-                    item.instance.deployment_id,
-                    item.host_alias,
-                    compact_summary(payload),
-                ),
-                Err((code, detail)) => println!(
-                    "[FAILED] {} ({}) @ {} — {code}: {detail}",
-                    item.instance.alias, item.instance.deployment_id, item.host_alias,
-                ),
+        println!("{}", status_table(outcomes, crate::chinese_output()));
+        if title == "doctor" {
+            for item in outcomes {
+                if let Ok(payload) = &item.result {
+                    print_single_status(&item.instance, &item.host_alias, payload, true);
+                }
             }
         }
     }
     failed
-}
-
-fn compact_summary(payload: &Value) -> String {
-    format!(
-        "health={} rev={} artifact={} backup={} controller={}",
-        value_str(payload.pointer("/health/state")),
-        payload
-            .get("revision")
-            .and_then(Value::as_u64)
-            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
-        value_str(payload.pointer("/artifact/current")),
-        value_str(payload.pointer("/backup/snapshot/created_at")),
-        value_str(payload.get("controller")),
-    )
 }
 
 fn value_str(value: Option<&Value>) -> String {
@@ -335,7 +311,6 @@ fn value_str(value: Option<&Value>) -> String {
 }
 
 fn status_table(outcomes: &[FleetItemOutcome], chinese: bool) -> String {
-    use unicode_width::UnicodeWidthStr;
     let headers = if chinese {
         ["实例", "主机", "版本", "健康", "最近备份 (UTC)"]
     } else {
@@ -380,38 +355,20 @@ fn status_table(outcomes: &[FleetItemOutcome], chinese: bool) -> String {
             backup,
         ]);
     }
-    let widths: [usize; 5] = std::array::from_fn(|column| {
-        rows.iter()
-            .map(|row| row[column].width())
-            .max()
-            .unwrap_or(0)
-    });
-    let separator = widths
-        .iter()
-        .map(|width| "-".repeat(*width))
-        .collect::<Vec<_>>()
-        .join("-+-");
-    let mut lines = Vec::new();
-    for (index, row) in rows.iter().enumerate() {
-        lines.push(
-            row.iter()
-                .enumerate()
-                .map(|(column, value)| {
-                    format!("{value}{}", " ".repeat(widths[column] - value.width()))
-                })
-                .collect::<Vec<_>>()
-                .join(" | ")
-                .trim_end()
-                .to_owned(),
-        );
-        if index == 0 {
-            lines.push(separator.clone());
-        }
-    }
+    let body: Vec<Vec<String>> = rows.iter().skip(1).map(|row| row.to_vec()).collect();
+    let mut lines = vec![crate::ui::table(&headers, &body)];
     for item in outcomes {
         if let Err((code, detail)) = &item.result {
+            let explanation = if chinese {
+                format!(
+                    "原因：{}\n诊断详情（原文）：{detail}",
+                    crate::cli::envelope::chinese_reason(code)
+                )
+            } else {
+                detail.clone()
+            };
             lines.push(format!(
-                "\n{} @ {}: {code}\n{detail}",
+                "\n{} @ {}: {code}\n{explanation}",
                 item.instance.alias, item.host_alias
             ));
         }
@@ -430,11 +387,12 @@ pub(crate) struct PartialFleetFailure {
 
 impl std::fmt::Display for PartialFleetFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
+        formatter.write_str(&crate::ui::message!(
             "{}/{} fleet targets failed; every successful result is shown above",
-            self.failed, self.total
-        )
+            "{}/{} 个实例查询失败；其余结果已完整显示",
+            self.failed,
+            self.total
+        ))
     }
 }
 
@@ -458,10 +416,11 @@ pub(crate) fn run_status_like(
         }
         let instances = store.list_instances()?;
         if instances.is_empty() {
-            println!(
-                "{}",
-                crate::cli::language::text("No instances are registered", "尚未注册实例")
-            );
+            if json_mode {
+                render_fleet_report(command, &[], true);
+            } else {
+                crate::ui::human!("No instances are registered", "尚未注册实例");
+            }
             return Ok(());
         }
         let mut items = Vec::with_capacity(instances.len());
@@ -519,53 +478,54 @@ pub(crate) fn run_status_like(
     }
 }
 
-fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Value, doctor: bool) {
+fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Value, _doctor: bool) {
+    let title = crate::ui::message!("Diagnostics for '{}'", "实例“{}”诊断", record.alias);
     println!(
-        "instance '{}' (deployment {}) on host '{host_alias}'",
-        record.alias,
-        value_str(payload.get("deployment_id")),
+        "\n{}",
+        crate::ui::fields(
+            &title,
+            &[
+                (crate::ui::text("Host", "主机"), host_alias.into()),
+                (
+                    crate::ui::text("Service URL", "服务地址"),
+                    value_str(payload.get("issuer"))
+                ),
+                (
+                    crate::ui::text("Runtime", "运行环境"),
+                    value_str(payload.pointer("/runtime/kind"))
+                ),
+                (
+                    crate::ui::text("Configuration", "配置文件"),
+                    value_str(payload.pointer("/config/reference"))
+                ),
+                (
+                    crate::ui::text("Controller", "控制器"),
+                    if record.controller_id.is_some() {
+                        crate::ui::text(
+                            "Locally bound; live authorization not queried",
+                            "本地已绑定，尚未查询实时授权",
+                        )
+                    } else {
+                        crate::ui::text("Not bound", "未绑定")
+                    }
+                    .into()
+                ),
+                (
+                    crate::ui::text("Last cached contact", "上次缓存连接"),
+                    match record.last_observation.as_ref() {
+                        None => crate::ui::text("Never checked", "尚未检查"),
+                        Some(value) if !value.reachable => crate::ui::text("Failed", "失败"),
+                        Some(_) => crate::ui::text("Succeeded", "成功"),
+                    }
+                    .into()
+                ),
+            ]
+        )
     );
-    println!("issuer: {}", value_str(payload.get("issuer")));
-    println!("helper: {}", value_str(payload.get("helper")));
-    println!(
-        "runtime: {}/{} on 127.0.0.1:{} revision {}",
-        value_str(payload.pointer("/runtime/kind")),
-        value_str(payload.pointer("/runtime/object")),
-        payload
-            .pointer("/runtime/loopback_port")
-            .and_then(Value::as_u64)
-            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
-        payload
-            .get("revision")
-            .and_then(Value::as_u64)
-            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
+    crate::ui::human!(
+        "Public access and backup recovery are verified separately: verify / backup restore-test.",
+        "公网访问和备份恢复需分别验证：verify / backup restore-test。"
     );
-    println!(
-        "config: {} (schema {})",
-        value_str(payload.pointer("/config/reference")),
-        value_str(payload.pointer("/config/schema")),
-    );
-    println!(
-        "artifacts: current={} previous={}",
-        value_str(payload.pointer("/artifact/current")),
-        value_str(payload.pointer("/artifact/previous")),
-    );
-    println!(
-        "health: {} — {}",
-        value_str(payload.pointer("/health/state")),
-        value_str(payload.pointer("/health/summary")),
-    );
-    println!(
-        "backup snapshot: {}",
-        value_str(payload.pointer("/backup/snapshot/created_at"))
-    );
-    println!("controller: {}", value_str(payload.get("controller")));
-    if doctor && let Some(diagnostics) = payload.get("diagnostics").and_then(Value::as_array) {
-        println!("diagnostics:");
-        for entry in diagnostics {
-            println!("  - {}", entry.as_str().unwrap_or("-"));
-        }
-    }
 }
 
 /// Read-only operation-log view (H04): control-side dispatch journal plus the
@@ -625,46 +585,55 @@ pub(crate) fn run_operation_view(
         return Ok(());
     }
 
-    println!(
-        "operation log for '{}' (deployment {})",
-        record.alias, record.deployment_id
-    );
-    match &pending {
-        Some(entry) => println!(
-            "control dispatch journal: operation {} state {:?} since {} (kid {})",
+    crate::ui::human!("Operation log for '{}'", "实例“{}”的操作记录", record.alias);
+    if let Some(entry) = &pending {
+        crate::ui::human!(
+            "Pending dispatch: {} (since {})",
+            "待确认的调度：{}（开始于 {}）",
             entry.operation_id,
-            entry.state,
-            entry.created_at.to_rfc3339(),
-            entry.kid
-        ),
-        None => println!("control dispatch journal: empty"),
+            entry.created_at.to_rfc3339()
+        );
     }
-    match &entries {
-        entries if entries.is_empty() => println!("target operations: none recorded"),
-        entries => {
-            println!("recent target operations:");
-            for entry in entries.iter().rev() {
-                let outcome = match &entry.outcome {
-                    Some(crate::target::OperationOutcomeSummary::Completed) => {
-                        "completed".to_owned()
+    let rows = entries
+        .iter()
+        .rev()
+        .map(|entry| {
+            vec![
+                entry.recorded_at.to_rfc3339(),
+                entry.action.clone(),
+                match entry.status {
+                    crate::target::JournalStatus::Pending => crate::ui::text("Pending", "待完成"),
+                    crate::target::JournalStatus::Completed => {
+                        crate::ui::text("Completed", "已完成")
                     }
-                    Some(crate::target::OperationOutcomeSummary::Failed { code, detail }) => {
-                        format!("failed {code}: {detail}")
-                    }
-                    None => "pending".to_owned(),
-                };
-                println!(
-                    "  {} {} [{}] {} — {outcome}",
-                    entry.recorded_at.to_rfc3339(),
-                    entry.operation_id,
-                    match entry.status {
-                        crate::target::JournalStatus::Pending => "pending",
-                        crate::target::JournalStatus::Completed => "completed",
-                        crate::target::JournalStatus::Failed => "failed",
-                    },
-                    entry.action,
-                );
-            }
+                    crate::target::JournalStatus::Failed => crate::ui::text("Failed", "失败"),
+                }
+                .to_owned(),
+                entry.operation_id.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        crate::ui::table(
+            &[
+                crate::ui::text("Time (UTC)", "时间（UTC）"),
+                crate::ui::text("Action", "操作"),
+                crate::ui::text("Status", "状态"),
+                crate::ui::text("Operation ID", "操作编号"),
+            ],
+            &rows
+        )
+    );
+    for entry in entries.iter().rev() {
+        if let Some(crate::target::OperationOutcomeSummary::Failed { code, detail }) =
+            &entry.outcome
+        {
+            crate::ui::human!(
+                "{}: {code}\nDetails: {detail}",
+                "{}：{code}\n诊断详情（原文）：{detail}",
+                entry.operation_id
+            );
         }
     }
     Ok(())
@@ -744,21 +713,35 @@ pub(crate) fn run_backup_view(
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
+    let title = crate::ui::message!("Backup for '{}'", "实例“{}”的备份", record.alias);
     println!(
-        "backup evidence for '{}' (deployment {}):",
-        record.alias, record.deployment_id
-    );
-    println!(
-        "  snapshot: {}",
-        value_str(payload.pointer("/backup/snapshot/created_at"))
-    );
-    println!(
-        "  local rollback: {}",
-        value_str(payload.pointer("/backup/local_rollback_ready"))
-    );
-    println!(
-        "  restore tested: {}",
-        value_str(payload.pointer("/backup/snapshot/restore_tested_at"))
+        "{}",
+        crate::ui::fields(
+            &title,
+            &[
+                (
+                    crate::ui::text("Created (UTC)", "创建时间 (UTC)"),
+                    value_str(payload.pointer("/backup/snapshot/created_at"))
+                ),
+                (
+                    crate::ui::text("Restore tested (UTC)", "恢复验证时间 (UTC)"),
+                    value_str(payload.pointer("/backup/snapshot/restore_tested_at"))
+                ),
+                (
+                    crate::ui::text("Local rollback ready", "本地回滚就绪"),
+                    if payload
+                        .pointer("/backup/local_rollback_ready")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        crate::ui::text("Yes", "是")
+                    } else {
+                        crate::ui::text("No", "否")
+                    }
+                    .into()
+                ),
+            ]
+        )
     );
     Ok(())
 }

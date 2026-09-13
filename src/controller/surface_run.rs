@@ -73,7 +73,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Discover { host } => {
             let context = DiscoveryContext::production()?;
             let report = crate::discover_adopt::run_discover(&context, DiscoverRequest { host })?;
-            println!("{report}");
+            crate::ui::print_report(&report);
             Ok(())
         }
         Command::Status { selector, all } => {
@@ -116,7 +116,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let merged = merge(&selector, instance_flag, "rollback")?;
             let context = LifecycleContext::production()?;
             let report = crate::instance_lifecycle::run_rollback(&context, merged.as_deref())?;
-            println!("{report}");
+            crate::ui::print_report(&report);
             Ok(())
         }
         Command::Operation { selector, limit } => {
@@ -141,7 +141,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let keys = ControllerKeyStore::open_default()?;
             let report =
                 crate::instance_lifecycle::run_uninstall(&context, &keys, merged.as_deref(), yes)?;
-            println!("{report}");
+            crate::ui::print_report(&report);
             Ok(())
         }
         // ---- final-model maintenance surface --------------------------------
@@ -219,18 +219,16 @@ fn run_backup(args: BackupArgs, global: Option<&str>, json_mode: bool) -> anyhow
     match result.outcome {
         crate::target::HostOutcome::Completed {
             body: crate::target::HostCompletionBody::BackupSnapshotCreated { manifest },
-        } => println!(
-            "snapshot {} created for '{}' at {}\nmanifest sha256: {}\nnext: nazoauthctl --instance {} backup restore-test",
-            manifest.snapshot_id,
-            record.alias,
-            manifest.created_at.to_rfc3339(),
-            manifest.manifest_sha256,
-            record.alias,
-        ),
+        } => crate::ui::print_value(&serde_json::json!({
+            "snapshot_id": manifest.snapshot_id, "instance": record.alias,
+            "created_at": manifest.created_at.to_rfc3339(),
+            "next_command": format!("nazoauthctl --instance {} backup restore-test", record.alias),
+        })),
         crate::target::HostOutcome::Completed {
             body: crate::target::HostCompletionBody::BackupRestoreTested { receipt },
-        } => println!(
+        } => crate::ui::human!(
             "snapshot {} was actually restored into isolated database {} at {}",
+            "备份恢复验证通过\n\n快照：{}\n隔离数据库：{}\n恢复时间：{}",
             receipt.snapshot_id,
             receipt.isolated_database,
             receipt.restored_at.to_rfc3339(),
@@ -316,14 +314,10 @@ fn run_backup_copy(
         source_target,
         destination_target.as_ref(),
     )?;
-    println!(
-        "snapshot {} copied from '{}' to distinct host '{}' at {}\nmanifest sha256: {}",
-        receipt.snapshot_id,
-        record.alias,
-        destination_host.alias,
-        receipt.verified_at.to_rfc3339(),
-        receipt.manifest_sha256,
-    );
+    crate::ui::print_value(&serde_json::json!({
+        "snapshot_id": receipt.snapshot_id, "source": record.alias,
+        "destination": destination_host.alias, "verified_at": receipt.verified_at.to_rfc3339(),
+    }));
     Ok(())
 }
 
@@ -688,9 +682,24 @@ fn run_policy(args: PolicyArgs, global: Option<&str>) -> anyhow::Result<()> {
     let store = RegistryStore::open_default()?;
     let record = crate::fleet::resolve_instance(&store, merged.as_deref(), "policy")?;
     let updated = store.set_backup_before_update(&record.deployment_id, args.mode)?;
-    println!(
-        "backup-before-update policy updated for '{}' to {:?}",
-        updated.alias, updated.backup_before_update
+    let policy = match updated.backup_before_update {
+        crate::registry::BackupBeforeUpdatePolicy::Off => crate::ui::text("Off", "关闭").to_owned(),
+        crate::registry::BackupBeforeUpdatePolicy::Warn => crate::ui::text(
+            "Warn when a verified backup is missing",
+            "缺少已验证备份时提醒",
+        )
+        .to_owned(),
+        crate::registry::BackupBeforeUpdatePolicy::Require { max_age_seconds } => {
+            crate::ui::message!(
+                "Require a verified backup within {max_age_seconds} seconds",
+                "必须有 {max_age_seconds} 秒内的已验证备份"
+            )
+        }
+    };
+    crate::ui::human!(
+        "Backup policy for '{}': {policy}",
+        "实例“{}”的备份策略：{policy}",
+        updated.alias
     );
     Ok(())
 }
@@ -1093,8 +1102,9 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             let remaining = not_before
                 .saturating_sub(chrono::Utc::now().timestamp())
                 .saturating_add(1);
-            eprintln!(
-                "recover: invalidation is durable; waiting {remaining}s before activating the recovered runtime"
+            crate::ui::warning!(
+                "recover: invalidation is durable; waiting {remaining}s before activating the recovered runtime",
+                "恢复：会话失效已生效，等待 {remaining} 秒后启动恢复后的服务。"
             );
             std::thread::sleep(std::time::Duration::from_secs(remaining.min(60) as u64));
         }
@@ -1168,7 +1178,11 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             }
         }
         journal.clear()?;
-        println!("recovery completed for '{}'", record.alias);
+        crate::ui::human!(
+            "recovery completed for '{}'",
+            "实例“{}”恢复完成",
+            record.alias
+        );
     }
     Ok(())
 }
@@ -1316,7 +1330,7 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         valkey_password: Some(valkey_password),
     };
     let report = crate::clean_install::run_clean_install(&context, request)?;
-    println!("{report}");
+    crate::ui::print_report(&report);
     Ok(())
 }
 
@@ -1325,7 +1339,7 @@ fn run_verify(merged: Option<String>) -> anyhow::Result<()> {
     let record = crate::fleet::resolve_instance(&store, merged.as_deref(), "verify")?;
     let prober = CurlPublicProber;
     let report = verify_public(&prober, &record.issuer);
-    println!("{}", report.render());
+    crate::ui::print_report(&report.render());
     Ok(())
 }
 
@@ -1367,9 +1381,12 @@ fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Resu
         crate::target::HostOutcome::Completed {
             body: crate::target::HostCompletionBody::AdminCreated { receipt },
         } => {
-            println!(
+            crate::ui::human!(
                 "administrator '{}' created for instance '{}' (user id: {})",
-                receipt.email, record.alias, receipt.user_id
+                "已为实例“{1}”创建管理员“{0}”（用户编号：{2}）",
+                receipt.email,
+                record.alias,
+                receipt.user_id
             );
             Ok(())
         }
@@ -1404,8 +1421,14 @@ fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
     };
     let context = LifecycleContext::production()?;
     let keys = ControllerKeyStore::open_default()?;
-    let report = crate::instance_lifecycle::run_update(&context, &keys, &request)?;
-    println!("{report}");
+    let report = crate::ui::during(
+        crate::ui::text(
+            "Verifying release and updating the instance…",
+            "正在验证发行版并更新实例……",
+        ),
+        || crate::instance_lifecycle::run_update(&context, &keys, &request),
+    )?;
+    crate::ui::print_report(&report);
     Ok(())
 }
 

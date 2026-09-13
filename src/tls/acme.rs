@@ -307,7 +307,7 @@ fn plan(
     ensure_no_pending(store, &record, &input.tenant, &input.hostname)?;
     let current = load_receipt(store, &record, &input.tenant, &input.hostname)?;
     let plan = build_plan(store, &record, &provider, &acme, current.as_ref())?;
-    println!("{}", serde_json::to_string_pretty(&plan)?);
+    crate::ui::print_value(&serde_json::to_value(&plan)?);
     Ok(())
 }
 
@@ -417,7 +417,7 @@ fn recover(
         validate_receipt_transaction(receipt, &transaction)?;
         cleanup_challenge(&transaction)?;
         archive_transaction(store, &transaction)?;
-        println!("{}", serde_json::to_string_pretty(&receipt)?);
+        crate::ui::print_value(&serde_json::to_value(receipt)?);
         return Ok(());
     }
     validate_previous_receipt(&transaction, current.as_ref())?;
@@ -442,17 +442,14 @@ fn show(
         validate_transaction_binding(store, transaction, &record, &tenant, &hostname)?;
     }
     let receipt = load_receipt(store, &record, &tenant, &hostname)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "schema": 1,
-            "deployment_id": record.deployment_id,
-            "tenant": tenant,
-            "hostname": hostname,
-            "pending": pending,
-            "receipt": receipt,
-        }))?
-    );
+    crate::ui::print_value(&serde_json::json!({
+        "schema": 1,
+        "deployment_id": record.deployment_id,
+        "tenant": tenant,
+        "hostname": hostname,
+        "pending": pending,
+        "receipt": receipt,
+    }));
     Ok(())
 }
 
@@ -1214,7 +1211,7 @@ fn commit_issued_material(
     persist_pending(store, transaction)?;
     cleanup_challenge(transaction)?;
     archive_transaction(store, transaction)?;
-    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    crate::ui::print_value(&serde_json::to_value(receipt)?);
     Ok(())
 }
 

@@ -41,36 +41,50 @@ pub(crate) struct UninstallPlan {
 /// nothing has been touched when this string is all the user asked for.
 impl UninstallPlan {
     pub(crate) fn render(&self) -> String {
-        let mut text = format!(
+        let mut text = crate::ui::message!(
             "uninstall plan for '{}' (deployment {}, host '{}')\n",
-            self.alias, self.deployment_id, self.host_alias
+            "实例“{}”的卸载计划\n\n部署：{}\n主机：{}\n",
+            self.alias,
+            self.deployment_id,
+            self.host_alias
         );
-        text.push_str("deletions (managed + deployment-scoped only):\n");
-        text.push_str(&format!(
+        text.push_str(crate::ui::text(
+            "deletions (managed + deployment-scoped only):\n",
+            "将删除（由 ctl 管理且仅属于此部署）：\n",
+        ));
+        text.push_str(&crate::ui::message!(
             "  - runtime object '{}' (target-owned runtime identity)\n",
+            "  - 运行实例“{}”\n",
             self.runtime_object
         ));
         for (id, kind, locator) in &self.managed_deletions {
             text.push_str(&format!("  - {id} ({kind}): {locator}\n"));
         }
-        text.push_str(&format!(
+        text.push_str(&crate::ui::message!(
             "  - config file {}\n  - ctl state document (journal retained)\n",
+            "  - 配置文件 {}\n  - ctl 部署状态（保留操作日志）\n",
             self.config_reference
         ));
         if self.kept_external.is_empty() {
-            text.push_str("kept: none declared\n");
+            text.push_str(crate::ui::text("kept: none declared\n", "保留资源：无\n"));
         } else {
-            text.push_str("kept (external/shared — ZERO DELETE):\n");
+            text.push_str(crate::ui::text(
+                "kept (external/shared — ZERO DELETE):\n",
+                "保留以下外部或共享资源：\n",
+            ));
             for (id, kind, locator) in &self.kept_external {
                 text.push_str(&format!("  - {id} ({kind}): {locator}\n"));
             }
         }
-        text.push_str("untouched: HostRecord and sibling instances on this host\n");
+        text.push_str(crate::ui::text(
+            "untouched: HostRecord and sibling instances on this host\n",
+            "主机注册记录与此主机的其他实例保持不变。\n",
+        ));
         text.push_str(
-            "Controller Slots in kept external data are unchanged; revoke them before uninstall if required\n",
+            crate::ui::text("Controller Slots in kept external data are unchanged; revoke them before uninstall if required\n", "外部数据库中的控制器授权会保留；如需撤销，请在卸载前操作。\n"),
         );
         text.push_str(
-            "local cleanup after target success: InstanceRecord and this deployment's controller key material\n",
+            crate::ui::text("local cleanup after target success: InstanceRecord and this deployment's controller key material\n", "目标卸载成功后，清理此实例的本地注册记录与控制器密钥。\n"),
         );
         text
     }
@@ -138,10 +152,32 @@ pub(crate) fn run_uninstall(
     let action = "uninstall";
     let (plan, target) = prepare_uninstall(context, selector)?;
     if !confirmed {
-        return Ok(format!(
-            "{}\nre-run with explicit confirmation (--yes at the CLI boundary) to execute",
-            plan.render()
-        ));
+        use std::io::IsTerminal as _;
+        if !crate::ui::json_mode()
+            && std::io::stdin().is_terminal()
+            && std::io::stderr().is_terminal()
+        {
+            crate::ui::print_report(&plan.render());
+            if !cliclack::confirm(crate::ui::text(
+                "Delete the resources listed above?",
+                "确认删除以上列出的资源？",
+            ))
+            .initial_value(false)
+            .interact()?
+            {
+                return Ok(crate::ui::text(
+                    "Uninstall cancelled; no resources deleted.",
+                    "已取消卸载，未删除资源。",
+                )
+                .into());
+            }
+        } else {
+            return Ok(crate::ui::message!(
+                "{}\nre-run with explicit confirmation (--yes at the CLI boundary) to execute",
+                "{}\n以上仅为计划，尚未删除资源。确认后添加 --yes 重新运行。",
+                plan.render()
+            ));
+        }
     }
     let instance_dir = controller_keys.instance_dir(&plan.deployment_id)?;
     crate::filesystem::ensure_private_directory(
@@ -193,12 +229,15 @@ pub(crate) fn run_uninstall(
             )
         })?;
 
-    Ok(format!(
+    Ok(crate::ui::message!(
         "uninstalled instance '{}' (deployment {})\n\
          managed resources removed per plan; external/shared resources were never touched\n\
          Controller Slots in kept external data were unchanged\n\
          InstanceRecord and local controller key material removed; HostRecord '{}' and sibling instances remain\n",
-        plan.alias, plan.deployment_id, plan.host_alias,
+        "实例“{}”已卸载（部署 {}）\n\n已按计划删除托管资源，保留外部和共享资源及其控制器授权。\n已清理本地实例记录和控制器密钥；主机“{}”及其其他实例保持不变。\n",
+        plan.alias,
+        plan.deployment_id,
+        plan.host_alias,
     ))
 }
 

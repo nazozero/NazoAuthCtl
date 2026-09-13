@@ -116,15 +116,12 @@ pub(super) fn controller_check(version: Option<&str>) -> anyhow::Result<()> {
     recover_controller_self_operation()?;
     let release = crate::release::VerifiedControllerRelease::verify(version)?;
     enforce_controller_trust(&release.version, &release.sha256)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "installed": env!("CARGO_PKG_VERSION"),
-            "candidate": release.version,
-            "sha256": release.sha256,
-            "repository": "nazozero/NazoAuthCtl",
-        }))?
-    );
+    crate::ui::print_value(&json!({
+        "installed": env!("CARGO_PKG_VERSION"),
+        "candidate": release.version,
+        "sha256": release.sha256,
+        "repository": "nazozero/NazoAuthCtl",
+    }));
     Ok(())
 }
 
@@ -200,7 +197,11 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     journal.phase = SelfUpdatePhase::TrustCommitted;
     persist_self_update_journal(&directory, &journal)?;
     finish_self_update_journal(&directory, &journal)?;
-    println!("nazoauthctl updated independently to {}", release.version);
+    crate::ui::human!(
+        "nazoauthctl updated independently to {}",
+        "nazoauthctl 已更新至 {}",
+        release.version
+    );
     Ok(())
 }
 
@@ -257,7 +258,11 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
     journal.phase = SelfUpdatePhase::TrustCommitted;
     persist_self_update_journal(&directory, &journal)?;
     finish_self_update_journal(&directory, &journal)?;
-    println!("nazoauthctl rolled back independently to {}", state.version);
+    crate::ui::human!(
+        "nazoauthctl rolled back independently to {}",
+        "nazoauthctl 已回滚至 {}",
+        state.version
+    );
     Ok(())
 }
 

@@ -60,19 +60,35 @@ pub(crate) fn run_rollback(
     let fresh = target.inspect_instance(&deployment_id)?;
     record_observation(context, &deployment_id, &fresh);
 
-    Ok(format!(
-        "rolled instance '{alias}' (deployment {deployment_id}) back to its previous verified \
-         artifact\n\
-         current artifact: {current}\n\
-         state committed at revision {applied_revision}; local health verified\n\
-         note: rollback restores artifact/config references only — data restore remains the \
-         separate recovery command\n\
-         next: nazoauthctl verify --instance {alias}\n",
-        alias = record.alias,
-        current = fresh
-            .artifact
-            .current
-            .clone()
-            .unwrap_or_else(|| "-".to_owned()),
+    let title = crate::ui::message!(
+        "Restored previous verified version for '{}'",
+        "实例“{}”已回滚至上一已验证版本",
+        record.alias
+    );
+    let report = crate::ui::fields(
+        &title,
+        &[
+            (
+                crate::ui::text("Version", "版本"),
+                fresh
+                    .current_release
+                    .as_ref()
+                    .map(|release| release.version.clone())
+                    .unwrap_or_else(|| "-".into()),
+            ),
+            (
+                crate::ui::text("Health", "健康"),
+                crate::ui::text("Local health verified", "本机健康检查通过").into(),
+            ),
+            (
+                crate::ui::text("Configuration revision", "配置修订"),
+                applied_revision,
+            ),
+        ],
+    );
+    Ok(crate::ui::message!(
+        "{report}\n\nDatabase contents were not restored.\nNext: nazoauthctl verify --instance {}\n",
+        "{report}\n\n本次未恢复数据库内容。\n下一步：nazoauthctl verify --instance {}\n",
+        record.alias
     ))
 }

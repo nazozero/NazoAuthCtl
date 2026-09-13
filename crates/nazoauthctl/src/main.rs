@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use cliclack::{intro, log, note, outro};
 use nazoauthctl_conformance::{
     ArtifactTrustPolicy, BearerToken, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
@@ -14,6 +14,17 @@ use nazoauthctl_conformance::{
     resolve_oidf_artifact, verify_oidf_artifact,
 };
 
+macro_rules! localized_message {
+    ($en:literal, $zh:literal $(, $($args:tt)*)?) => {
+        if nazoauthctl_core::presentation_text("en", "zh") == "zh" {
+            format!($zh $(, $($args)*)?)
+        } else { format!($en $(, $($args)*)?) }
+    };
+}
+macro_rules! localized_bail {
+    ($($args:tt)*) => { anyhow::bail!("{}", localized_message!($($args)*)) };
+}
+
 mod ordinary_run;
 
 const DEFAULT_POLL_TIMEOUT_SECONDS: u64 = 1_800;
@@ -22,6 +33,7 @@ const DEFAULT_JOBS: usize = 4;
 fn main() {
     let args = env::args_os().collect::<Vec<_>>();
     let json_requested = args.iter().any(|value| value == "--json");
+    nazoauthctl_core::configure_presentation(json_requested);
     let invocation = match parse_invocation(&args) {
         Ok(invocation) => invocation,
         Err(error) => exit_with_error(&error, json_requested),
@@ -56,29 +68,10 @@ fn execute_configure(
 ) -> anyhow::Result<()> {
     let (alias, tenant_domain, suite_origin) =
         nazoauthctl_core::configure_oidf(instance.as_deref(), &tenant_domain, &suite_origin)?;
-    let language = output_language();
-    if io::stdout().is_terminal() && io::stderr().is_terminal() {
-        let title = match language {
-            OutputLanguage::Chinese => "OIDF 配置已保存",
-            OutputLanguage::English => "OIDF configuration saved",
-        };
-        let (instance_label, domain_label) = match language {
-            OutputLanguage::Chinese => ("实例", "租户域名"),
-            OutputLanguage::English => ("Instance", "Tenant domain"),
-        };
-        intro("NazoAuth OIDF")?;
-        note(
-            title,
-            format!(
-                "{instance_label}: {alias}\n{domain_label}: {tenant_domain}\nOIDF Suite: {suite_origin}"
-            ),
-        )?;
-        outro(title)?;
-    } else {
-        println!(
-            "OIDF configuration for instance '{alias}': tenant domain {tenant_domain}; Suite {suite_origin}"
-        );
-    }
+    nazoauthctl_core::print_presentation_value(&serde_json::json!({
+        "schema": 1, "configured": true, "instance": alias,
+        "tenant_domain": tenant_domain, "suite_origin": suite_origin,
+    }));
     Ok(())
 }
 
@@ -104,7 +97,10 @@ fn parse_invocation(args: &[OsString]) -> anyhow::Result<Invocation> {
             value
                 .to_str()
                 .map(ToOwned::to_owned)
-                .context("command-line arguments must be valid UTF-8")
+                .context(nazoauthctl_core::presentation_text(
+                    "command-line arguments must be valid UTF-8",
+                    "命令行参数必须为有效的 UTF-8 文本",
+                ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let globals = nazoauthctl_core::parse_global_options(&values)?;
@@ -116,22 +112,42 @@ fn parse_invocation(args: &[OsString]) -> anyhow::Result<Invocation> {
         return Ok(Invocation::Core);
     }
 
+    if command
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+        && command.first().is_none_or(|arg| arg != "artifact")
+    {
+        print_run_help();
+        std::process::exit(0);
+    }
     match command {
         [artifact, operation, options @ ..] if artifact == "artifact" => match operation.as_str() {
             "plan" => parse_artifact_plan_options(options).map(Invocation::ArtifactPlan),
             "open" => parse_artifact_open_options(options).map(Invocation::ArtifactOpen),
             "resolve" => parse_artifact_resolve_options(options).map(Invocation::ArtifactResolve),
             "verify" => parse_artifact_verify_options(options).map(Invocation::ArtifactVerify),
-            other => bail!("unknown oidf artifact command: {other}"),
+            other => localized_bail!(
+                "unknown oidf artifact command: {other}",
+                "未知的 OIDF 制品命令：{other}"
+            ),
         },
         [command, options @ ..] if command == "configure" => {
             parse_configure_options(options, globals.instance)
         }
         [command, options @ ..] if command == "run" => parse_run_options(options, globals.instance)
-            .map(Box::new)
+            .map(|mut run| {
+                run.json |= globals.json;
+                Box::new(run)
+            })
             .map(Invocation::Run),
-        [command, ..] => bail!("unknown oidf command: {command}"),
-        [] => bail!("an oidf command is required"),
+        [command, ..] => localized_bail!(
+            "unknown oidf command: {command}",
+            "未知的 OIDF 命令：{command}"
+        ),
+        [] => localized_bail!(
+            "an oidf command is required",
+            "请指定 OIDF 子命令；使用 oidf --help 查看帮助"
+        ),
     }
 }
 
@@ -146,19 +162,30 @@ fn parse_configure_options(
         let option = values[index].as_str();
         let value = values
             .get(index + 1)
-            .with_context(|| format!("{option} requires a value"))?
+            .with_context(|| {
+                localized_message!("{option} requires a value", "{option} 需要一个值")
+            })?
             .clone();
         match option {
             "--tenant-domain" => set_once(&mut tenant_domain, value, option)?,
             "--suite" => set_once(&mut suite_origin, value, option)?,
-            _ => bail!("unknown oidf configure option: {option}"),
+            _ => localized_bail!(
+                "unknown oidf configure option: {option}",
+                "OIDF 配置不支持选项 {option}"
+            ),
         }
         index += 2;
     }
     Ok(Invocation::Configure {
         instance,
-        tenant_domain: tenant_domain.context("oidf configure requires --tenant-domain DOMAIN")?,
-        suite_origin: suite_origin.context("oidf configure requires --suite HTTPS_ORIGIN")?,
+        tenant_domain: tenant_domain.context(nazoauthctl_core::presentation_text(
+            "oidf configure requires --tenant-domain DOMAIN",
+            "OIDF 配置需要 --tenant-domain DOMAIN",
+        ))?,
+        suite_origin: suite_origin.context(nazoauthctl_core::presentation_text(
+            "oidf configure requires --suite HTTPS_ORIGIN",
+            "OIDF 配置需要 --suite HTTPS_ORIGIN",
+        ))?,
     })
 }
 
@@ -191,11 +218,16 @@ fn parse_artifact_plan_options(values: &[String]) -> anyhow::Result<ArtifactPlan
             option,
             "--trust-policy" | "--cache-dir" | "--digest" | "--require" | "--group" | "--plan"
         ) {
-            bail!("unknown oidf artifact plan option: {option}");
+            localized_bail!(
+                "unknown oidf artifact plan option: {option}",
+                "OIDF 制品 plan 不支持选项 {option}"
+            );
         }
         let value = values
             .get(index + 1)
-            .with_context(|| format!("{option} requires a value"))?
+            .with_context(|| {
+                localized_message!("{option} requires a value", "{option} 需要一个值")
+            })?
             .clone();
         match option {
             "--trust-policy" => set_once(&mut trust_policy, PathBuf::from(value), option)?,
@@ -209,9 +241,18 @@ fn parse_artifact_plan_options(values: &[String]) -> anyhow::Result<ArtifactPlan
         index += 2;
     }
     Ok(ArtifactPlanInvocation {
-        trust_policy: trust_policy.context("--trust-policy is required")?,
-        cache_directory: cache_directory.context("--cache-dir is required")?,
-        manifest_digest: manifest_digest.context("--digest is required")?,
+        trust_policy: trust_policy.context(nazoauthctl_core::presentation_text(
+            "--trust-policy is required",
+            "必须提供 --trust-policy",
+        ))?,
+        cache_directory: cache_directory.context(nazoauthctl_core::presentation_text(
+            "--cache-dir is required",
+            "必须提供 --cache-dir",
+        ))?,
+        manifest_digest: manifest_digest.context(nazoauthctl_core::presentation_text(
+            "--digest is required",
+            "必须提供 --digest",
+        ))?,
         capabilities,
         selection: OidfPlanSelection {
             groups,
@@ -222,8 +263,12 @@ fn parse_artifact_plan_options(values: &[String]) -> anyhow::Result<ArtifactPlan
 }
 
 fn execute_artifact_plan(invocation: ArtifactPlanInvocation) -> anyhow::Result<()> {
-    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
-        .context("OIDF artifact trust policy is invalid")?;
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy).context(
+        nazoauthctl_core::presentation_text(
+            "OIDF artifact trust policy is invalid",
+            "OIDF 制品信任配置无效",
+        ),
+    )?;
     let plan = open_cached_oidf_driver_plan(
         &invocation.cache_directory,
         &invocation.manifest_digest,
@@ -232,15 +277,21 @@ fn execute_artifact_plan(invocation: ArtifactPlanInvocation) -> anyhow::Result<(
         invocation.selection,
         current_unix_time()?,
     )
-    .context("cached OIDF driver plan compilation failed")?;
-    serde_json::to_writer_pretty(io::stdout().lock(), &plan)
-        .context("failed to write OIDF driver inspection plan")?;
-    writeln!(io::stdout()).context("failed to finish OIDF driver inspection plan")
+    .context(nazoauthctl_core::presentation_text(
+        "cached OIDF driver plan compilation failed",
+        "无法生成缓存 OIDF 驱动的检查计划",
+    ))?;
+    nazoauthctl_core::print_presentation_value(&serde_json::to_value(&plan)?);
+    Ok(())
 }
 
 fn print_artifact_plan_help() {
     println!(
-        "Usage:\n  nazoauthctl oidf artifact plan --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...] [--group ID ...] [--plan ID ...]\n\nThis is a read-only, offline inspection plan. It revalidates one exact cached artifact and compiles exact signed Matrix selections. Caller-supplied capability names are not attested negotiation. The output is explicitly not deployment-bound or executable and creates no run journal or resources."
+        "{}",
+        nazoauthctl_core::presentation_text(
+            "Usage:\n  nazoauthctl oidf artifact plan --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...] [--group ID ...] [--plan ID ...]\n\nThis is a read-only, offline inspection plan. It revalidates one exact cached artifact and compiles exact signed Matrix selections. Caller-supplied capability names are not attested negotiation. The output is explicitly not deployment-bound or executable and creates no run journal or resources.",
+            "用法：\n  nazoauthctl oidf artifact plan --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...] [--group ID ...] [--plan ID ...]\n\n离线检查指定的缓存制品，并根据所选分组或计划生成检查计划。此命令不执行测试、不创建资源，也不修改部署。默认显示可读摘要；在 oidf 前添加 --json 可查看完整结构。"
+        )
     );
 }
 
@@ -270,11 +321,16 @@ fn parse_artifact_open_options(values: &[String]) -> anyhow::Result<ArtifactOpen
             option,
             "--trust-policy" | "--cache-dir" | "--digest" | "--require"
         ) {
-            bail!("unknown oidf artifact open option: {option}");
+            localized_bail!(
+                "unknown oidf artifact open option: {option}",
+                "OIDF 制品 open 不支持选项 {option}"
+            );
         }
         let value = values
             .get(index + 1)
-            .with_context(|| format!("{option} requires a value"))?
+            .with_context(|| {
+                localized_message!("{option} requires a value", "{option} 需要一个值")
+            })?
             .clone();
         match option {
             "--trust-policy" => {
@@ -286,7 +342,7 @@ fn parse_artifact_open_options(values: &[String]) -> anyhow::Result<ArtifactOpen
             "--digest" => set_once(&mut manifest_digest, value, option)?,
             "--require" => {
                 if !capabilities.insert(value) {
-                    bail!("--require values must be unique");
+                    localized_bail!("--require values must be unique", "--require 的值不能重复");
                 }
             }
             _ => unreachable!(),
@@ -294,16 +350,29 @@ fn parse_artifact_open_options(values: &[String]) -> anyhow::Result<ArtifactOpen
         index += 2;
     }
     Ok(ArtifactOpenInvocation {
-        trust_policy: trust_policy.context("--trust-policy is required")?,
-        cache_directory: cache_directory.context("--cache-dir is required")?,
-        manifest_digest: manifest_digest.context("--digest is required")?,
+        trust_policy: trust_policy.context(nazoauthctl_core::presentation_text(
+            "--trust-policy is required",
+            "必须提供 --trust-policy",
+        ))?,
+        cache_directory: cache_directory.context(nazoauthctl_core::presentation_text(
+            "--cache-dir is required",
+            "必须提供 --cache-dir",
+        ))?,
+        manifest_digest: manifest_digest.context(nazoauthctl_core::presentation_text(
+            "--digest is required",
+            "必须提供 --digest",
+        ))?,
         capabilities,
     })
 }
 
 fn execute_artifact_open(invocation: ArtifactOpenInvocation) -> anyhow::Result<()> {
-    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
-        .context("OIDF artifact trust policy is invalid")?;
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy).context(
+        nazoauthctl_core::presentation_text(
+            "OIDF artifact trust policy is invalid",
+            "OIDF 制品信任配置无效",
+        ),
+    )?;
     let cached = open_cached_oidf_artifact(
         &invocation.cache_directory,
         &invocation.manifest_digest,
@@ -311,22 +380,25 @@ fn execute_artifact_open(invocation: ArtifactOpenInvocation) -> anyhow::Result<(
         &invocation.capabilities,
         current_unix_time()?,
     )
-    .context("cached OIDF artifact verification failed")?;
-    serde_json::to_writer_pretty(
-        io::stdout().lock(),
-        &serde_json::json!({
-            "schema": 1,
-            "opened": true,
-            "cache": cached,
-        }),
-    )
-    .context("failed to write cached artifact identity")?;
-    writeln!(io::stdout()).context("failed to finish cached artifact identity")
+    .context(nazoauthctl_core::presentation_text(
+        "cached OIDF artifact verification failed",
+        "缓存 OIDF 制品验证失败",
+    ))?;
+    nazoauthctl_core::print_presentation_value(&serde_json::json!({
+        "schema": 1,
+        "opened": true,
+        "cache": cached,
+    }));
+    Ok(())
 }
 
 fn print_artifact_open_help() {
     println!(
-        "Usage:\n  nazoauthctl oidf artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...]\n\nThe command performs no network request or mutation. It opens only the exact immutable digest entry and revalidates its commit record, source, ES256 signature, current validity window, Suite identity, declarative driver and Matrix digests/sizes/schemas, resource bounds, engine protocol, and every caller-supplied capability requirement."
+        "{}",
+        nazoauthctl_core::presentation_text(
+            "Usage:\n  nazoauthctl oidf artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...]\n\nThe command performs no network request or mutation. It opens only the exact immutable digest entry and revalidates its commit record, source, ES256 signature, current validity window, Suite identity, declarative driver and Matrix digests/sizes/schemas, resource bounds, engine protocol, and every caller-supplied capability requirement.",
+            "用法：\n  nazoauthctl oidf artifact open --trust-policy PATH --cache-dir PATH --digest SHA256 [--require NAME ...]\n\n离线打开并重新验证指定缓存，包括签名、有效期、测试服务身份及驱动和矩阵内容。此命令不访问网络、不修改部署。默认显示可读摘要；在 oidf 前添加 --json 可查看完整结构。"
+        )
     );
 }
 
@@ -356,11 +428,16 @@ fn parse_artifact_resolve_options(values: &[String]) -> anyhow::Result<ArtifactR
             option,
             "--trust-policy" | "--manifest-url" | "--cache-dir" | "--require"
         ) {
-            bail!("unknown oidf artifact resolve option: {option}");
+            localized_bail!(
+                "unknown oidf artifact resolve option: {option}",
+                "OIDF 制品 resolve 不支持选项 {option}"
+            );
         }
         let value = values
             .get(index + 1)
-            .with_context(|| format!("{option} requires a value"))?
+            .with_context(|| {
+                localized_message!("{option} requires a value", "{option} 需要一个值")
+            })?
             .clone();
         match option {
             "--trust-policy" => {
@@ -372,7 +449,7 @@ fn parse_artifact_resolve_options(values: &[String]) -> anyhow::Result<ArtifactR
             }
             "--require" => {
                 if !capabilities.insert(value) {
-                    bail!("--require values must be unique");
+                    localized_bail!("--require values must be unique", "--require 的值不能重复");
                 }
             }
             _ => unreachable!(),
@@ -380,16 +457,29 @@ fn parse_artifact_resolve_options(values: &[String]) -> anyhow::Result<ArtifactR
         index += 2;
     }
     Ok(ArtifactResolveInvocation {
-        trust_policy: trust_policy.context("--trust-policy is required")?,
-        manifest_url: manifest_url.context("--manifest-url is required")?,
-        cache_directory: cache_directory.context("--cache-dir is required")?,
+        trust_policy: trust_policy.context(nazoauthctl_core::presentation_text(
+            "--trust-policy is required",
+            "必须提供 --trust-policy",
+        ))?,
+        manifest_url: manifest_url.context(nazoauthctl_core::presentation_text(
+            "--manifest-url is required",
+            "必须提供 --manifest-url",
+        ))?,
+        cache_directory: cache_directory.context(nazoauthctl_core::presentation_text(
+            "--cache-dir is required",
+            "必须提供 --cache-dir",
+        ))?,
         capabilities,
     })
 }
 
 fn execute_artifact_resolve(invocation: ArtifactResolveInvocation) -> anyhow::Result<()> {
-    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
-        .context("OIDF artifact trust policy is invalid")?;
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy).context(
+        nazoauthctl_core::presentation_text(
+            "OIDF artifact trust policy is invalid",
+            "OIDF 制品信任配置无效",
+        ),
+    )?;
     let resolution = resolve_oidf_artifact(
         &invocation.manifest_url,
         &trust,
@@ -397,22 +487,25 @@ fn execute_artifact_resolve(invocation: ArtifactResolveInvocation) -> anyhow::Re
         &invocation.cache_directory,
         current_unix_time()?,
     )
-    .context("OIDF artifact discovery failed")?;
-    serde_json::to_writer_pretty(
-        io::stdout().lock(),
-        &serde_json::json!({
-            "schema": 1,
-            "resolved": true,
-            "resolution": resolution,
-        }),
-    )
-    .context("failed to write resolved artifact identity")?;
-    writeln!(io::stdout()).context("failed to finish resolved artifact identity")
+    .context(nazoauthctl_core::presentation_text(
+        "OIDF artifact discovery failed",
+        "OIDF 制品下载或解析失败",
+    ))?;
+    nazoauthctl_core::print_presentation_value(&serde_json::json!({
+        "schema": 1,
+        "resolved": true,
+        "resolution": resolution,
+    }));
+    Ok(())
 }
 
 fn print_artifact_resolve_help() {
     println!(
-        "Usage:\n  nazoauthctl oidf artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--require NAME ...]\n\nThe command fetches a bounded manifest without redirects, verifies it before following the signed declarative driver and Matrix URLs, verifies both exact payloads, and commits an immutable owner-only cache entry with a final verified record marker. It performs no NazoAuth or Suite mutation."
+        "{}",
+        nazoauthctl_core::presentation_text(
+            "Usage:\n  nazoauthctl oidf artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--require NAME ...]\n\nThe command fetches a bounded manifest without redirects, verifies it before following the signed declarative driver and Matrix URLs, verifies both exact payloads, and commits an immutable owner-only cache entry with a final verified record marker. It performs no NazoAuth or Suite mutation.",
+            "用法：\n  nazoauthctl oidf artifact resolve --trust-policy PATH --manifest-url HTTPS_URL --cache-dir PATH [--require NAME ...]\n\n下载并验证发布清单、驱动和矩阵，然后保存到本地缓存。此命令不修改 NazoAuth 或测试服务。默认显示可读摘要；在 oidf 前添加 --json 可查看完整结构。"
+        )
     );
 }
 
@@ -444,11 +537,16 @@ fn parse_artifact_verify_options(values: &[String]) -> anyhow::Result<ArtifactVe
             option,
             "--trust-policy" | "--manifest" | "--driver" | "--matrix" | "--require"
         ) {
-            bail!("unknown oidf artifact verify option: {option}");
+            localized_bail!(
+                "unknown oidf artifact verify option: {option}",
+                "OIDF 制品 verify 不支持选项 {option}"
+            );
         }
         let value = values
             .get(index + 1)
-            .with_context(|| format!("{option} requires a value"))?
+            .with_context(|| {
+                localized_message!("{option} requires a value", "{option} 需要一个值")
+            })?
             .clone();
         match option {
             "--trust-policy" => {
@@ -459,7 +557,7 @@ fn parse_artifact_verify_options(values: &[String]) -> anyhow::Result<ArtifactVe
             "--matrix" => set_once(&mut matrix, PathBuf::from(value), option)?,
             "--require" => {
                 if !capabilities.insert(value) {
-                    bail!("--require values must be unique");
+                    localized_bail!("--require values must be unique", "--require 的值不能重复");
                 }
             }
             _ => unreachable!(),
@@ -467,23 +565,45 @@ fn parse_artifact_verify_options(values: &[String]) -> anyhow::Result<ArtifactVe
         index += 2;
     }
     Ok(ArtifactVerifyInvocation {
-        trust_policy: trust_policy.context("--trust-policy is required")?,
-        manifest: manifest.context("--manifest is required")?,
-        driver: driver.context("--driver is required")?,
-        matrix: matrix.context("--matrix is required")?,
+        trust_policy: trust_policy.context(nazoauthctl_core::presentation_text(
+            "--trust-policy is required",
+            "必须提供 --trust-policy",
+        ))?,
+        manifest: manifest.context(nazoauthctl_core::presentation_text(
+            "--manifest is required",
+            "必须提供 --manifest",
+        ))?,
+        driver: driver.context(nazoauthctl_core::presentation_text(
+            "--driver is required",
+            "必须提供 --driver",
+        ))?,
+        matrix: matrix.context(nazoauthctl_core::presentation_text(
+            "--matrix is required",
+            "必须提供 --matrix",
+        ))?,
         capabilities,
     })
 }
 
 fn execute_artifact_verify(invocation: ArtifactVerifyInvocation) -> anyhow::Result<()> {
-    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy)
-        .context("OIDF artifact trust policy is invalid")?;
-    let manifest = read_compact_manifest(&invocation.manifest)
-        .context("signed OIDF driver manifest is invalid")?;
-    let driver =
-        read_artifact_driver(&invocation.driver).context("OIDF driver payload is invalid")?;
-    let matrix =
-        read_artifact_matrix(&invocation.matrix).context("OIDF artifact matrix is invalid")?;
+    let trust = ArtifactTrustPolicy::from_path(&invocation.trust_policy).context(
+        nazoauthctl_core::presentation_text(
+            "OIDF artifact trust policy is invalid",
+            "OIDF 制品信任配置无效",
+        ),
+    )?;
+    let manifest = read_compact_manifest(&invocation.manifest).context(
+        nazoauthctl_core::presentation_text(
+            "signed OIDF driver manifest is invalid",
+            "OIDF 驱动发布清单无效",
+        ),
+    )?;
+    let driver = read_artifact_driver(&invocation.driver).context(
+        nazoauthctl_core::presentation_text("OIDF driver payload is invalid", "OIDF 驱动内容无效"),
+    )?;
+    let matrix = read_artifact_matrix(&invocation.matrix).context(
+        nazoauthctl_core::presentation_text("OIDF artifact matrix is invalid", "OIDF 测试矩阵无效"),
+    )?;
     let artifact = verify_oidf_artifact(
         &manifest,
         &driver,
@@ -492,30 +612,39 @@ fn execute_artifact_verify(invocation: ArtifactVerifyInvocation) -> anyhow::Resu
         &invocation.capabilities,
         current_unix_time()?,
     )
-    .context("OIDF artifact verification failed")?;
-    serde_json::to_writer_pretty(
-        io::stdout().lock(),
-        &serde_json::json!({
-            "schema": 1,
-            "verified": true,
-            "artifact": artifact,
-        }),
-    )
-    .context("failed to write verified artifact identity")?;
-    writeln!(io::stdout()).context("failed to finish verified artifact identity")
+    .context(nazoauthctl_core::presentation_text(
+        "OIDF artifact verification failed",
+        "OIDF 制品验证失败",
+    ))?;
+    nazoauthctl_core::print_presentation_value(&serde_json::json!({
+        "schema": 1,
+        "verified": true,
+        "artifact": artifact,
+    }));
+    Ok(())
 }
 
 fn current_unix_time() -> anyhow::Result<i64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
+        .context(nazoauthctl_core::presentation_text(
+            "system clock is before the Unix epoch",
+            "系统时间早于 Unix 时间起点，请校准时钟",
+        ))?
         .as_secs();
-    i64::try_from(now).context("system clock exceeds the supported range")
+    i64::try_from(now).context(nazoauthctl_core::presentation_text(
+        "system clock exceeds the supported range",
+        "系统时间超出支持范围",
+    ))
 }
 
 fn print_artifact_verify_help() {
     println!(
-        "Usage:\n  nazoauthctl oidf artifact verify --trust-policy PATH --manifest PATH --driver PATH --matrix PATH [--require NAME ...]\n\nThe command performs no NazoAuth or Suite mutation. It emits a verified identity only after the local trust policy, ES256 signature, source, validity window, Suite identity, declarative driver digest/size/schema, matrix digest/size/schema, resource bounds, and all required capabilities have been accepted."
+        "{}",
+        nazoauthctl_core::presentation_text(
+            "Usage:\n  nazoauthctl oidf artifact verify --trust-policy PATH --manifest PATH --driver PATH --matrix PATH [--require NAME ...]\n\nThe command performs no NazoAuth or Suite mutation. It emits a verified identity only after the local trust policy, ES256 signature, source, validity window, Suite identity, declarative driver digest/size/schema, matrix digest/size/schema, resource bounds, and all required capabilities have been accepted.",
+            "用法：\n  nazoauthctl oidf artifact verify --trust-policy PATH --manifest PATH --driver PATH --matrix PATH [--require NAME ...]\n\n验证本地发布清单、驱动、矩阵及所需能力，成功后显示验证结果。此命令不修改 NazoAuth 或测试服务。默认显示可读摘要；在 oidf 前添加 --json 可查看完整结构。"
+        )
     );
 }
 
@@ -584,25 +713,37 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
             "--poll-timeout" | "--jobs" | "--token" => {
                 let value = values
                     .get(index + 1)
-                    .with_context(|| format!("{option} requires a value"))?
+                    .with_context(|| {
+                        localized_message!("{option} requires a value", "{option} 需要一个值")
+                    })?
                     .clone();
                 match option {
                     "--poll-timeout" => {
-                        poll_timeout = Duration::from_secs(
-                            value
-                                .parse::<u64>()
-                                .context("--poll-timeout must be an integer")?,
-                        );
+                        poll_timeout = Duration::from_secs(value.parse::<u64>().context(
+                            nazoauthctl_core::presentation_text(
+                                "--poll-timeout must be an integer",
+                                "--poll-timeout 必须为整数",
+                            ),
+                        )?);
                     }
                     "--jobs" => {
-                        jobs = value
-                            .parse::<usize>()
-                            .context("--jobs must be an integer")?;
+                        jobs =
+                            value
+                                .parse::<usize>()
+                                .context(nazoauthctl_core::presentation_text(
+                                    "--jobs must be an integer",
+                                    "--jobs 必须为整数",
+                                ))?;
                     }
                     "--token" => {
                         set_once(
                             &mut token,
-                            BearerToken::new(value).context("--token is invalid")?,
+                            BearerToken::new(value).context(
+                                nazoauthctl_core::presentation_text(
+                                    "--token is invalid",
+                                    "--token 的内容无效",
+                                ),
+                            )?,
                             "--token",
                         )?;
                     }
@@ -612,28 +753,37 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
             }
             "--token-stdin" => {
                 if token_stdin {
-                    bail!("--token-stdin may be specified only once");
+                    localized_bail!(
+                        "--token-stdin may be specified only once",
+                        "--token-stdin 只能指定一次"
+                    );
                 }
                 token_stdin = true;
                 index += 1;
             }
             "--json" => {
                 if json {
-                    bail!("--json may be specified only once");
+                    localized_bail!("--json may be specified only once", "--json 只能指定一次");
                 }
                 json = true;
                 index += 1;
             }
             "--delete-suite-plans" => {
                 if delete_suite_plans {
-                    bail!("--delete-suite-plans may be specified only once");
+                    localized_bail!(
+                        "--delete-suite-plans may be specified only once",
+                        "--delete-suite-plans 只能指定一次"
+                    );
                 }
                 delete_suite_plans = true;
                 index += 1;
             }
             "--fail-fast" => {
                 if fail_fast {
-                    bail!("--fail-fast may be specified only once");
+                    localized_bail!(
+                        "--fail-fast may be specified only once",
+                        "--fail-fast 只能指定一次"
+                    );
                 }
                 fail_fast = true;
                 index += 1;
@@ -641,12 +791,17 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
             "--exclude-plan" => {
                 let value = values
                     .get(index + 1)
-                    .with_context(|| format!("{option} requires a value"))?
+                    .with_context(|| {
+                        localized_message!("{option} requires a value", "{option} 需要一个值")
+                    })?
                     .clone();
                 push_unique_vec(&mut excluded_plans, value, option)?;
                 index += 2;
             }
-            value if value.starts_with('-') => bail!("unknown oidf run option: {value}"),
+            value if value.starts_with('-') => localized_bail!(
+                "unknown oidf run option: {value}",
+                "OIDF 测试不支持选项 {value}"
+            ),
             value => {
                 set_once(&mut selector, value.to_owned(), "OIDF selector")?;
                 index += 1;
@@ -661,31 +816,51 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                     "oidc, ciba, fapi, openid4vci, openid4vp, openid4vc".to_owned()
                 });
             anyhow::anyhow!(
-                "unknown OIDF selector `{}`; valid choices: {choices}",
-                selector.as_deref().unwrap_or_default()
+                "{}",
+                localized_message!(
+                    "unknown OIDF selector `{}`; valid choices: {choices}",
+                    "未知的 OIDF 选择项“{}”；可选项：{choices}",
+                    selector.as_deref().unwrap_or_default()
+                )
             )
         } else {
-            anyhow::anyhow!("bundled OIDF Matrix is invalid: {error}")
+            anyhow::anyhow!(
+                "{}",
+                localized_message!(
+                    "bundled OIDF Matrix is invalid: {error}",
+                    "内置 OIDF 矩阵无效：{error}"
+                )
+            )
         }
     })?;
     selection.excluded_plans = excluded_plans
         .iter()
         .map(|reference| {
             resolve_bundled_oidf_plan_id(reference).map_err(|_| {
-                anyhow::anyhow!("unknown or ambiguous excluded OIDF plan `{reference}`")
+                anyhow::anyhow!(
+                    "{}",
+                    localized_message!(
+                        "unknown or ambiguous excluded OIDF plan `{reference}`",
+                        "排除的 OIDF 计划“{reference}”不存在或不唯一"
+                    )
+                )
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let tenant_id = uuid::Uuid::now_v7().to_string();
     if token.is_some() && token_stdin {
-        bail!("--token and --token-stdin cannot be used together");
+        localized_bail!(
+            "--token and --token-stdin cannot be used together",
+            "--token 和 --token-stdin 不能同时使用"
+        );
     }
     if poll_timeout.is_zero()
         || poll_timeout > Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS)
         || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
     {
-        bail!(
-            "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds and jobs must be between 1 and {MAX_PARALLEL_JOBS}"
+        localized_bail!(
+            "poll timeout must be between 1 and {MAX_POLL_TIMEOUT_SECONDS} seconds and jobs must be between 1 and {MAX_PARALLEL_JOBS}",
+            "轮询超时必须为 1 到 {MAX_POLL_TIMEOUT_SECONDS} 秒，并行任务数必须为 1 到 {MAX_PARALLEL_JOBS}"
         );
     }
     Ok(RunInvocation {
@@ -706,7 +881,10 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
 
 fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> anyhow::Result<()> {
     if slot.replace(value).is_some() {
-        bail!("{option} may be specified only once");
+        localized_bail!(
+            "{option} may be specified only once",
+            "{option} 只能指定一次"
+        );
     }
     Ok(())
 }
@@ -717,14 +895,14 @@ fn push_unique(
     option: &str,
 ) -> anyhow::Result<()> {
     if !values.insert(value) {
-        bail!("{option} values must be unique");
+        localized_bail!("{option} values must be unique", "{option} 的值不能重复");
     }
     Ok(())
 }
 
 fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> anyhow::Result<()> {
     if values.contains(&value) {
-        bail!("{option} values must be unique");
+        localized_bail!("{option} values must be unique", "{option} 的值不能重复");
     }
     values.push(value);
     Ok(())

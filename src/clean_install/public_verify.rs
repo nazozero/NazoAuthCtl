@@ -50,28 +50,37 @@ pub(crate) struct PublicVerificationReport {
 impl PublicVerificationReport {
     /// Human rendering for the future `verify` CLI surface.
     pub(crate) fn render(&self) -> String {
-        let mut lines = vec![format!(
+        let mut lines = vec![crate::ui::message!(
             "public verification of {} at {}",
+            "公网验证：{}\n检查时间：{}",
             self.issuer,
             self.checked_at.to_rfc3339()
         )];
         if self.loopback_trial {
             lines.push(
-                "note: loopback origins are local trial endpoints and are never a public pass"
-                    .to_owned(),
+                crate::ui::text(
+                    "note: loopback origins are local trial endpoints and are never a public pass",
+                    "本机回环地址仅用于本地试运行，不能通过公网验证。",
+                )
+                .to_owned(),
             );
         }
         match &self.verdict {
-            PublicVerdict::Passed => lines.push("verdict: PASSED".to_owned()),
+            PublicVerdict::Passed => {
+                lines.push(crate::ui::text("verdict: PASSED", "结果：通过").to_owned())
+            }
             PublicVerdict::Failed { failures } => {
-                lines.push("verdict: FAILED".to_owned());
+                lines.push(crate::ui::text("verdict: FAILED", "结果：失败").to_owned());
                 for failure in failures {
                     lines.push(format!("  - {failure}"));
                 }
                 lines.push(
-                    "the deployed instance keeps running; fix the public boundary and re-run \
-                     `verify`"
-                        .to_owned(),
+                    crate::ui::text(
+                        "the deployed instance keeps running; fix the public boundary and re-run \
+                     `verify`",
+                        "实例继续运行。请修正公网访问配置后重新运行 verify。",
+                    )
+                    .to_owned(),
                 );
             }
         }

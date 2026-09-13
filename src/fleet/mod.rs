@@ -91,7 +91,7 @@ pub(crate) fn run_host(command: HostCommand) -> anyhow::Result<()> {
         HostCommand::Check { alias } => host_check(&context, &alias)?,
         HostCommand::Forget { alias, cascade } => host_forget(&context, &alias, cascade)?,
     };
-    println!("{report}");
+    crate::ui::print_report(&report);
     Ok(())
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn run_instance(command: InstanceCommand) -> anyhow::Result<()> {
             instance_relocate(&context, &selector, &to_host)?
         }
     };
-    println!("{report}");
+    crate::ui::print_report(&report);
     Ok(())
 }
 
@@ -253,16 +253,16 @@ fn bounded_error_text(error: &anyhow::Error) -> String {
 fn human_age(seconds: i64) -> String {
     let seconds = seconds.max(0);
     if seconds < 60 {
-        format!("{seconds}s")
+        crate::ui::message!("{seconds}s", "{seconds} 秒")
     } else if seconds < 3600 {
         let minutes = seconds / 60;
-        format!("{minutes}m")
+        crate::ui::message!("{minutes}m", "{minutes} 分钟")
     } else if seconds < 86_400 {
         let hours = seconds / 3_600;
-        format!("{hours}h")
+        crate::ui::message!("{hours}h", "{hours} 小时")
     } else {
         let days = seconds / 86_400;
-        format!("{days}d")
+        crate::ui::message!("{days}d", "{days} 天")
     }
 }
 
@@ -271,23 +271,31 @@ fn human_age(seconds: i64) -> String {
 /// authorization — mutations always go live first.
 fn observation_marker(observation: Option<&ObservationCache>) -> String {
     let Some(observation) = observation else {
-        return "never observed".to_owned();
+        return crate::ui::text("never observed", "尚未检查").to_owned();
     };
     let age_seconds = (chrono::Utc::now() - observation.observed_at).num_seconds();
     let class = if !observation.reachable {
-        "error"
+        crate::ui::text("error", "连接失败")
     } else if age_seconds > STALE_AFTER_HOURS * 3_600 {
-        "stale"
+        crate::ui::text("stale", "缓存过期")
     } else {
-        "fresh"
+        crate::ui::text("fresh", "近期检查")
     };
-    format!("{class} ({} ago)", human_age(age_seconds))
+    crate::ui::message!(
+        "{class} ({} ago)",
+        "{class}（{}前）",
+        human_age(age_seconds)
+    )
 }
 
 fn observation_summary_line(observation: Option<&ObservationCache>) -> String {
     match observation {
         None => String::new(),
-        Some(observation) => format!("      last contact: {}", observation.summary),
+        Some(observation) => crate::ui::message!(
+            "      last contact: {}",
+            "      上次连接详情（原文）：{}",
+            observation.summary
+        ),
     }
 }
 
@@ -354,17 +362,23 @@ fn host_add(
     let stored = context.store.add_host(record)?;
 
     let profile = stored.ssh_profile.as_deref().unwrap_or("-");
-    let mut report = format!(
-        "registered host '{}' ({})\ntransport: ssh (profile '{profile}'), privilege: {:?}\nhelper identity: {}\nobservation recorded\n",
+    let mut report = crate::ui::message!(
+        "registered host '{}' ({})\ntransport: ssh (profile '{profile}'), privilege: {}\nhelper identity: {}\nobservation recorded\n",
+        "主机“{}”已注册\n\n主机编号：{}\n连接：SSH（{profile}）\n权限：{}\n执行器：{}\n",
         stored.alias,
         stored.host_id,
-        stored.privilege,
+        if stored.privilege == HostPrivilege::Sudo {
+            "sudo"
+        } else {
+            crate::ui::text("Direct", "直接执行")
+        },
         summarize_hello(&hello)
     );
     if stored.privilege == HostPrivilege::Sudo {
-        report.push_str(&format!(
+        report.push_str(&crate::ui::message!(
             "note: formal operations use `sudo -n`; establish credentials once with \
-             `ssh -t {profile} sudo -v` or configure NOPASSWD\n"
+             `ssh -t {profile} sudo -v` or configure NOPASSWD\n",
+            "执行操作需要免交互 sudo。可先运行 `ssh -t {profile} sudo -v`，或配置 NOPASSWD。\n"
         ));
     }
     Ok(report)
@@ -388,33 +402,40 @@ fn host_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String> {
     }
     let hosts = context.store.list_hosts()?;
     let instances = context.store.list_instances()?;
-    let mut report =
-        String::from("ALIAS          TRANSPORT      PRIVILEGE  INSTANCES  OBSERVATION\n");
-    for host in &hosts {
-        let bound = instances
-            .iter()
-            .filter(|instance| instance.host_id == host.host_id)
-            .count();
-        let transport = match host.ssh_profile.as_deref() {
-            Some(profile) => format!("ssh:{profile}"),
-            None => "local".to_owned(),
-        };
-        let privilege = if host.privilege == HostPrivilege::Sudo {
-            "sudo"
-        } else {
-            "direct"
-        };
-        let observation = observation_marker(host.last_observation.as_ref());
-        let alias = host.alias.as_str();
-        report.push_str(&format!(
-            "{alias:<14} {transport:<14} {privilege:<10} {bound:<10} {observation}\n"
-        ));
-        let summary = observation_summary_line(host.last_observation.as_ref());
-        if !summary.is_empty() {
-            report.push_str(&summary);
-            report.push('\n');
-        }
-    }
+    let rows = hosts
+        .iter()
+        .map(|host| {
+            let bound = instances
+                .iter()
+                .filter(|instance| instance.host_id == host.host_id)
+                .count();
+            vec![
+                host.alias.clone(),
+                host.ssh_profile
+                    .as_ref()
+                    .map(|profile| format!("ssh:{profile}"))
+                    .unwrap_or_else(|| crate::ui::text("Local", "本机").into()),
+                if host.privilege == HostPrivilege::Sudo {
+                    "sudo"
+                } else {
+                    crate::ui::text("Direct", "直接执行")
+                }
+                .into(),
+                bound.to_string(),
+                observation_marker(host.last_observation.as_ref()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let report = crate::ui::table(
+        &[
+            crate::ui::text("Host", "主机"),
+            crate::ui::text("Connection", "连接"),
+            crate::ui::text("Privilege", "权限"),
+            crate::ui::text("Instances", "实例数"),
+            crate::ui::text("Last check", "最近检查"),
+        ],
+        &rows,
+    );
     Ok(report)
 }
 
@@ -428,15 +449,20 @@ fn host_show(context: &FleetContext, alias: &str) -> anyhow::Result<String> {
         .iter()
         .filter(|instance| instance.host_id == host.host_id)
         .collect();
-    let mut report = format!(
-        "host '{}' ({})\ntransport: {}\nprivilege: {:?}\nobservation: {}\n",
+    let mut report = crate::ui::message!(
+        "host '{}' ({})\ntransport: {}\nprivilege: {}\nobservation: {}\n",
+        "主机“{}”\n\n主机编号：{}\n连接：{}\n权限：{}\n最近检查：{}\n",
         host.alias,
         host.host_id,
         match host.transport {
             HostTransport::Local => "local".to_owned(),
             HostTransport::Ssh => format!("ssh ({})", host.ssh_profile.as_deref().unwrap_or("-")),
         },
-        host.privilege,
+        if host.privilege == HostPrivilege::Sudo {
+            "sudo"
+        } else {
+            crate::ui::text("Direct", "直接执行")
+        },
         observation_marker(host.last_observation.as_ref()),
     );
     let summary = observation_summary_line(host.last_observation.as_ref());
@@ -445,13 +471,16 @@ fn host_show(context: &FleetContext, alias: &str) -> anyhow::Result<String> {
         report.push('\n');
     }
     if instances.is_empty() {
-        report.push_str("instances: none\n");
+        report.push_str(crate::ui::text("instances: none\n", "实例：无\n"));
     } else {
-        report.push_str("instances:\n");
+        report.push_str(crate::ui::text("instances:\n", "实例：\n"));
         for instance in instances {
-            report.push_str(&format!(
+            report.push_str(&crate::ui::message!(
                 "  {} (deployment {}, issuer {})\n",
-                instance.alias, instance.deployment_id, instance.issuer
+                "  {}（部署 {}，服务地址 {}）\n",
+                instance.alias,
+                instance.deployment_id,
+                instance.issuer
             ));
         }
     }
@@ -476,14 +505,19 @@ fn host_check(context: &FleetContext, alias: &str) -> anyhow::Result<String> {
             context
                 .store
                 .set_host_observation(host.host_id, ObservationCache::now(true, summary.clone()))?;
-            let mut report = format!(
-                "checked host '{alias}' against the live target\nhelper identity: {summary}\ntarget identity verified\nobservation updated\n"
+            let mut report = crate::ui::message!(
+                "checked host '{alias}' against the live target\nhelper identity: {summary}\ntarget identity verified\nobservation updated\n",
+                "主机“{alias}”检查通过\n\n执行器：{summary}\n主机身份已验证，检查结果已更新。\n"
             );
             if drifted {
-                report.push_str("drift detected against the cached observation:\n");
+                report.push_str(crate::ui::text(
+                    "drift detected against the cached observation:\n",
+                    "当前结果与缓存的检查结果不同：\n",
+                ));
                 if let Some(cached) = host.last_observation.as_ref() {
-                    report.push_str(&format!(
+                    report.push_str(&crate::ui::message!(
                         "  cached: {}\n  live:   {summary}\n",
+                        "  上次：{}\n  当前：{summary}\n",
                         cached.summary
                     ));
                 }
@@ -505,20 +539,33 @@ fn host_check(context: &FleetContext, alias: &str) -> anyhow::Result<String> {
 fn host_forget(context: &FleetContext, alias: &str, cascade: bool) -> anyhow::Result<String> {
     // Registry-only by construction: no execution target is ever built here.
     let (_host, removed) = context.store.forget_host(alias, cascade)?;
-    let mut report = format!("forgot host '{alias}' (registry-only operation)\n");
+    let mut report = crate::ui::message!(
+        "forgot host '{alias}' (registry-only operation)\n",
+        "已移除主机“{alias}”的本地注册记录\n"
+    );
     if removed.is_empty() {
-        report.push_str("no local instance records referenced this host\n");
+        report.push_str(crate::ui::text(
+            "no local instance records referenced this host\n",
+            "没有实例引用此主机。\n",
+        ));
     } else {
-        report.push_str("removed local instance records:\n");
+        report.push_str(crate::ui::text(
+            "removed local instance records:\n",
+            "同时移除了以下实例的本地记录：\n",
+        ));
         for record in &removed {
-            report.push_str(&format!(
+            report.push_str(&crate::ui::message!(
                 "  {} (deployment {})\n",
-                record.alias, record.deployment_id
+                "  {}（部署 {}）\n",
+                record.alias,
+                record.deployment_id
             ));
         }
     }
-    report
-        .push_str("no remote operation was attempted; remote deployments keep running untouched\n");
+    report.push_str(crate::ui::text(
+        "no remote operation was attempted; remote deployments keep running untouched\n",
+        "远程部署保持运行。\n",
+    ));
     Ok(report)
 }
 
@@ -547,7 +594,10 @@ pub(crate) fn resolve_instance(
             });
     }
     match instances.as_slice() {
-        [] => bail!("no instances are registered yet"),
+        [] => crate::ui::fail!(
+            "{INSTANCE_NOT_REGISTERED}: no instances are registered yet",
+            "{INSTANCE_NOT_REGISTERED}：尚未注册实例，请先安装或注册部署"
+        ),
         [single] => Ok(single.clone()),
         many => {
             let candidates = many
@@ -637,30 +687,28 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
         }
     }
     let instances = context.store.list_instances()?;
-    let mut report = String::from(
-        "ALIAS       DEPLOYMENT-ID   HOST          ISSUER                       OBSERVATION\n",
-    );
+    let mut rows = Vec::new();
     for instance in &instances {
-        let host_label = match context.store.host_by_id(instance.host_id)? {
-            Some(host) => host.alias,
-            None => "<unknown>".to_owned(),
-        };
-        let marker = observation_marker(instance.last_observation.as_ref());
-        let alias = instance.alias.as_str();
-        let deployment = instance.deployment_id.as_str();
-        let issuer = instance.issuer.as_str();
-        report.push_str(&format!(
-            "{alias:<11} {deployment:<15} {host_label:<13} {issuer:<28} {marker}\n"
-        ));
-        let summary = observation_summary_line(instance.last_observation.as_ref());
-        if !summary.is_empty() {
-            report.push_str(&summary);
-            report.push('\n');
-        }
+        rows.push(vec![
+            instance.alias.clone(),
+            context
+                .store
+                .host_by_id(instance.host_id)?
+                .map(|host| host.alias)
+                .unwrap_or_else(|| crate::ui::text("Unknown", "未知").into()),
+            instance.issuer.clone(),
+            observation_marker(instance.last_observation.as_ref()),
+        ]);
     }
-    if instances.is_empty() {
-        report.push_str("(no instances registered)\n");
-    }
+    let report = crate::ui::table(
+        &[
+            crate::ui::text("Instance", "实例"),
+            crate::ui::text("Host", "主机"),
+            crate::ui::text("Service URL", "服务地址"),
+            crate::ui::text("Last check", "最近检查"),
+        ],
+        &rows,
+    );
     Ok(report)
 }
 
@@ -704,9 +752,12 @@ fn instance_rename(
     let explicit = merged_selector(source, "instance rename")?;
     let record = resolve_instance(&context.store, explicit.as_deref(), "instance rename")?;
     let renamed = context.store.rename_instance(&record.alias, new_alias)?;
-    Ok(format!(
+    Ok(crate::ui::message!(
         "renamed instance '{}' -> '{}' (deployment {}; key/issuer/host bindings unchanged)\n",
-        record.alias, renamed.alias, renamed.deployment_id
+        "实例“{}”已重命名为“{}”（部署 {}，原有绑定保持不变）。\n",
+        record.alias,
+        renamed.alias,
+        renamed.deployment_id
     ))
 }
 
@@ -715,9 +766,10 @@ fn instance_forget(context: &FleetContext, selector: &InstanceSelector) -> anyho
     let record = resolve_instance(&context.store, explicit.as_deref(), "instance forget")?;
     let mut report = String::new();
     if record.controller_id.is_some() || record.controller_key_ref.is_some() {
-        report.push_str(&format!(
+        report.push_str(&crate::ui::message!(
             "warning: instance '{}' carries controller binding references; forgetting removes \
              only the local Registry record — the Controller Slot at the server is NOT revoked\n",
+            "注意：实例“{}”仍有控制器授权。移除本地记录不会撤销服务端授权。\n",
             record.alias
         ));
     }
@@ -725,8 +777,7 @@ fn instance_forget(context: &FleetContext, selector: &InstanceSelector) -> anyho
     context
         .store
         .forget_instance_by_deployment(&record.deployment_id)?;
-    report.push_str(&format!(
-        "forgot instance '{}' (deployment {}) — registry-only operation\nthe remote instance keeps running and its controller slots are unchanged\n",
+    report.push_str(&crate::ui::message!("forgot instance '{}' (deployment {}) — registry-only operation\nthe remote instance keeps running and its controller slots are unchanged\n", "已移除实例“{}”（部署 {}）的本地注册记录。\n远程实例继续运行，控制器授权未撤销。\n",
         record.alias, record.deployment_id
     ));
     Ok(report)
@@ -809,9 +860,13 @@ fn instance_relocate(
             ),
         ),
     )?;
-    Ok(format!(
+    Ok(crate::ui::message!(
         "relocated instance '{}' (deployment {}) from host '{}' to host '{}'\n",
-        moved.alias, moved.deployment_id, current.alias, destination.alias
+        "实例“{}”（部署 {}）的主机绑定已从“{}”改为“{}”。\n",
+        moved.alias,
+        moved.deployment_id,
+        current.alias,
+        destination.alias
     ))
 }
 
@@ -1164,7 +1219,12 @@ mod tests {
         let report = host_list(&fixture.context, true)?;
         assert!(report.contains("server-dead"), "row must survive: {report}");
         assert!(report.contains("error ("), "{report}");
-        assert!(report.contains("timed out"), "{report}");
+        assert!(
+            report
+                .lines()
+                .any(|line| line.contains("server-dead") && line.contains("error (")),
+            "{report}"
+        );
 
         let dead = fixture.store().host_by_alias("server-dead")?.unwrap();
         let observation = dead.last_observation.expect("failure recorded");
@@ -1421,7 +1481,7 @@ mod tests {
         )?;
         let report = instance_list(&fixture.context, false)?;
         assert!(report.contains("fresh ("), "{report}");
-        assert!(report.contains("helper verified"), "{report}");
+        assert!(report.contains("https://auth.example.com"), "{report}");
         assert_eq!(
             fixture.calls.load(Ordering::Relaxed),
             0,

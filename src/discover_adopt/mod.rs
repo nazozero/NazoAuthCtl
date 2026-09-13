@@ -217,14 +217,18 @@ pub(crate) fn run_discover(
     let inspections = execute_state_list(target.as_ref())
         .context("discovery sweep failed; nothing was changed")?;
 
-    let mut report = format!(
+    let mut report = crate::ui::message!(
         "discovered {} NazoAuth deployment(s) on host '{}'\nhelper identity: {}\n",
+        "在主机“{1}”发现 {0} 个 NazoAuth 部署\n执行器：{2}\n",
         inspections.len(),
         host.alias,
         summarize_hello(&hello)
     );
     if inspections.is_empty() {
-        report.push_str("(no NazoAuth deployments found on this target; nothing to adopt)\n");
+        report.push_str(crate::ui::text(
+            "(no NazoAuth deployments found on this target; nothing to adopt)\n",
+            "此主机没有可注册的 NazoAuth 部署。\n",
+        ));
         return Ok(report);
     }
 
@@ -236,16 +240,17 @@ pub(crate) fn run_discover(
             &host.alias,
         ));
     }
-    report.push_str(
+    report.push_str(crate::ui::text(
         "discover is strictly read-only: no registry record, no cache entry, no target change\n",
-    );
+        "发现操作已完成，尚未注册或修改这些部署。\n",
+    ));
     Ok(report)
 }
 
 fn release_line(inspection: &InstanceInspection) -> String {
     match &inspection.current_release {
         Some(identity) => identity.version.clone(),
-        None => "not recorded".to_owned(),
+        None => crate::ui::text("not recorded", "未记录").to_owned(),
     }
 }
 
@@ -255,63 +260,42 @@ fn render_discovery_block(
     status: &CandidateStatus,
     host_alias: &str,
 ) -> String {
-    let classified = classify_resources(&inspection.resources);
-    let managed = classified
-        .iter()
-        .filter(|item| item.class == AdoptionClass::ManagedDeletion)
-        .count();
-    let artifacts = match (&inspection.artifact.current, &inspection.artifact.previous) {
-        (None, None) => "-".to_owned(),
-        (current, previous) => format!(
-            "current={} previous={}",
-            current.clone().unwrap_or_else(|| "-".to_owned()),
-            previous.clone().unwrap_or_else(|| "-".to_owned())
-        ),
-    };
-    let health = if inspection.healthy { "ok" } else { "down" };
-    let mut block = format!(
-        "[{index}] {}\n    issuer: {}\n    runtime: {}/{}\n    config: revision {} (schema {}, {})\n    artifacts: {artifacts}\n    release version: {}\n    health: {health} — {}\n",
-        inspection.deployment_id,
-        inspection.issuer,
-        inspection.runtime.kind,
-        inspection.runtime.object,
-        inspection.revision,
-        inspection.config_schema,
-        inspection.config_reference,
-        release_line(inspection),
-        inspection.health_summary,
+    let title = format!("[{index}] {}", inspection.deployment_id);
+    let mut block = crate::ui::fields(
+        &title,
+        &[
+            (
+                crate::ui::text("Service URL", "服务地址"),
+                inspection.issuer.clone(),
+            ),
+            (crate::ui::text("Version", "版本"), release_line(inspection)),
+            (
+                crate::ui::text("Runtime", "运行环境"),
+                inspection.runtime.kind.to_string(),
+            ),
+            (
+                crate::ui::text("Health", "健康"),
+                if inspection.healthy {
+                    crate::ui::text("Healthy", "正常")
+                } else {
+                    crate::ui::text("Unhealthy", "异常")
+                }
+                .into(),
+            ),
+        ],
     );
-    if classified.is_empty() {
-        block.push_str("    resources: none declared — treated entirely as external\n");
-    } else {
-        block.push_str(&format!(
-            "    resources: {} declared (managed+deletable: {managed}, external/shared zero-delete: {})\n",
-            classified.len(),
-            classified.len() - managed
-        ));
-        for item in &classified {
-            let note = match item.class {
-                AdoptionClass::ManagedDeletion => "managed+deployment",
-                AdoptionClass::ExternalZeroDelete => "external/shared (zero-delete protection)",
-            };
-            block.push_str(&format!(
-                "      - {} [{}] {} — {note}\n",
-                item.resource.resource_id, item.resource.kind, item.resource.locator
-            ));
-        }
-    }
+    block.push_str("\n\n");
+    block.push_str(&render_resources(inspection));
+    block.push('\n');
     match status {
-        CandidateStatus::Unregistered => block.push_str(&format!(
-            "    status: registration candidate\n    next step: nazoauthctl instance register --host {host_alias} --deployment-id {}\n",
+        CandidateStatus::Unregistered => block.push_str(&crate::ui::message!("    status: registration candidate\n    next step: nazoauthctl instance register --host {host_alias} --deployment-id {}\n", "状态：尚未注册\n下一步：nazoauthctl instance register --host {host_alias} --deployment-id {}\n",
             inspection.deployment_id
         )),
-        CandidateStatus::RegisteredHere { alias } => block.push_str(&format!(
-            "    status: registered on this host as '{alias}'\n"
+        CandidateStatus::RegisteredHere { alias } => block.push_str(&crate::ui::message!("    status: registered on this host as '{alias}'\n", "状态：已在此主机注册为“{alias}”\n"
         )),
-        CandidateStatus::RegisteredElsewhere { alias, host_alias: bound } => block.push_str(&format!(
-            "    status: RELOCATION CANDIDATE — registered under host '{bound}' as '{alias}'; \
+        CandidateStatus::RegisteredElsewhere { alias, host_alias: bound } => block.push_str(&crate::ui::message!("    status: RELOCATION CANDIDATE — registered under host '{bound}' as '{alias}'; \
              this record is never rewritten by discovery\n    relocation requires explicit \
-             proof through the new host: nazoauthctl instance relocate --instance {alias} --to-host {host_alias}\n"
+             proof through the new host: nazoauthctl instance relocate --instance {alias} --to-host {host_alias}\n", "状态：当前注册在主机“{bound}”，实例名为“{alias}”。本次发现未修改绑定。\n如需迁移绑定：nazoauthctl instance relocate --instance {alias} --to-host {host_alias}\n"
         )),
     }
     block.push('\n');
@@ -426,53 +410,59 @@ pub(crate) fn run_adopt(
 }
 
 fn render_adopt_report(record: &InstanceRecord, inspection: &InstanceInspection) -> String {
-    let classified = classify_resources(&inspection.resources);
-    let mut report = format!(
-        "adopted deployment '{}' as instance '{}' on the registry\nissuer: {}\n\
-         evidence derived from the target's own DeploymentState over a verified handshake\n\
-         observation recorded: {}\n",
+    let title = crate::ui::message!(
+        "Registered deployment '{}' as instance '{}'",
+        "部署“{}”已注册为实例“{}”",
         record.deployment_id,
-        record.alias,
-        record.issuer,
-        summarize_inspection(inspection),
+        record.alias
     );
-    if classified.is_empty() {
-        report.push_str(
-            "resources: none declared — everything is treated as external; uninstall could \
-             delete nothing\n",
-        );
-    } else {
-        let managed = classified
-            .iter()
-            .filter(|item| item.class == AdoptionClass::ManagedDeletion)
-            .count();
-        report.push_str(
-            "resource classification (from the authoritative target state; nothing upgraded \
-             to managed):\n",
-        );
-        for item in &classified {
-            let note = match item.class {
-                AdoptionClass::ManagedDeletion => {
-                    "managed+deployment: the only class uninstall may replace/delete"
-                }
-                AdoptionClass::ExternalZeroDelete => "external/shared: zero-delete protection",
-            };
-            report.push_str(&format!(
-                "  - {} [{}] {} — {note}\n",
-                item.resource.resource_id, item.resource.kind, item.resource.locator
-            ));
-        }
-        report.push_str(&format!(
-            "managed+deletable: {managed}; external/shared zero-delete: {}\n",
-            classified.len() - managed
-        ));
-    }
-    report.push_str(
-        "signed nothing; no controller key required; the target DeploymentState was not modified\n\
-         \nnext steps:\n\
-         1. create or confirm the instance administrator and enroll MFA at the instance itself\n\
-         2. establish the controller binding after MFA enrollment:\n\
-            nazoauthctl bind --instance <alias> --label <name>\n",
+    let mut report = crate::ui::fields(
+        &title,
+        &[
+            (
+                crate::ui::text("Service URL", "服务地址"),
+                record.issuer.clone(),
+            ),
+            (crate::ui::text("Version", "版本"), release_line(inspection)),
+        ],
     );
+    report.push_str("\n\n");
+    report.push_str(&render_resources(inspection));
+    report.push_str(&crate::ui::message!(
+        "\n\nNext: set up administrator MFA, then run nazoauthctl bind --instance {} --label production\n",
+        "\n\n下一步：设置管理员双重验证，然后运行 nazoauthctl bind --instance {} --label production\n", record.alias));
     report
+}
+
+fn render_resources(inspection: &InstanceInspection) -> String {
+    if inspection.resources.is_empty() {
+        return crate::ui::text("resources: none declared — everything is treated as external; uninstall could delete nothing", "未声明资源；所有资源按外部资源保留，卸载时不删除。 ").to_owned();
+    }
+    let rows = classify_resources(&inspection.resources)
+        .iter()
+        .map(|item| {
+            vec![
+                item.resource.kind.to_string(),
+                item.resource.locator.clone(),
+                match item.class {
+                    AdoptionClass::ManagedDeletion => {
+                        crate::ui::text("managed+deployment", "由 ctl 管理，卸载时删除")
+                    }
+                    AdoptionClass::ExternalZeroDelete => crate::ui::text(
+                        "external/shared: zero-delete protection",
+                        "外部或共享资源，保留",
+                    ),
+                }
+                .into(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    crate::ui::table(
+        &[
+            crate::ui::text("Resource type", "资源类型"),
+            crate::ui::text("Location", "位置"),
+            crate::ui::text("Ownership", "归属"),
+        ],
+        &rows,
+    )
 }

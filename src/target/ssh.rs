@@ -474,8 +474,9 @@ impl SshTarget {
                 self.profile
             );
         }
-        eprintln!(
+        crate::ui::warning!(
             "nazoauthctl: establishing sudo credentials on '{}' — complete the prompt",
+            "正在为主机“{}”验证 sudo 权限，请完成终端提示。",
             self.profile
         );
         let status = StdCommand::new(&self.program)
