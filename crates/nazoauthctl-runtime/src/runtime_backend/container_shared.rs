@@ -11,30 +11,17 @@ use std::{ffi::OsStr, time::Duration};
 use crate::process::Process;
 use anyhow::{Context as _, bail};
 
-use super::{
-    ContainerRestartPolicy, ContainerRuntimePolicy, ManagedValkeyRestore, NeutralMount,
-    OneShotTask, managed_config_digest,
-};
+use super::{ContainerRestartPolicy, ContainerRuntimePolicy, NeutralMount, OneShotTask};
 
-mod managed_dependencies;
 mod policy;
 mod recovery;
 
-pub use managed_dependencies::oci_backup_digests;
-pub(crate) use managed_dependencies::{
-    TemporaryPostgresCredentials, backup_managed_dependencies, load_dependency_restore_journal,
-    persist_dependency_restore_journal, postgres_database_from_service_file,
-    temporary_postgres_credentials, validate_sql_identifier, verify_oci_backup_artifacts,
-};
 #[cfg(all(test, unix))]
 use policy::observed_cap_drop_all;
 pub(crate) use policy::{
-    append_container_policy, append_managed_labels, assert_container_image,
-    assert_managed_container_policy, assert_managed_labels, command_stdout, container_is_running,
-    ensure_container, ensure_volume, inspect_document, inspect_document_optional,
-    inspect_image_environment, inspect_managed_container_id, is_engine_unavailable_error,
-    network_config_digest, network_gateway, prepare_managed_volume_ownership, reconcile_bound_file,
-    remove_managed_container_by_id, remove_managed_container_by_name, require_digest_pinned_image,
+    append_container_policy, assert_container_image, assert_managed_container_policy,
+    command_stdout, inspect_document, inspect_document_optional, inspect_image_environment,
+    is_engine_unavailable_error,
 };
 pub(crate) use recovery::{cleanup_recovery_candidate, stage_recovery_candidate};
 
@@ -42,7 +29,6 @@ pub(crate) use recovery::{cleanup_recovery_candidate, stage_recovery_candidate};
 /// is not an authorization boundary: the caller must provide the explicit
 /// uid:gid contract and the engine must accept it.
 pub const NON_ROOT_ONE_SHOT_USER: &str = "10001:10001";
-pub(crate) const VALKEY_RESTORE_CHECK_RESOURCE_KIND: &str = "valkey-restore-check";
 
 pub(crate) fn append_cosign_sandbox(process: Process) -> Process {
     process
@@ -54,77 +40,12 @@ pub(crate) fn append_cosign_sandbox(process: Process) -> Process {
         .arg("/tmp/cosign-home:rw,noexec,nosuid,nodev,size=16m")
 }
 
-pub(crate) fn valkey_restore_check_config_digest(
-    restore: &ManagedValkeyRestore,
-    volume: &str,
-    container: &str,
-) -> String {
-    managed_config_digest(
-        VALKEY_RESTORE_CHECK_RESOURCE_KIND,
-        &[
-            ("image", restore.image.as_str()),
-            ("volume", volume),
-            ("container", container),
-            ("network", "none"),
-            ("port", "6379"),
-            ("server-mode", "protected-mode=off;save=;appendonly=no"),
-        ],
-    )
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
 
-    use crate::runtime_backend::{
-        ArtifactReference, ManagedDependencyBackup, OneShotTask, managed_dependency_identity,
-    };
-    use crate::{
-        filesystem::PrivateTempDir, process::Process, runtime_backend::ManagedNetwork,
-        test_support::write_shell_executable,
-    };
-
-    #[test]
-    fn container_lookup_cannot_resolve_a_volume_with_the_container_name_as_prefix() {
-        let work = PrivateTempDir::new("runtime-container-inspect-type").unwrap();
-        let engine = work.path().join("fake-podman");
-        let generic_marker = work.path().join("generic-inspect-was-used");
-        let create_argv = work.path().join("create-argv");
-        write_shell_executable(
-            &engine,
-            &format!(
-                "if [ \"$*\" = 'container inspect managed-postgres --format {{{{json .}}}}' ]; then printf '%s\\n' 'no such object' >&2; exit 1; fi\nif [ \"$*\" = 'inspect managed-postgres' ]; then : > '{}'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
-                generic_marker.display(),
-                create_argv.display(),
-            ),
-        );
-        let network = ManagedNetwork {
-            name: "managed-network".to_owned(),
-            subnet: None,
-            deployment_id: "deployment-test".to_owned(),
-            control_authority: "controller-test".to_owned(),
-        };
-        super::ensure_container(
-            engine.as_os_str(),
-            "managed-postgres",
-            &network,
-            "runtime-test",
-            "postgres",
-            &format!("sha256:{}", "c".repeat(64)),
-            "postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            Process::new(engine.as_os_str()).args(["run", "--name", "managed-postgres"]),
-            "Podman",
-            &super::ContainerRuntimePolicy::managed_default(),
-            &[],
-            &[],
-        )
-        .unwrap();
-        assert!(!generic_marker.exists());
-        assert_eq!(
-            fs::read_to_string(create_argv).unwrap(),
-            "run\n--name\nmanaged-postgres\n"
-        );
-    }
+    use crate::runtime_backend::{ArtifactReference, OneShotTask};
+    use crate::{filesystem::PrivateTempDir, test_support::write_shell_executable};
 
     #[test]
     fn image_identity_uses_valid_engine_templates() {
@@ -136,87 +57,16 @@ mod tests {
             "if [ \"$*\" = 'container inspect managed-postgres --format {{json .}}' ]; then\n  printf '%s\\n' '{\"Config\":{\"Image\":\"docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}'\n  exit 0\nfi\nexit 1",
         );
         super::assert_container_image(
-            engine.as_os_str(),
-            &["container", "inspect", "managed-postgres"],
+            &super::inspect_document(
+                engine.as_os_str(),
+                &["container", "inspect", "managed-postgres"],
+                "test",
+            )
+            .unwrap(),
             expected,
             "Podman",
         )
         .unwrap();
-    }
-
-    #[test]
-    fn managed_identity_accepts_podman_lowercase_label_surface() {
-        let work = PrivateTempDir::new("runtime-podman-label-surface").unwrap();
-        let engine = work.path().join("fake-podman");
-        write_shell_executable(
-            &engine,
-            "printf '%s\n' '{\"labels\":{\"io.nazoauth.deployment-id\":\"deployment-test\",\"io.nazoauth.control-authority\":\"controller-test\",\"io.nazoauth.managed-resource\":\"network\",\"io.nazoauth.config-digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}'",
-        );
-        super::assert_managed_labels(
-            engine.as_os_str(),
-            &["network", "inspect", "managed-network"],
-            "deployment-test",
-            "controller-test",
-            None,
-            "network",
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "Podman",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn managed_dependency_policy_runs_services_as_the_image_non_root_identity() {
-        let work = PrivateTempDir::new("runtime-managed-service-user").unwrap();
-        let engine = work.path().join("fake-engine");
-        let arguments = work.path().join("arguments");
-        write_shell_executable(
-            &engine,
-            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
-        );
-        super::append_container_policy(
-            Process::new(engine.as_os_str()).arg("run"),
-            &super::ContainerRuntimePolicy::managed_postgres(),
-        )
-        .run_quiet()
-        .unwrap();
-        let arguments = fs::read_to_string(arguments).unwrap();
-        assert!(arguments.contains("--user\n999:999\n"));
-        assert!(arguments.contains("--cap-drop=ALL\n"));
-        assert!(arguments.contains("--read-only\n"));
-    }
-
-    #[test]
-    fn hardened_one_shot_policy_is_closed_before_the_image_positional() {
-        let work = PrivateTempDir::new("runtime-one-shot-order").unwrap();
-        let engine = work.path().join("fake-engine");
-        let arguments = work.path().join("arguments");
-        write_shell_executable(
-            &engine,
-            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
-        );
-        let image = "example.invalid/nazoauth@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-        super::hardened_one_shot_process(engine.as_os_str())
-            .args(["--network", "none"])
-            .arg(image)
-            .arg("nazoauth")
-            .arg("release-identity")
-            .run_quiet()
-            .unwrap();
-
-        let arguments = fs::read_to_string(arguments).unwrap();
-        let arguments = arguments.lines().collect::<Vec<_>>();
-        let policy = arguments
-            .iter()
-            .position(|argument| *argument == "--cap-drop=ALL")
-            .unwrap();
-        let image = arguments
-            .iter()
-            .position(|argument| *argument == image)
-            .unwrap_or_else(|| panic!("one-shot image is absent from {arguments:?}"));
-        assert!(policy < image);
-        assert!(!arguments.contains(&"ALL"));
     }
 
     #[test]
@@ -274,35 +124,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_volume_copy_has_only_offline_filesystem_capabilities() {
-        let work = PrivateTempDir::new("runtime-managed-volume-copy").unwrap();
-        let engine = work.path().join("fake-engine");
-        let arguments = work.path().join("arguments");
-        write_shell_executable(
-            &engine,
-            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
-        );
-
-        super::build_managed_volume_copy_process(engine.as_os_str())
-            .arg("example.invalid/valkey@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .args(["sh", "-c", "cp -a /source/. /destination/"])
-            .run_quiet()
-            .unwrap();
-
-        let arguments = fs::read_to_string(arguments).unwrap();
-        assert!(arguments.contains("--user\n0:0\n"));
-        assert!(arguments.contains("--network\nnone\n"));
-        assert!(arguments.contains("--read-only\n"));
-        assert!(arguments.contains("--cap-drop\nALL\n"));
-        assert!(arguments.contains("--cap-add\nCHOWN\n"));
-        assert!(arguments.contains("--cap-add\nDAC_OVERRIDE\n"));
-        assert!(arguments.contains("--cap-add\nFOWNER\n"));
-        assert!(arguments.contains("--security-opt\nno-new-privileges\n"));
-        assert!(!arguments.contains("NET_ADMIN"));
-        assert!(!arguments.contains("SYS_ADMIN"));
-    }
-
-    #[test]
     fn podman_expanded_cap_drop_all_is_recognized_without_accepting_partial_sets() {
         let complete = [
             "CAP_CHOWN",
@@ -322,113 +143,6 @@ mod tests {
         .collect::<Vec<_>>();
         assert!(super::observed_cap_drop_all(&complete));
         assert!(!super::observed_cap_drop_all(&complete[..10]));
-    }
-
-    #[test]
-    fn managed_valkey_backup_reads_auth_from_stdin_without_a_secret_environment_variable() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};
-
-        let work = PrivateTempDir::new("managed-valkey-backup-auth").unwrap();
-        if fs::metadata(work.path()).unwrap().uid() != 0 {
-            return;
-        }
-        let engine = work.path().join("fake-podman");
-        let argv = work.path().join("argv");
-        let lastsave_seen = work.path().join("lastsave-seen");
-        let password_file = work.path().join("valkey-password");
-        fs::create_dir(work.path().join("backup")).unwrap();
-        chown(work.path().join("backup"), Some(0), Some(10001)).unwrap();
-        fs::set_permissions(
-            work.path().join("backup"),
-            fs::Permissions::from_mode(0o750),
-        )
-        .unwrap();
-        fs::write(&password_file, "secret-canary").unwrap();
-        fs::set_permissions(&password_file, fs::Permissions::from_mode(0o400)).unwrap();
-        write_shell_executable(
-            &engine,
-            &format!(
-                "case \"$*\" in *--interactive*) IFS= read -r _ || true ;; esac\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *LASTSAVE*) if [ -e '{}' ]; then printf '101\\n'; else : > '{}'; printf '100\\n'; fi ;;\n  *) if [ \"$1\" = cp ]; then : > \"$3\"; fi; exit 0 ;;\nesac",
-                argv.display(),
-                lastsave_seen.display(),
-                lastsave_seen.display(),
-            ),
-        );
-        let postgres_image = format!("postgres@sha256:{}", "a".repeat(64));
-        let valkey_image = format!("valkey@sha256:{}", "b".repeat(64));
-        let backup = ManagedDependencyBackup {
-            destination: work.path().join("backup"),
-            network: "managed-network".to_owned(),
-            postgres_object: "managed-postgres".to_owned(),
-            postgres_volume: "managed-postgres-data".to_owned(),
-            postgres_image: postgres_image.clone(),
-            postgres_user: "nazoauth_runtime".to_owned(),
-            postgres_database: "oauth".to_owned(),
-            postgres_validation_image: postgres_image.clone(),
-            valkey_object: "managed-valkey".to_owned(),
-            valkey_volume: "managed-valkey-data".to_owned(),
-            valkey_image: valkey_image.clone(),
-            valkey_rdb_path: "/data/dump.rdb".to_owned(),
-            valkey_password_file: Some(password_file),
-            valkey_user: Some(super::super::MANAGED_VALKEY_BACKUP_USER.to_owned()),
-            identity: managed_dependency_identity(
-                "deployment-test",
-                "controller-test",
-                "runtime-test",
-                "managed-network",
-                None,
-                "managed-postgres",
-                "managed-postgres-data",
-                &postgres_image,
-                "oauth",
-                "nazoauth_runtime",
-                "managed-valkey",
-                "managed-valkey-data",
-                &valkey_image,
-            ),
-        };
-        super::backup_managed_dependencies(engine.as_os_str(), &backup, true).unwrap();
-        let arguments = fs::read_to_string(argv).unwrap();
-        assert!(arguments.contains("valkey-cli --user nazoauth_backup --askpass"));
-        assert!(!arguments.contains("VALKEYCLI_AUTH"));
-        assert!(!arguments.contains("REDISCLI_AUTH"));
-        assert!(!arguments.contains("secret-canary"));
-    }
-
-    #[test]
-    fn managed_restore_journal_rejects_backend_drift() {
-        let work = PrivateTempDir::new("managed-restore-journal-drift").unwrap();
-        let backup = work.path().join("backup");
-        fs::create_dir(&backup).unwrap();
-        fs::write(backup.join("SHA256SUMS"), b"placeholder\n").unwrap();
-        let image = format!("postgres@sha256:{}", "a".repeat(64));
-        let identity = managed_dependency_identity(
-            "deployment-test",
-            "controller-test",
-            "runtime-test",
-            "managed-network",
-            None,
-            "managed-postgres",
-            "managed-postgres-data",
-            &image,
-            "oauth",
-            "nazoauth_runtime",
-            "managed-valkey",
-            "managed-valkey-data",
-            &format!("valkey@sha256:{}", "b".repeat(64)),
-        );
-        let (path, journal) =
-            super::load_dependency_restore_journal(&backup, "Docker", &identity).unwrap();
-        super::persist_dependency_restore_journal(&path, &journal).unwrap();
-        let error =
-            super::load_dependency_restore_journal(&backup, "Podman", &identity).unwrap_err();
-        assert!(error.to_string().contains("not bound"));
-        let mut tampered = journal.clone();
-        tampered.deployment_id = "other-deployment".to_owned();
-        super::persist_dependency_restore_journal(&path, &tampered).unwrap();
-        let error =
-            super::load_dependency_restore_journal(&backup, "Docker", &identity).unwrap_err();
-        assert!(error.to_string().contains("not bound"));
     }
 
     #[test]
@@ -477,8 +191,12 @@ mod tests {
             });
             write_shell_executable(&engine, &format!("printf '%s\\n' '{}'", document));
             let error = super::assert_managed_container_policy(
-                engine.as_os_str(),
-                &["container", "inspect", "managed"],
+                &super::inspect_document(
+                    engine.as_os_str(),
+                    &["container", "inspect", "managed"],
+                    "test",
+                )
+                .unwrap(),
                 "Docker",
                 &policy,
                 "managed-network",
@@ -520,8 +238,12 @@ mod tests {
             });
             write_shell_executable(&engine, &format!("printf '%s\\n' '{}'", document));
             super::assert_managed_container_policy(
-                engine.as_os_str(),
-                &["container", "inspect", "managed"],
+                &super::inspect_document(
+                    engine.as_os_str(),
+                    &["container", "inspect", "managed"],
+                    "test",
+                )
+                .unwrap(),
                 backend,
                 &super::ContainerRuntimePolicy::managed_default(),
                 "managed-network",
@@ -558,53 +280,6 @@ mod tests {
             "/run/postgresql": "rw,noexec,nosuid,nodev,size=16777216,rprivate,tmpcopyup",
         });
         assert!(assert_tmpfs_policy(duplicate_option, "Podman").is_err());
-    }
-
-    #[test]
-    fn oci_backup_completion_and_artifact_digests_are_bound() {
-        use sha2::{Digest as _, Sha256};
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown};
-
-        let work = PrivateTempDir::new("oci-backup-completion-bound").unwrap();
-        if fs::metadata(work.path()).unwrap().uid() != 0 {
-            return;
-        }
-        let backup = work.path().join("backup");
-        fs::create_dir(&backup).unwrap();
-        chown(&backup, Some(0), Some(10001)).unwrap();
-        fs::set_permissions(&backup, fs::Permissions::from_mode(0o750)).unwrap();
-        let payload = backup.join("payload");
-        fs::write(&payload, b"payload").unwrap();
-        let digest = |bytes: &[u8]| {
-            Sha256::digest(bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        let payload_digest = digest(b"payload");
-        fs::write(
-            backup.join("SHA256SUMS"),
-            format!("{payload_digest}  payload\n"),
-        )
-        .unwrap();
-        let manifest_bytes = fs::read(backup.join("SHA256SUMS")).unwrap();
-        let manifest_digest = digest(&manifest_bytes);
-        fs::write(
-            backup.join("BACKUP-COMPLETE"),
-            format!("marker=BACKUP-COMPLETE\nversion=1\nmanifest-sha256={manifest_digest}\n"),
-        )
-        .unwrap();
-        for name in ["payload", "SHA256SUMS", "BACKUP-COMPLETE"] {
-            let path = backup.join(name);
-            chown(&path, Some(0), Some(10001)).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
-        }
-        let marker_digest = digest(&fs::read(backup.join("BACKUP-COMPLETE")).unwrap());
-        super::verify_oci_backup_artifacts(&backup, &manifest_digest, &marker_digest).unwrap();
-        fs::write(&payload, b"tampered").unwrap();
-        let error = super::verify_oci_backup_artifacts(&backup, &manifest_digest, &marker_digest)
-            .unwrap_err();
-        assert!(error.to_string().contains("checksum"));
     }
 }
 
@@ -675,53 +350,6 @@ pub(crate) fn one_shot_process(
         .args(&task.command))
 }
 
-/// Start a hardened one-shot container command before any caller-controlled
-/// engine options or image reference are appended.
-///
-/// Taking the engine binary rather than a partially assembled `Process`
-/// makes it impossible to append policy flags after the image positional.
-pub(crate) fn hardened_one_shot_process(command: &OsStr) -> Process {
-    let mut policy = ContainerRuntimePolicy::managed_default();
-    policy.restart = ContainerRestartPolicy::No;
-    append_container_policy(Process::new(command).args(["run", "--rm"]), &policy)
-        .arg("--user")
-        .arg(NON_ROOT_ONE_SHOT_USER)
-}
-
-/// Build the narrowly privileged process used to copy an already-validated
-/// managed data volume.  Dependency images write their data as image-specific
-/// UIDs (for example Valkey uses 999:1000), so the fixed non-root identity used
-/// by ordinary one-shot probes cannot read a mode-0600 source or preserve its
-/// ownership.  The copy remains offline, read-only at the container root, and
-/// receives only the filesystem capabilities required by `cp -a`.
-pub(crate) fn build_managed_volume_copy_process(command: &OsStr) -> Process {
-    Process::new(command).args([
-        "run",
-        "--rm",
-        "--user",
-        "0:0",
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--cap-add",
-        "CHOWN",
-        "--cap-add",
-        "DAC_OVERRIDE",
-        "--cap-add",
-        "FOWNER",
-        "--security-opt",
-        "no-new-privileges",
-        "--pids-limit",
-        "64",
-        "--memory",
-        "134217728",
-        "--cpus",
-        "1.000",
-    ])
-}
-
 fn validate_non_root_user(user: &str, backend_name: &str) -> anyhow::Result<()> {
     let Some((uid, gid)) = user.split_once(':') else {
         bail!("{backend_name} one-shot user must be an explicit UID:GID");
@@ -777,7 +405,6 @@ pub(crate) fn runnable_oci_image(
     local_artifact_id
         .map(ToOwned::to_owned)
         .or_else(|| normalize_local_image_id(image_reference, true))
-        .or_else(|| normalize_local_image_id(image_reference, false))
         .unwrap_or_else(|| {
             format!(
                 "{}@{}",

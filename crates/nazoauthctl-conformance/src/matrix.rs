@@ -200,19 +200,6 @@ impl MatrixDocument {
     pub fn plan_count(&self) -> usize {
         self.groups.iter().map(|group| group.plans.len()).sum()
     }
-
-    pub fn module_aliases(&self) -> Vec<String> {
-        self.groups
-            .iter()
-            .flat_map(|group| group.plans.iter())
-            .filter_map(|plan| {
-                plan.config
-                    .get("alias")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .collect()
-    }
 }
 
 impl MatrixGroup {

@@ -6,8 +6,6 @@ use anyhow::{Context as _, bail};
 
 use crate::process::Process;
 
-#[cfg(debug_assertions)]
-use super::super::DebugArtifactTask;
 use super::super::{
     ArtifactReference, BlobAttestationVerification, ContainerRuntimePolicy, HostServiceInstall,
     RuntimeReplacement, container_shared,
@@ -111,7 +109,7 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
     let mut command = container_shared::append_container_policy(
         super::append_rootless_user_namespace(
             Process::new(command)
-                .args(["run", "-d", "--name"])
+                .args(["create", "--name"])
                 .arg(&replacement.object_reference),
         ),
         policy,
@@ -169,17 +167,4 @@ pub(super) fn import_image(command: &OsStr, archive: &Path) -> anyhow::Result<()
 
 pub(super) fn install_host_service(_install: &HostServiceInstall) -> anyhow::Result<()> {
     bail!("Podman does not install systemd host services")
-}
-
-#[cfg(debug_assertions)]
-pub(super) fn run_debug_artifact_task(
-    command: &OsStr,
-    task: &DebugArtifactTask,
-) -> anyhow::Result<()> {
-    Process::new(command)
-        .args(["run", "--rm"])
-        .arg(&task.target)
-        .arg("nazoauth")
-        .args(&task.arguments)
-        .run_quiet()
 }

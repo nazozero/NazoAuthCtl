@@ -888,7 +888,7 @@ pub(super) fn descriptor_requires_reference(
     })
 }
 
-fn value_contains_reference(value: &Value, reference: &str) -> bool {
+pub(super) fn value_contains_reference(value: &Value, reference: &str) -> bool {
     match value {
         Value::Array(values) => values
             .iter()

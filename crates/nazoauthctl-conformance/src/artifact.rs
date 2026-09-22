@@ -233,7 +233,7 @@ impl ArtifactTrustPolicy {
     }
 
     pub fn from_path(path: &Path) -> Result<Self, ArtifactError> {
-        let bytes = crate::secure_file::read_bounded(path, 64 * 1024, true)
+        let bytes = crate::secure_file::read_bounded(path, 64 * 1024, false)
             .map_err(map_secure_file_error)?;
         Self::from_bytes(&bytes)
     }

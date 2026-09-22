@@ -254,11 +254,7 @@ fn load_public_key(
     deployment_id: &str,
     kid: &str,
 ) -> anyhow::Result<String> {
-    keys.list_keys(deployment_id)?
-        .into_iter()
-        .find(|summary| summary.kid == kid)
-        .map(|summary| summary.public_key)
-        .with_context(|| format!("kid '{kid}' vanished from the local store"))
+    keys.public_key(deployment_id, kid)
 }
 
 /// Pick a pending local candidate for a NEW proposal: newest non-active key
@@ -332,9 +328,6 @@ fn reconcile_from_snapshot(
             .iter()
             .filter(|kid| !listed_kids.contains(&kid.as_str()))
         {
-            if kid == &slot.kid {
-                continue;
-            }
             if keys.retire_kid(deployment, kid).is_ok() {
                 retired.push(kid.clone());
             } else {

@@ -35,6 +35,7 @@ pub(crate) fn stage_recovery_candidate(
     command: &OsStr,
     backend_name: &str,
     source: &RuntimeObservation,
+    source_document: &serde_json::Value,
     request: &RecoveryCandidateRequest,
     add_docker_host_gateway: bool,
     rootless_podman: bool,
@@ -76,12 +77,7 @@ pub(crate) fn stage_recovery_candidate(
             && !network.to_ascii_lowercase().starts_with("container:"),
         "{backend_name} recovery source uses an unsafe network namespace"
     );
-    let source_document = inspect_document(
-        command,
-        &["container", "inspect", &request.source_object_reference],
-        backend_name,
-    )?;
-    assert_source_surface(&source_document, backend_name, request)?;
+    assert_source_surface(source_document, backend_name, request)?;
 
     let mounts = recovery_mounts(source, request)?;
     let mut environment = source.safe_environment.clone();
@@ -563,15 +559,9 @@ fn assert_candidate_surface(
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect::<Vec<_>>();
     let image_environment = super::inspect_image_environment(command, image, backend_name)?;
-    super::assert_container_image(
-        command,
-        &["container", "inspect", &request.candidate_object_reference],
-        image,
-        backend_name,
-    )?;
+    super::assert_container_image(document, image, backend_name)?;
     super::assert_managed_container_policy(
-        command,
-        &["container", "inspect", &request.candidate_object_reference],
+        document,
         backend_name,
         policy,
         network,

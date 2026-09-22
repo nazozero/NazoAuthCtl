@@ -54,13 +54,11 @@ pub(super) fn parse_confirm_scoped(
     ))
 }
 
-pub(super) fn selector_from_parsed(
-    parsed: &super::fleet::ParsedOptions,
-) -> anyhow::Result<InstanceSelector> {
-    Ok(InstanceSelector {
+pub(super) fn selector_from_parsed(parsed: &super::fleet::ParsedOptions) -> InstanceSelector {
+    InstanceSelector {
         positional: parsed.positionals.first().cloned(),
         named: parsed.values.get("--instance").cloned(),
-    })
+    }
 }
 
 /// `nazoauthctl bind [--instance SELECTOR] --label NAME [--approval-token T]

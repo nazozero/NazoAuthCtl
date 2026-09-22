@@ -134,7 +134,8 @@ impl PreparedMaterialization {
             .map(|value| Zeroizing::new(value.to_string()))
     }
 
-    pub fn expected_clients(&self) -> BTreeSet<String> {
+    #[cfg(test)]
+    fn expected_clients(&self) -> BTreeSet<String> {
         self.clients.keys().cloned().collect()
     }
 
@@ -151,25 +152,6 @@ impl PreparedMaterialization {
 
     pub fn suite_base_url(&self) -> &str {
         &self.suite_base_url
-    }
-
-    /// Return the public CA certificates generated for every signed Matrix
-    /// client. Negative mTLS modules deliberately present an alternate Matrix
-    /// client's certificate, so the proxy must authenticate the run-scoped CA
-    /// before the application can reject the client binding. The corresponding
-    /// private keys remain in the prepared records and never enter this bundle.
-    pub fn mtls_trust_anchor_pem(&self) -> Zeroizing<String> {
-        let anchors = self
-            .clients
-            .values()
-            .map(|client| client.mtls_ca_certificate.as_str())
-            .collect::<BTreeSet<_>>();
-        let mut bundle = String::new();
-        for anchor in anchors {
-            bundle.push_str(anchor.trim());
-            bundle.push('\n');
-        }
-        Zeroizing::new(bundle)
     }
 
     /// Materialize the ordinary NazoAuth resource apply manifest for this
@@ -196,8 +178,11 @@ impl PreparedMaterialization {
         }
         let run_suffix = run_namespace_suffix(run_namespace);
         let user_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix)?;
-        let trust_policy_resource_id =
-            run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix)?;
+        let trust_policy_resource_id = self
+            .attestation
+            .as_ref()
+            .map(|_| run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix))
+            .transpose()?;
         let username = self
             .applicant_email
             .split_once('@')
@@ -319,34 +304,40 @@ impl PreparedMaterialization {
             )?;
         }
 
-        let attestation = self.attestation.as_ref().ok_or(MaterializerError::Crypto)?;
-        let public_material = Openid4vcTrustPolicy {
-            schema: 1,
-            client_attestation_issuer: format!("{}/", self.suite_base_url.trim_end_matches('/')),
-            client_attestation_jwks: strict_openid4vc_trust_jwks(
-                attestation.attester_public_jwks.as_str(),
-            )?,
-            key_attestation_jwks: strict_openid4vc_trust_jwks(
-                attestation.key_attestation_public_jwks.as_str(),
-            )?,
-            wallet_authorization_origins: vec![self.suite_base_url.clone()],
-            credential_trust_anchor_pem: combine_openid4vc_credential_trust_anchors(
-                attestation.trust_anchor_pem.as_str(),
-                &self.descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
-            )?,
-        };
-        validate_openid4vc_trust_policy(&public_material).map_err(|_| {
-            MaterializerError::InvalidField("tenant_resource_manifest.openid4vc_trust_policy")
-        })?;
-        let trust_payload =
-            serde_json::to_value(public_material).map_err(|_| MaterializerError::Encoding)?;
-        push_manifest_resource(
-            &mut resources,
-            &mut payload_total,
-            TenantResourceKind::Openid4vcTrustPolicy,
-            trust_policy_resource_id,
-            trust_payload,
-        )?;
+        if let (Some(attestation), Some(trust_policy_resource_id)) =
+            (&self.attestation, trust_policy_resource_id)
+        {
+            let public_material = Openid4vcTrustPolicy {
+                schema: 1,
+                client_attestation_issuer: format!(
+                    "{}/",
+                    self.suite_base_url.trim_end_matches('/')
+                ),
+                client_attestation_jwks: strict_openid4vc_trust_jwks(
+                    attestation.attester_public_jwks.as_str(),
+                )?,
+                key_attestation_jwks: strict_openid4vc_trust_jwks(
+                    attestation.key_attestation_public_jwks.as_str(),
+                )?,
+                wallet_authorization_origins: vec![self.suite_base_url.clone()],
+                credential_trust_anchor_pem: combine_openid4vc_credential_trust_anchors(
+                    attestation.trust_anchor_pem.as_str(),
+                    &self.descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+                )?,
+            };
+            validate_openid4vc_trust_policy(&public_material).map_err(|_| {
+                MaterializerError::InvalidField("tenant_resource_manifest.openid4vc_trust_policy")
+            })?;
+            let trust_payload =
+                serde_json::to_value(public_material).map_err(|_| MaterializerError::Encoding)?;
+            push_manifest_resource(
+                &mut resources,
+                &mut payload_total,
+                TenantResourceKind::Openid4vcTrustPolicy,
+                trust_policy_resource_id,
+                trust_payload,
+            )?;
+        }
 
         TenantResourceManifest::from_resources(resources)
     }
@@ -716,16 +707,6 @@ impl TenantResourceApplyOutput {
         }
 
         validate_apply_mappings(resource_mappings, &delta)?;
-        if delta
-            .keys()
-            .filter(|(kind, _)| *kind == TenantResourceKind::Openid4vcTrustPolicy)
-            .count()
-            != 1
-        {
-            return Err(MaterializerError::TenantResourceResultMismatch(
-                "OpenID4VC trust policy",
-            ));
-        }
 
         Ok(Self {
             operation_id: expected_operation_id.to_owned(),
@@ -1259,14 +1240,13 @@ impl DescriptorMaterializer {
         let applicant_email = Zeroizing::new(format!("oidf-{}@example.invalid", random_hex(16)));
         let tx_code = descriptor_requires_pre_authorized_vci(&descriptor)
             .then(|| Zeroizing::new(random_tx_code()));
-        // The official VCI runner may select proof type `attestation` for any
-        // VCI plan whose issuer metadata advertises it.  Keep one run-scoped
-        // attestation identity for all VCI plans; HAIP adds the client
-        // attestation envelope, but it is not the owner of the proof key.
-        // Keep one public trust object even when a selected subset does not
-        // include a VCI plan. The corresponding private keys remain in
-        // `PreparedMaterialization` and are consumed only when a finalized
-        // VCI/HAIP plan needs them.
+        // Only VC plans consume the run's attestation keys and trust policy.
+        let needs_attestation = descriptor.groups.iter().any(|group| {
+            group
+                .plans
+                .iter()
+                .any(|plan| plan.plan.starts_with("oid4vci-") || plan.plan.starts_with("oid4vp-"))
+        });
         let issuing_country = descriptor
             .openid4vc_credential_datasets
             .get("org.iso.18013.5.1.mDL")
@@ -1282,10 +1262,9 @@ impl DescriptorMaterializer {
                 "openid4vc_credential_datasets.org.iso.18013.5.1.mDL.issuing_country",
             ));
         }
-        let attestation = Some(generate_attestation_material(
-            suite_origin.as_str(),
-            issuing_country,
-        )?);
+        let attestation = needs_attestation
+            .then(|| generate_attestation_material(suite_origin.as_str(), issuing_country))
+            .transpose()?;
         let mut clients = BTreeMap::new();
         for (logical_client_id, policy) in policies {
             let registration = registrations
@@ -1295,6 +1274,7 @@ impl DescriptorMaterializer {
                 logical_client_id.clone(),
                 PreparedClient::new(
                     logical_client_id,
+                    &descriptor,
                     &policy,
                     registration,
                     target_issuer,
@@ -1345,23 +1325,28 @@ impl DescriptorMaterializer {
         tenant_signing_certificate_chain_pem: impl Into<String>,
     ) -> Result<TenantResourceMaterializedMatrix, MaterializerError> {
         let tenant_signing_certificate_chain_pem = tenant_signing_certificate_chain_pem.into();
-        let tenant_trust_anchor_pem = extract_single_mdoc_trust_anchor_from_bundle(
-            &tenant_signing_certificate_chain_pem,
-            "openid4vc_request_object_trust_anchor_pem",
-        )?;
-        let deployment_der = validate_single_mdoc_trust_anchor(
-            &tenant_trust_anchor_pem,
-            "credential_trust_anchor_pem",
-        )?;
-        let suite_der = validate_single_mdoc_trust_anchor(
-            &prepared.descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
-            "openid4vc_suite_mdoc_trust_anchor_pem",
-        )?;
-        if deployment_der == suite_der {
-            return Err(MaterializerError::InvalidField(
+        let tenant_trust_anchor_pem = if prepared.attestation.is_some() {
+            let tenant_trust_anchor_pem = extract_single_mdoc_trust_anchor_from_bundle(
+                &tenant_signing_certificate_chain_pem,
+                "openid4vc_request_object_trust_anchor_pem",
+            )?;
+            let deployment_der = validate_single_mdoc_trust_anchor(
+                &tenant_trust_anchor_pem,
                 "credential_trust_anchor_pem",
-            ));
-        }
+            )?;
+            let suite_der = validate_single_mdoc_trust_anchor(
+                &prepared.descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+                "openid4vc_suite_mdoc_trust_anchor_pem",
+            )?;
+            if deployment_der == suite_der {
+                return Err(MaterializerError::InvalidField(
+                    "credential_trust_anchor_pem",
+                ));
+            }
+            tenant_trust_anchor_pem
+        } else {
+            String::new()
+        };
 
         let expected_manifest = prepared.tenant_resource_manifest(prepared.request_jti())?;
         if expected_manifest.resource_identities() != apply_output.delta_resources() {
@@ -1381,10 +1366,7 @@ impl DescriptorMaterializer {
                 resource.kind == TenantResourceKind::Openid4vcTrustPolicy
                     && resource.resource_id == trust_policy_resource_id
             })
-            .cloned()
-            .ok_or(MaterializerError::TenantResourceResultMismatch(
-                "OpenID4VC trust policy",
-            ))?;
+            .cloned();
 
         let mappings = apply_output
             .resource_mappings()
@@ -1522,7 +1504,7 @@ pub struct TenantResourceMaterializedMatrix {
     resource_manifest_sha256: String,
     applicant_id: Uuid,
     clients: BTreeMap<String, String>,
-    trust_policy_identity: TenantResourceIdentity,
+    trust_policy_identity: Option<TenantResourceIdentity>,
 }
 
 impl Drop for TenantResourceMaterializedMatrix {
@@ -1582,16 +1564,8 @@ impl TenantResourceMaterializedMatrix {
         &self.clients
     }
 
-    pub fn trust_policy_identity(&self) -> &TenantResourceIdentity {
-        &self.trust_policy_identity
-    }
-
-    pub fn trust_policy_resource_id(&self) -> &str {
-        &self.trust_policy_identity.resource_id
-    }
-
-    pub fn trust_policy_digest(&self) -> &str {
-        &self.trust_policy_identity.digest
+    pub fn trust_policy_identity(&self) -> Option<&TenantResourceIdentity> {
+        self.trust_policy_identity.as_ref()
     }
 }
 
@@ -1615,13 +1589,41 @@ impl std::fmt::Debug for TenantResourceMaterializedMatrix {
 impl PreparedClient {
     fn new(
         logical_client_id: String,
+        descriptor: &MatrixDescriptor,
         policy: &CryptoPolicy,
         registration_template: &Value,
         target_issuer: &str,
         suite_origin: &str,
         request_jti: &str,
     ) -> Result<Self, MaterializerError> {
-        let generated = generate_client_crypto(policy)?;
+        let needs = |fields: &[&str]| {
+            fields.iter().any(|field| {
+                [
+                    format!("client.{logical_client_id}.{field}"),
+                    format!("generated.{field}"),
+                ]
+                .iter()
+                .any(|reference| {
+                    descriptor_requires_reference(descriptor, reference)
+                        || descriptor::value_contains_reference(registration_template, reference)
+                }) || descriptor::value_contains_reference(
+                    registration_template,
+                    &format!("client.{field}"),
+                )
+            })
+        };
+        let generated = generate_client_crypto(
+            policy,
+            needs(&["rsa.public_jwks", "rsa.private_jwks"]),
+            needs(&["ec.public_jwks", "ec.private_jwks"]),
+            registration_requires_mtls(registration_template)
+                || needs(&[
+                    "mtls.ca_cert",
+                    "mtls.client_cert",
+                    "mtls.client_key",
+                    "mtls.cert_sha256",
+                ]),
+        )?;
         let mut request = materialize_registration_template(
             registration_template,
             &logical_client_id,
@@ -1855,8 +1857,10 @@ mod tests {
 
     #[test]
     fn every_run_generates_fresh_secret_key_and_certificate_material() {
-        let first = generate_client_crypto(&CryptoPolicy::default()).expect("first material");
-        let second = generate_client_crypto(&CryptoPolicy::default()).expect("second material");
+        let first = generate_client_crypto(&CryptoPolicy::default(), true, true, true)
+            .expect("first material");
+        let second = generate_client_crypto(&CryptoPolicy::default(), true, true, true)
+            .expect("second material");
 
         assert_ne!(first.client_secret.as_str(), second.client_secret.as_str());
         assert_ne!(
@@ -1902,18 +1906,27 @@ mod tests {
     }
 
     #[test]
-    fn proxy_trust_bundle_contains_only_public_matrix_client_anchors() {
+    fn unreferenced_client_crypto_is_not_generated() {
         let prepared = prepare_for_test(
             descriptor(),
             "https://issuer.example",
             &suite(),
             request_jti(),
         )
-        .expect("prepare");
-        let anchors = prepared.mtls_trust_anchor_pem();
-        assert_eq!(anchors.matches("-----BEGIN CERTIFICATE-----").count(), 1);
-        assert_eq!(anchors.matches("-----END CERTIFICATE-----").count(), 1);
-        assert!(!anchors.contains("PRIVATE KEY"));
+        .unwrap();
+        assert!(prepared.attestation.is_none());
+        let manifest = prepared
+            .tenant_resource_manifest(prepared.request_jti())
+            .unwrap();
+        assert!(
+            !manifest
+                .resource_identities()
+                .iter()
+                .any(|identity| identity.kind == TenantResourceKind::Openid4vcTrustPolicy)
+        );
+        assert!(prepared.clients.values().all(
+            |client| client.mtls_ca_certificate.is_empty() && client.mtls_client_key.is_empty()
+        ));
     }
 
     fn tenant_resource_descriptor() -> MatrixDescriptor {
@@ -2353,10 +2366,7 @@ mod tests {
             finalized.clients(),
             &BTreeMap::from([("web".to_owned(), "actual-client".to_owned())])
         );
-        assert_eq!(
-            finalized.trust_policy_identity().kind,
-            TenantResourceKind::Openid4vcTrustPolicy
-        );
+        assert!(finalized.trust_policy_identity().is_none());
         assert_eq!(
             finalized.matrix().document.groups[0].plans[0].config["client_id"],
             "actual-client"
@@ -3032,7 +3042,7 @@ mod tests {
 
     #[test]
     fn deployment_and_suite_mdoc_roots_must_be_distinct_and_complete() {
-        let descriptor = descriptor();
+        let descriptor = tenant_resource_descriptor();
         let prepare = || {
             let prepared = prepare_for_test(
                 descriptor.clone(),

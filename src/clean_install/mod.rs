@@ -554,31 +554,19 @@ fn build_install_order(
     let openid4vp_management_token_file =
         target_os.join(&paths.secrets_dir, &["openid4vp-management-token"])?;
 
-    let database_runtime_url = format!(
-        "postgresql://{}:{}@{}:{}/{}",
-        request.database_runtime_endpoint.user,
-        crate::target::install_exec::percent_encode_credential(
-            request
-                .database_runtime_password
-                .as_ref()
-                .context("runtime PostgreSQL password is missing")?
-                .as_bytes(),
-        ),
-        request.database_runtime_endpoint.host,
-        request.database_runtime_endpoint.port,
-        request.database_runtime_endpoint.name,
+    let database_runtime_url = request.database_runtime_endpoint.postgres_url(
+        request
+            .database_runtime_password
+            .as_ref()
+            .context("runtime PostgreSQL password is missing")?
+            .as_bytes(),
     );
-    let valkey_url = format!(
-        "valkey://:{}@{}:{}",
-        crate::target::install_exec::percent_encode_credential(
-            request
-                .valkey_password
-                .as_ref()
-                .context("Valkey password is missing")?
-                .as_bytes(),
-        ),
-        request.valkey_endpoint.host,
-        request.valkey_endpoint.port,
+    let valkey_url = request.valkey_endpoint.valkey_url(
+        request
+            .valkey_password
+            .as_ref()
+            .context("Valkey password is missing")?
+            .as_bytes(),
     );
 
     let runtime = if runtime_kind == RuntimeBackendKind::Host {
@@ -827,13 +815,14 @@ fn prepare_install_operation(
     let deployment_id = format!("deploy-{}", Uuid::now_v7().simple());
     let operation_id = Uuid::now_v7();
     let state_epoch = Uuid::now_v7();
+    let runtime_kind = select_runtime(&hello.supported_runtimes, request.runtime)?;
     prepare_install_operation_with_identity(
         request,
         hello,
         &deployment_id,
         operation_id,
         state_epoch,
-        None,
+        runtime_kind,
         &DeploymentSecurityRoots::generate(),
     )
 }
@@ -844,23 +833,15 @@ fn prepare_install_operation_with_identity(
     deployment_id: &str,
     operation_id: Uuid,
     state_epoch: Uuid,
-    resumed_runtime_kind: Option<RuntimeBackendKind>,
+    runtime_kind: RuntimeBackendKind,
     security_roots: &DeploymentSecurityRoots,
 ) -> anyhow::Result<PreparedInstallOperation> {
     validate_key(deployment_id, "generated deployment id")?;
-    if state_epoch.is_nil() {
-        bail!("generated Valkey state epoch must not be nil");
-    }
     let target_os = TargetOs::parse(&hello.os)?;
-    let runtime_kind = match resumed_runtime_kind {
-        Some(runtime_kind) => {
-            if request.runtime.is_some_and(|value| value != runtime_kind) {
-                bail!("prepared install runtime no longer matches the verified target");
-            }
-            select_runtime(&hello.supported_runtimes, Some(runtime_kind))?
-        }
-        None => select_runtime(&hello.supported_runtimes, request.runtime)?,
-    };
+    if request.runtime.is_some_and(|value| value != runtime_kind) {
+        bail!("prepared install runtime no longer matches the verified target");
+    }
+    select_runtime(&hello.supported_runtimes, Some(runtime_kind))?;
     let runtime_object = if runtime_kind == RuntimeBackendKind::Host {
         format!(
             "nazoauth-{}.service",
@@ -1058,13 +1039,9 @@ pub(crate) fn run_clean_install(
                 &plan.deployment_id,
                 operation_id,
                 state_epoch,
-                Some(
-                    plan.runtime_kind
-                        .parse::<RuntimeBackendKind>()
-                        .with_context(
-                            || "prepared install journal contains an unsupported runtime kind",
-                        )?,
-                ),
+                plan.runtime_kind
+                    .parse::<RuntimeBackendKind>()
+                    .context("prepared install journal contains an unsupported runtime kind")?,
                 &security_roots,
             )?
         }
@@ -1081,7 +1058,7 @@ pub(crate) fn run_clean_install(
                 &deployment_id,
                 operation_id,
                 state_epoch,
-                Some(runtime_kind),
+                runtime_kind,
                 &security_roots,
             )?;
             let plan = install_journal::PreparedInstallPlan::new(

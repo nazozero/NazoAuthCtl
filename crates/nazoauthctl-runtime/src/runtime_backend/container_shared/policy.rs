@@ -3,34 +3,16 @@
 //! Engine-specific command dialects stay in their backend modules; this module
 //! owns the common policy and fail-closed object-surface checks.
 
-use std::{ffi::OsStr, path::Path, thread, time::Duration};
+use std::ffi::OsStr;
 
-use crate::filesystem::{open_secure_regular_file, sha256_file};
 use crate::process::Process;
 use anyhow::{Context as _, bail};
 
-use super::super::{
-    ContainerRestartPolicy, ContainerRuntimePolicy, ManagedNetwork, managed_network_config_digest,
-};
+use super::super::{ContainerRestartPolicy, ContainerRuntimePolicy};
 
 const ENGINE_FIXED_MOUNT_DESTINATIONS: &[&str] =
     &["/etc/hosts", "/etc/hostname", "/etc/resolv.conf"];
 const ENGINE_FIXED_ENV_NAMES: &[&str] = &["HOSTNAME", "HOME", "TERM", "LC_ALL", "container"];
-
-const DEPLOYMENT_LABEL: &str = "io.nazoauth.deployment-id";
-const AUTHORITY_LABEL: &str = "io.nazoauth.control-authority";
-const RUNTIME_INSTANCE_LABEL: &str = "io.nazoauth.runtime-instance-id";
-const RESOURCE_KIND_LABEL: &str = "io.nazoauth.managed-resource";
-const CONFIG_DIGEST_LABEL: &str = "io.nazoauth.config-digest";
-
-pub(crate) fn network_config_digest(network: &ManagedNetwork) -> String {
-    managed_network_config_digest(
-        &network.deployment_id,
-        &network.control_authority,
-        &network.name,
-        network.subnet.as_deref(),
-    )
-}
 
 /// Build the common hardening flags used by managed containers.
 pub(crate) fn append_container_policy(
@@ -87,121 +69,12 @@ pub(crate) fn append_container_policy(
     command
 }
 
-/// Require the complete managed-resource identity before an operation can
-/// inspect or mutate an engine object.  A deployment/authority pair is only a
-/// coarse namespace; runtime id, resource role and configuration digest close
-/// the cross-instance and stale-configuration gaps.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn assert_managed_labels(
-    command: &OsStr,
-    arguments: &[&str],
-    deployment_id: &str,
-    control_authority: &str,
-    runtime_instance_id: Option<&str>,
-    resource_kind: &str,
-    config_digest: &str,
-    backend_name: &str,
-) -> anyhow::Result<()> {
-    let mut expected_labels = vec![
-        (DEPLOYMENT_LABEL, deployment_id),
-        (AUTHORITY_LABEL, control_authority),
-        (RESOURCE_KIND_LABEL, resource_kind),
-        (CONFIG_DIGEST_LABEL, config_digest),
-    ];
-    if let Some(runtime_instance_id) = runtime_instance_id {
-        expected_labels.push((RUNTIME_INSTANCE_LABEL, runtime_instance_id));
-    }
-    let document = inspect_document(command, arguments, backend_name)?;
-    let labels = object_member_case_insensitive(&document, "config")
-        .and_then(|config| object_member_case_insensitive(config, "labels"))
-        .or_else(|| object_member_case_insensitive(&document, "labels"))
-        .and_then(serde_json::Value::as_object);
-    for (label, expected) in expected_labels {
-        if !labels
-            .and_then(|labels| labels.get(label))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| value == expected)
-        {
-            bail!(
-                "refusing to manage a {backend_name} object without the expected immutable managed-resource identity"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Rebind an atomically replaced host secret into an existing managed
-/// container. OCI bind mounts retain the old inode until the container is
-/// started again, so comparing only the configured source path misses secret
-/// and ACL rotations.
-pub(crate) fn reconcile_bound_file(
-    command: &OsStr,
-    object_reference: &str,
-    host_path: &Path,
-    container_path: &str,
-    backend_name: &str,
-) -> anyhow::Result<()> {
-    let mut host = open_secure_regular_file(host_path, "managed dependency bound file", false)?;
-    let expected = sha256_file(&mut host, "managed dependency bound file")?;
-    let observed = container_file_digest(command, object_reference, container_path)?;
-    if observed == expected {
-        return Ok(());
-    }
-
-    Process::new(command)
-        .args(["restart", object_reference])
-        .run_quiet()
-        .with_context(|| format!("failed to restart managed {backend_name} dependency"))?;
-    for _ in 0..30 {
-        if container_file_digest(command, object_reference, container_path)
-            .is_ok_and(|observed| observed == expected)
-        {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    bail!("managed {backend_name} dependency did not load the current bound file")
-}
-
-fn container_file_digest(
-    command: &OsStr,
-    object_reference: &str,
-    container_path: &str,
-) -> anyhow::Result<String> {
-    let output = Process::new(command)
-        .args(["exec", object_reference, "sha256sum", container_path])
-        .stdout()?;
-    let digest = output
-        .split_whitespace()
-        .next()
-        .context("managed dependency returned no bound-file digest")?;
-    if digest.len() != 64
-        || !digest
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
-        bail!("managed dependency returned an invalid bound-file digest");
-    }
-    Ok(digest.to_ascii_lowercase())
-}
-
-fn object_member_case_insensitive<'a>(
-    value: &'a serde_json::Value,
-    expected: &str,
-) -> Option<&'a serde_json::Value> {
-    value
-        .as_object()?
-        .iter()
-        .find_map(|(name, value)| name.eq_ignore_ascii_case(expected).then_some(value))
-}
-
 /// Compare the engine-reported image reference before touching a managed
 /// container.  The image reference is expected to be digest-pinned by the
 /// install/recovery policy; accepting a tag or an unavailable inspect field
 /// would turn the labels back into the only trust boundary.
 pub(crate) fn assert_container_image(
-    command: &OsStr,
-    arguments: &[&str],
+    document: &serde_json::Value,
     expected_image: &str,
     backend_name: &str,
 ) -> anyhow::Result<()> {
@@ -211,7 +84,6 @@ pub(crate) fn assert_container_image(
         .map(|(_, digest)| format!("sha256:{digest}"))
         .filter(|digest| super::valid_digest(digest))
         .context("managed dependency image has an invalid digest")?;
-    let document = inspect_document(command, arguments, backend_name)?;
     let mut actual = Vec::new();
     for value in [
         document.pointer("/Config/Image"),
@@ -258,257 +130,6 @@ pub(crate) fn require_digest_pinned_image(
     bail!("{backend_name} managed dependency image is not digest-pinned")
 }
 
-pub(crate) fn append_managed_labels(
-    mut command: Process,
-    deployment_id: &str,
-    control_authority: &str,
-    runtime_instance_id: Option<&str>,
-    resource_kind: &str,
-    config_digest: &str,
-) -> Process {
-    command = command
-        .arg("--label")
-        .arg(format!("{DEPLOYMENT_LABEL}={deployment_id}"))
-        .arg("--label")
-        .arg(format!("{AUTHORITY_LABEL}={control_authority}"))
-        .arg("--label")
-        .arg(format!("{RESOURCE_KIND_LABEL}={resource_kind}"))
-        .arg("--label")
-        .arg(format!("{CONFIG_DIGEST_LABEL}={config_digest}"));
-    if let Some(runtime_instance_id) = runtime_instance_id {
-        command = command
-            .arg("--label")
-            .arg(format!("{RUNTIME_INSTANCE_LABEL}={runtime_instance_id}"));
-    }
-    command
-}
-
-pub(crate) fn network_gateway(document: &serde_json::Value) -> Option<std::net::IpAddr> {
-    match document {
-        serde_json::Value::Object(object) => object.iter().find_map(|(key, value)| {
-            if key.eq_ignore_ascii_case("gateway") {
-                value.as_str().and_then(|value| value.parse().ok())
-            } else {
-                network_gateway(value)
-            }
-        }),
-        serde_json::Value::Array(values) => values.iter().find_map(network_gateway),
-        _ => None,
-    }
-}
-
-pub(crate) fn ensure_volume(
-    command: &OsStr,
-    name: &str,
-    network: &ManagedNetwork,
-    runtime_instance_id: &str,
-    resource_kind: &str,
-    config_digest: &str,
-    backend_name: &str,
-) -> anyhow::Result<()> {
-    let arguments = ["volume", "inspect", name];
-    if inspect_document_optional(command, &arguments, backend_name)?.is_some() {
-        return assert_managed_labels(
-            command,
-            &arguments,
-            &network.deployment_id,
-            &network.control_authority,
-            Some(runtime_instance_id),
-            resource_kind,
-            config_digest,
-            backend_name,
-        );
-    }
-    append_managed_labels(
-        Process::new(command).args(["volume", "create"]),
-        &network.deployment_id,
-        &network.control_authority,
-        Some(runtime_instance_id),
-        resource_kind,
-        config_digest,
-    )
-    .arg(name)
-    .run_quiet()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ensure_container(
-    command: &OsStr,
-    name: &str,
-    network: &ManagedNetwork,
-    runtime_instance_id: &str,
-    resource_kind: &str,
-    config_digest: &str,
-    expected_image: &str,
-    create: Process,
-    backend_name: &str,
-    policy: &ContainerRuntimePolicy,
-    expected_mounts: &[(&str, bool, Option<&str>)],
-    expected_environment: &[(&str, &str)],
-) -> anyhow::Result<()> {
-    let arguments = ["container", "inspect", name];
-    if inspect_document_optional(command, &arguments, backend_name)?.is_some() {
-        assert_managed_labels(
-            command,
-            &arguments,
-            &network.deployment_id,
-            &network.control_authority,
-            Some(runtime_instance_id),
-            resource_kind,
-            config_digest,
-            backend_name,
-        )?;
-        assert_container_image(command, &arguments, expected_image, backend_name)?;
-        let image_environment = inspect_image_environment(command, expected_image, backend_name)?;
-        assert_managed_container_policy(
-            command,
-            &arguments,
-            backend_name,
-            policy,
-            &network.name,
-            expected_mounts,
-            expected_environment,
-            &image_environment,
-        )?;
-        return Process::new(command).args(["start", name]).run_quiet();
-    }
-    create.run_quiet()
-}
-
-/// Return the immutable id of a temporary managed container only after both
-/// the name lookup and the id lookup carry the complete managed-resource
-/// identity.  A name collision with an unrelated object therefore fails
-/// closed instead of being removed or reused.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn inspect_managed_container_id(
-    command: &OsStr,
-    object_reference: &str,
-    deployment_id: &str,
-    control_authority: &str,
-    runtime_instance_id: Option<&str>,
-    resource_kind: &str,
-    config_digest: &str,
-    backend_name: &str,
-) -> anyhow::Result<Option<String>> {
-    let name_arguments = ["container", "inspect", object_reference];
-    let Some(document) = inspect_document_optional(command, &name_arguments, backend_name)? else {
-        return Ok(None);
-    };
-    assert_managed_labels(
-        command,
-        &name_arguments,
-        deployment_id,
-        control_authority,
-        runtime_instance_id,
-        resource_kind,
-        config_digest,
-        backend_name,
-    )?;
-    let id = object_member_case_insensitive(&document, "id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .context(format!(
-            "{backend_name} temporary managed container omitted immutable id"
-        ))?
-        .to_owned();
-    let id_arguments = ["container", "inspect", id.as_str()];
-    let id_document = inspect_document(command, &id_arguments, backend_name)?;
-    let observed_id = object_member_case_insensitive(&id_document, "id")
-        .and_then(serde_json::Value::as_str)
-        .context(format!(
-            "{backend_name} temporary managed container id inspect omitted immutable id"
-        ))?;
-    if observed_id != id {
-        bail!("{backend_name} temporary managed container immutable id changed");
-    }
-    assert_managed_labels(
-        command,
-        &id_arguments,
-        deployment_id,
-        control_authority,
-        runtime_instance_id,
-        resource_kind,
-        config_digest,
-        backend_name,
-    )?;
-    Ok(Some(id))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn remove_managed_container_by_id(
-    command: &OsStr,
-    object_id: &str,
-    deployment_id: &str,
-    control_authority: &str,
-    runtime_instance_id: Option<&str>,
-    resource_kind: &str,
-    config_digest: &str,
-    backend_name: &str,
-) -> anyhow::Result<()> {
-    let arguments = ["container", "inspect", object_id];
-    let Some(document) = inspect_document_optional(command, &arguments, backend_name)? else {
-        return Ok(());
-    };
-    let observed_id = object_member_case_insensitive(&document, "id")
-        .and_then(serde_json::Value::as_str)
-        .context(format!(
-            "{backend_name} temporary managed container id inspect omitted immutable id"
-        ))?;
-    if observed_id != object_id {
-        bail!("{backend_name} temporary managed container immutable id changed");
-    }
-    assert_managed_labels(
-        command,
-        &arguments,
-        deployment_id,
-        control_authority,
-        runtime_instance_id,
-        resource_kind,
-        config_digest,
-        backend_name,
-    )?;
-    Process::new(command)
-        .args(["rm", "--force", object_id])
-        .run_quiet()
-        .with_context(|| format!("failed to remove managed {backend_name} temporary container"))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn remove_managed_container_by_name(
-    command: &OsStr,
-    object_reference: &str,
-    deployment_id: &str,
-    control_authority: &str,
-    runtime_instance_id: Option<&str>,
-    resource_kind: &str,
-    config_digest: &str,
-    backend_name: &str,
-) -> anyhow::Result<()> {
-    let Some(object_id) = inspect_managed_container_id(
-        command,
-        object_reference,
-        deployment_id,
-        control_authority,
-        runtime_instance_id,
-        resource_kind,
-        config_digest,
-        backend_name,
-    )?
-    else {
-        return Ok(());
-    };
-    remove_managed_container_by_id(
-        command,
-        &object_id,
-        deployment_id,
-        control_authority,
-        runtime_instance_id,
-        resource_kind,
-        config_digest,
-        backend_name,
-    )
-}
-
 pub(crate) fn inspect_image_environment(
     command: &OsStr,
     image: &str,
@@ -533,48 +154,6 @@ pub(crate) fn inspect_image_environment(
         }
     }
     Ok(environment)
-}
-
-pub(crate) fn prepare_managed_volume_ownership(
-    command: &OsStr,
-    volume: &str,
-    image: &str,
-    destination: &str,
-    owner: &str,
-    backend_name: &str,
-) -> anyhow::Result<()> {
-    require_digest_pinned_image(image, backend_name)?;
-    Process::new(command)
-        .args([
-            "run",
-            "--rm",
-            "--user",
-            "0:0",
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--cap-add",
-            "CHOWN",
-            "--cap-add",
-            "DAC_OVERRIDE",
-            "--security-opt",
-            "no-new-privileges",
-            "--pids-limit",
-            "64",
-            "--memory",
-            "134217728",
-            "--cpus",
-            "1.000",
-            "--volume",
-        ])
-        .arg(format!("{volume}:{destination}"))
-        .args(["--entrypoint", "chown"])
-        .arg(image)
-        .args(["-R", owner, destination])
-        .run_quiet()
-        .with_context(|| format!("failed to initialize {backend_name} managed volume ownership"))
 }
 
 /// Inspect a single engine object as JSON.  The JSON path is deliberately
@@ -619,19 +198,6 @@ pub(crate) fn inspect_document_optional(
         .cloned()
         .unwrap_or(parsed);
     Ok(Some(value))
-}
-
-pub(crate) fn container_is_running(
-    command: &OsStr,
-    object: &str,
-    backend_name: &str,
-) -> anyhow::Result<bool> {
-    let arguments = ["container", "inspect", object];
-    let document = inspect_document(command, &arguments, backend_name)?;
-    document
-        .pointer("/State/Running")
-        .and_then(serde_json::Value::as_bool)
-        .context("container inspect omitted running state")
 }
 
 pub(crate) fn command_stdout(
@@ -685,8 +251,7 @@ fn stderr_engine_unavailable(stderr: &str) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assert_managed_container_policy(
-    command: &OsStr,
-    arguments: &[&str],
+    document: &serde_json::Value,
     backend_name: &str,
     policy: &ContainerRuntimePolicy,
     expected_network: &str,
@@ -694,7 +259,6 @@ pub(crate) fn assert_managed_container_policy(
     expected_environment: &[(&str, &str)],
     image_environment: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
-    let document = inspect_document(command, arguments, backend_name)?;
     let host_config = document
         .get("HostConfig")
         .context("container inspect omitted HostConfig")?;
@@ -743,7 +307,7 @@ pub(crate) fn assert_managed_container_policy(
         bail!("{backend_name} managed container restart policy drifted");
     }
     if let Some(expected_user) = &policy.service_user {
-        let observed_user = object_member_case_insensitive(&document, "config")
+        let observed_user = object_member_case_insensitive(document, "config")
             .and_then(|config| object_member_case_insensitive(config, "user"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
@@ -857,7 +421,6 @@ pub(crate) fn assert_managed_container_policy(
 
     let networks = document
         .pointer("/NetworkSettings/Networks")
-        .or_else(|| document.pointer("/NetworkSettings/Networks"))
         .and_then(serde_json::Value::as_object)
         .context("container inspect omitted network membership")?;
     if networks.len() != 1 || !networks.contains_key(expected_network) {
@@ -1112,4 +675,14 @@ fn parse_tmpfs_options(
         options.remove("tmpcopyup");
     }
     Ok(options)
+}
+
+fn object_member_case_insensitive<'a>(
+    value: &'a serde_json::Value,
+    expected: &str,
+) -> Option<&'a serde_json::Value> {
+    value
+        .as_object()?
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case(expected).then_some(value))
 }

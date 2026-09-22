@@ -34,6 +34,23 @@ pub(super) fn load_and_validate_material(
     hostname: &str,
     provider: &LoadedProvider,
 ) -> anyhow::Result<ValidatedMaterial> {
+    let material = load_valid_material(certificate_path, private_key_path, hostname, provider)?;
+    let minimum_validity = i64::try_from(provider.config.minimum_validity_seconds)
+        .context("TLS minimum validity does not fit signed time")?;
+    if material.not_after <= Utc::now().timestamp().saturating_add(minimum_validity) {
+        bail!("TLS certificate expires before the provider minimum validity window");
+    }
+    Ok(material)
+}
+
+/// Cryptographic and current-validity checks shared by admission and rollback.
+/// The admission window applies only when selecting new material.
+pub(super) fn load_valid_material(
+    certificate_path: &Path,
+    private_key_path: &Path,
+    hostname: &str,
+    provider: &LoadedProvider,
+) -> anyhow::Result<ValidatedMaterial> {
     let certificate_pem = read_secure_regular_file(
         certificate_path,
         "TLS certificate chain",
@@ -107,12 +124,6 @@ pub(super) fn load_and_validate_material(
     let (_, leaf) = X509Certificate::from_der(certificates[0].as_ref())
         .context("TLS leaf certificate DER is invalid")?;
     let not_after = leaf.validity().not_after.timestamp();
-    let now = Utc::now().timestamp();
-    let minimum_validity = i64::try_from(provider.config.minimum_validity_seconds)
-        .context("TLS minimum validity does not fit signed time")?;
-    if not_after <= now.saturating_add(minimum_validity) {
-        bail!("TLS certificate expires before the provider minimum validity window");
-    }
     let leaf_sha256 = sha256(certificates[0].as_ref());
     let certificate_sha256 = sha256(&certificate_pem);
     let private_key_sha256 = sha256(&private_key_pem);

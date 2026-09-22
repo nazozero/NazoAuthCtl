@@ -396,10 +396,6 @@ fn validate_descriptor(
         },
         "GetAclInformation",
     )?;
-    if private && size_info.AceCount != sids.len() as u32 {
-        bail!("secure object DACL must contain only trusted ACEs");
-    }
-    let mut trusted_seen = [false; 3];
     for index in 0..size_info.AceCount {
         let mut ace_ptr: *mut std::ffi::c_void = null_mut();
         check_bool(
@@ -415,15 +411,11 @@ fn validate_descriptor(
                 bail!("secure object DACL contains a non-trusted or empty ACE");
             }
             let ace_sid = (&ace.SidStart as *const u32).cast::<std::ffi::c_void>() as PSID;
-            let Some(index) = sids.iter().position(|candidate| unsafe {
+            if !sids.iter().any(|candidate| unsafe {
                 EqualSid(ace_sid, candidate.as_ptr() as PSID) != 0
-            }) else {
+            }) {
                 bail!("secure object DACL contains an untrusted principal");
-            };
-            if trusted_seen[index] {
-                bail!("secure object DACL contains duplicate trusted ACEs");
             }
-            trusted_seen[index] = true;
         } else if ace.Header.AceType == 0 && ace.Header.AceFlags & (INHERIT_ONLY_ACE as u8) == 0 {
             // A broad write ACE on an ancestor lets another account replace a
             // child between validation and open.  SYSTEM/Administrators are
@@ -965,6 +957,26 @@ pub fn open_append_file(path: &Path, label: &str) -> anyhow::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_acl_accepts_current_user_only_and_rejects_foreign_readers() {
+        with_security_attributes(0o600, false, 0, |attributes, _acl| {
+            let descriptor = unsafe { (*attributes).lpSecurityDescriptor };
+            let mut present = 0;
+            let mut defaulted = 0;
+            let mut acl = null_mut();
+            check_bool(unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }, "GetSecurityDescriptorDacl(test)")?;
+            // The creator includes SYSTEM and Administrators. A user-only ACL
+            // is also private and must not require granting extra access.
+            check_bool(unsafe { windows_sys::Win32::Security::DeleteAce(acl, 1) }, "DeleteAce")?;
+            check_bool(unsafe { windows_sys::Win32::Security::DeleteAce(acl, 1) }, "DeleteAce")?;
+            validate_descriptor(descriptor, true, true)?;
+            let everyone = well_known_sid(windows_sys::Win32::Security::WinWorldSid)?;
+            check_bool(unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 0, FILE_GENERIC_READ, everyone.as_ptr() as PSID) }, "AddAccessAllowedAceEx")?;
+            assert!(validate_descriptor(descriptor, true, true).is_err());
+            Ok(())
+        }).unwrap();
+    }
 
     #[test]
     fn staged_file_is_private_before_secret_bytes_are_written() {

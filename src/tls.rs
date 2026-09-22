@@ -1261,11 +1261,13 @@ fn rollback_transaction(
 ) -> anyhow::Result<()> {
     if transaction.phase.activation_may_have_happened() {
         let previous_roots = previous
-            .map(|receipt| validate_rollback_material(receipt, provider))
+            .map(|receipt| {
+                validate_rollback_material(receipt, provider).map(|roots| (receipt, roots))
+            })
             .transpose()?;
         restore_previous_activation(transaction)?;
-        match (previous, previous_roots) {
-            (Some(previous), Some(roots)) => verify_public(
+        match previous_roots {
+            Some((previous, roots)) => verify_public(
                 &provider.public_url,
                 &transaction.hostname,
                 &previous.leaf_certificate_sha256,
@@ -1273,7 +1275,7 @@ fn rollback_transaction(
                 &transaction.provider,
                 previous.proxy_configuration_sha256.as_deref(),
             )?,
-            (None, None) => verify_public_not_leaf(
+            None => verify_public_not_leaf(
                 &provider.public_url,
                 &transaction.hostname,
                 &transaction.leaf_certificate_sha256,
@@ -1281,7 +1283,6 @@ fn rollback_transaction(
                 &transaction.provider,
                 transaction.provider.native_proxy_program.is_some(),
             )?,
-            _ => bail!("TLS rollback proof state is inconsistent"),
         }
     }
     remove_inactive_generation(transaction)?;
@@ -1309,7 +1310,7 @@ fn validate_rollback_material(
     provider: &LoadedProvider,
 ) -> anyhow::Result<RootCertStore> {
     validate_receipt_provider_authority(receipt, provider)?;
-    let material = load_and_validate_material(
+    let material = material::load_valid_material(
         &receipt.generation.join("fullchain.pem"),
         &receipt.generation.join("private-key.pem"),
         &receipt.hostname,

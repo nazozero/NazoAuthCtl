@@ -341,6 +341,15 @@ impl ControllerKeyStore {
         }
     }
 
+    /// Read the selected key without depending on unrelated key records.
+    pub(crate) fn public_key(&self, deployment_id: &str, kid: &str) -> anyhow::Result<String> {
+        validate_instance_identifier(deployment_id)?;
+        validate_kid_shape(kid)?;
+        let dir = self.instance_dir_unchecked(deployment_id);
+        let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
+        Ok(self.read_key_record(&dir, kid)?.public_key)
+    }
+
     /// Idempotent get-or-create: return the active key, minting and
     /// activating exactly one new key iff none exists. Repeated calls return
     /// the same identity.

@@ -18,8 +18,6 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::oidf_protocol as nazo_operator_protocol;
-
 use super::{
     BrowserTargetOrigin,
     validation::{MAX_STEP_TIMEOUT, redacted_origin},
@@ -102,7 +100,7 @@ impl ExpectedTrustPolicyBinding {
         }
     }
 
-    fn matches(&self, actual: &nazo_operator_protocol::Openid4vpTrustPolicyBinding) -> bool {
+    fn matches(&self, actual: &crate::oidf_protocol::Openid4vpTrustPolicyBinding) -> bool {
         actual.binding_id.as_deref().is_some_and(|binding_id| {
             Uuid::parse_str(binding_id).is_ok_and(|parsed| parsed.to_string() == binding_id)
         }) && actual.resource_id.as_deref() == Some(self.resource_id.as_str())
@@ -200,7 +198,7 @@ impl OpenId4VpEvidenceContext {
     }
 
     fn validate(&self) -> Result<(), OpenId4VpError> {
-        nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(
+        crate::oidf_protocol::canonical_openid4vp_evidence_context_sha256(
             &protocol_evidence_context(self),
         )
         .map(|_| ())
@@ -465,36 +463,6 @@ impl OpenId4VpEvidenceVerifier {
             return Err(OpenId4VpError::InvalidEvidenceContext);
         }
         Ok(verifier)
-    }
-
-    /// Convert the live discovery binding into the non-secret anchor held by
-    /// the ordinary recovery journal. A later screenshot receipt is verified
-    /// against this journal-owned key, never a key carried by that receipt.
-    pub fn recovery_trust_anchor(
-        &self,
-        target_issuer: impl Into<String>,
-    ) -> Result<crate::OpenId4VpEvidenceTrustAnchor, OpenId4VpError> {
-        let target_issuer = target_issuer.into();
-        let issuer =
-            Url::parse(&target_issuer).map_err(|_| OpenId4VpError::InvalidEvidenceContext)?;
-        let anchor = crate::OpenId4VpEvidenceTrustAnchor {
-            target_issuer: issuer.as_str().trim_end_matches('/').to_owned(),
-            deployment_id: self.deployment_id.clone(),
-            runtime_instance_id: self.runtime_instance_id.clone(),
-            instance_key_id: self.instance_key_id.clone(),
-            instance_public_key_base64: self.instance_public_key_base64.clone(),
-        };
-        if issuer.scheme() != "https"
-            || issuer.host_str().is_none()
-            || !issuer.username().is_empty()
-            || issuer.password().is_some()
-            || issuer.query().is_some()
-            || issuer.fragment().is_some()
-            || !matches!(issuer.path(), "" | "/")
-        {
-            return Err(OpenId4VpError::InvalidEvidenceContext);
-        }
-        Ok(anchor)
     }
 }
 
@@ -1005,7 +973,7 @@ impl OpenId4VpVerifierClient {
                     ],
                     body: Some(
                         serde_json::to_vec(
-                            &nazo_operator_protocol::Openid4vpIssueVerificationReceiptRequest {
+                            &crate::oidf_protocol::Openid4vpIssueVerificationReceiptRequest {
                                 schema: 1,
                                 issuance_request_jti: issuance_request_jti.to_owned(),
                             },
@@ -1051,7 +1019,7 @@ impl OpenId4VpVerifierClient {
             .ok_or(OpenId4VpError::EvidenceUnavailable)?;
         let protocol_context = protocol_evidence_context(&context);
         let expected_sha256 =
-            nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(&protocol_context)
+            crate::oidf_protocol::canonical_openid4vp_evidence_context_sha256(&protocol_context)
                 .map_err(|_| OpenId4VpError::InvalidEvidenceContext)?;
         let mut endpoint = self.target_origin.as_url().clone();
         endpoint.set_path(&format!(
@@ -1060,7 +1028,7 @@ impl OpenId4VpVerifierClient {
         ));
         endpoint.set_query(None);
         endpoint.set_fragment(None);
-        let body = serde_json::to_vec(&nazo_operator_protocol::Openid4vpAttachEvidenceRequest {
+        let body = serde_json::to_vec(&crate::oidf_protocol::Openid4vpAttachEvidenceRequest {
             schema: 1,
             evidence_context: protocol_context.clone(),
         })
@@ -1093,12 +1061,12 @@ impl OpenId4VpVerifierClient {
         if !(200..300).contains(&response.status) {
             return Err(OpenId4VpError::UnexpectedEvidenceStatus);
         }
-        let response: nazo_operator_protocol::Openid4vpAttachEvidenceResponse =
+        let response: crate::oidf_protocol::Openid4vpAttachEvidenceResponse =
             serde_json::from_slice(&response.body)
                 .map_err(|_| OpenId4VpError::MalformedEvidenceResponse)?;
         let transaction_id = presentation.transaction_id.to_string();
         let presentation_binding_sha256 =
-            nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
+            crate::oidf_protocol::canonical_openid4vp_presentation_binding_sha256(
                 &response.presentation_binding,
             )
             .map_err(|_| attach_binding_mismatch("presentation_binding"))?;
@@ -1108,7 +1076,7 @@ impl OpenId4VpVerifierClient {
         if response.transaction_id != transaction_id {
             return Err(attach_binding_mismatch("transaction_id"));
         }
-        if response.status != nazo_operator_protocol::Openid4vpEvidenceAttachmentStatus::Attached {
+        if response.status != crate::oidf_protocol::Openid4vpEvidenceAttachmentStatus::Attached {
             return Err(attach_binding_mismatch("status"));
         }
         if response.evidence_context_sha256 != expected_sha256 {
@@ -1128,7 +1096,7 @@ impl OpenId4VpVerifierClient {
         }
         let target_issuer = self.target_origin.as_url().as_str().trim_end_matches('/');
         let intent_audience = format!("{target_issuer}/openid4vp/verification-intents");
-        let expected = nazo_operator_protocol::Openid4vpVerificationIntentExpectations {
+        let expected = crate::oidf_protocol::Openid4vpVerificationIntentExpectations {
             issuer: target_issuer,
             audience: &intent_audience,
             deployment_id: &verifier.deployment_id,
@@ -1139,7 +1107,7 @@ impl OpenId4VpVerifierClient {
             evidence_context_sha256: &expected_sha256,
             presentation_binding_sha256: &presentation_binding_sha256,
         };
-        let intent = nazo_operator_protocol::verify_openid4vp_verification_intent(
+        let intent = crate::oidf_protocol::verify_openid4vp_verification_intent(
             &response.intent_jws,
             &expected,
             &verifier.instance_public_key,
@@ -1215,9 +1183,9 @@ struct VerificationEvidenceResponse {
     transaction_id: Uuid,
     receipt_id: Uuid,
     issuance_request_jti: String,
-    status: nazo_operator_protocol::Openid4vpVerificationStatus,
+    status: crate::oidf_protocol::Openid4vpVerificationStatus,
     evidence_context: OpenId4VpEvidenceContext,
-    presentation_binding: nazo_operator_protocol::Openid4vpPresentationBinding,
+    presentation_binding: crate::oidf_protocol::Openid4vpPresentationBinding,
     intent_sha256: String,
     completed_at: String,
     expires_at: String,
@@ -1239,14 +1207,14 @@ fn verify_evidence_response(
 ) -> Result<OpenId4VpVerificationEvidence, OpenId4VpError> {
     let receipt_sha256 = sha256_hex(response.receipt_jws.as_bytes());
     let presentation_binding_sha256 =
-        nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
+        crate::oidf_protocol::canonical_openid4vp_presentation_binding_sha256(
             &response.presentation_binding,
         )
         .map_err(|_| issuance_binding_mismatch("presentation_binding"))?;
     if response.schema != 1 {
         return Err(issuance_binding_mismatch("schema"));
     }
-    if response.status != nazo_operator_protocol::Openid4vpVerificationStatus::Verified {
+    if response.status != crate::oidf_protocol::Openid4vpVerificationStatus::Verified {
         return Err(issuance_binding_mismatch("status"));
     }
     if response.transaction_id != expected_transaction_id {
@@ -1299,15 +1267,15 @@ fn verify_evidence_response(
         .map_err(|_| OpenId4VpError::EvidenceUrlDiagnostic(Box::new(ui_url_diagnostic.clone())))?,
     );
     let capability_sha256 =
-        nazo_operator_protocol::openid4vp_verification_capability_sha256(&capability)
+        crate::oidf_protocol::openid4vp_verification_capability_sha256(&capability)
             .map_err(|_| issuance_binding_mismatch("capability_sha256"))?;
     let protocol_context = protocol_evidence_context(&response.evidence_context);
     let evidence_context_sha256 =
-        nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(&protocol_context)
+        crate::oidf_protocol::canonical_openid4vp_evidence_context_sha256(&protocol_context)
             .map_err(|_| issuance_binding_mismatch("context_sha256"))?;
     let receipt_id = response.receipt_id.to_string();
     let transaction_id = response.transaction_id.to_string();
-    let expected = nazo_operator_protocol::Openid4vpVerificationReceiptExpectations {
+    let expected = crate::oidf_protocol::Openid4vpVerificationReceiptExpectations {
         issuer: &response.issuer,
         audience: &response.receipt_api_url,
         deployment_id: &verifier.deployment_id,
@@ -1323,7 +1291,7 @@ fn verify_evidence_response(
         capability_sha256: &capability_sha256,
     };
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let receipt = nazo_operator_protocol::verify_openid4vp_verification_receipt(
+    let receipt = crate::oidf_protocol::verify_openid4vp_verification_receipt(
         &response.receipt_jws,
         &expected,
         &verifier.instance_public_key,
@@ -1375,8 +1343,8 @@ fn verify_evidence_response(
 
 fn protocol_evidence_context(
     context: &OpenId4VpEvidenceContext,
-) -> nazo_operator_protocol::Openid4vpEvidenceContext {
-    nazo_operator_protocol::Openid4vpEvidenceContext {
+) -> crate::oidf_protocol::Openid4vpEvidenceContext {
+    crate::oidf_protocol::Openid4vpEvidenceContext {
         run_jti: context.run_jti.clone(),
         artifact_sha256: context.artifact_sha256.clone(),
         matrix_sha256: context.matrix_sha256.clone(),
@@ -1550,7 +1518,7 @@ fn issuance_url_diagnostic(field: &'static str, value: &str) -> OpenId4VpEvidenc
     let capability_sha256 = fragment
         .and_then(|fragment| fragment.strip_prefix("receipt="))
         .and_then(|capability| {
-            nazo_operator_protocol::openid4vp_verification_capability_sha256(capability).ok()
+            crate::oidf_protocol::openid4vp_verification_capability_sha256(capability).ok()
         });
     OpenId4VpEvidenceUrlDiagnostic {
         stage: "issuance",
@@ -1798,14 +1766,14 @@ mod tests {
     fn signed_attachment_trust_projection_must_match_the_local_create_binding() {
         let expected =
             ExpectedTrustPolicyBinding::from_conformance_binding(&trust_policy_binding());
-        let exact = nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+        let exact = crate::oidf_protocol::Openid4vpTrustPolicyBinding {
             binding_id: Some("550e8400-e29b-41d4-a716-446655440007".to_owned()),
             resource_id: Some("openid4vc-trust-policy:provider:0123456789abcdef".to_owned()),
             resource_digest: Some("a".repeat(64)),
         };
         assert!(expected.matches(&exact));
 
-        let none = nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+        let none = crate::oidf_protocol::Openid4vpTrustPolicyBinding {
             binding_id: None,
             resource_id: None,
             resource_digest: None,
@@ -1822,7 +1790,7 @@ mod tests {
         assert!(!expected.matches(&missing_binding_id));
 
         assert!(
-            !expected.matches(&nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+            !expected.matches(&crate::oidf_protocol::Openid4vpTrustPolicyBinding {
                 binding_id: None,
                 resource_id: None,
                 resource_digest: None,
@@ -1872,7 +1840,7 @@ mod tests {
             Some("receipt=".len() + capability.len())
         );
         let expected_capability_sha256 =
-            nazo_operator_protocol::openid4vp_verification_capability_sha256(capability)
+            crate::oidf_protocol::openid4vp_verification_capability_sha256(capability)
                 .expect("capability hash");
         assert_eq!(
             diagnostic.capability_sha256.as_deref(),
@@ -2178,7 +2146,7 @@ mod tests {
         .for_module("suite-plan-01", "module-item-001", "happy", &variant)
         .expect("module context");
         let expected_context_sha256 =
-            nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(
+            crate::oidf_protocol::canonical_openid4vp_evidence_context_sha256(
                 &protocol_evidence_context(&context),
             )
             .expect("context digest");
@@ -2193,21 +2161,21 @@ mod tests {
             verifying,
         )
         .expect("runtime verifier");
-        let presentation_binding = nazo_operator_protocol::Openid4vpPresentationBinding {
+        let presentation_binding = crate::oidf_protocol::Openid4vpPresentationBinding {
             presentation_request_sha256: "d".repeat(64),
-            trust_policy: nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+            trust_policy: crate::oidf_protocol::Openid4vpTrustPolicyBinding {
                 binding_id: Some("550e8400-e29b-41d4-a716-446655440007".to_owned()),
                 resource_id: Some("openid4vc-trust-policy:provider:0123456789abcdef".to_owned()),
                 resource_digest: Some("a".repeat(64)),
             },
         };
         let presentation_binding_sha256 =
-            nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
+            crate::oidf_protocol::canonical_openid4vp_presentation_binding_sha256(
                 &presentation_binding,
             )
             .expect("presentation binding digest");
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let intent = nazo_operator_protocol::Openid4vpVerificationIntent {
+        let intent = crate::oidf_protocol::Openid4vpVerificationIntent {
             schema: 1,
             iss: "https://issuer.example".to_owned(),
             aud: "https://issuer.example/openid4vp/verification-intents".to_owned(),
@@ -2223,7 +2191,7 @@ mod tests {
             presentation_binding: presentation_binding.clone(),
         };
         let intent_jws =
-            nazo_operator_protocol::sign_openid4vp_verification_intent(&intent, &key_id, &signing)
+            crate::oidf_protocol::sign_openid4vp_verification_intent(&intent, &key_id, &signing)
                 .expect("signed intent");
         let intent_sha256 = nazo_operator_protocol::compact_sha256(&intent_jws);
         let transport = Arc::new(CompletionTransport {
@@ -2504,19 +2472,19 @@ mod tests {
             Uuid::parse_str("550e8400-e29b-41d4-a716-446655440003").expect("receipt ID");
         let capability = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
         let capability_sha256 =
-            nazo_operator_protocol::openid4vp_verification_capability_sha256(capability)
+            crate::oidf_protocol::openid4vp_verification_capability_sha256(capability)
                 .expect("capability hash");
         let issuance_request_jti = "550e8400-e29b-41d4-a716-446655440004";
-        let presentation_binding = nazo_operator_protocol::Openid4vpPresentationBinding {
+        let presentation_binding = crate::oidf_protocol::Openid4vpPresentationBinding {
             presentation_request_sha256: "d".repeat(64),
-            trust_policy: nazo_operator_protocol::Openid4vpTrustPolicyBinding {
+            trust_policy: crate::oidf_protocol::Openid4vpTrustPolicyBinding {
                 binding_id: None,
                 resource_id: None,
                 resource_digest: None,
             },
         };
         let presentation_binding_sha256 =
-            nazo_operator_protocol::canonical_openid4vp_presentation_binding_sha256(
+            crate::oidf_protocol::canonical_openid4vp_presentation_binding_sha256(
                 &presentation_binding,
             )
             .expect("presentation binding digest");
@@ -2527,7 +2495,7 @@ mod tests {
         let expires = now + time::Duration::seconds(300);
         let completed_at = now.format(&Rfc3339).expect("completed timestamp");
         let expires_at = expires.format(&Rfc3339).expect("expiry timestamp");
-        let receipt = nazo_operator_protocol::Openid4vpVerificationReceipt {
+        let receipt = crate::oidf_protocol::Openid4vpVerificationReceipt {
             schema: 1,
             iss: "https://issuer.example".to_owned(),
             aud: "https://issuer.example/openid4vp/verification-receipts".to_owned(),
@@ -2540,17 +2508,16 @@ mod tests {
             tenant_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             transaction_id: transaction_id.to_string(),
             issuance_request_jti: issuance_request_jti.to_owned(),
-            status: nazo_operator_protocol::Openid4vpVerificationStatus::Verified,
+            status: crate::oidf_protocol::Openid4vpVerificationStatus::Verified,
             evidence_context: protocol_evidence_context(&context),
             presentation_binding: presentation_binding.clone(),
             intent_sha256: intent_sha256.clone(),
             completed_at: completed_at.clone(),
             capability_sha256: capability_sha256.clone(),
         };
-        let receipt_jws = nazo_operator_protocol::sign_openid4vp_verification_receipt(
-            &receipt, &key_id, &signing,
-        )
-        .expect("signed receipt");
+        let receipt_jws =
+            crate::oidf_protocol::sign_openid4vp_verification_receipt(&receipt, &key_id, &signing)
+                .expect("signed receipt");
         let receipt_sha256 = sha256_hex(receipt_jws.as_bytes());
         let response = serde_json::json!({
             "schema": 1,
@@ -2617,7 +2584,7 @@ mod tests {
         let other_key_id = nazo_operator_protocol::instance_key_id(&other_signing.verifying_key());
         let mut wrong_kid_receipt = receipt.clone();
         wrong_kid_receipt.instance_key_id = other_key_id.clone();
-        let wrong_kid_jws = nazo_operator_protocol::sign_openid4vp_verification_receipt(
+        let wrong_kid_jws = crate::oidf_protocol::sign_openid4vp_verification_receipt(
             &wrong_kid_receipt,
             &other_key_id,
             &other_signing,

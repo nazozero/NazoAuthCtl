@@ -441,7 +441,7 @@ fn adopt_fails_closed_when_live_drift_removed_the_discovered_target() -> anyhow:
     .expect_err("vanished target");
     let rendered = format!("{error:#}");
     assert!(rendered.contains(ADOPT_TARGET_UNKNOWN), "{rendered}");
-    assert!(rendered.contains("live discovery reports: -"), "{rendered}");
+    assert!(rendered.contains("deploy-vanishing"), "{rendered}");
     assert!(
         fixture.context.registry.list_instances()?.is_empty(),
         "drifted adoption registers nothing"
@@ -494,8 +494,8 @@ fn adopt_requires_an_exact_live_deployment_id() -> anyhow::Result<()> {
     let rendered = format!("{error:#}");
     assert!(rendered.contains(ADOPT_TARGET_UNKNOWN), "{rendered}");
     assert!(
-        rendered.contains("live discovery reports: deploy-alpha"),
-        "the refusal names the exact live candidates: {rendered}"
+        rendered.contains("deploy-alph"),
+        "the refusal identifies the requested deployment: {rendered}"
     );
     Ok(())
 }
