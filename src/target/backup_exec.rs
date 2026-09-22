@@ -611,9 +611,11 @@ pub(crate) fn write_transfer_chunk(
             BACKUP_EXECUTION_FAILED,
             "backup transfer destination is missing preceding chunks",
         ));
+    } else {
+        crate::filesystem::atomic_write(&path, b"", 0o600).map_err(backup_failure)?;
     }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true);
+    options.write(true);
     let mut file = options
         .open(&path)
         .map_err(|error| backup_failure(error.into()))?;
@@ -3338,6 +3340,20 @@ mod tests {
                 chunk.total_bytes,
                 &chunk.file_sha256,
                 &chunk.bytes,
+            )?;
+        }
+        // Imported backup bytes must already satisfy the private-file contract
+        // before publication, independently of the process token's default ACL.
+        for name in ["postgresql.dump", "deployment.tar", IMMUTABLE_MANIFEST_FILE] {
+            crate::filesystem::read_secure_regular_file(
+                &destination
+                    .path()
+                    .join("backup/transfers")
+                    .join(format!("import-{transfer}.partial"))
+                    .join(name),
+                "imported backup file",
+                true,
+                MAX_BACKUP_TRANSFER_FILE_BYTES,
             )?;
         }
         let source_host = Uuid::now_v7().to_string();
