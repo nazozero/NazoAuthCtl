@@ -52,3 +52,36 @@ clears the previous-artifact reference. Database recovery also clears that
 reference. Updates without migration retain the previous-artifact rollback
 path. Recovery still uses an independently verified snapshot, without trusting
 the currently running server.
+
+## Database backup sentinel compatibility
+
+Snapshot and restore compute the database sentinel in one read-only,
+read-committed PostgreSQL transaction. The controller locks the required
+relations, then checks both the migration ledger and the token-storage shape.
+The final SELECT reads every count and the migration head from one statement
+snapshot taken after those locks; it does not reuse the presence probe's snapshot.
+The legacy `oauth_tokens` layout retains its exact historical hash preimage.
+The layout introduced by migration `20260926000100` counts refresh contracts,
+families and spent proofs separately. Missing, mixed or ledger-inconsistent
+relations fail closed; an absent table is never treated as an empty table.
+
+This does not change backup manifest 4/5, restore receipt 2, or their checksum
+rules. Published snapshot metadata is not rewritten or rehashed. Restoring an
+old dump selects its legacy database facts before any server migration runs;
+a new dump selects its matching refresh-state facts. Do not add compatibility
+tables or views to the server to satisfy a controller backup query.
+
+The sentinel is a bounded identity check alongside the immutable dump's byte
+checksum, not a replacement for it. Its transaction does not extend across the
+separate `pg_dump` process; this change does not promise a new cross-process
+snapshot boundary or make a checksum-only check into a restore-test receipt.
+
+The focused real-PostgreSQL regression is
+`target::backup_exec::tests::database_sentinel_postgres_models_and_dump_restore`
+in package `nazoauthctl-core`. It is explicitly ignored by the ordinary
+cross-platform suite: run it with `--ignored --exact` and an isolated
+`NAZOAUTHCTL_TEST_DATABASE_URL` whose role can create databases, plus matching
+`psql`, `pg_dump` and `pg_restore` tools. It creates and removes only its
+randomly named test databases and checks legacy/current dump-restore hashes,
+changed facts, unknown layouts and missing tables. The regular suite retains
+the published manifest checksum fixtures and output-pollution checks.

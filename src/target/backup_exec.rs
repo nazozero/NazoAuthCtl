@@ -10,7 +10,7 @@ use std::{
     io::{Cursor, Read as _, Seek as _, SeekFrom, Write as _},
     net::TcpListener,
     path::{Component, Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -58,16 +58,7 @@ const SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID_SETTING: &str =
     "SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ID";
 const SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_ARCHIVE_PATH: &str =
     "app-secrets/signing-key-previous-encryption-key";
-const DATABASE_SENTINEL_SQL: &str = "SELECT concat_ws('|',
-    'controller_recovery_roots=' || (SELECT COUNT(*) FROM controller_recovery_roots),
-    'controller_registry_slots=' || (SELECT COUNT(*) FROM controller_registry_slots),
-    'migration_head=' || COALESCE((SELECT MAX(version)::text FROM __diesel_schema_migrations), ''),
-    'oauth_clients=' || (SELECT COUNT(*) FROM oauth_clients),
-    'oauth_tokens=' || (SELECT COUNT(*) FROM oauth_tokens),
-    'recovery_invalidations=' || (SELECT COUNT(*) FROM recovery_invalidations),
-    'tenants=' || (SELECT COUNT(*) FROM tenants),
-    'user_totp_credentials=' || (SELECT COUNT(*) FROM user_totp_credentials),
-    'users=' || (SELECT COUNT(*) FROM users))";
+const DATABASE_SENTINEL_SCRIPT: &str = include_str!("database_sentinel.sql");
 const SNAPSHOT_SENTINEL_FILE: &str = "snapshot-sentinel";
 const IMMUTABLE_MANIFEST_FILE: &str = "snapshot-manifest.json";
 
@@ -2379,22 +2370,52 @@ fn database_sentinel(database_url_file: &Path) -> anyhow::Result<String> {
     database_sentinel_with_connection(&postgres_connection(database_url_file)?)
 }
 fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow::Result<String> {
-    let output = run_postgres_command(
-        "psql",
-        connection,
-        [
+    // Meta-commands cannot be mixed with SQL in --command. A single stdin
+    // script keeps the shape decision and ACCESS SHARE locks in one read-only
+    // transaction, and excludes psql startup files and command tags from hashes.
+    let mut child = Command::new("psql")
+        .arg("--dbname")
+        .arg(connection.url_without_password.as_str())
+        .args([
+            "--no-psqlrc",
+            "--quiet",
             "--no-align",
             "--tuples-only",
-            "--command",
-            DATABASE_SENTINEL_SQL,
-        ],
-    )?;
-    ensure!(
-        output.stdout.len() <= 1024,
-        "database sentinel output is unexpectedly large"
-    );
-    let value = std::str::from_utf8(&output.stdout)?.trim();
+            "--set=ON_ERROR_STOP=1",
+            "--file=-",
+        ])
+        .env("PGPASSWORD", &connection.password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start psql")?;
+    let input_result = child
+        .stdin
+        .take()
+        .context("psql sentinel stdin is unavailable")
+        .and_then(|mut input| {
+            input
+                .write_all(DATABASE_SENTINEL_SCRIPT.as_bytes())
+                .context("failed to write the database sentinel script")
+        });
+    // Always reap the child, including an early SQL failure that closed stdin.
+    // Report its PostgreSQL failure before a consequential broken-pipe error.
+    let output = child.wait_with_output().context("failed to wait for psql")?;
+    let output = ensure_postgres_output("psql", output)?;
+    input_result?;
+    database_sentinel_digest(&output.stdout)
+}
+
+fn database_sentinel_digest(stdout: &[u8]) -> anyhow::Result<String> {
+    ensure!(stdout.len() <= 1024, "database sentinel output is unexpectedly large");
+    let value = std::str::from_utf8(stdout)?.trim();
     ensure!(!value.is_empty(), "database has no migration sentinel");
+    ensure!(
+        !value.contains(['\r', '\n']),
+        "database sentinel must contain exactly one fact, without command output"
+    );
+    // The legacy branch preserves its exact preimage and trim/SHA-256 behavior.
     Ok(backup::hex_digest(value.as_bytes()))
 }
 
@@ -3019,6 +3040,114 @@ mod tests {
 
     fn write_fixture(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> anyhow::Result<()> {
         crate::filesystem::atomic_write(path.as_ref(), bytes.as_ref(), 0o600)
+    }
+
+    #[test]
+    fn database_sentinel_keeps_legacy_hash_bytes_and_rejects_command_output() -> anyhow::Result<()> {
+        let legacy = b"controller_recovery_roots=1|controller_registry_slots=1|migration_head=20260925000100|oauth_clients=1|oauth_tokens=2|recovery_invalidations=1|tenants=1|user_totp_credentials=1|users=1\n";
+        assert_eq!(
+            database_sentinel_digest(legacy)?,
+            "08367ab8cd1b7dc03d66e17c1a8bbe713fd1d6480615e53374e725cd49a8792c"
+        );
+        for contaminated in [b"".as_slice(), b"BEGIN\nfact\nCOMMIT\n", b"first\nsecond\n", &[0xff]] {
+            assert!(database_sentinel_digest(contaminated).is_err());
+        }
+        assert!(database_sentinel_digest(&[b'x'; 1025]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn published_backup_manifests_retain_their_original_checksums() -> anyhow::Result<()> {
+        for bytes in [
+            include_bytes!("../../tests/fixtures/persistence/v0.2.27/snapshot-manifest.json").as_slice(),
+            include_bytes!("../../tests/fixtures/persistence/v0.2.28/snapshot-manifest.json").as_slice(),
+        ] {
+            let manifest: SnapshotManifest = serde_json::from_slice(bytes)?;
+            manifest.validate()?;
+            assert_eq!(manifest.computed_sha256()?, manifest.manifest_sha256);
+            let roundtrip: SnapshotManifest = serde_json::from_slice(&serde_json::to_vec(&manifest)?)?;
+            roundtrip.validate()?;
+            assert_eq!(roundtrip, manifest);
+        }
+        Ok(())
+    }
+
+    fn sentinel_fixture_sql(connection: &PostgresConnection, sql: &str) -> anyhow::Result<()> {
+        run_postgres_command(
+            "psql",
+            connection,
+            ["--no-psqlrc", "--quiet", "--set=ON_ERROR_STOP=1", "--command", sql],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires isolated PostgreSQL, psql/pg_dump/pg_restore and NAZOAUTHCTL_TEST_DATABASE_URL with CREATEDB"]
+    fn database_sentinel_postgres_models_and_dump_restore() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-sentinel-postgres")?;
+        let url_file = temp.path().join("database-url");
+        write_fixture(&url_file, std::env::var("NAZOAUTHCTL_TEST_DATABASE_URL")?)?;
+        let admin = postgres_connection(&url_file)?;
+        let suffix = Uuid::now_v7().simple().to_string();
+        let source_name = format!("nazo_sentinel_source_{suffix}");
+        let restored_name = format!("nazo_sentinel_restored_{suffix}");
+        create_database(&admin, &source_name)?;
+        let source = admin.with_database(&source_name);
+        let source_url_file = temp.path().join("source-database-url");
+        let result = (|| -> anyhow::Result<()> {
+            write_fixture(&source_url_file, source.with_password_url()?)?;
+            sentinel_fixture_sql(&source, "CREATE TABLE __diesel_schema_migrations (version VARCHAR(50) PRIMARY KEY); INSERT INTO __diesel_schema_migrations VALUES ('20260925000100')")?;
+            for table in [
+                "controller_recovery_roots", "controller_registry_slots", "oauth_clients",
+                "recovery_invalidations", "tenants", "user_totp_credentials", "users",
+            ] {
+                sentinel_fixture_sql(&source, &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY); INSERT INTO {table} VALUES (1)"))?;
+            }
+            sentinel_fixture_sql(&source, "CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY); INSERT INTO oauth_tokens VALUES (1), (2)")?;
+            let legacy = database_sentinel_with_connection(&source)?;
+            ensure!(legacy == "08367ab8cd1b7dc03d66e17c1a8bbe713fd1d6480615e53374e725cd49a8792c", "legacy SQL bytes or psql output changed");
+
+            for minimal in [false, true] {
+                if minimal {
+                    sentinel_fixture_sql(&source, "BEGIN; DROP TABLE oauth_tokens; CREATE TABLE oauth_refresh_contracts (id INTEGER PRIMARY KEY); CREATE TABLE oauth_refresh_families (id INTEGER PRIMARY KEY); CREATE TABLE oauth_refresh_spent_tokens (id INTEGER PRIMARY KEY); INSERT INTO oauth_refresh_contracts VALUES (1); INSERT INTO oauth_refresh_families VALUES (1), (2); INSERT INTO oauth_refresh_spent_tokens VALUES (1), (2), (3); INSERT INTO __diesel_schema_migrations VALUES ('20260926000100'); COMMIT")?;
+                }
+                let expected = database_sentinel_with_connection(&source)?;
+                if minimal {
+                    ensure!(expected != legacy, "new storage facts must not pretend to be legacy token counts");
+                }
+                let dump = temp.path().join(if minimal { "minimal.dump" } else { "legacy.dump" });
+                run_pg_dump(&source_url_file, &dump)?;
+                create_database(&admin, &restored_name)?;
+                restore_database(&admin, &dump, &restored_name)?;
+                let actual = database_sentinel_with_connection(&admin.with_database(&restored_name))?;
+                ensure!(actual == expected, "restored database does not preserve the sentinel hash");
+                drop_database(&admin, &restored_name)?;
+            }
+
+            let current = database_sentinel_with_connection(&source)?;
+            for table in ["oauth_refresh_contracts", "oauth_refresh_families", "oauth_refresh_spent_tokens"] {
+                sentinel_fixture_sql(&source, &format!("INSERT INTO {table} VALUES (99)"))?;
+                ensure!(database_sentinel_with_connection(&source)? != current, "changed {table} facts must change the sentinel");
+                sentinel_fixture_sql(&source, &format!("DELETE FROM {table} WHERE id = 99"))?;
+                ensure!(database_sentinel_with_connection(&source)? == current, "restored facts must restore the same hash");
+            }
+            sentinel_fixture_sql(&source, "CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY)")?;
+            ensure!(database_sentinel_with_connection(&source).is_err(), "mixed old/new token state must refuse");
+            sentinel_fixture_sql(&source, "DROP TABLE oauth_tokens; DELETE FROM __diesel_schema_migrations WHERE version = '20260926000100'")?;
+            ensure!(database_sentinel_with_connection(&source).is_err(), "new relations without the migration record must refuse");
+            sentinel_fixture_sql(&source, "INSERT INTO __diesel_schema_migrations VALUES ('20260926000100'); DROP TABLE oauth_refresh_spent_tokens")?;
+            ensure!(database_sentinel_with_connection(&source).is_err(), "a missing required relation is not an empty relation");
+            sentinel_fixture_sql(&source, "CREATE TABLE oauth_refresh_spent_tokens (id INTEGER PRIMARY KEY); DROP TABLE controller_registry_slots")?;
+            ensure!(database_sentinel_with_connection(&source).is_err(), "a missing shared relation must refuse");
+            Ok(())
+        })();
+        // Only these randomly named test databases are removed, even on error.
+        let restored_cleanup = drop_database(&admin, &restored_name);
+        let source_cleanup = drop_database(&admin, &source_name);
+        result?;
+        restored_cleanup?;
+        source_cleanup?;
+        Ok(())
     }
 
     #[test]
