@@ -2401,14 +2401,19 @@ fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow:
         });
     // Always reap the child, including an early SQL failure that closed stdin.
     // Report its PostgreSQL failure before a consequential broken-pipe error.
-    let output = child.wait_with_output().context("failed to wait for psql")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for psql")?;
     let output = ensure_postgres_output("psql", output)?;
     input_result?;
     database_sentinel_digest(&output.stdout)
 }
 
 fn database_sentinel_digest(stdout: &[u8]) -> anyhow::Result<String> {
-    ensure!(stdout.len() <= 1024, "database sentinel output is unexpectedly large");
+    ensure!(
+        stdout.len() <= 1024,
+        "database sentinel output is unexpectedly large"
+    );
     let value = std::str::from_utf8(stdout)?.trim();
     ensure!(!value.is_empty(), "database has no migration sentinel");
     ensure!(
@@ -3043,13 +3048,19 @@ mod tests {
     }
 
     #[test]
-    fn database_sentinel_keeps_legacy_hash_bytes_and_rejects_command_output() -> anyhow::Result<()> {
+    fn database_sentinel_keeps_legacy_hash_bytes_and_rejects_command_output() -> anyhow::Result<()>
+    {
         let legacy = b"controller_recovery_roots=1|controller_registry_slots=1|migration_head=20260925000100|oauth_clients=1|oauth_tokens=2|recovery_invalidations=1|tenants=1|user_totp_credentials=1|users=1\n";
         assert_eq!(
             database_sentinel_digest(legacy)?,
             "08367ab8cd1b7dc03d66e17c1a8bbe713fd1d6480615e53374e725cd49a8792c"
         );
-        for contaminated in [b"".as_slice(), b"BEGIN\nfact\nCOMMIT\n", b"first\nsecond\n", &[0xff]] {
+        for contaminated in [
+            b"".as_slice(),
+            b"BEGIN\nfact\nCOMMIT\n",
+            b"first\nsecond\n",
+            &[0xff],
+        ] {
             assert!(database_sentinel_digest(contaminated).is_err());
         }
         assert!(database_sentinel_digest(&[b'x'; 1025]).is_err());
@@ -3059,13 +3070,16 @@ mod tests {
     #[test]
     fn published_backup_manifests_retain_their_original_checksums() -> anyhow::Result<()> {
         for bytes in [
-            include_bytes!("../../tests/fixtures/persistence/v0.2.27/snapshot-manifest.json").as_slice(),
-            include_bytes!("../../tests/fixtures/persistence/v0.2.28/snapshot-manifest.json").as_slice(),
+            include_bytes!("../../tests/fixtures/persistence/v0.2.27/snapshot-manifest.json")
+                .as_slice(),
+            include_bytes!("../../tests/fixtures/persistence/v0.2.28/snapshot-manifest.json")
+                .as_slice(),
         ] {
             let manifest: SnapshotManifest = serde_json::from_slice(bytes)?;
             manifest.validate()?;
             assert_eq!(manifest.computed_sha256()?, manifest.manifest_sha256);
-            let roundtrip: SnapshotManifest = serde_json::from_slice(&serde_json::to_vec(&manifest)?)?;
+            let roundtrip: SnapshotManifest =
+                serde_json::from_slice(&serde_json::to_vec(&manifest)?)?;
             roundtrip.validate()?;
             assert_eq!(roundtrip, manifest);
         }
@@ -3076,7 +3090,13 @@ mod tests {
         run_postgres_command(
             "psql",
             connection,
-            ["--no-psqlrc", "--quiet", "--set=ON_ERROR_STOP=1", "--command", sql],
+            [
+                "--no-psqlrc",
+                "--quiet",
+                "--set=ON_ERROR_STOP=1",
+                "--command",
+                sql,
+            ],
         )?;
         Ok(())
     }
@@ -3096,49 +3116,116 @@ mod tests {
         let source_url_file = temp.path().join("source-database-url");
         let result = (|| -> anyhow::Result<()> {
             write_fixture(&source_url_file, source.with_password_url()?)?;
-            sentinel_fixture_sql(&source, "CREATE TABLE __diesel_schema_migrations (version VARCHAR(50) PRIMARY KEY); INSERT INTO __diesel_schema_migrations VALUES ('20260925000100')")?;
+            sentinel_fixture_sql(
+                &source,
+                "CREATE TABLE __diesel_schema_migrations (version VARCHAR(50) PRIMARY KEY); INSERT INTO __diesel_schema_migrations VALUES ('20260925000100')",
+            )?;
             for table in [
-                "controller_recovery_roots", "controller_registry_slots", "oauth_clients",
-                "recovery_invalidations", "tenants", "user_totp_credentials", "users",
+                "controller_recovery_roots",
+                "controller_registry_slots",
+                "oauth_clients",
+                "recovery_invalidations",
+                "tenants",
+                "user_totp_credentials",
+                "users",
             ] {
-                sentinel_fixture_sql(&source, &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY); INSERT INTO {table} VALUES (1)"))?;
+                sentinel_fixture_sql(
+                    &source,
+                    &format!(
+                        "CREATE TABLE {table} (id INTEGER PRIMARY KEY); INSERT INTO {table} VALUES (1)"
+                    ),
+                )?;
             }
-            sentinel_fixture_sql(&source, "CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY); INSERT INTO oauth_tokens VALUES (1), (2)")?;
+            sentinel_fixture_sql(
+                &source,
+                "CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY); INSERT INTO oauth_tokens VALUES (1), (2)",
+            )?;
             let legacy = database_sentinel_with_connection(&source)?;
-            ensure!(legacy == "08367ab8cd1b7dc03d66e17c1a8bbe713fd1d6480615e53374e725cd49a8792c", "legacy SQL bytes or psql output changed");
+            ensure!(
+                legacy == "08367ab8cd1b7dc03d66e17c1a8bbe713fd1d6480615e53374e725cd49a8792c",
+                "legacy SQL bytes or psql output changed"
+            );
 
             for minimal in [false, true] {
                 if minimal {
-                    sentinel_fixture_sql(&source, "BEGIN; DROP TABLE oauth_tokens; CREATE TABLE oauth_refresh_contracts (id INTEGER PRIMARY KEY); CREATE TABLE oauth_refresh_families (id INTEGER PRIMARY KEY); CREATE TABLE oauth_refresh_spent_tokens (id INTEGER PRIMARY KEY); INSERT INTO oauth_refresh_contracts VALUES (1); INSERT INTO oauth_refresh_families VALUES (1), (2); INSERT INTO oauth_refresh_spent_tokens VALUES (1), (2), (3); INSERT INTO __diesel_schema_migrations VALUES ('20260926000100'); COMMIT")?;
+                    sentinel_fixture_sql(
+                        &source,
+                        "BEGIN; DROP TABLE oauth_tokens; CREATE TABLE oauth_refresh_contracts (id INTEGER PRIMARY KEY); CREATE TABLE oauth_refresh_families (id INTEGER PRIMARY KEY); CREATE TABLE oauth_refresh_spent_tokens (id INTEGER PRIMARY KEY); INSERT INTO oauth_refresh_contracts VALUES (1); INSERT INTO oauth_refresh_families VALUES (1), (2); INSERT INTO oauth_refresh_spent_tokens VALUES (1), (2), (3); INSERT INTO __diesel_schema_migrations VALUES ('20260926000100'); COMMIT",
+                    )?;
                 }
                 let expected = database_sentinel_with_connection(&source)?;
                 if minimal {
-                    ensure!(expected != legacy, "new storage facts must not pretend to be legacy token counts");
+                    ensure!(
+                        expected != legacy,
+                        "new storage facts must not pretend to be legacy token counts"
+                    );
                 }
-                let dump = temp.path().join(if minimal { "minimal.dump" } else { "legacy.dump" });
+                let dump = temp.path().join(if minimal {
+                    "minimal.dump"
+                } else {
+                    "legacy.dump"
+                });
                 run_pg_dump(&source_url_file, &dump)?;
                 create_database(&admin, &restored_name)?;
                 restore_database(&admin, &dump, &restored_name)?;
-                let actual = database_sentinel_with_connection(&admin.with_database(&restored_name))?;
-                ensure!(actual == expected, "restored database does not preserve the sentinel hash");
+                let actual =
+                    database_sentinel_with_connection(&admin.with_database(&restored_name))?;
+                ensure!(
+                    actual == expected,
+                    "restored database does not preserve the sentinel hash"
+                );
                 drop_database(&admin, &restored_name)?;
             }
 
             let current = database_sentinel_with_connection(&source)?;
-            for table in ["oauth_refresh_contracts", "oauth_refresh_families", "oauth_refresh_spent_tokens"] {
+            for table in [
+                "oauth_refresh_contracts",
+                "oauth_refresh_families",
+                "oauth_refresh_spent_tokens",
+            ] {
                 sentinel_fixture_sql(&source, &format!("INSERT INTO {table} VALUES (99)"))?;
-                ensure!(database_sentinel_with_connection(&source)? != current, "changed {table} facts must change the sentinel");
+                ensure!(
+                    database_sentinel_with_connection(&source)? != current,
+                    "changed {table} facts must change the sentinel"
+                );
                 sentinel_fixture_sql(&source, &format!("DELETE FROM {table} WHERE id = 99"))?;
-                ensure!(database_sentinel_with_connection(&source)? == current, "restored facts must restore the same hash");
+                ensure!(
+                    database_sentinel_with_connection(&source)? == current,
+                    "restored facts must restore the same hash"
+                );
             }
-            sentinel_fixture_sql(&source, "CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY)")?;
-            ensure!(database_sentinel_with_connection(&source).is_err(), "mixed old/new token state must refuse");
-            sentinel_fixture_sql(&source, "DROP TABLE oauth_tokens; DELETE FROM __diesel_schema_migrations WHERE version = '20260926000100'")?;
-            ensure!(database_sentinel_with_connection(&source).is_err(), "new relations without the migration record must refuse");
-            sentinel_fixture_sql(&source, "INSERT INTO __diesel_schema_migrations VALUES ('20260926000100'); DROP TABLE oauth_refresh_spent_tokens")?;
-            ensure!(database_sentinel_with_connection(&source).is_err(), "a missing required relation is not an empty relation");
-            sentinel_fixture_sql(&source, "CREATE TABLE oauth_refresh_spent_tokens (id INTEGER PRIMARY KEY); DROP TABLE controller_registry_slots")?;
-            ensure!(database_sentinel_with_connection(&source).is_err(), "a missing shared relation must refuse");
+            sentinel_fixture_sql(
+                &source,
+                "CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY)",
+            )?;
+            ensure!(
+                database_sentinel_with_connection(&source).is_err(),
+                "mixed old/new token state must refuse"
+            );
+            sentinel_fixture_sql(
+                &source,
+                "DROP TABLE oauth_tokens; DELETE FROM __diesel_schema_migrations WHERE version = '20260926000100'",
+            )?;
+            ensure!(
+                database_sentinel_with_connection(&source).is_err(),
+                "new relations without the migration record must refuse"
+            );
+            sentinel_fixture_sql(
+                &source,
+                "INSERT INTO __diesel_schema_migrations VALUES ('20260926000100'); DROP TABLE oauth_refresh_spent_tokens",
+            )?;
+            ensure!(
+                database_sentinel_with_connection(&source).is_err(),
+                "a missing required relation is not an empty relation"
+            );
+            sentinel_fixture_sql(
+                &source,
+                "CREATE TABLE oauth_refresh_spent_tokens (id INTEGER PRIMARY KEY); DROP TABLE controller_registry_slots",
+            )?;
+            ensure!(
+                database_sentinel_with_connection(&source).is_err(),
+                "a missing shared relation must refuse"
+            );
             Ok(())
         })();
         // Only these randomly named test databases are removed, even on error.
@@ -3519,7 +3606,7 @@ mod tests {
         let temp = crate::filesystem::PrivateTempDir::new("backup-wrong-key-path")?;
         let config = temp.path().join("config.yaml");
         let secrets = temp.path().join("secrets");
-        fs::create_dir(&secrets)?;
+        crate::filesystem::ensure_private_directory(&secrets, "test recovery secrets")?;
         let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         write_fixture(
             secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET),
@@ -3555,7 +3642,7 @@ mod tests {
         let temp = crate::filesystem::PrivateTempDir::new("backup-invalid-key")?;
         let config = temp.path().join("config.yaml");
         let secrets = temp.path().join("secrets");
-        fs::create_dir(&secrets)?;
+        crate::filesystem::ensure_private_directory(&secrets, "test recovery secrets")?;
         let key = b"invalid";
         write_fixture(secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET), key)?;
         write_fixture(
@@ -3593,7 +3680,7 @@ mod tests {
         let temp = crate::filesystem::PrivateTempDir::new("backup-missing-previous-recovery")?;
         let config = temp.path().join("config.yaml");
         let secrets = temp.path().join("secrets");
-        fs::create_dir(&secrets)?;
+        crate::filesystem::ensure_private_directory(&secrets, "test recovery secrets")?;
         let current_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         write_fixture(
             secrets.join(SIGNING_KEY_ENCRYPTION_KEY_SECRET),
