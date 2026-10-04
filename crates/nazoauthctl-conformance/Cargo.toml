@@ -46,6 +46,10 @@ png = "=0.18.1"
 # owner-only filesystem implementation below is independently verified.
 keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# Explicit native target and raw legacy bytes for an isolated compatibility fixture.
+keyring-core = "1.0.0"
+
 [lints.rust]
 unsafe_code = "forbid"
 

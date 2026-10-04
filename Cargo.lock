@@ -1691,6 +1691,7 @@ dependencies = [
  "ed25519-dalek",
  "fs2",
  "keyring",
+ "keyring-core",
  "libc",
  "nazo-operator-protocol",
  "nazoauthctl-runtime",

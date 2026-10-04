@@ -22,7 +22,12 @@ separate Cargo tool, pip environment, Node package manifest, or Dockerfile.
   The controller keeps the same service/user digests, password representation,
   missing-entry handling and deletion behavior. It does not change Unix's
   private-file credential backend. The Windows namespace test constructs an
-  entry and checks its frozen service/user identifiers.
+  entry and checks its frozen service/user identifiers. A separate Windows
+  fixture writes the published native `user.service` target, Enterprise
+  persistence and raw UTF-16LE dummy bytes through the current native store API;
+  the product then verifies readback, origin isolation, deletion and `NoEntry`.
+  This verifies a native legacy-format fixture, not execution of the old Keyring
+  binary. The fixture has a unique private namespace and cleans up its own entry.
 - [Rustls 0.23.45](https://github.com/rustls/rustls/releases/tag/v/0.23.45) fixes
   acceptance of TLS 1.3 handshake messages across encryption levels. The existing
   certificate roots, hostname verification and crypto provider remain in use.

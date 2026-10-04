@@ -310,6 +310,56 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_native_legacy_format_credentials_and_isolates_origins() {
+        let work = nazoauthctl_runtime::filesystem::PrivateTempDir::new("legacy-credential")
+            .expect("private temporary namespace");
+        let store = CredentialStore::new(work.path()).expect("store");
+        let first = Origin::parse("https://legacy-suite.example").expect("origin");
+        let second = Origin::parse("https://other-suite.example").expect("origin");
+        // The product initializes Keyring's native store; both names are unique to this fixture.
+        assert!(store.load(&first).expect("new namespace").is_none());
+        let service = format!(
+            "nazoauthctl-conformance-{}",
+            digest_hex(work.path().to_string_lossy().as_bytes())
+        );
+        let user = format!("origin-{}", digest_hex(first.as_str().as_bytes()));
+        // Keyring 3.6.3 used user.service, Generic/Enterprise and UTF-16LE password bytes.
+        let target = format!("{user}.{service}");
+        let modifiers = std::collections::HashMap::from([
+            ("target", target.as_str()),
+            ("persistence", "Enterprise"),
+        ]);
+        let legacy = keyring_core::Entry::new_with_modifiers(&service, &user, &modifiers)
+            .expect("native legacy-format entry");
+        assert!(matches!(legacy.get_secret(), Err(keyring_core::Error::NoEntry)));
+        struct Cleanup(keyring_core::Entry);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.delete_credential();
+            }
+        }
+        let legacy = Cleanup(legacy);
+        let mut bytes = Zeroizing::new(
+            "legacy-token"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        legacy.0.set_secret(&bytes).expect("write frozen legacy encoding");
+        bytes.zeroize();
+        assert_eq!(
+            store.load(&first).expect("load legacy entry").expect("token").as_str(),
+            "legacy-token"
+        );
+        assert!(store.load(&second).expect("other origin").is_none());
+        store.remove(&first).expect("remove legacy entry");
+        assert!(matches!(legacy.0.get_secret(), Err(keyring_core::Error::NoEntry)));
+        assert!(store.load(&first).expect("removed entry").is_none());
+        store.remove(&first).expect("remove missing entry");
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn origin_isolation_uses_distinct_records() {
