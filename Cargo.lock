@@ -1646,14 +1646,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nazo-crypto"
+version = "0.2.16"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=19dfd5b709d18f46bcf609444374a89eb67c34fb#19dfd5b709d18f46bcf609444374a89eb67c34fb"
+dependencies = [
+ "ed25519-dalek",
+ "thiserror",
+]
+
+[[package]]
 name = "nazo-operator-protocol"
-version = "0.2.13"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=5810e56ecc8de25ed1ee8b12510ea004f8e6e3e0#5810e56ecc8de25ed1ee8b12510ea004f8e6e3e0"
+version = "0.2.16"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=19dfd5b709d18f46bcf609444374a89eb67c34fb#19dfd5b709d18f46bcf609444374a89eb67c34fb"
 dependencies = [
  "base64 0.23.1",
  "chrono",
- "ed25519-dalek",
  "hmac",
+ "nazo-crypto",
  "serde",
  "serde_json",
  "sha2",
@@ -1693,6 +1702,7 @@ dependencies = [
  "keyring",
  "keyring-core",
  "libc",
+ "nazo-crypto",
  "nazo-operator-protocol",
  "nazoauthctl-runtime",
  "p256",
@@ -1725,7 +1735,6 @@ dependencies = [
  "bytes",
  "chrono",
  "cliclack",
- "ed25519-dalek",
  "fs2",
  "http",
  "http-body-util",
@@ -1733,6 +1742,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "libc",
+ "nazo-crypto",
  "nazo-operator-protocol",
  "nazoauthctl-runtime",
  "qrcode",

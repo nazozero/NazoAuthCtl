@@ -348,8 +348,11 @@ fn verify_compact<T: DeserializeOwned>(
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature)
         .map_err(|_| ProtocolError::Base64)?;
-    key.verify(format!("{protected}.{payload}").as_bytes(), &signature_bytes)
-        .map_err(|_| ProtocolError::Signature)?;
+    key.verify(
+        format!("{protected}.{payload}").as_bytes(),
+        &signature_bytes,
+    )
+    .map_err(|_| ProtocolError::Signature)?;
     decode_json(payload)
 }
 
