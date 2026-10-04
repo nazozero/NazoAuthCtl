@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ed25519_dalek::VerifyingKey;
+use nazo_crypto::ed25519::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -2150,7 +2150,7 @@ mod tests {
                 &protocol_evidence_context(&context),
             )
             .expect("context digest");
-        let signing = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let signing = nazo_crypto::ed25519::SigningKey::from_bytes(&[8; 32]);
         let verifying = signing.verifying_key();
         let key_id = nazo_operator_protocol::instance_key_id(&verifying);
         let runtime_verifier = OpenId4VpEvidenceVerifier::new(
@@ -2355,7 +2355,7 @@ mod tests {
                 body: Vec::new(),
             })),
         });
-        let signing = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let signing = nazo_crypto::ed25519::SigningKey::from_bytes(&[7; 32]);
         let verifying = signing.verifying_key();
         let key_id = nazo_operator_protocol::instance_key_id(&verifying);
         let verifier = OpenId4VpEvidenceVerifier::new(
@@ -2441,7 +2441,7 @@ mod tests {
 
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
         let suite = Origin::parse("https://suite.example").expect("suite");
-        let signing = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let signing = nazo_crypto::ed25519::SigningKey::from_bytes(&[9; 32]);
         let verifying = signing.verifying_key();
         let key_id = nazo_operator_protocol::instance_key_id(&verifying);
         let runtime_verifier = OpenId4VpEvidenceVerifier::new(
@@ -2580,7 +2580,7 @@ mod tests {
             .is_err()
         );
 
-        let other_signing = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let other_signing = nazo_crypto::ed25519::SigningKey::from_bytes(&[8; 32]);
         let other_key_id = nazo_operator_protocol::instance_key_id(&other_signing.verifying_key());
         let mut wrong_kid_receipt = receipt.clone();
         wrong_kid_receipt.instance_key_id = other_key_id.clone();

@@ -2,8 +2,9 @@
 
 The four workspace manifests declare the current supported stable dependency
 lines. `Cargo.lock` fixes the resolved graph and registry checksums;
-`nazo-operator-protocol` remains an immutable Git revision whose published wire
-and persistence contracts must be reviewed before advancing it. Raising a
+`nazo-operator-protocol` and the Ed25519-only `nazo-crypto` primitive backend
+share one immutable Git revision. Their published wire and persistence contracts
+must be reviewed before advancing it. Raising a
 manifest's version floor does not mean the locked executable previously used
 that older version.
 
@@ -15,6 +16,14 @@ The Python maintenance scripts use the standard library; this repository has no
 separate Cargo tool, pip environment, Node package manifest, or Dockerfile.
 
 ## Compatibility and useful changes
+
+The controller identity owner prepares an opaque Ed25519 key once when loading
+or creating it. Signing and verification use that object directly, retaining
+the persisted 32-byte seed, public key, key identifier and accepted journal JWS
+bytes. The workspace tests freeze the old protocol revision's canonical request,
+request hash and complete JWS and verify that the upgraded backend accepts it.
+OpenID4VP evidence verification uses the same primitive type while its existing
+local wire model and validation remain in the conformance owner.
 
 - [Keyring 4](https://docs.rs/keyring/4.2.0/keyring/v1/index.html) separates its
   backend ecosystem and retains the simple `v1` interface. The Windows-only

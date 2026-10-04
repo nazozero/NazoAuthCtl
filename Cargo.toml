@@ -15,7 +15,8 @@ repository = "https://github.com/nazozero/NazoAuthCtl"
 rust-version = "1.99"
 
 [workspace.dependencies]
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "5810e56ecc8de25ed1ee8b12510ea004f8e6e3e0", version = "0.2.13", package = "nazo-operator-protocol" }
+nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "19dfd5b709d18f46bcf609444374a89eb67c34fb", version = "0.2.16", default-features = false, features = ["ed25519"] }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "19dfd5b709d18f46bcf609444374a89eb67c34fb", version = "0.2.16", package = "nazo-operator-protocol" }
 
 [package]
 name = "nazoauthctl-core"
@@ -38,7 +39,6 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 cliclack = "=0.5.6"
-ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
 http = "1.5.0"
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "rustls-platform-verifier"] }
@@ -48,6 +48,7 @@ hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1
 http-body-util = "0.1.5"
 instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
 libc = "0.2.190"
+nazo-crypto.workspace = true
 nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
 rand = "0.10.3"

@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn openid4vp_verifier_inputs_require_the_exact_runtime_public_key_binding() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]).verifying_key();
+        let key = nazo_crypto::ed25519::SigningKey::from_bytes(&[41; 32]).verifying_key();
         let encoded = nazo_operator_protocol::encode_instance_public_key(&key);
         let key_id = nazo_operator_protocol::instance_key_id(&key);
         assert!(

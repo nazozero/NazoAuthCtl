@@ -2772,7 +2772,7 @@ mod tests {
         let identity_dir = data_root.join(DEFAULT_INSTANCE_IDENTITY_DIRECTORY);
         crate::filesystem::ensure_private_directory(&data_root, "test app data")?;
         crate::filesystem::ensure_private_directory(&identity_dir, "test runtime identity")?;
-        let key = ed25519_dalek::SigningKey::from_bytes(&[31; 32]);
+        let key = nazo_crypto::ed25519::SigningKey::from_bytes(&[31; 32]);
         let public_key = key.verifying_key();
         let key_id = nazo_operator_protocol::instance_key_id(&public_key);
         let statement = nazo_operator_protocol::DeploymentStatement {
@@ -2842,7 +2842,7 @@ mod tests {
 
         let explicit_dir = temp.path().join("explicit-identity");
         crate::filesystem::ensure_private_directory(&explicit_dir, "explicit runtime identity")?;
-        let explicit_key = ed25519_dalek::SigningKey::from_bytes(&[32; 32]);
+        let explicit_key = nazo_crypto::ed25519::SigningKey::from_bytes(&[32; 32]);
         let explicit_key_id =
             nazo_operator_protocol::instance_key_id(&explicit_key.verifying_key());
         let mut explicit_statement = statement;

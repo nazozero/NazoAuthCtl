@@ -3,9 +3,9 @@
 //! Keep their provenance explicit until the shared protocol publishes them.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 #[cfg(test)]
-use ed25519_dalek::{Signer as _, SigningKey};
+use nazo_crypto::ed25519::SigningKey;
+use nazo_crypto::ed25519::VerifyingKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 
@@ -306,10 +306,7 @@ fn sign_compact<T: Serialize>(
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).map_err(|_| ProtocolError::Json)?);
     let signing_input = format!("{protected}.{payload}");
     let signature = key.sign(signing_input.as_bytes());
-    let compact = format!(
-        "{signing_input}.{}",
-        URL_SAFE_NO_PAD.encode(signature.to_bytes())
-    );
+    let compact = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature));
     if compact.len() > nazo_operator_protocol::MAX_COMPACT_JWS_BYTES {
         return Err(ProtocolError::TooLarge);
     }
@@ -351,9 +348,7 @@ fn verify_compact<T: DeserializeOwned>(
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature)
         .map_err(|_| ProtocolError::Base64)?;
-    let signature =
-        Signature::from_slice(&signature_bytes).map_err(|_| ProtocolError::Signature)?;
-    key.verify(format!("{protected}.{payload}").as_bytes(), &signature)
+    key.verify(format!("{protected}.{payload}").as_bytes(), &signature_bytes)
         .map_err(|_| ProtocolError::Signature)?;
     decode_json(payload)
 }

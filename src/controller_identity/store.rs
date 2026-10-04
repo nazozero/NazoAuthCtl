@@ -20,8 +20,8 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use fs2::FileExt as _;
+use nazo_crypto::ed25519::{SigningKey, VerifyingKey};
 use nazo_operator_protocol::controller_key_id;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -132,9 +132,8 @@ struct ActivePointer {
     active_kid: String,
 }
 
-/// A loaded active signing identity. The Ed25519 seed lives inside
-/// [`SigningKey`], which zeroizes its secret scalar on drop; no accessor
-/// exposes private bytes.
+/// A loaded active signing identity. Its opaque Ed25519 key is prepared once
+/// when loading or creating the identity, and zeroizes its secret state on drop.
 pub struct LoadedControllerKey {
     kid: String,
     signing_key: SigningKey,
@@ -679,7 +678,6 @@ impl ControllerKeyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer as _, Verifier as _};
 
     fn test_store() -> anyhow::Result<(filesystem::PrivateTempDir, ControllerKeyStore)> {
         let temp = filesystem::PrivateTempDir::new("nazauthctl-controller-keys-test")?;
@@ -867,7 +865,7 @@ mod tests {
 
         // Restore a consistent-looking record whose private key does not
         // derive the claimed kid.
-        let wrong_seed = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let wrong_seed = SigningKey::from_bytes(&[7u8; 32]);
         let inconsistent = serde_json::json!({
             "schema": CONTROLLER_KEY_STORE_SCHEMA,
             "kid": summary.kid,

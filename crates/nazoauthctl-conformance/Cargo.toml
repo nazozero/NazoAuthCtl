@@ -14,6 +14,7 @@ path = "src/lib.rs"
 nazoauthctl-runtime = { path = "../nazoauthctl-runtime" }
 anyhow = "1.0.104"
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys"] }
+nazo-crypto.workspace = true
 nazo-operator-protocol.workspace = true
 fs2 = "0.4.3"
 libc = "0.2.190"
