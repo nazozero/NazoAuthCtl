@@ -1764,9 +1764,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
-    use base64::{
-        Engine as _, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
-    };
+    use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD};
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
         KeyUsagePurpose,

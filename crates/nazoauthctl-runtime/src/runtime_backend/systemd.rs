@@ -176,10 +176,8 @@ impl RuntimeBackend for SystemdBackend {
                 missing.push(format!("systemd {property} hardening is not observable"));
             }
         }
-        for variable in ["DEPLOYMENT_ID"] {
-            if !safe_environment.contains_key(variable) {
-                missing.push(format!("systemd Environment is missing {variable}"));
-            }
+        if !safe_environment.contains_key("DEPLOYMENT_ID") {
+            missing.push("systemd Environment is missing DEPLOYMENT_ID".to_owned());
         }
         if properties
             .get("EnvironmentFiles")

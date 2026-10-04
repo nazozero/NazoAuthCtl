@@ -42,6 +42,18 @@ separate Cargo tool, pip environment, Node package manifest, or Dockerfile.
   should keep their ownership and error behavior; upgrading does not justify
   adding unsafe layout operations or replacing audited filesystem primitives.
 
+## Upstream version constraints
+
+Refreshing the graph preserves older major lines when the latest upstream
+package still requires them. For example, instant-acme 0.8.5 requires base64
+`^0.22`; reqwest 0.13.5 requires tower-http `^0.6.8`; pkcs1 0.7.5 requires der
+and spki `^0.7`; and several derive crates require syn `^2`. Ring 0.17.14 also
+requires getrandom `^0.2.10` and windows-sys `^0.52`. The current iana-time-zone
+limits windows-core to `>=0.56, <=0.62`. These requirements prevent substitution
+of the newest global major versions without an upstream release or an explicit
+compatibility migration. Keep their newest compatible versions and report the
+complete parent/range evidence with the dependency audit.
+
 ## Updating and verifying
 
 Check non-yanked stable versions in the official crates.io index and distinguish
