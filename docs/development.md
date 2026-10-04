@@ -51,6 +51,9 @@ container port 8000 and source-tree Compose variables do not select this port.
 
 ## Verification
 
+Dependency pins, compatibility constraints and useful upstream APIs are described
+in [dependency maintenance](dependencies.md).
+
 Use the pinned `rust-toolchain.toml`. Run commands from the repository root and
 select the owning package/test first. These are available entry points, not a
 mandatory sequence for every edit:

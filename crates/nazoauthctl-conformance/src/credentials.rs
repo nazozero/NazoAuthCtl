@@ -296,23 +296,49 @@ mod tests {
         assert!(!format!("{token}").contains("top-secret"));
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn windows_credential_namespace_matches_published_service_and_user() {
+        // Construct only: no existing Credential Manager values are read or written.
+        let root = Path::new(r"C:\NazoAuthCtlCredentialFixture");
+        let origin = Origin::parse("https://suite.example").expect("origin");
+        let entry = windows_entry(root, &origin).expect("entry");
+        assert_eq!(
+            entry.inner.get_specifiers(),
+            Some((
+                "nazoauthctl-conformance-609f14757e8864afb5a194282c0d9993d78d235981255bdee1e3a3a40933ab4a".to_owned(),
+                "origin-4d15bdf5a6cabec09a37e1ce891726fdb4f9f83ba7c70ac27a86245a414396b9".to_owned(),
+            ))
+        );
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn origin_isolation_uses_distinct_records() {
-        let root = fs::canonicalize(std::env::temp_dir())
-            .expect("canonical temporary root")
-            .join(format!("nazo-conformance-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let store = CredentialStore::new(&root).expect("store");
+        let work = nazoauthctl_runtime::filesystem::PrivateTempDir::new("credential-upgrade")
+            .expect("private temporary namespace");
+        let store = CredentialStore::new(work.path()).expect("store");
         let first = Origin::parse("https://suite-one.example").expect("origin");
         let second = Origin::parse("https://suite-two.example").expect("origin");
+        struct Cleanup<'a>(&'a CredentialStore, &'a Origin, &'a Origin);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.remove(self.1);
+                let _ = self.0.remove(self.2);
+            }
+        }
+        let _cleanup = Cleanup(&store, &first, &second);
+        assert!(store.load(&first).expect("missing entry").is_none());
+        store.remove(&first).expect("remove missing entry");
         let token = BearerToken::new("token-one").expect("token");
         store.save(&first, &token).expect("save");
-        assert!(store.load(&second).expect("load").is_none());
+        assert!(store.load(&second).expect("other origin").is_none());
         assert_eq!(
             store.load(&first).expect("load").expect("token").as_str(),
             "token-one"
         );
-        let _ = fs::remove_dir_all(root);
+        store.remove(&first).expect("remove stored entry");
+        assert!(store.load(&first).expect("removed entry").is_none());
+        store.remove(&first).expect("repeated remove");
     }
 }

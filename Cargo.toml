@@ -12,7 +12,7 @@ version = "0.2.31"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/nazozero/NazoAuthCtl"
-rust-version = "1.97"
+rust-version = "1.99"
 
 [workspace.dependencies]
 nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "5810e56ecc8de25ed1ee8b12510ea004f8e6e3e0", version = "0.2.13", package = "nazo-operator-protocol" }
@@ -33,7 +33,7 @@ path = "src/lib.rs"
 pre-release-validation = []
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 base64 = "0.23.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -41,33 +41,33 @@ cliclack = "=0.5.6"
 ed25519-dalek = "3.0.0"
 fs2 = "0.4.3"
 http = "1.5.0"
-hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "rustls-platform-verifier"] }
-hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "rustls-platform-verifier"] }
+hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 # Already compiled transitively (hyper-util depends on it); declared only so
 # the controller-identity admin client can name request/response body types.
-http-body-util = "0.1.3"
+http-body-util = "0.1.5"
 instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
-libc = "0.2.189"
+libc = "0.2.190"
 nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
-rand = "0.10.1"
+rand = "0.10.3"
 qrcode = { version = "0.14.1", default-features = false }
-rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
-semver = "1.0.27"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
-tar = "0.4.44"
-tokio = { version = "1.53.1", features = ["rt", "time"] }
+tar = "0.4.46"
+tokio = { version = "1.53.2", features = ["rt", "time"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 unicode-width = "0.2.2"
-uuid = { version = "1.24.1", features = ["v7", "serde"] }
+uuid = { version = "1.27.0", features = ["v7", "serde"] }
 x509-parser = "0.18.1"
-yaml_serde = "0.10.4"
-zeroize = { version = "1.8.2", features = ["derive", "serde"] }
+yaml_serde = "0.10.7"
+zeroize = { version = "1.9.0", features = ["derive", "serde"] }
 
 [lints.rust]
 unsafe_code = "forbid"
