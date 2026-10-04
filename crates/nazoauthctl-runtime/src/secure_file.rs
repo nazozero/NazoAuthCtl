@@ -768,7 +768,10 @@ mod tests {
 
         assert!(super::promote_private_file(&staged, &target).is_err());
 
-        assert_eq!(super::read_bounded(&staged, 32, true).unwrap(), b"new evidence");
+        assert_eq!(
+            super::read_bounded(&staged, 32, true).unwrap(),
+            b"new evidence"
+        );
         assert_eq!(
             super::read_bounded(&target, 32, true).unwrap(),
             b"original evidence"
@@ -809,7 +812,10 @@ mod tests {
         } else {
             (&second, &first, b"second".as_slice(), b"first".as_slice())
         };
-        assert_eq!(super::read_bounded(&target, 32, true).unwrap(), winning_bytes);
+        assert_eq!(
+            super::read_bounded(&target, 32, true).unwrap(),
+            winning_bytes
+        );
         assert_eq!(super::read_bounded(loser, 32, true).unwrap(), losing_bytes);
         assert_eq!(
             super::read_bounded(winner, 32, true),
