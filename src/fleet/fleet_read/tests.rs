@@ -25,6 +25,7 @@ impl ScriptedTarget {
         }
         Ok(InstanceInspection {
             current_release: None,
+            diagnostics: Vec::new(),
             current_instance_identity: None,
             deployment_id: deployment_id.to_owned(),
             issuer: "https://auth.example.com".to_owned(),

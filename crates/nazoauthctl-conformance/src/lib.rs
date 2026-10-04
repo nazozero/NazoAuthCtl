@@ -25,7 +25,7 @@ mod progress;
 mod proxy_trust;
 mod recovery;
 mod report;
-mod secure_file;
+use nazoauthctl_runtime::secure_file;
 mod transport;
 
 pub use artifact::{
@@ -101,7 +101,7 @@ pub use progress::{
     GroupProgress, GroupStatus, OutputLanguage, ProgressActivity, ProgressEvent, ProgressSink,
     ProgressSnapshot, StableRenderer, activity_label, current_matrix_label, redacted_variant,
 };
-pub use proxy_trust::ProxyTrustGuard;
+pub use proxy_trust::recover_proxy_trust;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryGuard, ConformanceRecoveryStore,
     OpenId4VpEvidenceTrustAnchor, SuiteRecoveryState, SuiteRetentionCommitResolution,

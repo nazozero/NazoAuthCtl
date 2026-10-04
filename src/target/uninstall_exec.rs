@@ -42,38 +42,12 @@ pub(crate) trait DeletionExecutor: Send + Sync {
     fn execute_deletion(&self, job: &DeletionJob<'_>) -> Result<(), Failure>;
 }
 
-/// Steps recorded for precise failure reporting.
-#[derive(Default)]
-pub(crate) struct PerformedDeletions {
-    pub(crate) removed_objects: Vec<String>,
-    pub(crate) removed_paths: Vec<String>,
-}
-
 /// Production executor backed by the real adapters.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostDeletionExecutor;
 
 impl DeletionExecutor for HostDeletionExecutor {
     fn execute_deletion(&self, job: &DeletionJob<'_>) -> Result<(), Failure> {
-        let mut performed = PerformedDeletions::default();
-        match self.run(job, &mut performed) {
-            Ok(()) => Ok(()),
-            Err(failure) => {
-                // Deletions are not undone on failure: partial destruction is
-                // reported exactly so the operator can re-run the same plan
-                // (every step is idempotent by identity re-confirmation).
-                Err(failure)
-            }
-        }
-    }
-}
-
-impl HostDeletionExecutor {
-    fn run(
-        &self,
-        job: &DeletionJob<'_>,
-        performed: &mut PerformedDeletions,
-    ) -> Result<(), Failure> {
         let kind = job.runtime_kind;
         privilege_gate(kind)?;
         let backend = crate::runtime_backend::backend(kind);
@@ -119,9 +93,6 @@ impl HostDeletionExecutor {
                     sanitize(error.to_string()),
                 )
             })?;
-            performed
-                .removed_objects
-                .push(job.runtime_object.to_owned());
         }
 
         // 2. Delete only resources the authoritative target state classifies
@@ -132,7 +103,7 @@ impl HostDeletionExecutor {
                 && resource.scope == super::deployment_state::ResourceScope::Deployment
                 && resource.kind != "container"
         }) {
-            delete_managed_resource(&resource.kind, &resource.locator, performed)?;
+            delete_managed_resource(&resource.kind, &resource.locator)?;
         }
 
         // 3. The configuration file created by install/managed by the update
@@ -148,9 +119,6 @@ impl HostDeletionExecutor {
                     format!("failed to remove {}: {error}", config_path.display()),
                 )
             })?;
-            performed
-                .removed_paths
-                .push(job.config_reference.to_owned());
         }
         if config_marker.exists() {
             filesystem::remove_file_durable(&config_marker).map_err(|error| {
@@ -173,11 +141,7 @@ impl HostDeletionExecutor {
 /// Delete ONE re-confirmed managed+deployment resource by its concrete kind.
 /// Unknown kinds fail closed — there is no best-effort guessing about how to
 /// destroy something ctl cannot precisely describe.
-fn delete_managed_resource(
-    kind: &str,
-    locator: &str,
-    performed: &mut PerformedDeletions,
-) -> Result<(), Failure> {
+fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
     match kind {
         "directory" => {
             let path = Path::new(locator);
@@ -219,7 +183,6 @@ fn delete_managed_resource(
                     format!("failed to delete directory {}: {error}", path.display()),
                 )
             })?;
-            performed.removed_paths.push(locator.to_owned());
             Ok(())
         }
         "file" => {
@@ -260,7 +223,6 @@ fn delete_managed_resource(
                         format!("failed to delete file {}: {error}", path.display()),
                     )
                 })?;
-                performed.removed_paths.push(locator.to_owned());
             }
             if marker.exists() {
                 filesystem::remove_file_durable(marker).map_err(|error| {
@@ -406,13 +368,12 @@ mod tests {
             std::fs::set_permissions(&release, permissions)?;
         }
         let locator = path.to_string_lossy().into_owned();
-        let mut performed = PerformedDeletions::default();
 
-        delete_managed_resource("directory", &locator, &mut performed)?;
+        delete_managed_resource("directory", &locator)?;
         assert!(!path.exists());
-        delete_managed_resource("directory", &locator, &mut performed)?;
+        delete_managed_resource("directory", &locator)?;
 
-        let error = delete_managed_resource("directory", "relative/path", &mut performed)
+        let error = delete_managed_resource("directory", "relative/path")
             .expect_err("a non-absolute locator remains protected");
         assert_eq!(
             error.code,
@@ -428,16 +389,15 @@ mod tests {
         let locator = path.to_string_lossy().into_owned();
         let marker = std::path::PathBuf::from(format!("{locator}.nazoauth-owned"));
         std::fs::write(&marker, "deploy-alpha")?;
-        let mut performed = PerformedDeletions::default();
 
         // This is the exact crash window after the file was removed but
         // before its sibling ownership marker was removed.
-        delete_managed_resource("file", &locator, &mut performed)?;
+        delete_managed_resource("file", &locator)?;
         assert!(!marker.exists());
-        delete_managed_resource("file", &locator, &mut performed)?;
+        delete_managed_resource("file", &locator)?;
 
         std::fs::write(&path, b"managed by authoritative target state")?;
-        delete_managed_resource("file", &locator, &mut performed)?;
+        delete_managed_resource("file", &locator)?;
         assert!(!path.exists());
         Ok(())
     }

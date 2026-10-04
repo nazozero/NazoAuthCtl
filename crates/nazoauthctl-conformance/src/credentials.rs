@@ -42,15 +42,6 @@ impl BearerToken {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-
-    /// Read a token from an owner-only regular file using the shared bounded
-    /// secure-file primitive.  The token value is never included in errors.
-    pub fn read_file(path: &Path) -> Result<Self, CredentialStoreError> {
-        let bytes = crate::secure_file::read_bounded(path, MAX_TOKEN_BYTES, true)
-            .map_err(map_secure_file_error)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| CredentialStoreError::InvalidToken)?;
-        Self::new(text).map_err(|_| CredentialStoreError::InvalidToken)
-    }
 }
 
 impl std::fmt::Debug for BearerToken {
@@ -165,28 +156,6 @@ impl CredentialStore {
         }
     }
 
-    /// Read a token from an inherited descriptor without putting the value in
-    /// argv or an environment variable. The descriptor is reopened and its
-    /// resulting object is checked as a regular owner-only file. Anonymous
-    /// pipes are intentionally unsupported here; callers should use a private
-    /// file or pass an already parsed token from the CLI's channel layer.
-    #[cfg(unix)]
-    pub fn read_descriptor(fd: u32) -> Result<BearerToken, CredentialStoreError> {
-        if fd < 3 {
-            return Err(CredentialStoreError::InvalidDescriptor);
-        }
-        let bytes = crate::secure_file::read_descriptor(fd, MAX_TOKEN_BYTES, true)
-            .map(Zeroizing::new)
-            .map_err(map_secure_file_error)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| CredentialStoreError::InvalidToken)?;
-        BearerToken::new(text).map_err(|_| CredentialStoreError::InvalidToken)
-    }
-
-    #[cfg(not(unix))]
-    pub fn read_descriptor(_fd: u32) -> Result<BearerToken, CredentialStoreError> {
-        Err(CredentialStoreError::UnsupportedPlatform)
-    }
-
     #[cfg(unix)]
     fn path_for(&self, origin: &Origin) -> PathBuf {
         self.root
@@ -198,7 +167,6 @@ impl CredentialStore {
 pub enum CredentialStoreError {
     UnsupportedPlatform,
     InvalidToken,
-    InvalidDescriptor,
     NotFound,
     OriginMismatch,
     Oversize,
@@ -215,7 +183,6 @@ impl std::fmt::Display for CredentialStoreError {
                 "secure credential persistence is unavailable on this platform"
             }
             Self::InvalidToken => "bearer token is invalid",
-            Self::InvalidDescriptor => "credential descriptor is invalid",
             Self::NotFound => "credential was not found",
             Self::OriginMismatch => "credential origin does not match the requested Suite origin",
             Self::Oversize => "credential exceeds the size limit",
@@ -305,6 +272,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), CredentialStoreError> {
     }
 }
 
+#[cfg(unix)]
 fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> CredentialStoreError {
     match error {
         crate::secure_file::SecureFileError::UnsupportedPlatform => {

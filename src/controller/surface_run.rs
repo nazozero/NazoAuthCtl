@@ -31,6 +31,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         cli.command,
         Command::SelfVerifyState
             | Command::RemoteExec
+            | Command::RemoteTransferStream
             | Command::SelfUpdate { .. }
             | Command::SelfRollback
             | Command::SelfCheck(_)
@@ -148,6 +149,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Admin(command) => run_admin(command, instance_flag),
         Command::Tls(command) => crate::tls::run(instance_flag, command, super::require_root),
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
+        Command::RemoteTransferStream => crate::target::remote_exec::run_stream_stdio(),
         Command::SelfCheck(version) => super::self_update::controller_check(version.as_deref()),
         Command::SelfVerifyState => super::state_check::run(),
         Command::SelfUpdate { version } => {

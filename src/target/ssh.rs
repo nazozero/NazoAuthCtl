@@ -181,6 +181,7 @@ pub struct SshTarget {
     program: PathBuf,
     timeout: Duration,
     handshake: RefCell<Option<RemoteHello>>,
+    transfer_session: RefCell<Option<nazoauthctl_runtime::process::LineSession>>,
 }
 
 impl SshTarget {
@@ -233,6 +234,7 @@ impl SshTarget {
             profile,
             timeout: DEFAULT_EXEC_TIMEOUT,
             handshake: RefCell::new(None),
+            transfer_session: RefCell::new(None),
         })
     }
 
@@ -298,20 +300,33 @@ impl SshTarget {
     /// One bounded stdin→stdout round trip through the fixed argv.
     fn transmit(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
         let payload = encode_host_operation(operation)?;
-        let output = Process::new(self.program.clone())
-            .args(self.exec_args())
-            .timeout(self.timeout)
-            .stdin_output(&payload)
-            .map_err(|error| {
-                self.process_failure(
-                    error,
-                    &format!("OpenSSH client ({}) failed", self.program.display()),
-                )
-            })?;
-        if !output.status.success() {
-            bail!("{}", self.transport_failure(output.status, &output.stderr));
-        }
-        let result = parse_host_result(&output.stdout).map_err(|rejection| {
+        let streaming = matches!(
+            operation.operation,
+            super::wire::HostOperationBody::BackupTransferRead { .. }
+                | super::wire::HostOperationBody::BackupTransferWrite { .. }
+        ) && self.handshake.borrow().as_ref().is_some_and(|hello| {
+            semver::Version::parse(hello.version.trim_start_matches('v'))
+                .is_ok_and(|version| version >= semver::Version::new(0, 2, 31))
+        });
+        let stdout = if streaming {
+            self.transmit_transfer_frame(payload)?
+        } else {
+            let output = Process::new(self.program.clone())
+                .args(self.exec_args())
+                .timeout(self.timeout)
+                .stdin_output(&payload)
+                .map_err(|error| {
+                    self.process_failure(
+                        error,
+                        &format!("OpenSSH client ({}) failed", self.program.display()),
+                    )
+                })?;
+            if !output.status.success() {
+                bail!("{}", self.transport_failure(output.status, &output.stderr));
+            }
+            output.stdout
+        };
+        let result = parse_host_result(&stdout).map_err(|rejection| {
             anyhow::anyhow!(
                 "remote exec on '{}' did not return a valid HostResult ({rejection}); \
                  stdout must carry exactly one answer",
@@ -327,6 +342,32 @@ impl SshTarget {
             );
         }
         Ok(result)
+    }
+
+    fn transmit_transfer_frame(&self, mut payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        let mut session = self.transfer_session.borrow_mut();
+        if session.is_none() {
+            let mut args = self.exec_args();
+            *args.last_mut().context("missing remote command")? = "transfer-stream".into();
+            let mut opened = Process::new(self.program.clone())
+                .args(args)
+                .timeout(self.timeout)
+                .line_session(super::wire::MAX_HOST_RESULT_BYTES + 1)?;
+            if opened.exchange(Vec::new())? != super::remote_exec::STREAM_GREETING {
+                bail!("remote helper returned an invalid transfer stream greeting");
+            }
+            *session = Some(opened);
+        }
+        payload.push(b'\n');
+        let result = session
+            .as_mut()
+            .expect("transfer session was opened")
+            .exchange(payload);
+        if result.is_err() {
+            *session = None;
+        }
+        result
+            .map_err(|error| self.process_failure(error, "OpenSSH backup transfer session failed"))
     }
 
     /// Classify a failed SSH invocation into closed, actionable categories.
@@ -742,6 +783,16 @@ mod tests {
     fn unix_stub_script() -> String {
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$(dirname "$0")/argv.txt"
+case "$*" in
+  *'remote transfer-stream')
+    printf 'nazoauthctl-transfer-stream-1\n'
+    while IFS= read -r input; do
+      caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
+      sed "s/__OPERATION_ID__/${caller:-none}/g" "$(dirname "$0")/response.json"
+      printf '\n'
+    done
+    exit 0 ;;
+esac
 input=$(cat)
 printf '%s' "$input" > "$(dirname "$0")/stdin.json"
 caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
@@ -778,6 +829,15 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
             "$ErrorActionPreference = 'Stop'",
             "$here = Split-Path -Parent $MyInvocation.MyCommand.Path",
             "Add-Content -LiteralPath (Join-Path $here 'argv.txt') -Encoding Ascii -Value ($args -join ' ')",
+            "if ($args[-1] -eq 'transfer-stream') {",
+            "  [Console]::Out.Write(\"nazoauthctl-transfer-stream-1`n\")",
+            "  $template = Get-Content -LiteralPath (Join-Path $here 'response.json') -Raw",
+            "  while ($null -ne ($line = [Console]::ReadLine())) {",
+            "    $id = ($line | ConvertFrom-Json).operation_id",
+            r#"    [Console]::Out.Write($template.Replace('__OPERATION_ID__', $id) + "`n")"#,
+            "  }",
+            "  exit 0",
+            "}",
             "$stdinText = [Console]::In.ReadToEnd()",
             "[IO.File]::WriteAllText((Join-Path $here 'stdin.json'), $stdinText, [Text.UTF8Encoding]::new($false))",
             "$m = [regex]::Match($stdinText, '\"operation_id\":\"([0-9a-fA-F-]+)\"')",
@@ -891,6 +951,43 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     // ---------- behavior over the stub transport ----------
 
     #[test]
+    fn backup_chunks_reuse_new_helpers_and_keep_old_helpers_compatible() {
+        for (version, expected_calls) in [("0.2.30", 3), ("0.2.31", 2)] {
+            let stub = SshStub::install_with_hello(
+                &StubScenario {
+                    response_json: &ping_response_json("transport-fixture"),
+                    stderr_text: None,
+                    exit_code: 0,
+                },
+                Some(&hello_response_json(version)),
+            )
+            .unwrap();
+            let target = ssh_target(HostPrivilege::Direct, &stub).unwrap();
+            target.inspect_host().unwrap();
+            for offset in [0, 1024] {
+                let operation = HostOperation::backup_transfer_read(
+                    Uuid::now_v7().to_string(),
+                    "deployment-a",
+                    Uuid::now_v7().to_string(),
+                    "deployment.tar",
+                    offset,
+                );
+                let result = target.transmit(&operation).unwrap();
+                assert_eq!(result.operation_id, operation.operation_id);
+            }
+            let calls = stub.argv_invocations();
+            assert_eq!(calls.len(), expected_calls, "{version}: {calls:?}");
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|args| args.ends_with("transfer-stream"))
+                    .count(),
+                usize::from(version == "0.2.31")
+            );
+        }
+    }
+
+    #[test]
     fn handshake_verifies_and_inspect_host_maps_the_announcement() {
         let stub = SshStub::install(&StubScenario {
             response_json: &hello_response_json(env!("CARGO_PKG_VERSION")),
@@ -950,6 +1047,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
     fn sample_inspection() -> InstanceInspection {
         InstanceInspection {
             current_release: None,
+            diagnostics: Vec::new(),
             current_instance_identity: None,
             deployment_id: "deploy-alpha".to_owned(),
             issuer: "https://auth.example.com".to_owned(),

@@ -320,3 +320,9 @@ The helper handshake does not attest a server transport capability. There is no
 additional TLS capability endpoint or NazoAuth version table. A server that cannot
 load the selected configuration fails readiness and follows ordinary recovery.
 No HTTP fallback is implemented or permitted here.
+
+
+Rollback checks that the previous certificate is currently valid, matches its
+hostname/private key, and satisfies its recorded trust/material bindings. The
+`minimum_validity_seconds` admission threshold applies to new material, not to
+a still-valid previous generation needed for rollback.

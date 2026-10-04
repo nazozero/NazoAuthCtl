@@ -1073,23 +1073,114 @@ fn answer_journal_read(
 }
 
 fn redact_log_line(line: &str) -> String {
-    let lower = line.to_ascii_lowercase();
-    if [
-        "authorization",
-        "password",
-        "secret",
-        "token",
-        "cookie",
-        "database_url",
-        "valkey_url",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
-        "[redacted sensitive log line]".to_owned()
-    } else {
-        wire::sanitize(line.to_owned())
+    fn sensitive(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "cookie"
+                | "set-cookie"
+                | "database_url"
+                | "valkey_url"
+        ) || ["password", "secret", "token", "private_key"]
+            .iter()
+            .any(|suffix| name == *suffix || name.ends_with(&format!("_{suffix}")))
     }
+    fn redact_text(line: &str) -> String {
+        let bytes = line.as_bytes();
+        let mut output = String::new();
+        let mut copied = 0;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if !bytes[cursor].is_ascii_alphanumeric() && !matches!(bytes[cursor], b'_' | b'-') {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || matches!(bytes[cursor], b'_' | b'-'))
+            {
+                cursor += 1;
+            }
+            let name = &line[start..cursor];
+            if !sensitive(name) {
+                continue;
+            }
+            if start > 0
+                && matches!(bytes[start - 1], b'"' | b'\'')
+                && bytes.get(cursor) == Some(&bytes[start - 1])
+            {
+                cursor += 1;
+            }
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor == bytes.len() || !matches!(bytes[cursor], b':' | b'=') {
+                continue;
+            }
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let value_start = cursor;
+            if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
+                let quote = bytes[cursor];
+                cursor += 1;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\\' {
+                        cursor = (cursor + 2).min(bytes.len());
+                    } else if bytes[cursor] == quote {
+                        cursor += 1;
+                        break;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            } else if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+            ) {
+                cursor = bytes.len();
+            } else {
+                while cursor < bytes.len()
+                    && !bytes[cursor].is_ascii_whitespace()
+                    && !matches!(bytes[cursor], b',' | b';' | b'}')
+                {
+                    cursor += 1;
+                }
+            }
+            output.push_str(&line[copied..value_start]);
+            output.push_str("[redacted]");
+            copied = cursor;
+        }
+        output.push_str(&line[copied..]);
+        output
+    }
+    fn redact_json(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (name, value) in fields {
+                    if sensitive(name) {
+                        *value = serde_json::Value::String("[redacted]".to_owned());
+                    } else {
+                        redact_json(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(redact_json),
+            serde_json::Value::String(text) => *text = redact_text(text),
+            _ => {}
+        }
+    }
+    let redacted = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(mut value) => {
+            redact_json(&mut value);
+            value.to_string()
+        }
+        Err(_) => redact_text(line),
+    };
+    wire::sanitize(redacted)
 }
 
 /// Execute one G03 update order: the lifecycle executor performs the full
@@ -1702,12 +1793,8 @@ fn inspection_from_state(
     state: DeploymentState,
 ) -> Result<InstanceInspection, Failure> {
     let scope_dir = store.scope_dir(&state.deployment_id)?;
-    let backup = backup::backup_projection(&scope_dir, &state).map_err(|error| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            wire::sanitize(format!("invalid backup evidence: {error}")),
-        )
-    })?;
+    let mut diagnostics = Vec::new();
+    let backup = backup::inspect_backup(&scope_dir, &state, &mut diagnostics);
     Ok(InstanceInspection {
         deployment_id: state.deployment_id,
         issuer: state.issuer,
@@ -1728,6 +1815,7 @@ fn inspection_from_state(
         // fact that only the dedicated inspect kind surfaces.
         config_revision_marker: None,
         current_release: state.current_release,
+        diagnostics,
         current_instance_identity: None,
     })
 }
@@ -1756,44 +1844,22 @@ fn answer_inspect(
     let deployment_id = operation.deployment_id.clone().unwrap_or_default();
     let state = store.load_existing(&deployment_id)?;
     let scope_dir = store.scope_dir(&deployment_id)?;
-    let backup = backup::backup_projection(&scope_dir, &state).map_err(|error| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            wire::sanitize(format!("invalid backup evidence: {error}")),
-        )
-    })?;
-    let current_instance_identity = current_instance_identity(&state)?;
-    let config_revision_marker = Some(&scope_dir).and_then(|scope| {
-        std::fs::read(scope.join("config-revision"))
-            .ok()
-            .map(|bytes| String::from_utf8_lossy(bytes.trim_ascii()).into_owned())
-            .filter(|value| !value.is_empty())
-    });
+    let identity = current_instance_identity(&state);
+    let mut inspection = inspection_from_state(store, state)?;
+    match identity {
+        Ok(value) => inspection.current_instance_identity = value,
+        Err(error) => inspection.diagnostics.push(wire::sanitize(format!(
+            "runtime identity: {}",
+            error.detail
+        ))),
+    }
+    inspection.config_revision_marker = std::fs::read(scope_dir.join("config-revision"))
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(bytes.trim_ascii()).into_owned())
+        .filter(|value| !value.is_empty());
     Ok(HostResult::completed(
         &operation.operation_id,
-        HostCompletionBody::StateInspect {
-            inspection: InstanceInspection {
-                deployment_id: state.deployment_id.clone(),
-                issuer: state.issuer.clone(),
-                observed_at: Utc::now(),
-                revision: state.config.revision,
-                runtime: state.runtime.clone(),
-                artifact: state.artifact.clone(),
-                config_reference: state.config.reference.clone(),
-                config_schema: state.config.schema.clone(),
-                resources: state.resources.clone(),
-                healthy: state.local_health.healthy,
-                health_summary: state.local_health.summary.clone(),
-                backup,
-                active_host_operation: state
-                    .active_host_operation
-                    .as_ref()
-                    .map(|active| active.operation_id.clone()),
-                config_revision_marker,
-                current_release: state.current_release.clone(),
-                current_instance_identity,
-            },
-        },
+        HostCompletionBody::StateInspect { inspection },
     ))
 }
 
@@ -1886,26 +1952,7 @@ impl ExecutionTarget for LocalTarget {
         // State mutations run under the C07 journal contract on this machine
         // exactly as the remote exec helper journals them on a target host —
         // the install use case cannot tell the transports apart.
-        if matches!(
-            operation.operation,
-            HostOperationBody::StateMutate { .. }
-                | HostOperationBody::BackupRecover { .. }
-                | HostOperationBody::BackupRecoveryCandidateStage { .. }
-                | HostOperationBody::BackupRecoveryCandidateControl { .. }
-                | HostOperationBody::BackupRecoveryCandidateCleanup { .. }
-                | HostOperationBody::BackupRecoveryActivate { .. }
-                | HostOperationBody::BackupSnapshot {}
-                | HostOperationBody::BackupRestoreTest {}
-                | HostOperationBody::BackupExportPrepare {}
-                | HostOperationBody::BackupImportPrepare {}
-                | HostOperationBody::BackupTransferRead { .. }
-                | HostOperationBody::BackupTransferWrite { .. }
-                | HostOperationBody::BackupImportFinalize { .. }
-                | HostOperationBody::BackupOffHostRecord { .. }
-                | HostOperationBody::BackupTransferCleanup { .. }
-                | HostOperationBody::ControlOperation { .. }
-                | HostOperationBody::AdminCreate { .. }
-        ) {
+        if operation.operation.requires_journal() {
             let journal = TargetJournal::open(&self.state_root)?;
             return self.execute_journaled_validated(operation, &journal);
         }
@@ -1944,6 +1991,30 @@ impl ExecutionTarget for LocalTarget {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_redaction_preserves_diagnostics_and_masks_values() {
+        assert_eq!(
+            super::redact_log_line("token validation failed: 令牌已过期"),
+            "token validation failed: 令牌已过期"
+        );
+        assert_eq!(
+            super::redact_log_line("login password=hidden user=alice"),
+            "login password=[redacted] user=alice"
+        );
+        assert_eq!(
+            super::redact_log_line("request Authorization: Bearer hidden"),
+            "request Authorization: [redacted]"
+        );
+        assert_eq!(
+            super::redact_log_line(r#"INFO {"token":"hidden","event":"failure"}"#),
+            r#"INFO {"token":[redacted],"event":"failure"}"#
+        );
+        let value = super::redact_log_line(
+            r#"{"event":"token rejected","access_token":"hidden","context":{"password":"hidden"}}"#,
+        );
+        assert!(!value.contains("hidden"));
+        assert!(value.contains("token rejected"));
+    }
     use super::*;
     use crate::filesystem::PrivateTempDir;
 

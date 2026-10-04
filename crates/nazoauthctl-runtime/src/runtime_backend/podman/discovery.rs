@@ -17,10 +17,19 @@ pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation
     )?;
     let mut observations = Vec::new();
     for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
-        match inspect(command, id) {
-            Ok(observation) if observation.server_command_verified => {
-                observations.push(observation)
+        let candidate = container_shared::inspect_document_optional(
+            command,
+            &["container", "inspect", id],
+            "Podman",
+        )
+        .and_then(|value| match value {
+            Some(value) if is_server_document(&value) => {
+                observation_from_document(command, &value).map(Some)
             }
+            _ => Ok(None),
+        });
+        match candidate {
+            Ok(Some(observation)) => observations.push(observation),
             Ok(_) => {}
             Err(error) if container_shared::is_engine_unavailable_error(&error) => {
                 return Err(error);
@@ -34,18 +43,10 @@ pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation
     Ok(observations)
 }
 
-pub(super) fn inspect(
-    command: &OsStr,
-    object_reference: &str,
-) -> anyhow::Result<RuntimeObservation> {
-    let value = container_shared::inspect_document(
-        command,
-        &["container", "inspect", object_reference],
-        "Podman",
-    )?;
-    let config = value
-        .get("Config")
-        .context("Podman inspect omitted Config")?;
+fn is_server_document(value: &serde_json::Value) -> bool {
+    let Some(config) = value.get("Config") else {
+        return false;
+    };
     let command_values = config
         .get("Command")
         .or_else(|| config.get("Cmd"))
@@ -61,7 +62,29 @@ pub(super) fn inspect(
         .map(|value| vec![value.to_owned()])
         .unwrap_or_default();
     complete_command.extend(command_values);
-    let server_command_verified = server_command_verified(&complete_command);
+    server_command_verified(&complete_command)
+}
+
+pub(super) fn inspect(
+    command: &OsStr,
+    object_reference: &str,
+) -> anyhow::Result<RuntimeObservation> {
+    let value = container_shared::inspect_document(
+        command,
+        &["container", "inspect", object_reference],
+        "Podman",
+    )?;
+    observation_from_document(command, &value)
+}
+
+pub(super) fn observation_from_document(
+    command: &OsStr,
+    value: &serde_json::Value,
+) -> anyhow::Result<RuntimeObservation> {
+    let config = value
+        .get("Config")
+        .context("Podman inspect omitted Config")?;
+    let server_command_verified = is_server_document(value);
     let image_reference = value
         .get("ImageName")
         .or_else(|| config.get("Image"))
@@ -89,13 +112,13 @@ pub(super) fn inspect(
                 Some("trusted OCI digest could not be resolved".to_owned()),
             ),
         };
-    let ports = parse_ports(&value)?;
+    let ports = parse_ports(value)?;
     let networks = value
         .pointer("/NetworkSettings/Networks")
         .and_then(serde_json::Value::as_object)
         .map(|networks| networks.keys().cloned().collect())
         .unwrap_or_default();
-    let mounts = parse_mounts(&value)?;
+    let mounts = parse_mounts(value)?;
     let safe_environment = safe_environment(
         config
             .get("Env")
@@ -257,16 +280,13 @@ pub(super) fn inspect_optional(
     command: &OsStr,
     object_reference: &str,
 ) -> anyhow::Result<Option<RuntimeObservation>> {
-    if container_shared::inspect_document_optional(
+    container_shared::inspect_document_optional(
         command,
         &["container", "inspect", object_reference],
         "Podman",
     )?
-    .is_none()
-    {
-        return Ok(None);
-    }
-    Ok(Some(inspect(command, object_reference)?))
+    .map(|value| observation_from_document(command, &value))
+    .transpose()
 }
 
 /// Whether any locally cached image carries exactly the repository digest
@@ -321,28 +341,16 @@ pub(super) fn resolve_image_digest(
         local_image_id,
         "{{json .RepoDigests}}",
     )?;
-    let expected = image_reference
-        .rsplit_once('@')
-        .map(|(_, digest)| digest.to_ascii_lowercase());
-    if let Ok(values) = serde_json::from_str::<Vec<String>>(repo_digests.trim()) {
-        if let Some(digest) = values
+    if let Ok(values) = serde_json::from_str::<Vec<String>>(repo_digests.trim())
+        && let Some(digest) = values
             .iter()
             .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
             .find(|digest| {
                 container_shared::valid_digest(digest)
                     && container_shared::requested_digest_matches(image_reference, digest)
             })
-        {
-            return Ok(digest.to_ascii_lowercase());
-        }
-        if expected.is_none()
-            && let Some(digest) = values
-                .iter()
-                .filter_map(|value| value.rsplit_once('@').map(|(_, digest)| digest))
-                .find(|digest| container_shared::valid_digest(digest))
-        {
-            return Ok(digest.to_ascii_lowercase());
-        }
+    {
+        return Ok(digest.to_ascii_lowercase());
     }
     let digest = image_inspect_output(command, image_reference, local_image_id, "{{.Digest}}")?;
     let digest = digest.trim();

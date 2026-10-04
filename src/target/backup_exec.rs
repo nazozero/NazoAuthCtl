@@ -402,10 +402,12 @@ pub(crate) fn prepare_export(
     }
     crate::filesystem::ensure_private_directory(&directory, "backup export directory")
         .map_err(backup_failure)?;
-    for name in ["postgresql.dump", "deployment.tar", IMMUTABLE_MANIFEST_FILE] {
+    for name in ["postgresql.dump", "deployment.tar"] {
         fs::hard_link(snapshot_dir.join(name), directory.join(name))
             .map_err(|error| backup_failure(error.into()))?;
     }
+    backup::write_manifest_at(&directory.join(IMMUTABLE_MANIFEST_FILE), &manifest)
+        .map_err(backup_failure)?;
     verify_snapshot_files(&directory, &manifest).map_err(backup_failure)?;
     let mut files = manifest.files;
     files.push(
@@ -569,20 +571,42 @@ pub(crate) fn write_transfer_chunk(
         .join("transfers")
         .join(format!("import-{operation}.partial"));
     let path = directory.join(file_name);
-    if offset > 0 {
+    let end = offset + bytes.as_bytes().len() as u64;
+    if path.exists() {
         let metadata = fs::symlink_metadata(&path).map_err(|error| backup_failure(error.into()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != offset {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() < offset
+            || metadata.len() > end
+        {
             return Err(Failure::new(
                 BACKUP_EXECUTION_FAILED,
                 "backup transfer destination offset does not match its partial file",
             ));
         }
+        // Pending journal replay may observe a complete or partially written
+        // chunk. Only bytes belonging to this exact request may be overwritten.
+        let mut file = fs::File::open(&path).map_err(|error| backup_failure(error.into()))?;
+        let mut existing = vec![0; (metadata.len() - offset) as usize];
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut existing))
+            .map_err(|error| backup_failure(error.into()))?;
+        if existing != bytes.as_bytes()[..existing.len()] {
+            return Err(Failure::new(
+                BACKUP_EXECUTION_FAILED,
+                "backup transfer replay conflicts with persisted chunk bytes",
+            ));
+        }
+    } else if offset != 0 {
+        return Err(Failure::new(
+            BACKUP_EXECUTION_FAILED,
+            "backup transfer destination is missing preceding chunks",
+        ));
+    } else {
+        crate::filesystem::atomic_write(&path, b"", 0o600).map_err(backup_failure)?;
     }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true);
-    if offset == 0 {
-        options.truncate(true);
-    }
+    options.write(true);
     let mut file = options
         .open(&path)
         .map_err(|error| backup_failure(error.into()))?;
@@ -636,7 +660,15 @@ pub(crate) fn finalize_import(
         .join("backup")
         .join("transfers")
         .join(format!("import-{operation}.partial"));
-    let manifest = backup::load_manifest_at(&incoming.join(IMMUTABLE_MANIFEST_FILE))
+    // Keep the operation-bound manifest until transfer cleanup. The incoming
+    // directory disappears at publication, before the terminal journal is durable.
+    let binding = incoming.with_extension("manifest.json");
+    let manifest_path = if incoming.exists() {
+        incoming.join(IMMUTABLE_MANIFEST_FILE)
+    } else {
+        binding.clone()
+    };
+    let manifest = backup::load_manifest_at(&manifest_path)
         .map_err(backup_failure)?
         .ok_or_else(|| {
             Failure::new(
@@ -652,7 +684,6 @@ pub(crate) fn finalize_import(
             "backup import manifest binding differs from the transfer request",
         ));
     }
-    verify_snapshot_files(&incoming, &manifest).map_err(backup_failure)?;
     let final_dir = scope_dir
         .join("backup")
         .join("snapshots")
@@ -672,8 +703,15 @@ pub(crate) fn finalize_import(
                 "destination snapshot id is occupied by different bytes",
             ));
         }
-        fs::remove_dir_all(&incoming).map_err(|error| backup_failure(error.into()))?;
+        verify_snapshot_files(&final_dir, &manifest).map_err(backup_failure)?;
+        if incoming.exists() {
+            verify_snapshot_files(&incoming, &manifest).map_err(backup_failure)?;
+            backup::write_manifest_at(&binding, &manifest).map_err(backup_failure)?;
+            fs::remove_dir_all(&incoming).map_err(|error| backup_failure(error.into()))?;
+        }
     } else {
+        verify_snapshot_files(&incoming, &manifest).map_err(backup_failure)?;
+        backup::write_manifest_at(&binding, &manifest).map_err(backup_failure)?;
         crate::filesystem::ensure_private_directory(
             final_dir.parent().expect("snapshot has parent"),
             "off-host snapshot root",
@@ -681,6 +719,8 @@ pub(crate) fn finalize_import(
         .map_err(backup_failure)?;
         fs::rename(&incoming, &final_dir).map_err(|error| backup_failure(error.into()))?;
     }
+    crate::filesystem::sync_parent(&final_dir).map_err(backup_failure)?;
+    crate::filesystem::sync_parent(&incoming).map_err(backup_failure)?;
     let receipt = backup::OffHostCopyReceipt {
         schema: backup::OFF_HOST_COPY_RECEIPT_SCHEMA,
         deployment_id: deployment_id.to_owned(),
@@ -716,6 +756,13 @@ pub(crate) fn cleanup_transfer(scope_dir: &Path, operation_id: &str) -> Result<(
             "backup copy operation id must be a UUID",
         )
     })?;
+    remove_file_if_present(
+        &scope_dir
+            .join("backup")
+            .join("transfers")
+            .join(format!("import-{operation}.manifest.json")),
+    )
+    .map_err(backup_failure)?;
     for name in [
         format!("export-{operation}"),
         format!("import-{operation}.partial"),
@@ -835,27 +882,12 @@ pub(crate) fn recover(
         return Ok(facts);
     }
     let extracted = recovery_root.join("extracted");
-    if extracted.exists() {
-        let mut found = Vec::new();
-        collect_regular_files(&extracted, &extracted, &mut found).map_err(restore_failure)?;
-        found.sort_by(|left, right| left.path.cmp(&right.path));
-        let mut expected = manifest.archive_files.clone();
-        expected.sort_by(|left, right| left.path.cmp(&right.path));
-        if found != expected {
-            return Err(Failure::new(
-                RESTORE_TEST_FAILED,
-                "recovery staging differs from the snapshot manifest",
-            ));
-        }
-    } else {
-        fs::create_dir(&extracted).map_err(|error| restore_failure(error.into()))?;
-        extract_deployment_archive(
-            &snapshot_dir.join("deployment.tar"),
-            &extracted,
-            &manifest.archive_files,
-        )
-        .map_err(restore_failure)?;
-    }
+    prepare_recovery_archive(
+        &snapshot_dir.join("deployment.tar"),
+        &extracted,
+        &manifest.archive_files,
+    )
+    .map_err(restore_failure)?;
     let extracted_data = extracted.join("app-data");
     let extracted_secrets = extracted.join("app-secrets");
     let extracted_config = extracted.join("config.yaml");
@@ -973,25 +1005,12 @@ pub(crate) fn recover(
             ));
         }
     }
-    write_secret(
-        &extracted_secrets.join("database-lifecycle-url"),
-        &original_connection
-            .with_database(&database)
-            .with_password_url()
-            .map_err(restore_failure)?,
-    )
-    .map_err(restore_failure)?;
     let runtime_connection = postgres_connection(&extracted_secrets.join("database-runtime-url"))
         .map_err(restore_failure)?;
     let runtime_database_url = runtime_connection
         .with_database(&database)
         .with_password_url()
         .map_err(restore_failure)?;
-    write_secret(
-        &extracted_secrets.join("database-runtime-url"),
-        &runtime_database_url,
-    )
-    .map_err(restore_failure)?;
     let restored_config =
         rewrite_recovery_config(&extracted_config, &runtime_database_url, state_epoch)
             .map_err(restore_failure)?;
@@ -1007,13 +1026,28 @@ pub(crate) fn recover(
     if !staged_data.exists()
         && !recovery_path_switched(&target_data, operation, "data").map_err(restore_failure)?
     {
-        copy_tree(&extracted_data, &staged_data).map_err(restore_failure)?;
+        copy_tree_atomic(&extracted_data, &staged_data).map_err(restore_failure)?;
     }
     if !staged_secrets.exists()
         && !recovery_path_switched(&target_secrets, operation, "secrets")
             .map_err(restore_failure)?
     {
-        copy_tree(&extracted_secrets, &staged_secrets).map_err(restore_failure)?;
+        copy_tree_atomic(&extracted_secrets, &staged_secrets).map_err(restore_failure)?;
+    }
+    if staged_secrets.exists() {
+        write_secret(
+            &staged_secrets.join("database-lifecycle-url"),
+            &original_connection
+                .with_database(&database)
+                .with_password_url()
+                .map_err(restore_failure)?,
+        )
+        .map_err(restore_failure)?;
+        write_secret(
+            &staged_secrets.join("database-runtime-url"),
+            &runtime_database_url,
+        )
+        .map_err(restore_failure)?;
     }
     if !staged_config.exists()
         && !recovery_path_switched(&target_config, operation, "config").map_err(restore_failure)?
@@ -1155,12 +1189,7 @@ pub(crate) fn stage_recovery_candidate(
             version_floor,
             runtime_root,
         )?;
-        let release = verified.release.ok_or_else(|| {
-            Failure::new(
-                RESTORE_TEST_FAILED,
-                "recovery target Release has no verified release identity",
-            )
-        })?;
+        let release = verified.release;
         if let Some(requested) = target.version.as_deref()
             && release.version != requested
         {
@@ -2101,6 +2130,57 @@ fn relative_archive_path(path: &Path) -> anyhow::Result<String> {
     Ok(parts.join("/"))
 }
 
+fn prepare_recovery_archive(
+    archive: &Path,
+    destination: &Path,
+    expected: &[SnapshotFile],
+) -> anyhow::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "recovery extraction must be a real directory"
+            );
+            let mut found = Vec::new();
+            collect_regular_files(destination, destination, &mut found)?;
+            found.sort_by(|a, b| a.path.cmp(&b.path));
+            let mut sorted_expected = expected.to_vec();
+            sorted_expected.sort_by(|a, b| a.path.cmp(&b.path));
+            if found == sorted_expected {
+                return Ok(());
+            }
+            // This operation-owned directory is derived entirely from the
+            // verified archive. An interrupted older extraction is disposable.
+            fs::remove_dir_all(destination)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let partial = destination.with_extension("partial");
+    match fs::symlink_metadata(&partial) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "partial extraction must be a real directory"
+            );
+            fs::remove_dir_all(&partial)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    fs::create_dir(&partial)?;
+    extract_deployment_archive(archive, &partial, expected)?;
+    for file in expected {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(cfg!(windows))
+            .open(partial.join(&file.path))?
+            .sync_all()?;
+    }
+    fs::rename(&partial, destination)?;
+    crate::filesystem::sync_parent(destination)
+}
+
 fn extract_deployment_archive(
     archive_path: &Path,
     destination: &Path,
@@ -2463,6 +2543,28 @@ fn sibling_operation_path(target: &Path, operation: Uuid, suffix: &str) -> anyho
     Ok(parent.join(format!(".{name}.nazo-recovery-{operation}-{suffix}")))
 }
 
+fn copy_tree_atomic(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    let name = destination
+        .file_name()
+        .context("staging destination has no name")?
+        .to_string_lossy();
+    let partial = destination.with_file_name(format!("{name}.partial"));
+    match fs::symlink_metadata(&partial) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "partial recovery staging must be a real directory"
+            );
+            fs::remove_dir_all(&partial)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    copy_tree(source, &partial)?;
+    fs::rename(&partial, destination)?;
+    crate::filesystem::sync_parent(destination)
+}
+
 fn copy_tree(source: &Path, destination: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     ensure!(
@@ -2483,10 +2585,17 @@ fn copy_tree(source: &Path, destination: &Path) -> anyhow::Result<()> {
             copy_tree(&source, &destination)?;
         } else if metadata.is_file() {
             fs::copy(&source, &destination)?;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(cfg!(windows))
+                .open(&destination)?
+                .sync_all()?;
         } else {
             bail!("recovery source contains a non-regular entry");
         }
     }
+    #[cfg(unix)]
+    fs::File::open(destination)?.sync_all()?;
     Ok(())
 }
 
@@ -2628,6 +2737,7 @@ fn start_candidate(
         container_policy: Some(ContainerRuntimePolicy::managed_app()),
     };
     backend.replace(&replacement)?;
+    backend.start(candidate)?;
     fetch_runtime(port, LOCAL_READINESS_PATH, &state.issuer, &config_bytes)?;
     ensure!(
         oidc_signing_key_ids(port, &state.issuer, &config_bytes)? == manifest.oidc_signing_key_ids,
@@ -3043,6 +3153,52 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    #[test]
+    fn recovery_extraction_rebuilds_interrupted_staging_and_reuses_complete_content()
+    -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("recovery-extraction")?;
+        let archive_path = temp.path().join("deployment.tar");
+        let mut archive = TarBuilder::new(fs::File::create(&archive_path)?);
+        let mut expected = Vec::new();
+        append_bytes(
+            &mut archive,
+            Path::new("config.yaml"),
+            b"complete",
+            &mut expected,
+        )?;
+        archive.finish()?;
+        drop(archive);
+        let destination = temp.path().join("extracted");
+        fs::create_dir(&destination)?;
+        fs::write(destination.join("config.yaml"), b"partial")?;
+        let partial = destination.with_extension("partial");
+        fs::create_dir(&partial)?;
+        fs::write(partial.join("leftover"), b"partial")?;
+        prepare_recovery_archive(&archive_path, &destination, &expected)?;
+        assert_eq!(fs::read(destination.join("config.yaml"))?, b"complete");
+        assert!(!partial.exists());
+        // A completed extraction no longer needs to read the archive again.
+        prepare_recovery_archive(&temp.path().join("absent.tar"), &destination, &expected)?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_copy_rebuilds_only_the_unpublished_partial_tree() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("recovery-copy")?;
+        let source = temp.path().join("source");
+        fs::create_dir(&source)?;
+        write_fixture(source.join("secret"), b"original")?;
+        let destination = temp.path().join("stage");
+        let partial = temp.path().join("stage.partial");
+        fs::create_dir(&partial)?;
+        write_fixture(partial.join("leftover"), b"incomplete")?;
+        copy_tree_atomic(&source, &destination)?;
+        assert_eq!(fs::read(destination.join("secret"))?, b"original");
+        assert!(!destination.join("leftover").exists());
+        assert_eq!(fs::read(source.join("secret"))?, b"original");
+        Ok(())
+    }
+
     fn write_fixture(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> anyhow::Result<()> {
         crate::filesystem::atomic_write(path.as_ref(), bytes.as_ref(), 0o600)
     }
@@ -3377,7 +3533,87 @@ mod tests {
         assert_eq!(replayed, manifest);
         assert!(!backup::receipt_path(&scope_dir).exists());
         assert!(!backup::off_host_receipt_path(&scope_dir).exists());
-        assert_eq!(backup::load_manifest(&scope_dir)?, Some(manifest));
+        assert_eq!(backup::load_manifest(&scope_dir)?, Some(manifest.clone()));
+
+        // Export remains readable even though large payloads are hard-linked.
+        let transfer = Uuid::now_v7().to_string();
+        let plan = prepare_export(&scope_dir, &state, &transfer)?;
+        let destination = crate::filesystem::PrivateTempDir::new("backup-import-replay")?;
+        prepare_import(destination.path(), deployment_id, &transfer)?;
+        for file in plan.files {
+            let chunk = read_transfer_chunk(
+                &scope_dir,
+                &transfer,
+                &file.path,
+                0,
+                MAX_BACKUP_TRANSFER_CHUNK_BYTES as u32,
+            )?;
+            write_transfer_chunk(
+                destination.path(),
+                &transfer,
+                &file.path,
+                0,
+                chunk.total_bytes,
+                &chunk.file_sha256,
+                &chunk.bytes,
+            )?;
+        }
+        // Imported backup bytes must already satisfy the private-file contract
+        // before publication, independently of the process token's default ACL.
+        for name in ["postgresql.dump", "deployment.tar", IMMUTABLE_MANIFEST_FILE] {
+            crate::filesystem::read_secure_regular_file(
+                &destination
+                    .path()
+                    .join("backup/transfers")
+                    .join(format!("import-{transfer}.partial"))
+                    .join(name),
+                "imported backup file",
+                true,
+                MAX_BACKUP_TRANSFER_FILE_BYTES,
+            )?;
+        }
+        let source_host = Uuid::now_v7().to_string();
+        let destination_host = Uuid::now_v7().to_string();
+        let first = finalize_import(
+            destination.path(),
+            deployment_id,
+            &transfer,
+            &manifest.manifest_sha256,
+            &source_host,
+            &destination_host,
+        )?;
+        // Incoming has been renamed; replay must prove the published snapshot.
+        let replay = finalize_import(
+            destination.path(),
+            deployment_id,
+            &transfer,
+            &manifest.manifest_sha256,
+            &source_host,
+            &destination_host,
+        )?;
+        assert_eq!(first.manifest_sha256, replay.manifest_sha256);
+        assert_eq!(first.snapshot_id, replay.snapshot_id);
+        assert!(
+            finalize_import(
+                destination.path(),
+                deployment_id,
+                &transfer,
+                &"f".repeat(64),
+                &source_host,
+                &destination_host
+            )
+            .is_err()
+        );
+        // A diagnostic inspection retains verified snapshot facts despite a damaged receipt.
+        write_fixture(backup::receipt_path(&scope_dir), b"broken")?;
+        let mut diagnostics = Vec::new();
+        let projection = backup::inspect_backup(&scope_dir, &state, &mut diagnostics);
+        assert_eq!(
+            projection.snapshot.unwrap().manifest_sha256,
+            manifest.manifest_sha256
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(backup::backup_projection(&scope_dir, &state).is_err());
         Ok(())
     }
 
@@ -3412,7 +3648,42 @@ mod tests {
             .join("backup/transfers")
             .join(format!("import-{operation}.partial"))
             .join("deployment.tar");
-        assert_eq!(fs::read(path)?, b"abcdef");
+        // A crash after the write but before its terminal journal replays this chunk.
+        write_transfer_chunk(
+            temp.path(),
+            &operation,
+            "deployment.tar",
+            3,
+            6,
+            &digest,
+            &second,
+        )?;
+        assert_eq!(fs::read(&path)?, b"abcdef");
+        // The same pending request can also encounter a partial write.
+        fs::OpenOptions::new().write(true).open(&path)?.set_len(4)?;
+        write_transfer_chunk(
+            temp.path(),
+            &operation,
+            "deployment.tar",
+            3,
+            6,
+            &digest,
+            &second,
+        )?;
+        assert_eq!(fs::read(&path)?, b"abcdef");
+        let conflicting = BackupTransferBytes::try_new(b"xyz".to_vec())?;
+        assert!(
+            write_transfer_chunk(
+                temp.path(),
+                &operation,
+                "deployment.tar",
+                3,
+                6,
+                &digest,
+                &conflicting
+            )
+            .is_err()
+        );
         assert!(
             write_transfer_chunk(
                 temp.path(),

@@ -875,14 +875,7 @@ fn fail_after_started_process<T>(
 
 #[cfg(unix)]
 fn current_effective_uid() -> Option<u32> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status.lines().find_map(|line| {
-        let values = line
-            .strip_prefix("Uid:")?
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        values.get(1)?.parse::<u32>().ok()
-    })
+    Some(rustix::process::geteuid().as_raw())
 }
 
 impl BrowserDriver for ManagedWebDriver {

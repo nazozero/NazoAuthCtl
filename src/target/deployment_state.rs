@@ -209,10 +209,7 @@ impl Resource {
         crate::registry::validate_identifier(&self.kind, 64, "resource kind")?;
         if self.locator.is_empty()
             || self.locator.len() > 512
-            || self
-                .locator
-                .chars()
-                .any(|character| character.is_whitespace() || character.is_control())
+            || self.locator.chars().any(char::is_control)
         {
             bail!("resource locator must be a single-line reference of at most 512 characters");
         }
@@ -819,7 +816,7 @@ impl TargetStateStore {
         state.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
         })?;
-        self.persist_exact_or_recover(deployment_id, &scope, state)
+        self.persist_exact(&scope, state)
     }
 
     /// Apply a config change under revision CAS (F04). `expected_revision`
@@ -1019,7 +1016,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        self.persist_exact_or_recover(deployment_id, &scope, state)
+        self.persist_exact(&scope, state)
     }
 
     /// Commit the state facts produced by a completed recovery (H06). The
@@ -1165,7 +1162,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        self.persist_exact_or_recover(deployment_id, &scope, state)
+        self.persist_exact(&scope, state)
     }
 
     /// Remove the state document after a completed uninstall (G06). An exact
@@ -1270,53 +1267,6 @@ impl TargetStateStore {
         Ok(true)
     }
 
-    /// Record a target-local health fact (goal plan 06 §2: `local_health` is
-    /// written by whoever can actually observe the runtime). This is an
-    /// observation, not a config change: the CAS revision does not move.
-    /// Only the operation that produced the current state revision may write
-    /// the health record — a stale or foreign operation id is rejected so
-    /// interrupted lifecycles cannot stamp observations they never made.
-    pub fn record_local_health(
-        &self,
-        deployment_id: &str,
-        healthy: bool,
-        summary: String,
-        operation_id: &str,
-    ) -> Result<HealthRecord, Failure> {
-        if summary.len() > 512 {
-            return Err(Failure::new(
-                super::wire::HOST_ERR_OPERATION_INVALID,
-                "health summary must be at most 512 characters",
-            ));
-        }
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
-        let mut state = self.load_existing(deployment_id)?;
-        let owns = state
-            .active_host_operation
-            .as_ref()
-            .is_some_and(|active| active.operation_id == operation_id);
-        if !owns {
-            return Err(Failure::new(
-                DEPLOYMENT_UNKNOWN,
-                format!(
-                    "health observation rejected: '{deployment_id}' is not currently owned by \
-                     operation {operation_id}"
-                ),
-            ));
-        }
-        let record = HealthRecord {
-            healthy,
-            summary,
-            checked_at: Utc::now(),
-        };
-        state.local_health = record.clone();
-        let scope = journal::deployment_scope(deployment_id).map_err(|error| {
-            Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
-        })?;
-        persist(&scope_path(&self.root, &scope), &state)?;
-        Ok(record)
-    }
-
     fn lock_path(&self, deployment_id: &str) -> Result<PathBuf, Failure> {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
@@ -1325,25 +1275,14 @@ impl TargetStateStore {
     }
 
     /// Persist one complete state generation while its StateLock is held.
-    /// A failed parent-directory sync can occur after the atomic rename; only
-    /// an exact re-read of the attempted state proves that commit succeeded.
-    fn persist_exact_or_recover(
+    /// Readback cannot substitute for a successful durable publication.
+    fn persist_exact(
         &self,
-        deployment_id: &str,
         scope: &str,
         state: DeploymentState,
     ) -> Result<DeploymentState, Failure> {
-        match persist(&scope_path(&self.root, scope), &state) {
-            Ok(()) => Ok(state),
-            Err(_)
-                if self
-                    .load_existing(deployment_id)
-                    .is_ok_and(|stored| stored == state) =>
-            {
-                Ok(state)
-            }
-            Err(failure) => Err(failure),
-        }
+        persist(&scope_path(&self.root, scope), &state)?;
+        Ok(state)
     }
 }
 

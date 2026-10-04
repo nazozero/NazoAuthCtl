@@ -176,8 +176,6 @@ fn open_secure_regular_file_with_owner(
         .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
     validate_secure_file_metadata(&opened, path, label, private, expected_owner_uid)?;
     validate_same_file(&before, &opened, label)?;
-    #[cfg(windows)]
-    windows::validate_file_handle(&file, path, label, private)?;
     Ok(file)
 }
 
@@ -866,14 +864,8 @@ pub fn sha256(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(unix)]
 fn configure_secure_open(options: &mut OpenOptions) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
-    #[cfg(not(unix))]
-    let _ = options;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
 }
 
 pub fn sha256_file(file: &mut File, description: &str) -> anyhow::Result<String> {

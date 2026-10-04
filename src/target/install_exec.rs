@@ -261,6 +261,27 @@ pub struct ExternalEndpoint {
     pub user: String,
 }
 
+impl ExternalEndpoint {
+    pub(crate) fn postgres_url(&self, password: &[u8]) -> String {
+        format!(
+            "postgresql://{}:{}@{}:{}/{}",
+            self.user,
+            percent_encode_credential(password),
+            self.host,
+            self.port,
+            self.name
+        )
+    }
+    pub(crate) fn valkey_url(&self, password: &[u8]) -> String {
+        format!(
+            "valkey://:{}@{}:{}",
+            percent_encode_credential(password),
+            self.host,
+            self.port
+        )
+    }
+}
+
 impl InstallOrder {
     /// Enforce every invariant dispatch relies on. Called from
     /// `HostOperation::validate` so malformed orders fail at admission.
@@ -816,28 +837,15 @@ impl HostInstallExecutor {
                             )
                         })?;
                         let value = match secret.purpose.as_str() {
-                            "database-runtime-url" => format!(
-                                "postgresql://{}:{}@{}:{}/{}",
-                                job.order.database_runtime_endpoint.user,
-                                percent_encode_credential(credential.as_bytes()),
-                                job.order.database_runtime_endpoint.host,
-                                job.order.database_runtime_endpoint.port,
-                                job.order.database_runtime_endpoint.name,
-                            ),
-                            "database-lifecycle-url" => format!(
-                                "postgresql://{}:{}@{}:{}/{}",
-                                job.order.database_lifecycle_endpoint.user,
-                                percent_encode_credential(credential.as_bytes()),
-                                job.order.database_lifecycle_endpoint.host,
-                                job.order.database_lifecycle_endpoint.port,
-                                job.order.database_lifecycle_endpoint.name,
-                            ),
-                            _ => format!(
-                                "valkey://:{}@{}:{}",
-                                percent_encode_credential(credential.as_bytes()),
-                                job.order.valkey_endpoint.host,
-                                job.order.valkey_endpoint.port,
-                            ),
+                            "database-runtime-url" => job
+                                .order
+                                .database_runtime_endpoint
+                                .postgres_url(credential.as_bytes()),
+                            "database-lifecycle-url" => job
+                                .order
+                                .database_lifecycle_endpoint
+                                .postgres_url(credential.as_bytes()),
+                            _ => job.order.valkey_endpoint.valkey_url(credential.as_bytes()),
                         };
                         atomic_write(&path, value.as_bytes(), 0o440).map_err(|error| {
                             Failure::new(SECRET_PROVISION_FAILED, sanitize(error.to_string()))
@@ -871,11 +879,20 @@ impl HostInstallExecutor {
             }
             if kind.is_container() {
                 set_runtime_identity(&path, false, rootless_podman)?;
-                if let Some(parent) = path.parent() {
-                    set_runtime_identity_directory(parent, rootless_podman)?;
-                }
             }
             performed.generated_secrets.push(secret.path.clone());
+        }
+
+        if kind.is_container() {
+            let parents = job
+                .order
+                .secrets
+                .iter()
+                .filter_map(|secret| Path::new(&secret.path).parent())
+                .collect::<std::collections::BTreeSet<_>>();
+            for parent in parents {
+                set_runtime_identity_directory(parent, rootless_podman)?;
+            }
         }
 
         // The writable data directory is mounted straight into the container:
@@ -931,7 +948,7 @@ impl HostInstallExecutor {
 
         Ok(InstallFacts {
             artifact_reference: format!("sha256:{}", verified.digest),
-            release: verified.release,
+            release: Some(verified.release),
         })
     }
 }
@@ -1159,7 +1176,7 @@ fn start_container_runtime(
     let replacement = runtime_backend::RuntimeReplacement {
         object_reference: job.runtime.object.clone(),
         artifact: runtime_artifact.clone(),
-        local_artifact_id: verified.local_artifact_id.clone(),
+        local_artifact_id: None,
         command: vec!["nazoauth".to_owned(), "server".to_owned()],
         mounts,
         environment,

@@ -85,3 +85,24 @@ cross-platform suite: run it with `--ignored --exact` and an isolated
 randomly named test databases and checks legacy/current dump-restore hashes,
 changed facts, unknown layouts and missing tables. The regular suite retains
 the published manifest checksum fixtures and output-pollution checks.
+
+## Operation-specific compatibility
+
+Host wire schema 11 and existing operation/result payloads are retained. An
+inspection can now return independently readable facts with `diagnostics` when
+unrelated backup or identity metadata is damaged; healthy results omit this
+field. Admission, snapshot consumption and `self verify-state` still validate
+the facts they actually use.
+
+From controller/helper 0.2.31, backup chunks reuse one bounded SSH helper
+session per target. The controller selects this only after the verified helper
+hello advertises 0.2.31 or newer. Older helpers use the existing one-operation
+transport. Chunk identities, digests, journal replay and interrupted-copy
+semantics remain unchanged; no new command option is needed.
+Imported files receive private permissions and the current user's ownership
+before the first chunk is written, including on elevated Windows hosts.
+
+ACME accounts are keyed by deployment and CA directory. Existing pending
+transactions keep their recorded account path; new transactions automatically
+reuse a matching legacy account. Historical account files remain available to
+validate receipts bound to their original key.

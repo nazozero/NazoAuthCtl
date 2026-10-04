@@ -280,3 +280,16 @@ then issues a digest-bound Revoke, persists each typed terminal result, and
 removes the private manifest only through the journal's deletion-intent state
 machine. mTLS trust is an ordinary tenant resource; ingress forwards the RFC
 9440 client-certificate header and no per-run proxy trust file is installed.
+
+
+A trust-policy document contains public verification authority, not a secret.
+It may be readable by other users; trusted ownership and protection against
+untrusted writes are still required. Credentials, private keys and private
+evidence retain their private-file requirements.
+
+The pinned operator-protocol dependency remains authoritative for its exported
+types. The existing VP receipt/intent extension in `oidf_protocol.rs` is not
+present in that pinned revision. Its active consumers remain explicit local
+imports until the producer and shared protocol can be updated together; it must
+not masquerade as a re-export of the dependency. Removing it independently
+would remove a currently used conformance capability.

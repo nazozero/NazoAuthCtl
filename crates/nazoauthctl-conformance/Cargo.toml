@@ -11,6 +11,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+nazoauthctl-runtime = { path = "../nazoauthctl-runtime" }
 anyhow = "1.0.103"
 aws-lc-rs = { version = "1.18.0", default-features = false, features = ["aws-lc-sys"] }
 nazo-operator-protocol.workspace = true

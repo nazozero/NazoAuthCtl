@@ -17,7 +17,6 @@ use crate::{
 
 const MAX_PROFILE_TOKEN_BYTES: u64 = 4 * 1024;
 const DYNAMIC_REGISTRATION_TOKEN_NAME: &str = "dynamic-registration-token";
-const CIBA_DECISION_TOKEN_NAME: &str = "ciba-decision-token";
 const OPENID4VP_MANAGEMENT_TOKEN_NAME: &str = "openid4vp-management-token";
 const OPENID4VCI_MANAGEMENT_TOKEN_NAME: &str = "openid4vci-management-token";
 
@@ -437,10 +436,6 @@ impl ConformanceSession {
             tenant_id,
             b"nazoauth/dynamic-client-registration/initial-access/v1",
         )
-    }
-
-    pub fn ciba_automated_decision_token(&self) -> anyhow::Result<zeroize::Zeroizing<String>> {
-        self.read_profile_secret(CIBA_DECISION_TOKEN_NAME, "CIBA automated-decision token")
     }
 
     fn read_profile_secret(

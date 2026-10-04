@@ -53,17 +53,6 @@ impl BrowserRunnerState {
             .find(|url| !self.visited.iter().any(|seen| seen == *url))
     }
 
-    pub fn mark_visited(&mut self, url: &Url, policy: &BrowserPolicy) -> Result<(), BrowserError> {
-        policy.validate_url(url)?;
-        if !self.urls.iter().any(|candidate| candidate == url) {
-            return Err(BrowserError::InvalidSchema);
-        }
-        if !self.visited.iter().any(|seen| seen == url) {
-            self.visited.push(url.clone());
-        }
-        Ok(())
-    }
-
     pub fn urls(&self) -> &[Url] {
         &self.urls
     }

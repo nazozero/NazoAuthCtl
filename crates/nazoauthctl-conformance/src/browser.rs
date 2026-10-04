@@ -24,8 +24,6 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::oidf_protocol as nazo_operator_protocol;
-
 #[cfg(test)]
 use crate::origin::Origin;
 
@@ -1170,7 +1168,7 @@ fn vp_result_url_diagnostic(
         fragment
             .and_then(|value| value.strip_prefix("receipt="))
             .and_then(|capability| {
-                nazo_operator_protocol::openid4vp_verification_capability_sha256(capability).ok()
+                crate::oidf_protocol::openid4vp_verification_capability_sha256(capability).ok()
             })
             .is_some_and(|actual| actual == expected)
     });
@@ -1582,24 +1580,6 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
 
     pub fn policy(&self) -> &BrowserPolicy {
         &self.policy
-    }
-
-    pub fn run_commands(&mut self, commands: &[BrowserCommand]) -> Result<usize, BrowserError> {
-        self.run_commands_with_review_capture(
-            commands,
-            None,
-            &mut BrowserRunReport {
-                steps: 0,
-                tasks: 0,
-                entry_index: 0,
-                final_origin: String::new(),
-                review_screenshots: Vec::new(),
-                review_screenshot_attempts: 0,
-                review_screenshots_required: 0,
-                review_screenshots_required_captured: 0,
-                review_screenshots_missing: 0,
-            },
-        )
     }
 
     fn run_commands_with_review_capture(
@@ -2546,14 +2526,6 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         self.expect_result_text(&root, "vp-receipt-sha256", &evidence.receipt.receipt_sha256)
     }
 
-    pub fn run_command_values(&mut self, commands: &[Value]) -> Result<usize, BrowserError> {
-        let parsed = commands
-            .iter()
-            .map(BrowserCommand::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        self.run_commands(&parsed)
-    }
-
     fn execute_command(&mut self, command: &BrowserCommand) -> Result<(), BrowserError> {
         match command {
             BrowserCommand::WaitForElement {
@@ -2562,13 +2534,14 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 text_pattern,
                 ..
             } => {
+                let text_pattern = text_pattern.as_deref().map(compile_pattern).transpose()?;
                 let deadline = self.deadline(*timeout);
                 loop {
                     match self.driver.find_element(selector) {
                         Ok(element) => {
-                            if let Some(pattern) = text_pattern {
+                            if let Some(pattern) = &text_pattern {
                                 match self.driver.element_text(&element) {
-                                    Ok(text) if compile_pattern(pattern)?.is_match(&text) => {
+                                    Ok(text) if pattern.is_match(&text) => {
                                         return Ok(());
                                     }
                                     Ok(_)
@@ -2715,15 +2688,15 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         })
     }
 
-    fn matching_entry(
+    fn matching_entry<'a>(
         &self,
         current: &Url,
-        entries: &[BrowserEntry],
-    ) -> Result<usize, BrowserError> {
+        entries: &'a [BrowserEntry],
+    ) -> Result<(usize, &'a BrowserEntry), BrowserError> {
         for (index, entry) in entries.iter().enumerate() {
             let Some(limit) = entry.match_limit else {
                 if glob_matches(&entry.match_pattern, current.as_str()) {
-                    return Ok(index);
+                    return Ok((index, entry));
                 }
                 continue;
             };
@@ -2731,7 +2704,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
                 continue;
             }
             if glob_matches(&entry.match_pattern, current.as_str()) {
-                return Ok(index);
+                return Ok((index, entry));
             }
         }
         Err(BrowserError::NoMatchingEntry)
@@ -2743,10 +2716,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         entries: &[BrowserEntry],
         suite_evidence_url: &Url,
     ) -> Result<bool, BrowserError> {
-        let entry_index = self.matching_entry(authorization_url, entries)?;
-        let entry = entries
-            .get(entry_index)
-            .ok_or(BrowserError::InvalidSchema)?;
+        let (entry_index, entry) = self.matching_entry(authorization_url, entries)?;
         self.select_navigation_entry(entry_index, entry);
         selected_required_review_screenshot_marker(entry, suite_evidence_url)
     }
@@ -2763,10 +2733,7 @@ impl<D: BrowserDriver> BrowserExecutor<D> {
         self.policy.validate_url(authorization_url)?;
         self.redirects = 0;
         self.last_url = None;
-        let entry_index = self.matching_entry(authorization_url, entries)?;
-        let entry = entries
-            .get(entry_index)
-            .ok_or(BrowserError::InvalidSchema)?;
+        let (entry_index, entry) = self.matching_entry(authorization_url, entries)?;
         self.select_navigation_entry(entry_index, entry);
         self.navigate(authorization_url)?;
         *self.entry_uses.entry(entry_index).or_default() += 1;
@@ -2962,6 +2929,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn url_globs_bind_literal_patterns_and_both_ends() {
+        for (pattern, value, matches) in [
+            ("abc", "abc", true),
+            ("abc", "abcdef", false),
+            ("", "unexpected", false),
+            ("", "", true),
+            ("*", "anything", true),
+            ("abc*", "abcdef", true),
+            ("*abc", "xabc", true),
+            ("*abc", "abcx", false),
+            ("a*b*c", "axbyc", true),
+            ("a*b*c", "axbycz", false),
+            ("aa*aa", "aaa", false),
+            ("a**c", "abc", true),
+        ] {
+            assert_eq!(glob_matches(pattern, value), matches, "{pattern}: {value}");
+        }
+        assert!(validation::validate_contains("https://auth.example/...").is_ok());
+        assert!(validation::validate_contains("\n").is_err());
+    }
+
+    #[test]
     fn plaintext_remote_driver_is_rejected() {
         assert!(matches!(
             WebDriverEndpoint::parse("http://driver.example:9515"),
@@ -3025,13 +3014,13 @@ mod tests {
     }
 
     #[test]
-    fn contains_is_not_a_selector_and_rejects_urls() {
+    fn contains_is_text_and_accepts_urls_without_navigating() {
         let command = BrowserCommand::try_from(&json!(["wait", "contains", "/ui/consent", 30]))
             .expect("contains");
         assert!(matches!(command, BrowserCommand::WaitContains { .. }));
         assert!(
             BrowserCommand::try_from(&json!(["wait", "contains", "https://evil.example", 30]))
-                .is_err()
+                .is_ok()
         );
     }
 
@@ -5186,7 +5175,7 @@ mod tests {
         )
         .expect("bootstrap");
         let expected_capability_sha256 =
-            nazo_operator_protocol::openid4vp_verification_capability_sha256(
+            crate::oidf_protocol::openid4vp_verification_capability_sha256(
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             )
             .expect("capability hash");
@@ -5235,7 +5224,7 @@ mod tests {
         )
         .expect("bootstrap");
         let expected_capability_sha256 =
-            nazo_operator_protocol::openid4vp_verification_capability_sha256(
+            crate::oidf_protocol::openid4vp_verification_capability_sha256(
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             )
             .expect("capability hash");

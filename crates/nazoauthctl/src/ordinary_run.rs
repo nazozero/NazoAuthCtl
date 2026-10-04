@@ -32,13 +32,14 @@ use nazoauthctl_conformance::{
     OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
     OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
     OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
-    ProgressEvent, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
-    SuiteClientError, SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    ProgressEvent, ProgressSink, RunControl, StableRenderer, SuiteClient, SuiteClientError,
+    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
     SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
     TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
     TenantResourceRecoveryPhase, Transport, activity_label, bundled_oidf_matrix,
-    current_matrix_label, open_bundled_oidf_driver_plan, recover_suite_resources,
-    write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    current_matrix_label, open_bundled_oidf_driver_plan, recover_proxy_trust,
+    recover_suite_resources, write_private_control_evidence_bundle,
+    write_review_screenshot_manifest,
 };
 use serde::Serialize;
 use url::Url;
@@ -514,6 +515,18 @@ fn execute_with_progress<S: ProgressSink>(
         now,
     )
     .context("bundled OIDF Matrix cannot be opened")?;
+    let requires_vci = driver_plan.plans.iter().any(|plan| {
+        matches!(
+            plan.driver_handler.automation,
+            OidfDriverAutomation::Openid4vci
+        )
+    });
+    let requires_vp = driver_plan.plans.iter().any(|plan| {
+        matches!(
+            plan.driver_handler.automation,
+            OidfDriverAutomation::Openid4vp { .. }
+        )
+    });
     let requires_browser = driver_plan
         .plans
         .iter()
@@ -572,9 +585,6 @@ fn execute_with_progress<S: ProgressSink>(
         .iter()
         .map(|plan| (plan.plan_id.clone(), plan.resource_budget.clone()))
         .collect::<BTreeMap<_, _>>();
-    if plan_resource_budgets.len() != driver_plan.plans.len() {
-        bail!("signed driver plan contains duplicate Matrix plan IDs");
-    }
     let mut selected_resource_budget = driver_plan.selected_resource_budget.clone();
     // The official Suite owns each plan's live module list and may add tests
     // without changing the plan identity. Bound the run by the artifact-wide
@@ -763,8 +773,12 @@ fn execute_with_progress<S: ProgressSink>(
         apply_controller_kid: ordinary.controller_kid().to_owned(),
         apply_revision: ordinary.applied_revision(),
         resource_manifest_sha256: ordinary.resource_manifest_sha256().to_owned(),
-        trust_policy_resource_id: ordinary.trust_policy_resource_id().to_owned(),
-        trust_policy_digest: ordinary.trust_policy_digest().to_owned(),
+        trust_policy_resource_id: ordinary
+            .trust_policy_identity()
+            .map(|identity| identity.resource_id.clone()),
+        trust_policy_digest: ordinary
+            .trust_policy_identity()
+            .map(|identity| identity.digest.clone()),
         applicant_id: ordinary.applicant_id().to_string(),
         client_count: u32::try_from(ordinary.clients().len())
             .context("ordinary client mapping count exceeds the report bound")?,
@@ -792,6 +806,8 @@ fn execute_with_progress<S: ProgressSink>(
         ciba_approver,
         &evidence_directory,
         requires_browser,
+        requires_vci,
+        requires_vp,
         captures_review_screenshots,
         control,
         Arc::clone(&user_interrupted),
@@ -1192,8 +1208,8 @@ mod acceptance_tests {
                 apply_controller_kid: "kid".to_owned(),
                 apply_revision: 1,
                 resource_manifest_sha256: "manifest".to_owned(),
-                trust_policy_resource_id: "policy".to_owned(),
-                trust_policy_digest: "policy-digest".to_owned(),
+                trust_policy_resource_id: Some("policy".to_owned()),
+                trust_policy_digest: Some("policy-digest".to_owned()),
                 applicant_id: "applicant".to_owned(),
                 client_count: 1,
                 cleanup_complete: true,
@@ -2241,8 +2257,10 @@ struct DeploymentReport {
     apply_controller_kid: String,
     apply_revision: u64,
     resource_manifest_sha256: String,
-    trust_policy_resource_id: String,
-    trust_policy_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_policy_resource_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_policy_digest: Option<String>,
     applicant_id: String,
     client_count: u32,
     cleanup_complete: bool,
@@ -2271,23 +2289,29 @@ fn run_signed_suite<S: ProgressSink>(
     ciba_approver: Option<Arc<CibaUserApprovalClient>>,
     evidence_directory: &Path,
     requires_browser: bool,
+    requires_vci: bool,
+    requires_vp: bool,
     captures_review_screenshots: bool,
     control: RunControl,
     user_interrupted: Arc<AtomicBool>,
     interrupt_notice: &'static str,
     progress: &mut S,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
-    let binding = ConformanceBinding::openid4vc_trust_policy(
-        materialized.trust_policy_resource_id(),
-        materialized.trust_policy_digest(),
-    )?;
+    let binding = materialized
+        .trust_policy_identity()
+        .map(|identity| {
+            ConformanceBinding::openid4vc_trust_policy(&identity.resource_id, &identity.digest)
+        })
+        .transpose()?;
     let target_origin = BrowserTargetOrigin::parse(target_issuer)?;
     let applicant_id = *materialized.applicant_id();
-    let openid4vci_management_token = session
-        .openid4vci_management_token(&invocation.tenant_id)
+    let openid4vci_management_token = requires_vci
+        .then(|| session.openid4vci_management_token(&invocation.tenant_id))
+        .transpose()
         .context("failed to derive the run tenant OpenID4VCI management token")?;
-    let openid4vp_management_token = session
-        .openid4vp_management_token(&invocation.tenant_id)
+    let openid4vp_management_token = requires_vp
+        .then(|| session.openid4vp_management_token(&invocation.tenant_id))
+        .transpose()
         .context("failed to derive the run tenant OpenID4VP management token")?;
     let review_screenshot_run_jti = recovery
         .lock()
@@ -2321,20 +2345,21 @@ fn run_signed_suite<S: ProgressSink>(
         interrupt.interrupt();
     })
     .context("failed to install the conformance interrupt handler")?;
-    let mut managed_browsers = Vec::with_capacity(invocation.jobs);
+    let jobs = invocation.jobs.min(selected.document.plan_count());
+    let mut managed_browsers = Vec::with_capacity(jobs);
     let run_result = (|| -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
         if control.is_interrupted() {
             bail!("run interrupted");
         }
-        let mut automation = Vec::with_capacity(invocation.jobs);
-        for index in 0..invocation.jobs {
+        let mut automation = Vec::with_capacity(jobs);
+        for index in 0..jobs {
             if control.is_interrupted() {
                 bail!("run interrupted");
             }
             let browser: Option<Arc<Mutex<dyn BrowserAutomation>>> = if requires_browser {
                 progress.activity(&ProgressActivity::StartingBrowser {
                     current: index + 1,
-                    total: invocation.jobs,
+                    total: jobs,
                 });
                 let managed_browser = build_browser(target_issuer, suite_origin)?;
                 managed_browsers.push(managed_browser.clone());
@@ -2342,8 +2367,8 @@ fn run_signed_suite<S: ProgressSink>(
             } else {
                 None
             };
-            let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
-                Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
+            let issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>> = openid4vci_management_token.as_ref().map(|management_token| -> anyhow::Result<Arc<Mutex<dyn OpenId4VciIssuerDriver>>> {
+                Ok(Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
                     OpenId4VciIssuerConfig::new(
                         target_origin.clone(),
                         suite_origin.clone(),
@@ -2353,22 +2378,32 @@ fn run_signed_suite<S: ProgressSink>(
                         secrets.applicant_password.clone(),
                         Duration::from_secs(30),
                     )?,
-                    openid4vci_management_token.clone(),
+                    management_token.clone(),
                     token.clone(),
-                )?));
-            let verifier_client = OpenId4VpVerifierClient::new(
-                target_origin.clone(),
-                suite_origin.clone(),
-                openid4vp_management_token.clone(),
-                Duration::from_secs(30),
-                binding.clone(),
-            )?;
-            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
+                )?)))
+            }).transpose()?;
+            let verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>> = openid4vp_management_token
+                .as_ref()
+                .map(
+                    |management_token| -> anyhow::Result<Arc<Mutex<dyn OpenId4VpVerifier>>> {
+                        let verifier_client = OpenId4VpVerifierClient::new(
+                            target_origin.clone(),
+                            suite_origin.clone(),
+                            management_token.clone(),
+                            Duration::from_secs(30),
+                            binding
+                                .clone()
+                                .context("selected OpenID4VP plan has no trust policy")?,
+                        )?;
+                        Ok(Arc::new(Mutex::new(verifier_client)))
+                    },
+                )
+                .transpose()?;
             automation.push(ConformanceAutomation {
                 browser,
                 review_screenshot_capture: review_screenshot_capture.clone(),
-                verifier: Some(verifier),
-                issuer: Some(issuer),
+                verifier,
+                issuer,
                 ciba_approver: ciba_approver.clone(),
             });
         }
@@ -2643,24 +2678,19 @@ fn suite_retention_manifest(
     let plans = report
         .plans
         .iter()
-        .filter(|plan| {
+        .filter_map(|plan| {
             plan.suite_plan_id
                 .as_ref()
-                .is_some_and(|plan_id| retained_plan_ids.contains(plan_id))
+                .filter(|id| retained_plan_ids.contains(id))
+                .map(|id| (plan, id))
         })
-        .map(|plan| {
-            let suite_plan_id = plan
-                .suite_plan_id
-                .clone()
-                .context("settled retained report has no Suite plan ID")?;
-            Ok(SuiteRetentionPlan {
-                matrix_plan_id: plan.matrix_plan_id.clone(),
-                suite_plan_id,
-                plan_name: plan.plan_name.clone(),
-                plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&plan.matrix_plan_id),
-            })
+        .map(|(plan, suite_plan_id)| SuiteRetentionPlan {
+            matrix_plan_id: plan.matrix_plan_id.clone(),
+            suite_plan_id: suite_plan_id.clone(),
+            plan_name: plan.plan_name.clone(),
+            plan_alias_sha256: SuiteRetentionManifest::plan_alias_sha256(&plan.matrix_plan_id),
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     Ok(SuiteRetentionManifest {
         schema: 2,
         suite_origin: report.suite_origin.clone(),
@@ -2725,7 +2755,7 @@ fn cleanup_run_resources(
     session: &nazoauthctl_core::ConformanceSession,
     recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> anyhow::Result<Vec<EvidenceControlOperation>> {
-    if recovery.tenant_absent() {
+    if recovery.tenant_absent() || recovery.apply_operation().is_none() {
         cleanup_ephemeral_tenant(session, recovery)?;
         return Ok(Vec::new());
     }
@@ -3371,57 +3401,19 @@ fn recover_pending_runs(
                         .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}")),
                 );
             }
-            if tenant_present {
-                recover_ephemeral_tenant(session, &mut recovery)?;
-            } else {
+            if !tenant_present {
                 recovery.mark_tenant_absent(directory_revision)?;
             }
             if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
+                cleanup_ephemeral_tenant(session, &mut recovery)?;
                 recovery.publish_committed_suite_retention_manifest()?;
                 let receipt = recovery.suite_retention_manifest_receipt()?;
-                cleanup_ephemeral_tenant(session, &mut recovery)?;
                 if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
                     recovery.finish()?;
                 }
                 return Ok(receipt);
             }
-            if !recovery.tenant_absent() && recovery.baseline_enumerate_operation().is_none() {
-                let outcome = session.execute_control_operation(
-                    ControlOperationPayload::TenantResourceEnumerate {
-                        tenant_id: binding.tenant_id.clone(),
-                        selectors: Vec::new(),
-                    },
-                    None,
-                    |completion| {
-                        recovery.record_terminal_completion(
-                            TenantResourceRecoveryPhase::BaselineEnumerated,
-                            control_operation(completion),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-                successful_control_completion(outcome, "recovery baseline Enumerate")?;
-            }
-            if !recovery.tenant_absent() && recovery.apply_operation().is_none() {
-                let material = recovery.read_private_material()?;
-                let outcome = session.execute_control_operation(
-                    ControlOperationPayload::TenantResourceApply {
-                        tenant_id: binding.tenant_id.clone(),
-                        resources: binding.resource_identities.clone(),
-                    },
-                    Some(material.to_vec()),
-                    |completion| {
-                        recovery.record_terminal_completion(
-                            TenantResourceRecoveryPhase::Applied,
-                            control_operation(completion),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-                successful_control_completion(outcome, "recovery Apply")?;
-            }
             if !recovery.suite_cleanup_complete() {
-                recovery.discard_prepared_suite_retention_staging()?;
                 if let Some(suite) = recovery.suite_recovery() {
                     recover_suite_resources(suite_client, suite)
                         .map_err(|error| anyhow::anyhow!(error))?;
@@ -3430,11 +3422,12 @@ fn recover_pending_runs(
             }
             if !recovery.proxy_cleanup_complete() {
                 if let Some(proxy) = binding.proxy.as_ref() {
-                    ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                    recover_proxy_trust(&proxy.bundle_path, &proxy.reload_executable)?;
                 }
                 recovery.mark_proxy_cleanup_complete()?;
             }
             cleanup_run_resources(session, &mut recovery)?;
+            recovery.discard_prepared_suite_retention_staging()?;
             let receipt = recovery.suite_retention_manifest_receipt()?;
             if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
                 recovery.finish()?;
@@ -3457,74 +3450,6 @@ fn recover_pending_runs(
     }
 }
 
-fn recover_ephemeral_tenant(
-    session: &nazoauthctl_core::ConformanceSession,
-    recovery: &mut nazoauthctl_conformance::ConformanceRecoveryGuard,
-) -> anyhow::Result<()> {
-    let tenant = EphemeralTenant::from_ids(
-        &recovery.ordinary_binding().tenant_id,
-        &recovery.ordinary_binding().realm_id,
-        &recovery.ordinary_binding().organization_id,
-        &recovery.ordinary_binding().tenant_domain,
-        recovery.ordinary_binding().issuer_port,
-    )?;
-    if !recovery.tenant_created() {
-        let expected_revision = recovery.ordinary_binding().tenant_create_expected_revision;
-        let outcome = session.execute_control_operation(
-            tenant.create_operation(expected_revision),
-            None,
-            |completion| {
-                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
-                    recovery.mark_tenant_created()?;
-                }
-                Ok(())
-            },
-        )?;
-        successful_control_completion(outcome, "recovery temporary tenant Create")?;
-    }
-    if !recovery.tenant_key_generated() {
-        let outcome = session.execute_control_operation(
-            ControlOperationPayload::TenantKeysGenerateLocal {
-                tenant_id: tenant.tenant_id.clone(),
-                alg: "ES256".to_owned(),
-                purposes: vec!["credential".to_owned(), "presentation_request".to_owned()],
-            },
-            None,
-            |completion| {
-                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
-                    recovery.mark_tenant_key_generated()?;
-                }
-                Ok(())
-            },
-        )?;
-        successful_control_completion(outcome, "recovery tenant key generation")?;
-    }
-    if !recovery.tenant_reloaded() {
-        let expected_revision = match recovery.tenant_reload_expected_revision() {
-            Some(revision) => revision,
-            None => {
-                let revision = directory_revision(session)?;
-                recovery.prepare_tenant_reload(revision)?;
-                revision
-            }
-        };
-        let outcome = session.execute_control_operation(
-            ControlOperationPayload::TenantDirectoryReload {
-                expected_revision,
-                tenant_id: tenant.tenant_id,
-            },
-            None,
-            |completion| {
-                if completion.result.outcome == nazo_operator_protocol::ControlOutcome::Succeeded {
-                    recovery.mark_tenant_reloaded()?;
-                }
-                Ok(())
-            },
-        )?;
-        successful_control_completion(outcome, "recovery temporary tenant Reload")?;
-    }
-    Ok(())
-}
 fn evidence_runtime(
     runtime: &nazoauthctl_core::ConformanceRuntimeEvidence,
 ) -> EvidenceRuntimeIdentity {

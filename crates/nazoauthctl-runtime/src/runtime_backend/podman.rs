@@ -6,7 +6,6 @@
 //! command policy remains auditable without changing the public backend API.
 
 mod discovery;
-mod managed_dependencies;
 mod one_shot;
 mod operations;
 
@@ -15,13 +14,9 @@ use std::ffi::OsString;
 use crate::RuntimeBackendKind;
 use crate::process::Process;
 
-#[cfg(debug_assertions)]
-use super::DebugArtifactTask;
 use super::{
-    BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
-    ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore, NeutralMount,
-    OneShotTask, RecoveryCandidateEndpoint, RecoveryCandidateRequest, RuntimeBackend,
-    RuntimeObservation, RuntimeReplacement,
+    BlobAttestationVerification, HostServiceInstall, OneShotTask, RecoveryCandidateEndpoint,
+    RecoveryCandidateRequest, RuntimeBackend, RuntimeObservation, RuntimeReplacement,
 };
 
 pub struct PodmanBackend {
@@ -124,10 +119,16 @@ impl RuntimeBackend for PodmanBackend {
         &self,
         request: &RecoveryCandidateRequest,
     ) -> anyhow::Result<RecoveryCandidateEndpoint> {
+        let document = super::container_shared::inspect_document(
+            &self.command,
+            &["container", "inspect", &request.source_object_reference],
+            "Podman",
+        )?;
         super::container_shared::stage_recovery_candidate(
             &self.command,
             "Podman",
-            &discovery::inspect(&self.command, &request.source_object_reference)?,
+            &discovery::observation_from_document(&self.command, &document)?,
+            &document,
             request,
             false,
             is_rootless(),
@@ -157,43 +158,8 @@ impl RuntimeBackend for PodmanBackend {
         operations::import_image(&self.command, archive)
     }
 
-    fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()> {
-        managed_dependencies::restore_postgres(&self.command, restore)
-    }
-
-    fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()> {
-        managed_dependencies::restore_valkey(&self.command, restore)
-    }
-
-    fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()> {
-        managed_dependencies::execute_postgres(&self.command, command)
-    }
-
-    fn backup_managed_dependencies(&self, backup: &ManagedDependencyBackup) -> anyhow::Result<()> {
-        managed_dependencies::backup(&self.command, backup)
-    }
-
-    fn ensure_managed_network(
-        &self,
-        network: &super::ManagedNetwork,
-    ) -> anyhow::Result<std::net::IpAddr> {
-        managed_dependencies::ensure_network(&self.command, network)
-    }
-
-    fn ensure_managed_dependencies(
-        &self,
-        dependencies: &ManagedDependencies,
-    ) -> anyhow::Result<()> {
-        managed_dependencies::ensure_dependencies(&self.command, dependencies)
-    }
-
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {
         operations::install_host_service(install)
-    }
-
-    #[cfg(debug_assertions)]
-    fn run_debug_artifact_task(&self, task: &DebugArtifactTask) -> anyhow::Result<()> {
-        operations::run_debug_artifact_task(&self.command, task)
     }
 
     fn verify_blob_attestation(
@@ -203,19 +169,11 @@ impl RuntimeBackend for PodmanBackend {
         operations::verify_blob_attestation(&self.command, verification)
     }
 
-    fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String> {
-        discovery::resolve_image_digest(&self.command, image_reference, None)
-    }
-
     fn local_image_matches_digest(&self, image_reference: &str) -> bool {
         discovery::local_image_matches_digest(&self.command, image_reference)
     }
 
     fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String> {
         discovery::resolve_local_image_id(&self.command, image_reference)
-    }
-
-    fn describe_mounts(&self, object_reference: &str) -> anyhow::Result<Vec<NeutralMount>> {
-        Ok(self.inspect(object_reference)?.mounts)
     }
 }

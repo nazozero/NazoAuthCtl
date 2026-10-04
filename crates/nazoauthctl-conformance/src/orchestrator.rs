@@ -97,7 +97,7 @@ pub struct ConformanceRunConfig {
     pub target_origin: Option<BrowserTargetOrigin>,
     /// The deployment-owned trust-policy resource binding allocated for this
     /// run. Keeping it on the run config prevents partial requests.
-    pub binding: ConformanceBinding,
+    pub binding: Option<ConformanceBinding>,
     pub poll_timeout: Duration,
     pub control: RunControl,
     /// Exact signed execution lane for every selected Matrix plan. The map is
@@ -1341,12 +1341,17 @@ impl ConformanceRunner {
                                 break 'execute;
                             };
                             let haip = plan.plan_name == "oid4vp-1final-verifier-haip-test-plan";
+                            let Some(binding) = self.config.binding.clone() else {
+                                errors.push("OpenID4VP trust policy binding is missing".to_owned());
+                                groups[group_index].status = GroupStatus::Failed;
+                                break 'execute;
+                            };
                             let request = match OpenId4VpStartRequest::new(
                                 alias,
                                 &module.test_name,
                                 plan.variant.clone(),
                                 haip,
-                                self.config.binding.clone(),
+                                binding,
                             ) {
                                 Ok(request) => request,
                                 Err(error) => {
@@ -3505,7 +3510,7 @@ mod tests {
             client: client.clone(),
             matrix: selected.clone(),
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -3534,7 +3539,7 @@ mod tests {
                 client,
                 matrix: overflow_matrix,
                 target_origin: None,
-                binding: test_binding(),
+                binding: Some(test_binding()),
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
                 plan_lanes: BTreeMap::from([
@@ -3579,7 +3584,7 @@ mod tests {
             client: client.clone(),
             matrix: one_plan_matrix(serde_json::json!({})),
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -3670,7 +3675,7 @@ mod tests {
             client,
             matrix: one_plan_matrix(serde_json::json!({})),
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -3747,7 +3752,7 @@ mod tests {
             client,
             matrix,
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -3864,7 +3869,7 @@ mod tests {
             client,
             matrix,
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -3922,7 +3927,7 @@ mod tests {
             client,
             matrix: one_plan_matrix(serde_json::json!({})),
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -4004,7 +4009,7 @@ mod tests {
             client,
             matrix: one_plan_matrix(serde_json::json!({})),
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -4054,7 +4059,7 @@ mod tests {
                 client,
                 matrix: selected,
                 target_origin: None,
-                binding: test_binding(),
+                binding: Some(test_binding()),
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
                 plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -4277,7 +4282,7 @@ mod tests {
                 digest: "digest".into(),
             },
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(30),
             control,
             plan_lanes: BTreeMap::new(),
@@ -4347,7 +4352,7 @@ mod tests {
                 digest: "digest".into(),
             },
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(30),
             control: control.clone(),
             plan_lanes: BTreeMap::new(),
@@ -4438,7 +4443,7 @@ mod tests {
                 digest: "digest".into(),
             },
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(30),
             control: RunControl::default(),
             plan_lanes: BTreeMap::new(),
@@ -4528,7 +4533,7 @@ mod tests {
                 digest: "digest".into(),
             },
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(30),
             control: RunControl::default(),
             plan_lanes: BTreeMap::new(),
@@ -4739,7 +4744,7 @@ mod tests {
                 digest: "digest".into(),
             },
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(5),
             control: RunControl::default(),
             plan_lanes: BTreeMap::new(),
@@ -4855,7 +4860,7 @@ mod tests {
                 digest: "digest".into(),
             },
             target_origin: None,
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_millis(250),
             control,
             plan_lanes: BTreeMap::new(),
@@ -5001,7 +5006,7 @@ mod tests {
             target_origin: Some(
                 BrowserTargetOrigin::parse("https://target.example").expect("target"),
             ),
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(2),
             control: RunControl::default(),
             plan_lanes: BTreeMap::new(),
@@ -5207,7 +5212,7 @@ mod tests {
             target_origin: Some(
                 BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
             ),
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -5399,7 +5404,7 @@ mod tests {
             target_origin: Some(
                 BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
             ),
-            binding: test_binding(),
+            binding: Some(test_binding()),
             poll_timeout: Duration::from_secs(1),
             control: RunControl::default(),
             plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
@@ -5601,7 +5606,7 @@ mod tests {
                 target_origin: Some(
                     BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
                 ),
-                binding: test_binding(),
+                binding: Some(test_binding()),
                 poll_timeout: Duration::from_secs(1),
                 control: RunControl::default(),
                 plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),

@@ -94,7 +94,7 @@ nazoauthctl tls acme recover \
    capability, JTI, configuration/trust digests, allowed ACME origins, and
    expiry in a durable journal;
 2. persists and journal-binds the ACME account key before network use, then
-   creates or restores the configuration-bound account with that same key;
+   creates or restores the deployment/CA account with that same key;
 3. creates or resumes one exact-identifier order by its server-issued URL;
 4. journals the HTTP-01 path and digest before atomically publishing it;
 5. persists the server key and CSR before finalizing the order;
@@ -145,3 +145,12 @@ capabilities. NazoAuth #127's closed Direct TLS baseline does not provide the
 atomic reload or authenticated controller protocol for those operations; they
 still require the ordinary dynamically negotiated capabilities tracked by
 NazoAuth #128/#129 and parent #130.
+
+
+The deployment reuses one account per CA directory across hostname, webroot,
+polling and contact changes. Contact changes update that account. The current
+configuration still controls allowed HTTPS origins for every request. Account
+migration is automatic and retains old account files for receipt verification.
+Issuing a new certificate does not require the previous certificate/key files
+to remain present. `show`, installation and completed-operation recovery verify
+the actual material referenced by the receipt they consume.
