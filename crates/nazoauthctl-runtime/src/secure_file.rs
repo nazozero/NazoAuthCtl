@@ -382,8 +382,9 @@ pub fn remove_private_file_if_exact(path: &Path, bytes: &[u8]) -> Result<(), Sec
 }
 
 /// Promote a previously fsynced private file in the same private directory.
-/// The caller must verify the content before calling this; this primitive
-/// refuses replacement of an existing destination and fsyncs the directory.
+/// The caller must verify the content before calling this. Publication atomically
+/// refuses an existing destination and, on Unix, fsyncs the directory. Platforms
+/// without a native no-replace rename fail without publishing the file.
 pub fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureFileError> {
     let from = normalize_absolute(from)?;
     let to = normalize_absolute(to)?;
@@ -399,32 +400,50 @@ pub fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureFileErro
     #[cfg(windows)]
     {
         validate_directory(parent, true)?;
-        crate::filesystem::open_secure_regular_file(&from, "staged evidence", true)
-            .map_err(map_runtime_error)?;
-        // Windows rename is atomic and refuses an existing destination.
-        fs::rename(&from, &to).map_err(map_io_error)
+        crate::filesystem::promote_private_file_no_replace(&from, &to).map_err(map_runtime_error)
     }
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "redox"
+        )
+    ))]
     {
         let parent_file = open_directory_chain(parent, true, false)?;
         let from_name = from.file_name().ok_or(SecureFileError::UnsafePath)?;
         let to_name = to.file_name().ok_or(SecureFileError::UnsafePath)?;
         let source = openat_file(&parent_file, from_name, OFlags::RDONLY)?;
         validate_file_metadata(&source.metadata().map_err(|_| SecureFileError::Io)?, true)?;
-        match openat_file(&parent_file, to_name, OFlags::RDONLY) {
-            Ok(existing) => {
-                validate_file_metadata(
-                    &existing.metadata().map_err(|_| SecureFileError::Io)?,
-                    true,
-                )?;
-                return Err(SecureFileError::UnsafePath);
+        rustix::fs::renameat_with(
+            &parent_file,
+            from_name,
+            &parent_file,
+            to_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                SecureFileError::UnsafePath
+            } else {
+                map_errno(error)
             }
-            Err(SecureFileError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        rustix::fs::renameat(&parent_file, from_name, &parent_file, to_name)
-            .map_err(|_| SecureFileError::Io)?;
+        })?;
         rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "redox"
+        ))
+    ))]
+    {
+        Err(SecureFileError::UnsupportedPlatform)
     }
 }
 
@@ -721,5 +740,80 @@ mod tests {
         assert!(bytes == b"first" || bytes == b"second");
         assert_eq!(super::write_new_or_exact(&path, &bytes, true), Ok(()));
         std::fs::remove_dir_all(root).expect("cleanup temporary evidence");
+    }
+
+    #[test]
+    fn promote_private_file_publishes_and_removes_the_staged_name() {
+        let root = crate::filesystem::PrivateTempDir::new("private-promotion").unwrap();
+        let staged = root.path().join("pending.json");
+        let target = root.path().join("committed.json");
+        super::write_atomic(&staged, b"verified", true).unwrap();
+
+        super::promote_private_file(&staged, &target).unwrap();
+
+        assert_eq!(super::read_bounded(&target, 32, true).unwrap(), b"verified");
+        assert_eq!(
+            super::read_bounded(&staged, 32, true),
+            Err(super::SecureFileError::NotFound)
+        );
+    }
+
+    #[test]
+    fn promote_private_file_preserves_an_existing_target_and_the_source() {
+        let root = crate::filesystem::PrivateTempDir::new("private-promotion-conflict").unwrap();
+        let staged = root.path().join("pending.json");
+        let target = root.path().join("committed.json");
+        super::write_atomic(&staged, b"new evidence", true).unwrap();
+        super::write_atomic(&target, b"original evidence", true).unwrap();
+
+        assert!(super::promote_private_file(&staged, &target).is_err());
+
+        assert_eq!(super::read_bounded(&staged, 32, true).unwrap(), b"new evidence");
+        assert_eq!(
+            super::read_bounded(&target, 32, true).unwrap(),
+            b"original evidence"
+        );
+    }
+
+    #[test]
+    fn promote_private_file_allows_only_one_concurrent_publisher() {
+        use std::sync::{Arc, Barrier};
+
+        let root = crate::filesystem::PrivateTempDir::new("private-promotion-race").unwrap();
+        let first = root.path().join("first.pending");
+        let second = root.path().join("second.pending");
+        let target = root.path().join("committed.json");
+        super::write_atomic(&first, b"first", true).unwrap();
+        super::write_atomic(&second, b"second", true).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|staged| {
+                let staged = staged.clone();
+                let target = target.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    super::promote_private_file(&staged, &target)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let (winner, loser, winning_bytes, losing_bytes) = if results[0].is_ok() {
+            (&first, &second, b"first".as_slice(), b"second".as_slice())
+        } else {
+            (&second, &first, b"second".as_slice(), b"first".as_slice())
+        };
+        assert_eq!(super::read_bounded(&target, 32, true).unwrap(), winning_bytes);
+        assert_eq!(super::read_bounded(loser, 32, true).unwrap(), losing_bytes);
+        assert_eq!(
+            super::read_bounded(winner, 32, true),
+            Err(super::SecureFileError::NotFound)
+        );
     }
 }

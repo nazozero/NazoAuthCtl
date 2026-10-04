@@ -748,7 +748,12 @@ fn stage_path(target: &Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(target.with_file_name(format!(".{name}.nazoauth-{}.tmp", uuid::Uuid::now_v7())))
 }
 
-fn rename_replace(file: &File, parent: &File, target: &Path) -> anyhow::Result<()> {
+fn rename_file(
+    file: &File,
+    parent: &File,
+    target: &Path,
+    replace_existing: bool,
+) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     // Keep the destination directory handle open without FILE_SHARE_DELETE.
     // SetFileInformationByHandle on the local Windows provider rejects a
@@ -779,7 +784,7 @@ fn rename_replace(file: &File, parent: &File, target: &Path) -> anyhow::Result<(
         unsafe {
             ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len());
             (*info).Anonymous = FILE_RENAME_INFO_0 {
-                ReplaceIfExists: true,
+                ReplaceIfExists: replace_existing,
             };
             (*info).RootDirectory = null_mut();
             (*info).FileNameLength = (name.len() * 2) as u32;
@@ -810,6 +815,21 @@ fn rename_replace(file: &File, parent: &File, target: &Path) -> anyhow::Result<(
     bail!("SetFileInformationByHandle(FileRenameInfo) exhausted path forms")
 }
 
+pub fn promote_private_file_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    let parent_path = from.parent().context("staged private file has no parent")?;
+    if to.parent() != Some(parent_path) {
+        bail!("private file promotion requires the same directory");
+    }
+    let parent = open_directory_handle(
+        parent_path,
+        FILE_ADD_FILE | FILE_DELETE_CHILD | READ_CONTROL,
+    )?;
+    validate_acl_handle_as_directory(&parent, true)?;
+    let source = open_handle(from, FILE_GENERIC_READ | READ_CONTROL | DELETE, OPEN_EXISTING)?;
+    validate_acl_handle(&source, true)?;
+    rename_file(&source, &parent, to, false)
+}
+
 fn commit_staged(
     staged: File,
     stage: &Path,
@@ -827,7 +847,7 @@ fn commit_staged(
         staged
             .sync_all()
             .with_context(|| format!("failed to persist staged {}", target.display()))?;
-        rename_replace(&staged, parent, target)
+        rename_file(&staged, parent, target, true)
     })();
     if let Err(error) = result {
         drop(staged);
