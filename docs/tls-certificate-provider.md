@@ -4,10 +4,10 @@ Human output follows the CLI locale and uses readable fields. Place `--json`
 before the command to obtain the complete structured result. See
 [language and presentation](cli-presentation.md).
 
-This document defines the certificate transaction part of issue #31, including
+This document defines the certificate transaction, including
 optional native Nginx/Angie configuration in the same atomic generation.
-It is a NazoAuthCtl provider protocol, not a NazoAuth server protocol and not a
-claim that NazoAuth Direct TLS capability discovery already exists. The v1
+It is a NazoAuthCtl provider protocol. Server listener configuration and reload
+behavior belong to the [deployment contract](tls-deployment.md). The v1
 provider is Unix-only because its security contract requires atomic symlink
 replacement and owner/mode checks that are not equivalent to portable Windows
 filesystem APIs.
@@ -320,3 +320,9 @@ The helper handshake does not attest a server transport capability. There is no
 additional TLS capability endpoint or NazoAuth version table. A server that cannot
 load the selected configuration fails readiness and follows ordinary recovery.
 No HTTP fallback is implemented or permitted here.
+
+
+Rollback checks that the previous certificate is currently valid, matches its
+hostname/private key, and satisfies its recorded trust/material bindings. The
+`minimum_validity_seconds` admission threshold applies to new material, not to
+a still-valid previous generation needed for rollback.

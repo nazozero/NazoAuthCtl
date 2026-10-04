@@ -92,7 +92,6 @@ pub(crate) fn read_deployment_state(bytes: &[u8]) -> anyhow::Result<DeploymentSt
             }
             object.insert("schema".into(), DEPLOYMENT_STATE_SCHEMA.into());
         }
-        Some(version) if version == u64::from(DEPLOYMENT_STATE_SCHEMA) => {}
         other => bail!(
             "unsupported deployment state schema {other:?}; preserve this state and use a controller supporting its format"
         ),

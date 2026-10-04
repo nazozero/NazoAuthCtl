@@ -193,6 +193,70 @@ impl Process {
         self.collect_output(child, Some(input))
     }
 
+    /// Start a bounded line protocol using the same environment and process-tree
+    /// ownership as one-shot commands. The session dies with its owner.
+    pub fn line_session(&self, max_reply_bytes: usize) -> anyhow::Result<LineSession> {
+        let mut child = self
+            .command()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("session stdin is missing")?;
+        let stdout = child.stdout.take().context("session stdout is missing")?;
+        let mut stderr = child.stderr.take().context("session stderr is missing")?;
+        let (requests, request_receiver) = mpsc::sync_channel::<Vec<u8>>(1);
+        let (response_sender, responses) = mpsc::sync_channel(1);
+        let diagnostics = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let captured = std::sync::Arc::clone(&diagnostics);
+        thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(length) = stderr.read(&mut buffer) {
+                if length == 0 {
+                    break;
+                }
+                if let Ok(mut bytes) = captured.lock() {
+                    let keep = length.min((MAX_CAPTURE_BYTES as usize).saturating_sub(bytes.len()));
+                    bytes.extend_from_slice(&buffer[..keep]);
+                }
+            }
+        });
+        thread::spawn(move || {
+            use std::io::BufRead as _;
+            let mut stdout = std::io::BufReader::new(stdout);
+            while let Ok(request) = request_receiver.recv() {
+                let response = (|| -> anyhow::Result<Vec<u8>> {
+                    if !request.is_empty() {
+                        stdin.write_all(&request)?;
+                        stdin.flush()?;
+                    }
+                    let mut response = Vec::new();
+                    (&mut stdout)
+                        .take(max_reply_bytes as u64 + 1)
+                        .read_until(b'\n', &mut response)?;
+                    if response.is_empty() {
+                        bail!("session closed before answering");
+                    }
+                    if response.len() > max_reply_bytes || !response.ends_with(b"\n") {
+                        bail!("session response exceeds its frame limit or is truncated");
+                    }
+                    Ok(response)
+                })();
+                let failed = response.is_err();
+                if response_sender.send(response).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Ok(LineSession {
+            child,
+            requests,
+            responses,
+            diagnostics,
+            timeout: self.timeout,
+        })
+    }
+
     pub fn stdout_file(&self, path: &Path) -> anyhow::Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -302,6 +366,48 @@ fn read_bounded(reader: impl std::io::Read) -> anyhow::Result<Vec<u8>> {
         bail!("child output exceeded the capture limit");
     }
     Ok(bytes)
+}
+
+#[derive(Debug)]
+pub struct LineSession {
+    child: std::process::Child,
+    requests: SyncSender<Vec<u8>>,
+    responses: Receiver<anyhow::Result<Vec<u8>>>,
+    diagnostics: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    timeout: Duration,
+}
+
+impl LineSession {
+    /// An empty request reads the peer's initial greeting without writing.
+    pub fn exchange(&mut self, request: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        self.requests
+            .try_send(request)
+            .context("session request channel is unavailable")?;
+        let result = match self.responses.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(error) => {
+                terminate_and_reap(&mut self.child);
+                return Err(error).context("session timed out or closed waiting for a reply");
+            }
+        };
+        if result.is_err() {
+            terminate_and_reap(&mut self.child);
+        }
+        result.map_err(|error| {
+            let diagnostics = self
+                .diagnostics
+                .lock()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            error.context(diagnostics)
+        })
+    }
+}
+
+impl Drop for LineSession {
+    fn drop(&mut self) {
+        terminate_and_reap(&mut self.child);
+    }
 }
 
 fn wait_or_kill(
@@ -443,6 +549,62 @@ mod descendant_tests {
 #[cfg(test)]
 mod process_tests {
     use super::Process;
+
+    #[test]
+    fn line_session_timeout_reaps_the_child() {
+        #[cfg(windows)]
+        let process =
+            Process::new("pwsh").args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        #[cfg(unix)]
+        let process = Process::new("sh").args(["-c", "sleep 60"]);
+        let mut session = process
+            .timeout(std::time::Duration::from_millis(100))
+            .line_session(32)
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            session
+                .exchange(Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
+        assert!(session.child.try_wait().unwrap().is_some());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn line_session_reuses_process_and_bounds_replies() {
+        #[cfg(windows)]
+        let process = Process::new("pwsh").args(["-NoProfile", "-Command", "[Console]::Out.WriteLine('ready'); while ($null -ne ($line = [Console]::ReadLine())) { [Console]::Out.WriteLine($line) }"]);
+        #[cfg(unix)]
+        let process = Process::new("sh").args([
+            "-c",
+            "printf 'ready\n'; while IFS= read -r line; do printf '%s\n' \"$line\"; done",
+        ]);
+        let mut session = process.line_session(32).unwrap();
+        assert_eq!(
+            String::from_utf8(session.exchange(Vec::new()).unwrap())
+                .unwrap()
+                .trim(),
+            "ready"
+        );
+        assert_eq!(
+            String::from_utf8(session.exchange(b"first\n".to_vec()).unwrap())
+                .unwrap()
+                .trim(),
+            "first"
+        );
+        assert_eq!(
+            String::from_utf8(session.exchange(b"second\n".to_vec()).unwrap())
+                .unwrap()
+                .trim(),
+            "second"
+        );
+        let mut oversized = vec![b'x'; 33];
+        oversized.push(b'\n');
+        assert!(session.exchange(oversized).is_err());
+    }
 
     #[cfg(windows)]
     #[test]

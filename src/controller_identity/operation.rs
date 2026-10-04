@@ -231,6 +231,35 @@ mod tests {
     }
 
     #[test]
+    fn opaque_keys_preserve_published_control_operation_bytes() -> anyhow::Result<()> {
+        // Published by operator-protocol 5810e56 before the opaque-key migration.
+        let key = nazo_crypto::ed25519::SigningKey::from_bytes(&[23; 32]);
+        let operation = ControlOperation {
+            schema: CONTROL_OPERATION_SCHEMA,
+            operation_id: "019c8ca2-30a6-7000-8000-000000000005".to_owned(),
+            kid: nazo_operator_protocol::controller_key_id(&key.verifying_key()),
+            deployment_id: "deployment-1".to_owned(),
+            config_revision: "config-revision-1".to_owned(),
+            operation: ControlOperationPayload::MigrateApply,
+        };
+        assert_eq!(
+            nazo_operator_protocol::canonical_control_operation_bytes(&operation)?,
+            b"{\"config_revision\":\"config-revision-1\",\"deployment_id\":\"deployment-1\",\"kid\":\"43q81579CNuUUYqQOVL_6fivfotGhLY1kWMc746Iccg\",\"operation\":{\"name\":\"migrate-apply\"},\"operation_id\":\"019c8ca2-30a6-7000-8000-000000000005\",\"schema\":3}".to_vec(),
+        );
+        assert_eq!(
+            control_operation_request_hash(&operation)?,
+            "8261e7f3ece52ee7b063689c98ead4265f2f4e5e5b40c09b2fe3909af31eceff",
+        );
+        let compact = "eyJhbGciOiJFZERTQSIsImtpZCI6IjQzcTgxNTc5Q051VVVZcVFPVkxfNmZpdmZvdEdoTFkxa1dNYzc0NkljY2ciLCJ0eXAiOiJuYXpvYXV0aC1jb250cm9sLW9wZXJhdGlvbitqd3QifQ.eyJjb25maWdfcmV2aXNpb24iOiJjb25maWctcmV2aXNpb24tMSIsImRlcGxveW1lbnRfaWQiOiJkZXBsb3ltZW50LTEiLCJraWQiOiI0M3E4MTU3OUNOdVVVWXFRT1ZMXzZmaXZmb3RHaExZMWtXTWM3NDZJY2NnIiwib3BlcmF0aW9uIjp7Im5hbWUiOiJtaWdyYXRlLWFwcGx5In0sIm9wZXJhdGlvbl9pZCI6IjAxOWM4Y2EyLTMwYTYtNzAwMC04MDAwLTAwMDAwMDAwMDAwNSIsInNjaGVtYSI6M30.__QjcrIzfNFJTfMmihviVhgwtlKJLsTPad71ZWHrpJmh_u99c4Qh0J9BphS1CedkdPLKRUFjDD6BCAcRFHYCBA";
+        assert_eq!(sign_control_operation(&operation, &key)?, compact);
+        assert_eq!(
+            verify_control_operation_signature(compact, &operation.kid, &key.verifying_key())?,
+            operation,
+        );
+        Ok(())
+    }
+
+    #[test]
     fn roundtrip_against_contract_verify_api() -> anyhow::Result<()> {
         let f = fixture()?;
         register_instance(&f, "production", "deploy-alpha")?;

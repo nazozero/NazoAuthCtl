@@ -18,7 +18,7 @@ use std::{
 
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum SecureFileError {
+pub enum SecureFileError {
     // This is emitted by the Windows/unsupported-platform branches and must
     // remain part of the shared error contract even though Unix builds cannot
     // construct it.
@@ -32,7 +32,7 @@ pub(crate) enum SecureFileError {
 
 /// Return a lexical absolute path.  Parent components are rejected rather
 /// than normalized through an attacker-controlled symlink.
-pub(crate) fn normalize_absolute(path: &Path) -> Result<PathBuf, SecureFileError> {
+pub fn normalize_absolute(path: &Path) -> Result<PathBuf, SecureFileError> {
     let source = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -58,12 +58,8 @@ pub(crate) fn normalize_absolute(path: &Path) -> Result<PathBuf, SecureFileError
 
 /// Ensure a directory exists one component at a time.  No ancestor may be a
 /// symlink, and owner/mode checks are applied before and after creation.
-pub(crate) fn ensure_directory(path: &Path, private: bool) -> Result<PathBuf, SecureFileError> {
+pub fn ensure_directory(path: &Path, private: bool) -> Result<PathBuf, SecureFileError> {
     let absolute = normalize_absolute(path)?;
-    #[cfg(all(not(unix), windows))]
-    if private {
-        return Err(SecureFileError::UnsupportedPlatform);
-    }
     #[cfg(all(not(unix), not(windows)))]
     {
         let _ = private;
@@ -71,11 +67,12 @@ pub(crate) fn ensure_directory(path: &Path, private: bool) -> Result<PathBuf, Se
     }
     #[cfg(windows)]
     {
-        fs::create_dir_all(&absolute).map_err(|_| SecureFileError::Io)?;
-        let metadata = fs::symlink_metadata(&absolute).map_err(|_| SecureFileError::Io)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(SecureFileError::UnsafePath);
+        if private {
+            crate::filesystem::ensure_private_directory(&absolute, "private directory")
+        } else {
+            crate::filesystem::ensure_directory_chain(&absolute)
         }
+        .map_err(map_runtime_error)?;
         Ok(absolute)
     }
     #[cfg(unix)]
@@ -86,12 +83,8 @@ pub(crate) fn ensure_directory(path: &Path, private: bool) -> Result<PathBuf, Se
 }
 
 /// Validate an existing directory without creating or changing it.
-pub(crate) fn validate_directory(path: &Path, private: bool) -> Result<PathBuf, SecureFileError> {
+pub fn validate_directory(path: &Path, private: bool) -> Result<PathBuf, SecureFileError> {
     let absolute = normalize_absolute(path)?;
-    #[cfg(all(not(unix), windows))]
-    if private {
-        return Err(SecureFileError::UnsupportedPlatform);
-    }
     #[cfg(all(not(unix), not(windows)))]
     {
         let _ = private;
@@ -99,16 +92,9 @@ pub(crate) fn validate_directory(path: &Path, private: bool) -> Result<PathBuf, 
     }
     #[cfg(windows)]
     {
-        let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                SecureFileError::NotFound
-            } else {
-                SecureFileError::Io
-            }
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(SecureFileError::UnsafePath);
-        }
+        fs::symlink_metadata(&absolute).map_err(map_io_error)?;
+        crate::filesystem::validate_secure_directory(&absolute, "directory", private)
+            .map_err(map_runtime_error)?;
         Ok(absolute)
     }
     #[cfg(unix)]
@@ -120,14 +106,18 @@ pub(crate) fn validate_directory(path: &Path, private: bool) -> Result<PathBuf, 
 
 /// Open a stable lock inode without following links. The caller owns locking
 /// and timeout policy; this primitive only establishes path and file identity.
-pub(crate) fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, SecureFileError> {
+pub fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
     validate_directory(parent, private)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (private, parent);
         Err(SecureFileError::UnsupportedPlatform)
+    }
+    #[cfg(windows)]
+    {
+        crate::filesystem::open_lock_file(&absolute, false, "lock file").map_err(map_runtime_error)
     }
     #[cfg(unix)]
     {
@@ -148,18 +138,10 @@ pub(crate) fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, Sec
 
 /// Atomically replace a regular file.  The temporary is random, owner-only,
 /// fsynced before rename, and its parent is fsynced after rename.
-pub(crate) fn write_atomic(
-    path: &Path,
-    bytes: &[u8],
-    private: bool,
-) -> Result<(), SecureFileError> {
+pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
     ensure_directory(parent, private)?;
-    #[cfg(all(not(unix), windows))]
-    if private {
-        return Err(SecureFileError::UnsupportedPlatform);
-    }
     #[cfg(all(not(unix), not(windows)))]
     {
         let _ = (bytes, private);
@@ -167,8 +149,8 @@ pub(crate) fn write_atomic(
     }
     #[cfg(windows)]
     {
-        let _ = bytes;
-        Err(SecureFileError::UnsupportedPlatform)
+        crate::filesystem::atomic_write(&absolute, bytes, if private { 0o600 } else { 0o644 })
+            .map_err(map_runtime_error)
     }
     #[cfg(unix)]
     {
@@ -228,28 +210,19 @@ pub(crate) fn write_atomic(
 /// already created the destination, the bytes must match exactly; this never
 /// falls back to a rename that could replace evidence owned by that writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(unix),
-    expect(dead_code, reason = "secure evidence publication is Unix-only")
-)]
-pub(crate) enum NewOrExactOutcome {
+pub enum NewOrExactOutcome {
     Created,
     Existing,
 }
 
-#[cfg(unix)]
-pub(crate) fn write_new_or_exact(
-    path: &Path,
-    bytes: &[u8],
-    private: bool,
-) -> Result<(), SecureFileError> {
+pub fn write_new_or_exact(path: &Path, bytes: &[u8], private: bool) -> Result<(), SecureFileError> {
     write_new_or_exact_with_outcome(path, bytes, private).map(|_| ())
 }
 
 /// Same as [`write_new_or_exact`], but tells a paired-file caller whether it
 /// owns the newly published file and may therefore safely remove it if the
 /// companion write fails. An exact pre-existing file is never removed.
-pub(crate) fn write_new_or_exact_with_outcome(
+pub fn write_new_or_exact_with_outcome(
     path: &Path,
     bytes: &[u8],
     private: bool,
@@ -257,10 +230,32 @@ pub(crate) fn write_new_or_exact_with_outcome(
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
     ensure_directory(parent, private)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (bytes, private);
         Err(SecureFileError::UnsupportedPlatform)
+    }
+    #[cfg(windows)]
+    {
+        match read_bounded(&absolute, bytes.len(), private) {
+            Ok(existing) if existing == bytes => return Ok(NewOrExactOutcome::Existing),
+            Ok(_) => return Err(SecureFileError::Io),
+            Err(SecureFileError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let stage = parent.join(format!(".new-{}", uuid::Uuid::now_v7()));
+        write_atomic(&stage, bytes, private)?;
+        let published = fs::hard_link(&stage, &absolute);
+        if let Err(error) = published {
+            let _ = fs::remove_file(&stage);
+            return match read_bounded(&absolute, bytes.len(), private) {
+                Ok(existing) if existing == bytes => Ok(NewOrExactOutcome::Existing),
+                _ => Err(map_io_error(error)),
+            };
+        }
+        fs::remove_file(&stage).map_err(map_io_error)?;
+        crate::filesystem::sync_parent(&absolute).map_err(map_runtime_error)?;
+        Ok(NewOrExactOutcome::Created)
     }
     #[cfg(unix)]
     {
@@ -357,16 +352,21 @@ pub(crate) fn write_new_or_exact_with_outcome(
 /// Removes a root-private file only after confirming its exact bytes. This is
 /// intentionally narrow: it is used to roll back a just-created PNG/audit
 /// companion, never to replace or clean up evidence of an unknown writer.
-pub(crate) fn remove_private_file_if_exact(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), SecureFileError> {
+pub fn remove_private_file_if_exact(path: &Path, bytes: &[u8]) -> Result<(), SecureFileError> {
     let absolute = normalize_absolute(path)?;
+    #[cfg(not(windows))]
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (bytes, parent);
         Err(SecureFileError::UnsupportedPlatform)
+    }
+    #[cfg(windows)]
+    {
+        if read_bounded(&absolute, bytes.len(), true)? != bytes {
+            return Err(SecureFileError::Io);
+        }
+        remove_file(&absolute, true)
     }
     #[cfg(unix)]
     {
@@ -382,58 +382,81 @@ pub(crate) fn remove_private_file_if_exact(
 }
 
 /// Promote a previously fsynced private file in the same private directory.
-/// The caller must verify the content before calling this; this primitive
-/// refuses replacement of an existing destination and fsyncs the directory.
-pub(crate) fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureFileError> {
+/// The caller must verify the content before calling this. Publication atomically
+/// refuses an existing destination and, on Unix, fsyncs the directory. Platforms
+/// without a native no-replace rename fail without publishing the file.
+pub fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureFileError> {
     let from = normalize_absolute(from)?;
     let to = normalize_absolute(to)?;
     let parent = from.parent().ok_or(SecureFileError::UnsafePath)?;
     if to.parent() != Some(parent) {
         return Err(SecureFileError::UnsafePath);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (&from, &to, parent);
         Err(SecureFileError::UnsupportedPlatform)
     }
-    #[cfg(unix)]
+    #[cfg(windows)]
+    {
+        validate_directory(parent, true)?;
+        crate::filesystem::promote_private_file_no_replace(&from, &to).map_err(map_runtime_error)
+    }
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "redox"
+        )
+    ))]
     {
         let parent_file = open_directory_chain(parent, true, false)?;
         let from_name = from.file_name().ok_or(SecureFileError::UnsafePath)?;
         let to_name = to.file_name().ok_or(SecureFileError::UnsafePath)?;
         let source = openat_file(&parent_file, from_name, OFlags::RDONLY)?;
         validate_file_metadata(&source.metadata().map_err(|_| SecureFileError::Io)?, true)?;
-        match openat_file(&parent_file, to_name, OFlags::RDONLY) {
-            Ok(existing) => {
-                validate_file_metadata(
-                    &existing.metadata().map_err(|_| SecureFileError::Io)?,
-                    true,
-                )?;
-                return Err(SecureFileError::UnsafePath);
+        rustix::fs::renameat_with(
+            &parent_file,
+            from_name,
+            &parent_file,
+            to_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                SecureFileError::UnsafePath
+            } else {
+                map_errno(error)
             }
-            Err(SecureFileError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        rustix::fs::renameat(&parent_file, from_name, &parent_file, to_name)
-            .map_err(|_| SecureFileError::Io)?;
+        })?;
         rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "redox"
+        ))
+    ))]
+    {
+        Err(SecureFileError::UnsupportedPlatform)
     }
 }
 
 /// Open and read a bounded regular file with O_NOFOLLOW.  Metadata is checked
 /// both before and after reading, preventing replacement races from being
 /// mistaken for a successful read.
-pub(crate) fn read_bounded(
+pub fn read_bounded(
     path: &Path,
     max_bytes: usize,
     private: bool,
 ) -> Result<Vec<u8>, SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
-    #[cfg(all(not(unix), windows))]
-    if private {
-        return Err(SecureFileError::UnsupportedPlatform);
-    }
     #[cfg(all(not(unix), not(windows)))]
     {
         let _ = max_bytes;
@@ -449,17 +472,24 @@ pub(crate) fn read_bounded(
     };
     #[cfg(windows)]
     {
-        let _ = (&absolute, parent, max_bytes, private);
-        Err(SecureFileError::UnsupportedPlatform)
+        use std::io::Read as _;
+        fs::symlink_metadata(&absolute).map_err(map_io_error)?;
+        validate_directory(parent, private)?;
+        let file = crate::filesystem::open_secure_regular_file(&absolute, "bounded file", private)
+            .map_err(map_runtime_error)?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(map_io_error)?;
+        if bytes.len() > max_bytes {
+            return Err(SecureFileError::Oversize);
+        }
+        Ok(bytes)
     }
     #[cfg(unix)]
     {
-        let before = file.metadata().map_err(|_| SecureFileError::Io)?;
         let opened = file.metadata().map_err(|_| SecureFileError::Io)?;
         validate_file_metadata(&opened, private)?;
-        if !same_file(&before, &opened) {
-            return Err(SecureFileError::UnsafePath);
-        }
         let mut bytes = Vec::new();
         (&mut file)
             .take(max_bytes.saturating_add(1) as u64)
@@ -467,10 +497,6 @@ pub(crate) fn read_bounded(
             .map_err(|_| SecureFileError::Io)?;
         if bytes.len() > max_bytes {
             return Err(SecureFileError::Oversize);
-        }
-        let after = file.metadata().map_err(|_| SecureFileError::Io)?;
-        if !same_file(&opened, &after) {
-            return Err(SecureFileError::UnsafePath);
         }
         Ok(bytes)
     }
@@ -481,39 +507,8 @@ pub(crate) fn read_bounded(
     }
 }
 
-/// Read an inherited regular descriptor.  `/proc/self/fd/N` is a kernel
-/// descriptor alias (not an attacker-selected path); identity is checked on
-/// the opened handle and again after the bounded read.
 #[cfg(unix)]
-pub(crate) fn read_descriptor(
-    fd: u32,
-    max_bytes: usize,
-    private: bool,
-) -> Result<Vec<u8>, SecureFileError> {
-    if fd < 3 {
-        return Err(SecureFileError::UnsafePath);
-    }
-    let path = format!("/proc/self/fd/{fd}");
-    let mut file = File::open(path).map_err(|_| SecureFileError::Io)?;
-    let before = file.metadata().map_err(|_| SecureFileError::Io)?;
-    validate_descriptor_metadata(&before, private)?;
-    let mut bytes = Vec::new();
-    (&mut file)
-        .take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| SecureFileError::Io)?;
-    if bytes.len() > max_bytes {
-        return Err(SecureFileError::Oversize);
-    }
-    let after = file.metadata().map_err(|_| SecureFileError::Io)?;
-    if !same_file(&before, &after) {
-        return Err(SecureFileError::UnsafePath);
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
-pub(crate) fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
+pub fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
     #[cfg(unix)]
@@ -528,8 +523,8 @@ pub(crate) fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileEr
     }
 }
 
-#[cfg(not(unix))]
-pub(crate) fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
+#[cfg(not(any(unix, windows)))]
+pub fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
     let _ = (path, private);
     Err(SecureFileError::UnsupportedPlatform)
 }
@@ -666,27 +661,6 @@ fn validate_file_metadata(metadata: &fs::Metadata, private: bool) -> Result<(), 
 }
 
 #[cfg(unix)]
-fn validate_descriptor_metadata(
-    metadata: &fs::Metadata,
-    private: bool,
-) -> Result<(), SecureFileError> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    if metadata.file_type().is_fifo() {
-        if !owner_is_current_or_root(metadata.uid()) || (private && metadata.mode() & 0o077 != 0) {
-            return Err(SecureFileError::UnsafePath);
-        }
-        return Ok(());
-    }
-    validate_file_metadata(metadata, private)
-}
-
-#[cfg(unix)]
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(unix)]
 fn owner_is_current_or_root(uid: u32) -> bool {
     uid == 0 || rustix::process::geteuid().as_raw() == uid
 }
@@ -696,10 +670,45 @@ fn hex_suffix(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(windows)]
+pub fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
+    let absolute = normalize_absolute(path)?;
+    fs::symlink_metadata(&absolute).map_err(map_io_error)?;
+    validate_directory(
+        absolute.parent().ok_or(SecureFileError::UnsafePath)?,
+        private,
+    )?;
+    crate::filesystem::open_secure_regular_file(&absolute, "removed file", private)
+        .map_err(map_runtime_error)?;
+    crate::filesystem::remove_file_durable(&absolute).map_err(map_runtime_error)
+}
+
+#[cfg(windows)]
+fn map_io_error(error: std::io::Error) -> SecureFileError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        SecureFileError::NotFound
+    } else {
+        SecureFileError::Io
+    }
+}
+
+#[cfg(windows)]
+fn map_runtime_error(error: anyhow::Error) -> SecureFileError {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        SecureFileError::NotFound
+    } else {
+        SecureFileError::UnsafePath
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::thread;
 
+    #[cfg(unix)]
     #[test]
     fn current_effective_user_is_an_accepted_owner() {
         let current = rustix::process::geteuid().as_raw();
@@ -731,5 +740,86 @@ mod tests {
         assert!(bytes == b"first" || bytes == b"second");
         assert_eq!(super::write_new_or_exact(&path, &bytes, true), Ok(()));
         std::fs::remove_dir_all(root).expect("cleanup temporary evidence");
+    }
+
+    #[test]
+    fn promote_private_file_publishes_and_removes_the_staged_name() {
+        let root = crate::filesystem::PrivateTempDir::new("private-promotion").unwrap();
+        let staged = root.path().join("pending.json");
+        let target = root.path().join("committed.json");
+        super::write_atomic(&staged, b"verified", true).unwrap();
+
+        super::promote_private_file(&staged, &target).unwrap();
+
+        assert_eq!(super::read_bounded(&target, 32, true).unwrap(), b"verified");
+        assert_eq!(
+            super::read_bounded(&staged, 32, true),
+            Err(super::SecureFileError::NotFound)
+        );
+    }
+
+    #[test]
+    fn promote_private_file_preserves_an_existing_target_and_the_source() {
+        let root = crate::filesystem::PrivateTempDir::new("private-promotion-conflict").unwrap();
+        let staged = root.path().join("pending.json");
+        let target = root.path().join("committed.json");
+        super::write_atomic(&staged, b"new evidence", true).unwrap();
+        super::write_atomic(&target, b"original evidence", true).unwrap();
+
+        assert!(super::promote_private_file(&staged, &target).is_err());
+
+        assert_eq!(
+            super::read_bounded(&staged, 32, true).unwrap(),
+            b"new evidence"
+        );
+        assert_eq!(
+            super::read_bounded(&target, 32, true).unwrap(),
+            b"original evidence"
+        );
+    }
+
+    #[test]
+    fn promote_private_file_allows_only_one_concurrent_publisher() {
+        use std::sync::{Arc, Barrier};
+
+        let root = crate::filesystem::PrivateTempDir::new("private-promotion-race").unwrap();
+        let first = root.path().join("first.pending");
+        let second = root.path().join("second.pending");
+        let target = root.path().join("committed.json");
+        super::write_atomic(&first, b"first", true).unwrap();
+        super::write_atomic(&second, b"second", true).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|staged| {
+                let staged = staged.clone();
+                let target = target.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    super::promote_private_file(&staged, &target)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let (winner, loser, winning_bytes, losing_bytes) = if results[0].is_ok() {
+            (&first, &second, b"first".as_slice(), b"second".as_slice())
+        } else {
+            (&second, &first, b"second".as_slice(), b"first".as_slice())
+        };
+        assert_eq!(
+            super::read_bounded(&target, 32, true).unwrap(),
+            winning_bytes
+        );
+        assert_eq!(super::read_bounded(loser, 32, true).unwrap(), losing_bytes);
+        assert_eq!(
+            super::read_bounded(winner, 32, true),
+            Err(super::SecureFileError::NotFound)
+        );
     }
 }

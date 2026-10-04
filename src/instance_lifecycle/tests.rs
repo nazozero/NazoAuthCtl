@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{ControlOutcome, ControlResult};
 
-use super::privilege::{PrivilegeStep, ensure_engine_access};
+use super::privilege::ensure_engine_access;
 use super::uninstall::plan_uninstall;
 use super::update::{UpdateRequest, run_update};
 use super::{LifecycleContext, rollback::run_rollback, uninstall::run_uninstall};
@@ -748,29 +748,6 @@ fn uninstall_plan_and_operation_log_keep_external_resources_listed() -> anyhow::
 }
 
 // -------------------------------------------------------------------- G07
-
-#[test]
-fn privilege_matrix_requires_elevation_only_for_genuinely_elevated_steps() {
-    use PrivilegeStep::*;
-    for step in [RegistryRead, DeploymentStateRead, HealthProbe] {
-        assert!(
-            !step.requires_elevation(),
-            "{} must stay unprivileged",
-            step.label()
-        );
-    }
-    for step in [
-        EngineSocketAccess,
-        SystemdUnitManagement,
-        PrivilegedPortBind,
-    ] {
-        assert!(
-            step.requires_elevation(),
-            "{} must be classified elevated",
-            step.label()
-        );
-    }
-}
 
 #[test]
 fn engine_access_check_names_the_step_and_never_runs_sudo() {

@@ -570,6 +570,14 @@ fn offline_validation_proves_chain_san_server_usage_and_key_match() {
         validated.leaf_sha256.clone(),
     );
     assert!(validate_rollback_material(&receipt, &provider).is_ok());
+    let mut renewal_provider = provider.clone();
+    renewal_provider.config.minimum_validity_seconds =
+        (validated.not_after - Utc::now().timestamp()) as u64 + 3600;
+    assert!(
+        load_and_validate_material(certificate, private_key, &input.hostname, &renewal_provider)
+            .is_err()
+    );
+    assert!(validate_rollback_material(&receipt, &renewal_provider).is_ok());
     let mut changed_provider = provider.clone();
     changed_provider.config_sha256 = "c".repeat(64);
     assert!(validate_rollback_material(&receipt, &changed_provider).is_err());

@@ -364,10 +364,6 @@ impl HostOperationBody {
             Self::BackupTransferCleanup { .. } => "backup-transfer-cleanup",
         }
     }
-
-    pub(crate) fn is_ephemeral_backup_read(&self) -> bool {
-        matches!(self, Self::BackupTransferRead { .. })
-    }
 }
 
 impl HostOperation {
@@ -1563,6 +1559,9 @@ pub struct AdminProvisionReceipt {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceInspection {
+    /// Failures in optional projections, never substitutes for execution facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
     pub deployment_id: String,
     pub issuer: String,
     pub observed_at: DateTime<Utc>,
@@ -1852,23 +1851,22 @@ fn valid_token(value: &str, max_chars: usize) -> bool {
         && value.chars().all(|character| character.is_ascii_graphic())
 }
 
-/// Bound a diagnostic token: printable ASCII only, hard length cap.
+/// Bound diagnostic text without destroying printable Unicode.
 pub(super) fn sanitize(value: impl Into<String>) -> String {
     let value: String = value.into();
-    let characters: Vec<char> = value.chars().collect();
-    let truncated = characters.len() > 200;
+    let mut characters = value.chars();
     let mut bounded: String = characters
-        .into_iter()
+        .by_ref()
         .take(200)
         .map(|character| {
-            if character.is_ascii_graphic() || character == ' ' {
+            if !character.is_control() {
                 character
             } else {
                 '?'
             }
         })
         .collect();
-    if truncated {
+    if characters.next().is_some() {
         bounded.push('…');
     }
     bounded
@@ -2360,6 +2358,7 @@ mod tests {
             active_host_operation: None,
             config_revision_marker: None,
             current_release: None,
+            diagnostics: Vec::new(),
             current_instance_identity: Some(RuntimeInstanceIdentity {
                 runtime_instance_id: "runtime-alpha".to_owned(),
                 instance_key_id: "instance-key-alpha".to_owned(),

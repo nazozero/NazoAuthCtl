@@ -244,6 +244,7 @@ pub(super) fn current_install_source(
     let loaded = load_receipt_record(store, record, &tenant, &hostname)?
         .context("no current ACME issuance receipt exists for this binding")?;
     let receipt = loaded.receipt;
+    validate_receipt_artifacts(store, &receipt)?;
     validate_install_authority(
         &receipt,
         record.declaration_revision,
@@ -415,6 +416,7 @@ fn recover(
         .filter(|receipt| receipt.jti == transaction.jti)
     {
         validate_receipt_transaction(receipt, &transaction)?;
+        validate_receipt_artifacts(store, receipt)?;
         cleanup_challenge(&transaction)?;
         archive_transaction(store, &transaction)?;
         crate::ui::print_value(&serde_json::to_value(receipt)?);
@@ -442,6 +444,9 @@ fn show(
         validate_transaction_binding(store, transaction, &record, &tenant, &hostname)?;
     }
     let receipt = load_receipt(store, &record, &tenant, &hostname)?;
+    if let Some(receipt) = &receipt {
+        validate_receipt_artifacts(store, receipt)?;
+    }
     crate::ui::print_value(&serde_json::json!({
         "schema": 1,
         "deployment_id": record.deployment_id,
@@ -858,16 +863,50 @@ async fn load_or_create_account(
         .map(super::material::root_store_from_pem)
         .transpose()?;
     let builder = Account::builder_with_http(build_http_client(authority.clone(), roots)?);
+    let _account_lock = store.shared_resource_lock(&format!(
+        "acme-account-{}",
+        sha256(
+            format!(
+                "{}\0{}",
+                transaction.deployment_id, transaction.directory_url
+            )
+            .as_bytes()
+        )
+    ))?;
+    migrate_account_if_needed(store, transaction, acme)?;
     match load_account(&transaction.account_path)? {
-        Some(account_record) => {
+        Some(mut account_record) => {
             validate_account_record(&account_record, transaction, acme)?;
             bind_account_key_digest(store, transaction, &account_record.account_key_sha256)?;
             retire_account_key_draft(&transaction.account_path)?;
+            let contacts_changed =
+                account_record.contacts_sha256 != contacts_sha256(&acme.config.contacts);
+            let updated_record = if contacts_changed {
+                account_record.contacts_sha256 = contacts_sha256(&acme.config.contacts);
+                Some(Zeroizing::new(serde_json::to_vec_pretty(&account_record)?))
+            } else {
+                None
+            };
             let account = builder
                 .from_credentials(account_record.credentials)
                 .await
                 .context("failed to restore ACME account")?;
             authority.require_url(account.id(), "restored ACME account URL")?;
+            if contacts_changed {
+                let contacts = acme
+                    .config
+                    .contacts
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                account
+                    .update_contacts(&contacts)
+                    .await
+                    .context("failed to update ACME account contacts")?;
+                if let Some(bytes) = updated_record {
+                    atomic_write(&transaction.account_path, &bytes, 0o600)?;
+                }
+            }
             Ok(account)
         }
         None => {
@@ -936,10 +975,7 @@ fn validate_account_record(
 ) -> anyhow::Result<()> {
     if account.schema != ACCOUNT_SCHEMA
         || account.deployment_id != transaction.deployment_id
-        || account.acme_config_sha256 != acme.sha256
         || account.directory_url != acme.config.directory_url
-        || account.allowed_origins != acme.config.allowed_origins
-        || account.contacts_sha256 != contacts_sha256(&acme.config.contacts)
         || transaction
             .account_key_sha256
             .as_ref()
@@ -1249,13 +1285,15 @@ fn validate_transaction_binding(
             )
             .join("transactions")
             .join(&transaction.jti)
-        || transaction.account_path
-            != account_path_for_binding(
-                store,
-                &record.deployment_id,
-                &transaction.directory_url,
-                &transaction.acme_config_sha256,
-            )
+        || (transaction.account_path
+            != account_path_for_directory(store, &record.deployment_id, &transaction.directory_url)
+            && transaction.account_path
+                != account_path_for_binding(
+                    store,
+                    &record.deployment_id,
+                    &transaction.directory_url,
+                    &transaction.acme_config_sha256,
+                ))
     {
         bail!("ACME transaction does not match the selected deployment binding");
     }
@@ -1682,7 +1720,6 @@ fn load_receipt_record(
         bail!("ACME issuance receipt differs from the selected binding");
     }
     validate_receipt_shape(store, &receipt)?;
-    validate_receipt_artifacts(store, &receipt)?;
     Ok(Some(LoadedAcmeReceipt {
         receipt,
         receipt_sha256: sha256(&bytes),
@@ -1707,23 +1744,32 @@ fn validate_receipt_artifacts(store: &TlsStore, receipt: &AcmeReceipt) -> anyhow
     {
         bail!("ACME receipt material differs from its bound digest");
     }
-    let account = load_account(&account_path_for_binding(
-        store,
-        &receipt.deployment_id,
-        &receipt.directory_url,
-        &receipt.acme_config_sha256,
-    ))?
-    .context("ACME receipt account credentials are missing")?;
-    if account.schema != ACCOUNT_SCHEMA
-        || account.deployment_id != receipt.deployment_id
-        || account.acme_config_sha256 != receipt.acme_config_sha256
-        || account.directory_url != receipt.directory_url
-        || account.allowed_origins != receipt.allowed_origins
-        || account.account_key_sha256 != receipt.account_key_sha256
-    {
-        bail!("ACME receipt account credentials differ from its authority binding");
-    }
+    validate_receipt_account(store, receipt)?;
     Ok(())
+}
+
+fn validate_receipt_account(store: &TlsStore, receipt: &AcmeReceipt) -> anyhow::Result<()> {
+    for path in [
+        account_path_for_directory(store, &receipt.deployment_id, &receipt.directory_url),
+        account_path_for_binding(
+            store,
+            &receipt.deployment_id,
+            &receipt.directory_url,
+            &receipt.acme_config_sha256,
+        ),
+    ] {
+        // A deployment may retain several historical account keys. Only the
+        // key bound by this receipt is relevant to validating its artifacts.
+        if let Ok(Some(account)) = load_account(&path)
+            && account.schema == ACCOUNT_SCHEMA
+            && account.deployment_id == receipt.deployment_id
+            && account.directory_url == receipt.directory_url
+            && account.account_key_sha256 == receipt.account_key_sha256
+        {
+            return Ok(());
+        }
+    }
+    bail!("ACME receipt account credentials are missing or differ from its authority binding")
 }
 
 fn read_optional_private(
@@ -1820,12 +1866,71 @@ fn acme_binding_directory(
 }
 
 fn account_path(store: &TlsStore, record: &TlsRecord, acme: &LoadedAcmeConfig) -> PathBuf {
-    account_path_for_binding(
-        store,
-        &record.deployment_id,
-        &acme.config.directory_url,
-        &acme.sha256,
-    )
+    account_path_for_directory(store, &record.deployment_id, &acme.config.directory_url)
+}
+
+fn account_path_for_directory(
+    store: &TlsStore,
+    deployment_id: &str,
+    directory_url: &str,
+) -> PathBuf {
+    store
+        .deployment_state_dir(deployment_id)
+        .join("tls-acme")
+        .join("accounts")
+        .join(format!("account-{}.json", sha256(directory_url.as_bytes())))
+}
+
+// Existing transactions keep their exact path. New transactions reuse the CA
+// account, including accounts written before the directory-based namespace.
+fn migrate_account_if_needed(
+    store: &TlsStore,
+    transaction: &AcmeTransaction,
+    acme: &LoadedAcmeConfig,
+) -> anyhow::Result<()> {
+    if transaction.account_path
+        != account_path_for_directory(
+            store,
+            &transaction.deployment_id,
+            &transaction.directory_url,
+        )
+        || transaction.account_path.exists()
+    {
+        return Ok(());
+    }
+    let parent = transaction
+        .account_path
+        .parent()
+        .context("ACME account has no parent")?;
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("failed to list legacy ACME accounts"),
+    };
+    let mut candidates = entries.collect::<Result<Vec<_>, _>>()?;
+    candidates.sort_by_key(|entry| entry.file_name());
+    for entry in candidates {
+        // Only an authenticated, internally consistent legacy record is a
+        // migration source. Unrelated damaged records do not block issuance.
+        let Ok(Some(account)) = load_account(&entry.path()) else {
+            continue;
+        };
+        if validate_account_record(&account, transaction, acme).is_err()
+            || entry.path()
+                != account_path_for_binding(
+                    store,
+                    &account.deployment_id,
+                    &account.directory_url,
+                    &account.acme_config_sha256,
+                )
+        {
+            continue;
+        }
+        let bytes = Zeroizing::new(serde_json::to_vec_pretty(&account)?);
+        atomic_write(&transaction.account_path, &bytes, 0o600)?;
+        break;
+    }
+    Ok(())
 }
 
 fn account_path_for_binding(
@@ -1885,6 +1990,68 @@ fn validate_absolute_normalized(path: &Path, label: &str) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use crate::filesystem::PrivateTempDir;
+
+    #[test]
+    fn ca_account_migrates_across_config_changes_and_receipts_select_their_key() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let work = PrivateTempDir::new("acme-account-migration").unwrap();
+        let store = TlsStore {
+            config_root: work.path().join("config"),
+            state_root: work.path().join("state"),
+        };
+        let mut transaction = test_transaction_for_store(&store);
+        let legacy_path = transaction.account_path.clone();
+        let (_, key) = Key::generate_pkcs8().unwrap();
+        let digest = sha256(key.secret_pkcs8_der());
+        let account = AccountRecord {
+            schema: ACCOUNT_SCHEMA, deployment_id: transaction.deployment_id.clone(),
+            acme_config_sha256: transaction.acme_config_sha256.clone(),
+            directory_url: transaction.directory_url.clone(), allowed_origins: transaction.allowed_origins.clone(),
+            contacts_sha256: "a".repeat(64), account_key_sha256: digest.clone(), created_at: 1,
+            credentials: serde_json::from_value(serde_json::json!({
+                "id":"https://acme.example/account/1", "key_pkcs8":URL_SAFE_NO_PAD.encode(key.secret_pkcs8_der()),
+                "directory": transaction.directory_url,
+            })).unwrap(),
+        };
+        atomic_write(&legacy_path, &serde_json::to_vec(&account).unwrap(), 0o600).unwrap();
+        transaction.acme_config_sha256 = "f".repeat(64);
+        transaction.hostname = "second.example".into();
+        transaction.account_key_sha256 = None;
+        transaction.account_path = account_path_for_directory(
+            &store,
+            &transaction.deployment_id,
+            &transaction.directory_url,
+        );
+        let acme = LoadedAcmeConfig {
+            config: test_config(work.path().join("other-webroot")),
+            sha256: transaction.acme_config_sha256.clone(),
+            source_bytes: Vec::new(),
+            directory_trust_anchor: None,
+        };
+        migrate_account_if_needed(&store, &transaction, &acme).unwrap();
+        assert_eq!(
+            load_account(&transaction.account_path)
+                .unwrap()
+                .unwrap()
+                .account_key_sha256,
+            digest
+        );
+        transaction.account_key_sha256 = Some(digest.clone());
+        let mut receipt = test_receipt(&transaction);
+        let unrelated = account_path_for_binding(
+            &store,
+            &receipt.deployment_id,
+            &receipt.directory_url,
+            &receipt.acme_config_sha256,
+        );
+        atomic_write(&unrelated, b"corrupt unrelated legacy account", 0o600).unwrap();
+        validate_receipt_account(&store, &receipt).unwrap();
+        receipt.acme_config_sha256 = account.acme_config_sha256;
+        atomic_write(&transaction.account_path, b"corrupt newer account", 0o600).unwrap();
+        validate_receipt_account(&store, &receipt).unwrap();
+        receipt.account_key_sha256 = "0".repeat(64);
+        assert!(validate_receipt_account(&store, &receipt).is_err());
+    }
 
     #[test]
     fn synchronous_transaction_driver_persists_account_errors_without_panicking() {

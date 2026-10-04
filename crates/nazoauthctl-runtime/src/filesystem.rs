@@ -80,6 +80,11 @@ impl Drop for PrivateTempDir {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn promote_private_file_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    windows::promote_private_file_no_replace(from, to)
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -99,12 +104,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> 
                 path.display()
             );
         }
-        // `std::fs::rename` cannot atomically replace an existing destination on
-        // Windows. A two-rename fallback creates a power-loss window in which the
-        // authoritative journal/configuration path does not exist. Keep the
-        // replacement in one platform-native commit operation instead. The
-        // implementation also anchors Unix operations to the opened parent
-        // directory, so a concurrent ancestor rename cannot redirect the commit.
+        // Commit replacement in one operation, without a two-rename window
+        // where the authoritative path would be absent. Unix operations are
+        // anchored to the opened parent directory; Windows uses the native
+        // handle implementation above.
         let mut file = atomic_write_file::AtomicWriteFile::open(path)
             .with_context(|| format!("failed to stage atomic write for {}", path.display()))?;
         set_file_mode(file.as_file(), mode)?;
@@ -176,8 +179,6 @@ fn open_secure_regular_file_with_owner(
         .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
     validate_secure_file_metadata(&opened, path, label, private, expected_owner_uid)?;
     validate_same_file(&before, &opened, label)?;
-    #[cfg(windows)]
-    windows::validate_file_handle(&file, path, label, private)?;
     Ok(file)
 }
 
@@ -866,14 +867,8 @@ pub fn sha256(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(unix)]
 fn configure_secure_open(options: &mut OpenOptions) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
-    #[cfg(not(unix))]
-    let _ = options;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
 }
 
 pub fn sha256_file(file: &mut File, description: &str) -> anyhow::Result<String> {

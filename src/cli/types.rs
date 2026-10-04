@@ -128,6 +128,7 @@ pub(crate) enum Command {
     /// §3.2): one bounded HostOperation JSON on stdin, one HostResult JSON on
     /// stdout, no daemon. Invoked only through OpenSSH by the control side.
     RemoteExec,
+    RemoteTransferStream,
     /// Controller self-maintenance: signed NazoAuthCtl releases only.
     SelfCheck(Option<String>),
     SelfUpdate {

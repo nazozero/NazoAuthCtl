@@ -58,10 +58,6 @@ impl BrowserTargetOrigin {
         Ok(Self { url: canonical })
     }
 
-    pub fn from_origin(origin: &Origin) -> Result<Self, BrowserError> {
-        Self::parse(origin.as_str())
-    }
-
     pub fn as_url(&self) -> &Url {
         &self.url
     }
@@ -99,7 +95,6 @@ impl BrowserPolicy {
             suite_origin,
             limits: BrowserLimits::default(),
         };
-        policy.limits.validate()?;
         Ok(policy)
     }
 
@@ -178,12 +173,7 @@ impl BrowserLimits {
 }
 
 pub(super) fn validate_contains(value: &str) -> Result<(), BrowserError> {
-    if value.is_empty()
-        || value.len() > MAX_MATCH_BYTES
-        || value.chars().any(char::is_control)
-        || value.contains("://")
-        || value.contains("..")
-    {
+    if value.is_empty() || value.len() > MAX_MATCH_BYTES || value.chars().any(char::is_control) {
         return Err(BrowserError::InvalidSchema);
     }
     Ok(())
@@ -204,18 +194,19 @@ pub(super) fn validate_match_pattern(value: &str, max: usize) -> Result<(), Brow
 }
 
 pub(super) fn glob_matches(pattern: &str, value: &str) -> bool {
-    let mut remainder = value;
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return false;
+    let Some((first, suffix)) = pattern.split_once('*') else {
+        return pattern == value;
     };
+    let mut remainder = value;
     if !remainder.starts_with(first) {
         return false;
     }
     remainder = &remainder[first.len()..];
-    let mut suffixes: Vec<&str> = parts.collect();
-    let last = suffixes.pop().unwrap_or("");
-    for part in suffixes {
+    let mut parts = suffix.split('*');
+    let last = parts
+        .next_back()
+        .expect("split always contains one segment");
+    for part in parts {
         let Some(index) = remainder.find(part) else {
             return false;
         };

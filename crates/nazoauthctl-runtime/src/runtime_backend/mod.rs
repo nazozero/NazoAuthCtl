@@ -3,11 +3,10 @@ mod docker;
 mod podman;
 mod systemd;
 
-use std::{collections::BTreeMap, fmt::Write as _, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 /// Validate a path before rendering it into a systemd unit directive.
 pub fn safe_systemd_path(path: &std::path::Path) -> anyhow::Result<()> {
@@ -59,7 +58,6 @@ fn safe_absolute(path: &std::path::Path) -> anyhow::Result<()> {
 /// because image metadata drifts (exposed for the G-wave control executor).
 pub use container_shared::NON_ROOT_ONE_SHOT_USER;
 pub use container_shared::normalize_local_image_id;
-pub use container_shared::oci_backup_digests;
 pub use docker::DockerBackend;
 pub use podman::PodmanBackend;
 pub use systemd::{
@@ -301,18 +299,6 @@ impl ContainerRuntimePolicy {
         policy.restart = ContainerRestartPolicy::No;
         policy
     }
-
-    pub fn managed_postgres() -> Self {
-        let mut policy = Self::managed_default();
-        policy.service_user = Some("999:999".to_owned());
-        policy
-    }
-
-    pub fn managed_valkey() -> Self {
-        let mut policy = Self::managed_default();
-        policy.service_user = Some("999:1000".to_owned());
-        policy
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -333,249 +319,6 @@ pub struct OneShotTask {
 }
 
 #[derive(Clone, Debug)]
-pub struct ManagedPostgresRestore {
-    pub network: String,
-    pub postgres_object: String,
-    pub postgres_image: String,
-    pub backup_directory: PathBuf,
-    pub service_file: PathBuf,
-    pub password_file: PathBuf,
-    pub image: String,
-    pub manifest_digest: String,
-    pub completion_marker_digest: String,
-    pub identity: ManagedDependencyIdentity,
-}
-
-#[derive(Clone, Debug)]
-pub struct ManagedValkeyRestore {
-    pub network: String,
-    pub object_reference: String,
-    pub data_volume: String,
-    pub backup_directory: PathBuf,
-    pub image: String,
-    pub manifest_digest: String,
-    pub completion_marker_digest: String,
-    pub identity: ManagedDependencyIdentity,
-}
-
-#[derive(Clone, Debug)]
-pub struct ManagedPostgresCommand {
-    pub object_reference: String,
-    pub network: String,
-    pub database: String,
-    pub user: String,
-    pub stdin: Vec<u8>,
-    pub image: String,
-    pub identity: ManagedDependencyIdentity,
-}
-
-#[derive(Clone, Debug)]
-pub struct ManagedDependencyBackup {
-    pub destination: PathBuf,
-    pub network: String,
-    pub postgres_object: String,
-    pub postgres_volume: String,
-    pub postgres_image: String,
-    pub postgres_user: String,
-    pub postgres_database: String,
-    pub postgres_validation_image: String,
-    pub valkey_object: String,
-    pub valkey_volume: String,
-    pub valkey_image: String,
-    pub valkey_rdb_path: String,
-    pub valkey_password_file: Option<PathBuf>,
-    pub valkey_user: Option<String>,
-    pub identity: ManagedDependencyIdentity,
-}
-
-/// Immutable identities and configuration digests used when a managed
-/// dependency is touched.  Runtime/deployment labels alone are not enough:
-/// the digest binds the expected object role, names, network, volumes and
-/// pinned images to the operation that is about to run.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedDependencyIdentity {
-    pub deployment_id: String,
-    pub control_authority: String,
-    pub runtime_instance_id: String,
-    pub network_config_digest: String,
-    pub postgres_config_digest: String,
-    pub postgres_volume_config_digest: String,
-    pub valkey_config_digest: String,
-    pub valkey_volume_config_digest: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct ManagedNetwork {
-    pub name: String,
-    pub subnet: Option<String>,
-    pub deployment_id: String,
-    pub control_authority: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct ManagedDependencies {
-    pub network: ManagedNetwork,
-    pub runtime_instance_id: String,
-    pub postgres_object: String,
-    pub postgres_volume: String,
-    pub postgres_image: String,
-    pub postgres_database: String,
-    pub postgres_user: String,
-    pub postgres_password_file: PathBuf,
-    pub valkey_object: String,
-    pub valkey_volume: String,
-    pub valkey_image: String,
-    pub valkey_password_file: PathBuf,
-    pub valkey_acl_file: PathBuf,
-    pub valkey_user: String,
-}
-
-pub const MANAGED_VALKEY_RUNTIME_USER: &str = "nazoauth_runtime";
-pub const MANAGED_VALKEY_BACKUP_USER: &str = "nazoauth_backup";
-
-impl ManagedDependencies {
-    pub fn identity(&self) -> ManagedDependencyIdentity {
-        managed_dependency_identity(
-            &self.network.deployment_id,
-            &self.network.control_authority,
-            &self.runtime_instance_id,
-            &self.network.name,
-            self.network.subnet.as_deref(),
-            &self.postgres_object,
-            &self.postgres_volume,
-            &self.postgres_image,
-            &self.postgres_database,
-            &self.postgres_user,
-            &self.valkey_object,
-            &self.valkey_volume,
-            &self.valkey_image,
-        )
-    }
-}
-
-/// Build a stable, length-delimited digest for a managed resource's
-/// immutable configuration.  Length prefixes avoid ambiguity when values are
-/// concatenated (for example `ab` + `c` versus `a` + `bc`).
-pub fn managed_config_digest(resource_kind: &str, fields: &[(&str, &str)]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"nazoauthctl-managed-resource-v1\0");
-    update_digest_part(&mut digest, "resource-kind", resource_kind);
-    for (name, value) in fields {
-        update_digest_part(&mut digest, name, value);
-    }
-    let digest = digest.finalize();
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        write!(&mut encoded, "{byte:02x}").expect("writing digest to String cannot fail");
-    }
-    format!("sha256:{encoded}")
-}
-
-fn update_digest_part(digest: &mut Sha256, name: &str, value: &str) {
-    digest.update(name.len().to_string().as_bytes());
-    digest.update(b":");
-    digest.update(name.as_bytes());
-    digest.update(value.len().to_string().as_bytes());
-    digest.update(b":");
-    digest.update(value.as_bytes());
-    digest.update(b"\0");
-}
-
-pub fn managed_network_config_digest(
-    deployment_id: &str,
-    control_authority: &str,
-    network: &str,
-    subnet: Option<&str>,
-) -> String {
-    let mut fields = vec![
-        ("deployment-id", deployment_id),
-        ("control-authority", control_authority),
-        ("network", network),
-    ];
-    if let Some(subnet) = subnet {
-        fields.push(("subnet", subnet));
-    }
-    managed_config_digest("network", &fields)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn managed_dependency_identity(
-    deployment_id: &str,
-    control_authority: &str,
-    runtime_instance_id: &str,
-    network: &str,
-    network_subnet: Option<&str>,
-    postgres_object: &str,
-    postgres_volume: &str,
-    postgres_image: &str,
-    postgres_database: &str,
-    postgres_user: &str,
-    valkey_object: &str,
-    valkey_volume: &str,
-    valkey_image: &str,
-) -> ManagedDependencyIdentity {
-    let common = [
-        ("deployment-id", deployment_id),
-        ("control-authority", control_authority),
-        ("runtime-instance-id", runtime_instance_id),
-        ("network", network),
-    ];
-    // A network is deployment-scoped and may be ensured before the runtime
-    // instance is materialized.  Its immutable digest therefore binds the
-    // network's own deployment/authority/name identity; dependency resources
-    // additionally bind the runtime instance below.
-    let mut network_fields = vec![
-        ("deployment-id", deployment_id),
-        ("control-authority", control_authority),
-        ("network", network),
-    ];
-    if let Some(subnet) = network_subnet {
-        network_fields.push(("subnet", subnet));
-    }
-    let network_config_digest = managed_config_digest("network", &network_fields);
-
-    let mut postgres_fields = common.to_vec();
-    postgres_fields.extend([
-        ("role", "postgres"),
-        ("object", postgres_object),
-        ("volume", postgres_volume),
-        ("image", postgres_image),
-        ("database", postgres_database),
-        ("user", postgres_user),
-    ]);
-    let postgres_config_digest = managed_config_digest("postgres", &postgres_fields);
-
-    let mut postgres_volume_fields = common.to_vec();
-    postgres_volume_fields.extend([("role", "postgres-volume"), ("volume", postgres_volume)]);
-    let postgres_volume_config_digest =
-        managed_config_digest("postgres-volume", &postgres_volume_fields);
-
-    let mut valkey_fields = common.to_vec();
-    valkey_fields.extend([
-        ("role", "valkey"),
-        ("object", valkey_object),
-        ("volume", valkey_volume),
-        ("image", valkey_image),
-    ]);
-    let valkey_config_digest = managed_config_digest("valkey", &valkey_fields);
-
-    let mut valkey_volume_fields = common.to_vec();
-    valkey_volume_fields.extend([("role", "valkey-volume"), ("volume", valkey_volume)]);
-    let valkey_volume_config_digest = managed_config_digest("valkey-volume", &valkey_volume_fields);
-
-    ManagedDependencyIdentity {
-        deployment_id: deployment_id.to_owned(),
-        control_authority: control_authority.to_owned(),
-        runtime_instance_id: runtime_instance_id.to_owned(),
-        network_config_digest,
-        postgres_config_digest,
-        postgres_volume_config_digest,
-        valkey_config_digest,
-        valkey_volume_config_digest,
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct HostServiceInstall {
     pub service_name: String,
     pub deployment_id: String,
@@ -587,13 +330,6 @@ pub struct HostServiceInstall {
     pub config: PathBuf,
     pub data_root: PathBuf,
     pub secret_paths: Vec<PathBuf>,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Clone, Debug)]
-pub struct DebugArtifactTask {
-    pub target: String,
-    pub arguments: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -628,6 +364,7 @@ pub trait RuntimeBackend {
     fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()>;
     fn restart(&self, object_reference: &str) -> anyhow::Result<()>;
     fn remove(&self, object_reference: &str) -> anyhow::Result<()>;
+    /// Replace the runtime object without starting it. The caller restores the desired running state.
     fn replace(&self, replacement: &RuntimeReplacement) -> anyhow::Result<()>;
     /// Create a one-use, loopback-only candidate from a stopped runtime after
     /// proving the complete recover-only container surface.
@@ -651,25 +388,12 @@ pub trait RuntimeBackend {
     fn local_image_matches_digest(&self, image_reference: &str) -> bool;
     fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()>;
     fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()>;
-    fn restore_managed_postgres(&self, restore: &ManagedPostgresRestore) -> anyhow::Result<()>;
-    fn restore_managed_valkey(&self, restore: &ManagedValkeyRestore) -> anyhow::Result<()>;
-    fn execute_managed_postgres(&self, command: &ManagedPostgresCommand) -> anyhow::Result<()>;
-    fn backup_managed_dependencies(&self, backup: &ManagedDependencyBackup) -> anyhow::Result<()>;
-    fn ensure_managed_network(&self, network: &ManagedNetwork) -> anyhow::Result<std::net::IpAddr>;
-    fn ensure_managed_dependencies(&self, dependencies: &ManagedDependencies)
-    -> anyhow::Result<()>;
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()>;
-    #[cfg(debug_assertions)]
-    fn run_debug_artifact_task(&self, task: &DebugArtifactTask) -> anyhow::Result<()>;
     fn verify_blob_attestation(
         &self,
         verification: &BlobAttestationVerification,
     ) -> anyhow::Result<()>;
-    fn resolve_image_digest(&self, image_reference: &str) -> anyhow::Result<String>;
     fn resolve_local_image_id(&self, image_reference: &str) -> anyhow::Result<String>;
-    fn describe_mounts(&self, object_reference: &str) -> anyhow::Result<Vec<NeutralMount>> {
-        Ok(self.inspect(object_reference)?.mounts)
-    }
 }
 
 pub fn safe_environment(values: &[serde_json::Value]) -> BTreeMap<String, String> {

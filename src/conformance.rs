@@ -17,7 +17,6 @@ use crate::{
 
 const MAX_PROFILE_TOKEN_BYTES: u64 = 4 * 1024;
 const DYNAMIC_REGISTRATION_TOKEN_NAME: &str = "dynamic-registration-token";
-const CIBA_DECISION_TOKEN_NAME: &str = "ciba-decision-token";
 const OPENID4VP_MANAGEMENT_TOKEN_NAME: &str = "openid4vp-management-token";
 const OPENID4VCI_MANAGEMENT_TOKEN_NAME: &str = "openid4vci-management-token";
 
@@ -439,10 +438,6 @@ impl ConformanceSession {
         )
     }
 
-    pub fn ciba_automated_decision_token(&self) -> anyhow::Result<zeroize::Zeroizing<String>> {
-        self.read_profile_secret(CIBA_DECISION_TOKEN_NAME, "CIBA automated-decision token")
-    }
-
     fn read_profile_secret(
         &self,
         name: &str,
@@ -599,7 +594,7 @@ mod tests {
 
     #[test]
     fn openid4vp_verifier_inputs_require_the_exact_runtime_public_key_binding() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]).verifying_key();
+        let key = nazo_crypto::ed25519::SigningKey::from_bytes(&[41; 32]).verifying_key();
         let encoded = nazo_operator_protocol::encode_instance_public_key(&key);
         let key_id = nazo_operator_protocol::instance_key_id(&key);
         assert!(

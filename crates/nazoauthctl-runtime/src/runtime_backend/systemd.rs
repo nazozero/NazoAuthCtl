@@ -16,13 +16,10 @@ use crate::{
     process::Process,
 };
 
-#[cfg(debug_assertions)]
-use super::DebugArtifactTask;
 use super::{
-    BlobAttestationVerification, HostServiceInstall, ManagedDependencies, ManagedDependencyBackup,
-    ManagedNetwork, ManagedPostgresCommand, ManagedPostgresRestore, ManagedValkeyRestore,
-    OneShotTask, RecoveryCandidateEndpoint, RecoveryCandidateRequest, RuntimeBackend,
-    RuntimeObservation, RuntimeReplacement, safe_environment, safe_systemd_path,
+    BlobAttestationVerification, HostServiceInstall, OneShotTask, RecoveryCandidateEndpoint,
+    RecoveryCandidateRequest, RuntimeBackend, RuntimeObservation, RuntimeReplacement,
+    safe_environment, safe_systemd_path,
 };
 
 pub struct SystemdBackend;
@@ -120,6 +117,7 @@ impl RuntimeBackend for SystemdBackend {
         let server_command_verified = command_is_nazoauth_server(&exec_start);
         let artifact = executable
             .as_deref()
+            .filter(|_| server_command_verified)
             .and_then(|path| host_artifact(Path::new(path)).ok())
             .unwrap_or(ArtifactReference::Unknown);
         let mut missing = vec![
@@ -178,10 +176,8 @@ impl RuntimeBackend for SystemdBackend {
                 missing.push(format!("systemd {property} hardening is not observable"));
             }
         }
-        for variable in ["DEPLOYMENT_ID"] {
-            if !safe_environment.contains_key(variable) {
-                missing.push(format!("systemd Environment is missing {variable}"));
-            }
+        if !safe_environment.contains_key("DEPLOYMENT_ID") {
+            missing.push("systemd Environment is missing DEPLOYMENT_ID".to_owned());
         }
         if properties
             .get("EnvironmentFiles")
@@ -436,36 +432,6 @@ impl RuntimeBackend for SystemdBackend {
         bail!("systemd backend does not manage OCI images")
     }
 
-    fn restore_managed_postgres(&self, _restore: &ManagedPostgresRestore) -> anyhow::Result<()> {
-        bail!("systemd backend does not manage containerized PostgreSQL")
-    }
-
-    fn restore_managed_valkey(&self, _restore: &ManagedValkeyRestore) -> anyhow::Result<()> {
-        bail!("systemd backend does not manage containerized Valkey")
-    }
-
-    fn execute_managed_postgres(&self, _command: &ManagedPostgresCommand) -> anyhow::Result<()> {
-        bail!("systemd backend does not manage containerized PostgreSQL")
-    }
-
-    fn backup_managed_dependencies(&self, _backup: &ManagedDependencyBackup) -> anyhow::Result<()> {
-        bail!("systemd does not manage container dependency backups")
-    }
-
-    fn ensure_managed_network(
-        &self,
-        _network: &ManagedNetwork,
-    ) -> anyhow::Result<std::net::IpAddr> {
-        bail!("systemd does not manage container networks")
-    }
-
-    fn ensure_managed_dependencies(
-        &self,
-        _dependencies: &ManagedDependencies,
-    ) -> anyhow::Result<()> {
-        bail!("systemd does not manage container dependencies")
-    }
-
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {
         validate_host_service_install(install)?;
         if Process::new("id")
@@ -571,15 +537,6 @@ impl RuntimeBackend for SystemdBackend {
         Process::new("systemctl")
             .args(["enable", install.service_name.as_str()])
             .run_quiet()
-    }
-
-    #[cfg(debug_assertions)]
-    fn run_debug_artifact_task(&self, task: &DebugArtifactTask) -> anyhow::Result<()> {
-        Process::new(&task.target).args(&task.arguments).run_quiet()
-    }
-
-    fn resolve_image_digest(&self, _image_reference: &str) -> anyhow::Result<String> {
-        bail!("systemd backend does not manage OCI images")
     }
 
     fn local_image_matches_digest(&self, _image_reference: &str) -> bool {
@@ -934,9 +891,7 @@ fn add_operator_credentials(
     unit: &str,
 ) -> anyhow::Result<(Process, BTreeSet<String>)> {
     let mut credential_environment = BTreeSet::new();
-    for (environment, _) in OPERATOR_CREDENTIAL_ENVIRONMENT {
-        let credential = operator_credential_name(environment)
-            .expect("operator credential table contains its own environment key");
+    for (environment, credential) in OPERATOR_CREDENTIAL_ENVIRONMENT {
         let Some(source) = task.environment.get(environment) else {
             continue;
         };
@@ -984,6 +939,7 @@ fn systemd_credential_path(unit: &str, credential: &str) -> anyhow::Result<Strin
     Ok(format!("/run/credentials/{unit}/{credential}"))
 }
 
+#[cfg(test)]
 fn operator_credential_name(environment: &str) -> Option<&'static str> {
     OPERATOR_CREDENTIAL_ENVIRONMENT
         .iter()
@@ -1201,80 +1157,7 @@ fn decode_systemd_scalar(value: &str) -> anyhow::Result<String> {
 
 fn split_systemd_argv(value: &str) -> anyhow::Result<Vec<String>> {
     validate_systemd_exec_input(value)?;
-    let bytes = value.as_bytes();
-    let mut values = Vec::new();
-    let mut current = Vec::new();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor].is_ascii_whitespace() {
-            if !current.is_empty() {
-                values.push(String::from_utf8(std::mem::take(&mut current))?);
-            }
-            cursor += 1;
-            continue;
-        }
-        if bytes[cursor] != b'\\' {
-            if bytes[cursor] < 0x80 {
-                current.push(bytes[cursor]);
-                cursor += 1;
-            } else {
-                let character = value[cursor..]
-                    .chars()
-                    .next()
-                    .context("systemd ExecStart contains invalid UTF-8")?;
-                let length = character.len_utf8();
-                current.extend_from_slice(&bytes[cursor..cursor + length]);
-                cursor += length;
-            }
-            continue;
-        }
-        cursor += 1;
-        if cursor >= bytes.len() {
-            bail!("systemd ExecStart contains a truncated escape");
-        }
-        match bytes[cursor] {
-            b'x' if cursor + 2 < bytes.len() => {
-                let high = hex_value(bytes[cursor + 1])?;
-                let low = hex_value(bytes[cursor + 2])?;
-                current.push(high * 16 + low);
-                cursor += 3;
-            }
-            b'n' => {
-                current.push(b'\n');
-                cursor += 1;
-            }
-            b'r' => {
-                current.push(b'\r');
-                cursor += 1;
-            }
-            b't' => {
-                current.push(b'\t');
-                cursor += 1;
-            }
-            b's' => {
-                current.push(b' ');
-                cursor += 1;
-            }
-            b'\\' | b'"' | b'\'' => {
-                current.push(bytes[cursor]);
-                cursor += 1;
-            }
-            _ => bail!("systemd ExecStart contains an unsupported escape"),
-        }
-    }
-    if !current.is_empty() {
-        values.push(String::from_utf8(current)?);
-    }
-    Ok(values)
-}
-
-fn hex_value(value: u8) -> anyhow::Result<u8> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => bail!("systemd ExecStart contains an invalid hex escape"),
-    }
+    Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
 }
 
 fn validate_systemd_exec_input(value: &str) -> anyhow::Result<()> {

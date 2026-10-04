@@ -144,6 +144,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::Admin(_) => "admin",
         cli::Command::Tls(_) => "tls",
         cli::Command::RemoteExec => "remote exec",
+        cli::Command::RemoteTransferStream => "remote transfer-stream",
         cli::Command::SelfCheck(_) => "self check",
         cli::Command::SelfUpdate { .. } => "self update",
         cli::Command::SelfRollback => "self rollback",
