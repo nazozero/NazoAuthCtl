@@ -333,7 +333,10 @@ mod tests {
         ]);
         let legacy = keyring_core::Entry::new_with_modifiers(&service, &user, &modifiers)
             .expect("native legacy-format entry");
-        assert!(matches!(legacy.get_secret(), Err(keyring_core::Error::NoEntry)));
+        assert!(matches!(
+            legacy.get_secret(),
+            Err(keyring_core::Error::NoEntry)
+        ));
         struct Cleanup(keyring_core::Entry);
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -347,15 +350,25 @@ mod tests {
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>(),
         );
-        legacy.0.set_secret(&bytes).expect("write frozen legacy encoding");
+        legacy
+            .0
+            .set_secret(&bytes)
+            .expect("write frozen legacy encoding");
         bytes.zeroize();
         assert_eq!(
-            store.load(&first).expect("load legacy entry").expect("token").as_str(),
+            store
+                .load(&first)
+                .expect("load legacy entry")
+                .expect("token")
+                .as_str(),
             "legacy-token"
         );
         assert!(store.load(&second).expect("other origin").is_none());
         store.remove(&first).expect("remove legacy entry");
-        assert!(matches!(legacy.0.get_secret(), Err(keyring_core::Error::NoEntry)));
+        assert!(matches!(
+            legacy.0.get_secret(),
+            Err(keyring_core::Error::NoEntry)
+        ));
         assert!(store.load(&first).expect("removed entry").is_none());
         store.remove(&first).expect("remove missing entry");
     }
