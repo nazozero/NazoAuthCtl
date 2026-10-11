@@ -31,3 +31,19 @@ The bundled HAIP issuer clients explicitly require PAR, as required by HAIP 1.0 
 The official VP wallet may return a result page instead of an HTTP redirect. The controller then visits only the completion URL returned by the target start operation. Target rejection or an unrelated redirect still fails; runtime-signed evidence and official REVIEW outcomes retain their existing checks.
 
 For issuer-initiated multiple-client authorization, the Suite log's two explicit `VCIWaitForCredentialOffer` transitions determine when the second offer is due. A local completed-browser cache is not authoritative because another registered browser worker can complete the first flow. No offer is sent while browser URLs are pending, and repeated polling remains bounded to two offers.
+
+
+## Review evidence is separate from module completion
+
+An official REVIEW entry needs its stated evidence. A browser placeholder update
+may contain only `page_source`; neither that message nor a completed module proves
+that a screenshot exists. For visual obligations, check the actual image in the
+official entry against the retained PNG and manifest, then review its content and
+module/transaction binding. Do not reconstruct screenshots from old HTML and
+label them as historical captures.
+
+Keep local review decisions separate from official results and certification
+approval. The [2026-10-11 deployment review](oidf-hostinger-20261011.md#follow-up-retained-evidence-review)
+accepted 24 VP image obligations and 12 scope warnings, but found 17 missing OIDC
+screenshots and retained two mdoc privacy warnings. Local success, a filled
+placeholder, or green CI does not close those gaps.

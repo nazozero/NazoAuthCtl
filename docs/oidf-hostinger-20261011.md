@@ -51,7 +51,7 @@ It used no manual offers or excluded plans. All 397 module files and 24 real
 WebDriver screenshots match their recorded hashes. The ephemeral tenant and
 private run material were cleaned, while official plans were retained for review.
 `local_success=true` and `matrix_expectations_satisfied=true`; official
-`suite_pass` and `acceptance_pass` remain false pending review. The six warnings
+`suite_pass` and `acceptance_pass` remain false. The follow-up evidence review below identifies the exact remaining obligations. The six warnings
 are two fresh-signer mdoc timestamp privacy heuristics and four discovery scope
 warnings. None is relabeled PASS.
 
@@ -66,3 +66,37 @@ validated binary for current-schema backups until this repair is released.
 [Full deployment report](https://github.com/nazozero/NazoAuth/blob/6177b290f87f88f515a78ea2abd41f0003a338c4/docs/operations/reports/main-upgrade-2026-10-10.md)
 contains command exit records, prior failed/interrupted runs, source identities,
 all module outcomes, retained plan IDs and private evidence manifest digests.
+
+## Follow-up retained-evidence review
+
+All 41 REVIEW and 14 WARNING modules in the composite ledger were reviewed on
+2026-10-11. Local decisions are **24 PASS, 12 ACCEPTABLE, 17 INCOMPLETE and 2 OPEN**.
+These labels do not modify any official Suite result.
+
+The 24 VP images show the verified-result page. Each official image matches its
+retained WebDriver PNG and has a distinct module, transaction path and receipt
+hash. Their identical pixels are expected for the minimal shared success page.
+The 12 scope warnings are acceptable: the omitted application/credential scopes
+are actually granted by successful token responses, and RFC 8414 permits their
+omission from discovery.
+
+The first run's 17 OIDC REVIEW entries contain page source, not screenshots;
+the initial evidence manifest contains no screenshot records. Placeholder-filled
+messages must not be treated as proof of rendered image evidence. Six second-login,
+three redirect-rejection and eight logout obligations require fresh targeted
+browser captures; the old tenant has been cleaned. Do not render retained HTML
+and present it as an original screenshot. For invalid logout inputs, capture the
+local confirmation and final result plus no-RP-redirect evidence: the specification
+allows local confirmation instead of requiring a particular error-page message.
+
+Both mdoc warnings involve ten credentials sharing the same certificate's exact
+notBefore time. This explains the precision without a per-request timestamp,
+but does not establish a sufficient independent-holder cohort or a privacy-rule
+exception. They remain open. Do not weaken validity checks or simply wait for the
+Suite freshness heuristic to disappear.
+
+[Complete review and 55-module evidence ledger](https://github.com/nazozero/NazoAuth/blob/b399fb67f97a27ba5f30576f11d2dd9c9e0d5927/docs/operations/reports/oidf-review-2026-10-11.md)
+records source identities, hashes, standards and closure criteria. The review
+made no code, deployment, Suite-state or test-result changes. Documentation links,
+ledger coverage, image hashes and `git diff --check` passed. The existing validated
+controller source passed all four CI platforms in run `38071315296`.
