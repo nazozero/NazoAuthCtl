@@ -1,5 +1,10 @@
 # Upgraded deployment and official OIDF validation, 2026-10-11
 
+> Follow-up: [WebDriver removal and Suite HTML evidence validation](oidf-no-webdriver-20261011.md)
+> supersedes the blanket PNG-only classification below. The historical run and
+> its artifacts remain unchanged; the new run records three mdoc privacy warnings.
+
+
 Validated controller source: `dbd8b0647731dcf4fa3d725cd8269fc745f9e5ee`.
 Deployed NazoAuth source: `8abe4fe33891621ce2659f78d6bc2c224f042e17`.
 Official Suite reported version 5.3.2; the bundled matrix retains its historical

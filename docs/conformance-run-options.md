@@ -28,24 +28,24 @@ Backup validation probes the token schema before computing its sentinel. Legacy 
 
 The bundled HAIP issuer clients explicitly require PAR, as required by HAIP 1.0 section 4 when using the authorization endpoint. Wallet attestation authentication remains unchanged. This changes the recorded matrix digest without excluding any module.
 
-The official VP wallet may return a result page instead of an HTTP redirect. The controller then visits only the completion URL returned by the target start operation. Target rejection or an unrelated redirect still fails; runtime-signed evidence and official REVIEW outcomes retain their existing checks.
+The official VP wallet may return a result page instead of an HTTP redirect. The controller then visits only the completion URL returned by the target start operation. Target rejection or an unrelated redirect still fails. Historical signed-receipt checks remain for older records, and official REVIEW outcomes remain unchanged.
 
 For issuer-initiated multiple-client authorization, the Suite log's two explicit `VCIWaitForCredentialOffer` transitions determine when the second offer is due. A local completed-browser cache is not authoritative because another registered browser worker can complete the first flow. No offer is sent while browser URLs are pending, and repeated polling remains bounded to two offers.
 
 
-## Review evidence is separate from module completion
+## Browser execution and review evidence
 
-An official REVIEW entry needs its stated evidence. A browser placeholder update
-may contain only `page_source`; neither that message nor a completed module proves
-that a screenshot exists. For visual obligations, check the actual image in the
-official entry against the retained PNG and manifest, then review its content and
-module/transaction binding. Do not reconstruct screenshots from old HTML and
-label them as historical captures.
+New runs use the official Suite scripted browser and its per-module sessions.
+The controller does not install or start a local browser or WebDriver. HTTP VCI,
+VP and CIBA drivers remain; VP independently checks the target transaction's
+completion endpoint before accepting the interaction.
 
-Keep local review decisions separate from official results and certification
-approval. The [2026-10-11 deployment review](oidf-hostinger-20261011.md#follow-up-retained-evidence-review)
-accepted 24 VP image obligations and 12 scope warnings, but recorded 17 OIDC modules without PNG
-and retained two mdoc privacy warnings. The PNG-based assessment is under
-re-evaluation against the official Suite HTML evidence path; see
-[the browser removal validation](oidf-no-webdriver-20261011.md). Local execution
-success and certification approval remain separate.
+The Suite may fill review placeholders with HTML evidence. The controller keeps
+that HTML and its metadata, rejects unfilled placeholders, and preserves
+REVIEW as REVIEW. Historical PNG and signed-receipt validators remain for older
+records. No HTML reconstruction is labeled a real screenshot.
+
+The [removal validation](oidf-no-webdriver-20261011.md) covers 516 official
+modules and corrects the earlier blanket PNG-only objection to 17 OIDC records.
+The current run still contains three mdoc privacy warnings. Certification
+approval remains separate from local execution success.

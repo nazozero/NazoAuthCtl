@@ -1,0 +1,1472 @@
+{
+  "source_sha": "e46dd90ddd3b8a70c162370b00ef1155323cd400",
+  "server_source_sha": "8abe4fe33891621ce2659f78d6bc2c224f042e17",
+  "suite_versions": [
+    "5.3.2"
+  ],
+  "scope": "21 selected plans; not the full 44-plan matrix",
+  "outcomes": {
+    "REVIEW": 41,
+    "PASSED": 457,
+    "SKIPPED": 11,
+    "WARNING": 7
+  },
+  "module_count": 516,
+  "local_tests_passed": 248,
+  "local_tests_ignored": 0,
+  "html_review_entries": 41,
+  "withdrawn_image_obligations": 35,
+  "unfilled": 0,
+  "local_png_count": 0,
+  "runs": [
+    {
+      "name": "vp-p038",
+      "result": {
+        "command": [
+          "$CTL",
+          "--instance",
+          "production",
+          "oidf",
+          "run",
+          "openid4vc-vp-p038",
+          "--json",
+          "--jobs",
+          "4",
+          "--poll-timeout",
+          "1800"
+        ],
+        "exit_code": 0,
+        "seconds": 30.81150722503662
+      },
+      "local_success": true,
+      "outcomes": {
+        "REVIEW": 3,
+        "PASSED": 7
+      },
+      "module_count": 10,
+      "plans": 1,
+      "failed": [],
+      "incomplete": [],
+      "review_count": 3,
+      "html_review_count": 3,
+      "unfilled": 0,
+      "screenshots": 0,
+      "suite_pass": false,
+      "acceptance_pass": false,
+      "integrity": {
+        "defined_modules": 10,
+        "created_instances": 10,
+        "terminal_modules": 10,
+        "all_modules_instantiated": true,
+        "all_modules_terminal": true,
+        "all_modules_settled": true,
+        "cleanup_complete": false,
+        "retention_requested": true,
+        "retention_eligible": true,
+        "retention_candidate_settled": true,
+        "retention_committed": true,
+        "suite_resources_settled": true
+      },
+      "cleanup": {
+        "cancelled": [],
+        "deleted_plans": [],
+        "immutable_plans": [],
+        "failures": []
+      },
+      "target_cleanup_complete": true,
+      "module_hashes_verified": 10,
+      "manifest_sha256": "4f119139afbf03fcf07ca29ec41f13b535f7e1917ab34f097cd89f7bdbd1d2b7",
+      "owned_processes": {
+        "samples": 123,
+        "interval_seconds": 0.25,
+        "process_names": [
+          "nazoauthctl-sel",
+          "netavark",
+          "nft",
+          "podman"
+        ],
+        "scope": "only ctl process and descendants"
+      }
+    },
+    {
+      "name": "openid4vc-rest",
+      "result": {
+        "command": [
+          "$CTL",
+          "--instance",
+          "production",
+          "oidf",
+          "run",
+          "openid4vc",
+          "--exclude-plan",
+          "p038",
+          "--json",
+          "--jobs",
+          "4",
+          "--poll-timeout",
+          "1800"
+        ],
+        "exit_code": 0,
+        "seconds": 587.6998190879822
+      },
+      "local_success": true,
+      "outcomes": {
+        "PASSED": 356,
+        "SKIPPED": 3,
+        "WARNING": 7,
+        "REVIEW": 21
+      },
+      "module_count": 387,
+      "plans": 16,
+      "failed": [],
+      "incomplete": [],
+      "review_count": 53,
+      "html_review_count": 21,
+      "unfilled": 0,
+      "screenshots": 0,
+      "suite_pass": false,
+      "acceptance_pass": false,
+      "integrity": {
+        "defined_modules": 387,
+        "created_instances": 387,
+        "terminal_modules": 387,
+        "all_modules_instantiated": true,
+        "all_modules_terminal": true,
+        "all_modules_settled": true,
+        "cleanup_complete": false,
+        "retention_requested": true,
+        "retention_eligible": true,
+        "retention_candidate_settled": true,
+        "retention_committed": true,
+        "suite_resources_settled": true
+      },
+      "cleanup": {
+        "cancelled": [],
+        "deleted_plans": [],
+        "immutable_plans": [],
+        "failures": []
+      },
+      "target_cleanup_complete": true,
+      "module_hashes_verified": 387,
+      "manifest_sha256": "cd2b37792441f50e2db1b7c482967480a3d77dfc24c2a7e152c9f7f8351a8804",
+      "owned_processes": {
+        "samples": 2347,
+        "interval_seconds": 0.25,
+        "process_names": [
+          "conmon",
+          "nazoauthctl-sel",
+          "netavark",
+          "podman",
+          "rpm"
+        ],
+        "scope": "only ctl process and descendants"
+      }
+    },
+    {
+      "name": "oidc-review",
+      "result": {
+        "command": [
+          "$CTL",
+          "--instance",
+          "production",
+          "oidf",
+          "run",
+          "oidc",
+          "--exclude-plan",
+          "p004",
+          "--exclude-plan",
+          "p005",
+          "--json",
+          "--jobs",
+          "4",
+          "--poll-timeout",
+          "1800"
+        ],
+        "exit_code": 0,
+        "seconds": 210.54352974891663
+      },
+      "local_success": true,
+      "outcomes": {
+        "PASSED": 91,
+        "REVIEW": 9,
+        "SKIPPED": 8
+      },
+      "module_count": 108,
+      "plans": 3,
+      "failed": [],
+      "incomplete": [],
+      "review_count": 12,
+      "html_review_count": 9,
+      "unfilled": 0,
+      "screenshots": 0,
+      "suite_pass": false,
+      "acceptance_pass": false,
+      "integrity": {
+        "defined_modules": 108,
+        "created_instances": 108,
+        "terminal_modules": 108,
+        "all_modules_instantiated": true,
+        "all_modules_terminal": true,
+        "all_modules_settled": true,
+        "cleanup_complete": false,
+        "retention_requested": true,
+        "retention_eligible": true,
+        "retention_candidate_settled": true,
+        "retention_committed": true,
+        "suite_resources_settled": true
+      },
+      "cleanup": {
+        "cancelled": [],
+        "deleted_plans": [],
+        "immutable_plans": [],
+        "failures": []
+      },
+      "target_cleanup_complete": true,
+      "module_hashes_verified": 108,
+      "manifest_sha256": "e5ea90c59ad953ccdf4edcdb5d98b48437be85e4726fa48b7cda57e64782dbce",
+      "owned_processes": {
+        "samples": 840,
+        "interval_seconds": 0.25,
+        "process_names": [
+          "nazoauthctl-sel",
+          "netavark",
+          "podman",
+          "rpm"
+        ],
+        "scope": "only ctl process and descendants"
+      }
+    },
+    {
+      "name": "oidc-logout",
+      "result": {
+        "command": [
+          "$CTL",
+          "--instance",
+          "production",
+          "oidf",
+          "run",
+          "oidc-logout-p006",
+          "--json",
+          "--jobs",
+          "4",
+          "--poll-timeout",
+          "1800"
+        ],
+        "exit_code": 0,
+        "seconds": 61.90057849884033
+      },
+      "local_success": true,
+      "outcomes": {
+        "PASSED": 3,
+        "REVIEW": 8
+      },
+      "module_count": 11,
+      "plans": 1,
+      "failed": [],
+      "incomplete": [],
+      "review_count": 8,
+      "html_review_count": 8,
+      "unfilled": 0,
+      "screenshots": 0,
+      "suite_pass": false,
+      "acceptance_pass": false,
+      "integrity": {
+        "defined_modules": 11,
+        "created_instances": 11,
+        "terminal_modules": 11,
+        "all_modules_instantiated": true,
+        "all_modules_terminal": true,
+        "all_modules_settled": true,
+        "cleanup_complete": false,
+        "retention_requested": true,
+        "retention_eligible": true,
+        "retention_candidate_settled": true,
+        "retention_committed": true,
+        "suite_resources_settled": true
+      },
+      "cleanup": {
+        "cancelled": [],
+        "deleted_plans": [],
+        "immutable_plans": [],
+        "failures": []
+      },
+      "target_cleanup_complete": true,
+      "module_hashes_verified": 11,
+      "manifest_sha256": "e431593c203e26728cf3049392851ce8eac3365a7bd60bd4bced9a9e0549d3f7",
+      "owned_processes": {
+        "samples": 247,
+        "interval_seconds": 0.25,
+        "process_names": [
+          "crun",
+          "nazoauthctl-sel",
+          "netavark",
+          "podman",
+          "rpm"
+        ],
+        "scope": "only ctl process and descendants"
+      }
+    }
+  ],
+  "review_ledger": [
+    {
+      "module_id": "KdktRe45Uz5Rci4",
+      "test_name": "oid4vp-1final-verifier-happy-flow",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "2a4605386bfced368538378f0f58b14ae0a05b10d82e714364bc3d5c47a42f3c",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "CiunoSWx2MOtDNx",
+      "test_name": "oid4vp-1final-verifier-minimal-cnf-jwk",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "5430374a4a436f63c07bc123b6677f726626e17664c6b921b0757d49ef0c93ee",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "QTHlf8mo91z12aA",
+      "test_name": "oid4vp-1final-verifier-request-uri-method-post",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "76772ecd64dcfefab76fb5423d051eb4d93abaad94a39b17d8d23a6ab350888b",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "QFlmxBfG0E4hYQ8",
+      "test_name": "fapi2-security-profile-final-ensure-different-state-inside-and-outside-request-object",
+      "source": "ExpectRequestDifferentStateInsideAndOutsideErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "WTdxBd1EyIdaV7h",
+      "test_name": "fapi2-security-profile-final-ensure-authorization-request-with-long-state",
+      "source": "ExpectRequestObjectWithLongStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "VvqCJtraZ7Watpl",
+      "test_name": "fapi2-security-profile-final-state-only-outside-request-object-not-used",
+      "source": "ExpectRequestObjectMissingStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "Dr8uVT1nE4GsTu2",
+      "test_name": "fapi2-security-profile-final-ensure-unsigned-authorization-request-without-using-par-fails",
+      "source": "ExpectAuthorizationRequestWithoutRequestObjectErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "2FZr9rz1UJSNHHl",
+      "test_name": "fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+      "source": "ExpectLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "zycfHCrscsZwN5C",
+      "test_name": "fapi2-security-profile-final-par-attempt-reuse-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "K11udTZpvSnO6lC",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-expired-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "PRhKYvCkFahDyS5",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-request_uri-for-different-client",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "NizgyqNEY7XTD41",
+      "test_name": "fapi2-security-profile-final-ensure-different-state-inside-and-outside-request-object",
+      "source": "ExpectRequestDifferentStateInsideAndOutsideErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "YGP30iIFXmZbcQn",
+      "test_name": "fapi2-security-profile-final-ensure-authorization-request-with-long-state",
+      "source": "ExpectRequestObjectWithLongStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "OHH2F4bwIBB0gf2",
+      "test_name": "fapi2-security-profile-final-state-only-outside-request-object-not-used",
+      "source": "ExpectRequestObjectMissingStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "RrChHTsRv2OZAqP",
+      "test_name": "fapi2-security-profile-final-ensure-unsigned-authorization-request-without-using-par-fails",
+      "source": "ExpectAuthorizationRequestWithoutRequestObjectErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "nHhCPkqn3crtmun",
+      "test_name": "fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+      "source": "ExpectLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "ba2kSK4DjPOLSEu",
+      "test_name": "fapi2-security-profile-final-par-attempt-reuse-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "QuV3DEhAPyi9sJq",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-expired-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "K40Wl7Smsv973aZ",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-request_uri-for-different-client",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "gWcr0NSp5OsEXkS",
+      "test_name": "fapi2-security-profile-final-ensure-different-state-inside-and-outside-request-object",
+      "source": "ExpectRequestDifferentStateInsideAndOutsideErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "wr1vwvBywDZiBFk",
+      "test_name": "fapi2-security-profile-final-ensure-authorization-request-with-long-state",
+      "source": "ExpectRequestObjectWithLongStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "RfBGiFuBl4Ubo6n",
+      "test_name": "fapi2-security-profile-final-state-only-outside-request-object-not-used",
+      "source": "ExpectRequestObjectMissingStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "77qFfYdNkRH0tpw",
+      "test_name": "fapi2-security-profile-final-ensure-unsigned-authorization-request-without-using-par-fails",
+      "source": "ExpectAuthorizationRequestWithoutRequestObjectErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "PNcknfBR756Mbhy",
+      "test_name": "fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+      "source": "ExpectLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "1rSs4PsmLbA0eLZ",
+      "test_name": "fapi2-security-profile-final-par-attempt-reuse-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "SZZqgqj5SMz1GEK",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-expired-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "tg5tUwVPAO7958w",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-request_uri-for-different-client",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "UqonIGwYFmD6OeY",
+      "test_name": "fapi2-security-profile-final-ensure-different-state-inside-and-outside-request-object",
+      "source": "ExpectRequestDifferentStateInsideAndOutsideErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "PIDNSZGxPKsJDbn",
+      "test_name": "fapi2-security-profile-final-ensure-authorization-request-with-long-state",
+      "source": "ExpectRequestObjectWithLongStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "ZAZRtG6IEL9U7T6",
+      "test_name": "fapi2-security-profile-final-state-only-outside-request-object-not-used",
+      "source": "ExpectRequestObjectMissingStateErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "He4kipXKyStW3rM",
+      "test_name": "fapi2-security-profile-final-ensure-unsigned-authorization-request-without-using-par-fails",
+      "source": "ExpectAuthorizationRequestWithoutRequestObjectErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "yUHA54ULzNHevwe",
+      "test_name": "fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds",
+      "source": "ExpectLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "e65iZIGwvHK0Zur",
+      "test_name": "fapi2-security-profile-final-par-attempt-reuse-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "l9BRMyk4uVpq4TC",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-expired-request_uri",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "iDuC5I38V4mFyMP",
+      "test_name": "fapi2-security-profile-final-par-attempt-to-use-request_uri-for-different-client",
+      "source": "ExpectInvalidRequestUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "jbbpQBFCLGDcU1s",
+      "test_name": "oid4vp-1final-verifier-happy-flow",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "a846aaee32d201da91d578af5a2e4c2beff1f4d67c8a1a0a9b9685a4f8f9f8c7",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "2mXDMGvvlSvqPyM",
+      "test_name": "oid4vp-1final-verifier-minimal-cnf-jwk",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "437cfd01343432899ff088b1de1245d6d78fed985db2a9b2f1084b64ca13723e",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "RpHQSCg2FV6mpAX",
+      "test_name": "oid4vp-1final-verifier-request-uri-method-post",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "cd9a68f396a92d123c01346482680508e5bf638844dc84b135fd3ceb70395064",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "Jw21C6VjmN6rpfr",
+      "test_name": "oid4vp-1final-verifier-request-uri-fetched-twice",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "d31eebc7bfad302365bd588ce2be9378dcafaff4bcc739ffb2c8077e9a7650c6",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "Jnr8lW5p3rmxLDg",
+      "test_name": "oid4vp-1final-verifier-happy-flow",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "1cb6faea36e3338c5375eca5ac8cefea3c19613827cfaed949acd092285268c1",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "Wnk2fuYlbP16wno",
+      "test_name": "oid4vp-1final-verifier-request-uri-method-post",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "670401b2970a4198d4e8fbf8a68d7f0de9d4505f23a9640512602e566ad1118a",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "ky9aSeI8IbPHUql",
+      "test_name": "oid4vp-1final-verifier-request-uri-fetched-twice",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "8075e7dea723d0ee98932dbd5a9f98490b51a857d4ff30eb2bb7b883884336f1",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "UFHLOie4q5o9RfL",
+      "test_name": "oid4vp-1final-verifier-happy-flow",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "87f445a443864b022c60588da40f2a68fc820826fc40a6152b6b386d159d94a2",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "vnTWfL1GAep6emg",
+      "test_name": "oid4vp-1final-verifier-minimal-cnf-jwk",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "6b2c27bfafab6999fee58a8d99c813cd7ce8ae5ef2df628f06dc6dc504474d61",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "aiX1wXYipPPcgdM",
+      "test_name": "oid4vp-1final-verifier-request-uri-method-post",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "90c9f490464e662c4faf60114dbc51e8ff3902927a345201221dd9df75bf42fe",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "WsBPxDo5577KdAf",
+      "test_name": "oid4vp-1final-verifier-request-uri-fetched-twice",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "4ac68b63d9558a1cfe63a0a1bfa91745c064f6e376ce98a28d309cff4cde1c88",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "Z4dJrbJ3bTXZ4TO",
+      "test_name": "oid4vp-1final-verifier-happy-flow",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "8a2e3a079724e66304e3d45123b8ac96b6959bd4e2f2f6888c24eb0fe2be1297",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "MA4X22C96yUanDO",
+      "test_name": "oid4vp-1final-verifier-request-uri-method-post",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "1fbc706c3c2c1858a6c9934f3c26b228160f1b0e1c294eda666a4a72f6679dee",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "YI0z8Rv2MCpV4Ew",
+      "test_name": "oid4vp-1final-verifier-request-uri-fetched-twice",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "af4e8ca104e10e858bf2884eac41075c58c952a998f50da870e275837db2d0a0",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "TGIrnQ54rvP2FPa",
+      "test_name": "oid4vp-1final-verifier-happy-flow",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "c7695a7b5a9cf960434e942a6601105c454e6e3fc0b319a624f472c6f7533b80",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "42OAyyYqOM2B1Ex",
+      "test_name": "oid4vp-1final-verifier-minimal-cnf-jwk",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "4f003d02ab60ec8c1132991b3f355cc369665e0122c8685bc31f132cc0bd1193",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "GsX2eo9IRXVelIL",
+      "test_name": "oid4vp-1final-verifier-request-uri-method-post",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "a2cc3fae64ef43ab4267079121b6bdae2c55fce22e8a2feec21921aaa0fda09c",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "zwNtQT7Ty00Kw24",
+      "test_name": "oid4vp-1final-verifier-request-uri-fetched-twice",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "459c061b9eab9088bff67ccb810684d282928058d70bb791ceb8801459db25cb",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "dixxZMQuJmtbr9S",
+      "test_name": "oid4vp-1final-verifier-happy-flow",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "51adc6017d06295f237f3f3306891bf97f7ae8d744227c732378286f68178c3a",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "fcVqT8FyqY53HGo",
+      "test_name": "oid4vp-1final-verifier-request-uri-method-post",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "6996997f0471ce6f31e8ea945157954cd8f20123dc3964c656e80bd2f1d9b885",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "ZAjTwfkCYbIPveS",
+      "test_name": "oid4vp-1final-verifier-request-uri-fetched-twice",
+      "source": "ExpectVerifierSuccessfulVerificationPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "bcbbfdee96f72b1f5892b81d029fd8e659ab49b4d18ee29c2569fdaf7ad5755d",
+      "html_bytes": 516,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "65f1c19620835f336310a338607965b5ee61dd4d99b6bd135db152543efe4dc9"
+    },
+    {
+      "module_id": "vuyE3IaifITKqng",
+      "test_name": "oidcc-response-type-missing",
+      "source": "ExpectResponseTypeMissingErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "kdZbZjIxvUvbxSe",
+      "test_name": "oidcc-prompt-login",
+      "source": "ExpectSecondLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "73879a12b963951dabf6c5106ba0ab05010438f7ca8eb99ed7adde8d029fc366",
+      "html_bytes": 8511,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "SODZTyvvLWuWQVq",
+      "test_name": "oidcc-max-age-1",
+      "source": "ExpectSecondLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "73879a12b963951dabf6c5106ba0ab05010438f7ca8eb99ed7adde8d029fc366",
+      "html_bytes": 8511,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "xNbMSdMz2nS0MSU",
+      "test_name": "oidcc-ensure-registered-redirect-uri",
+      "source": "ExpectRedirectUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "7850be51c4e0fa41470692c0104b92f8c5abf621e0bea56a421638834b316307",
+      "html_bytes": 185,
+      "content_type": "application/json",
+      "has_png": false,
+      "matched_regexp_sha256": "f11cc9a1b7fcbefe92e9bc4b98258e3842707dbc4217cdaf710132125aa8572e"
+    },
+    {
+      "module_id": "GLW7HKUPeRPnRzJ",
+      "test_name": "oidcc-response-type-missing",
+      "source": "ExpectResponseTypeMissingErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "H1O3Ztb9swhVHx9",
+      "test_name": "oidcc-prompt-login",
+      "source": "ExpectSecondLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "73879a12b963951dabf6c5106ba0ab05010438f7ca8eb99ed7adde8d029fc366",
+      "html_bytes": 8511,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "ALcshsGVT7t6nuC",
+      "test_name": "oidcc-max-age-1",
+      "source": "ExpectSecondLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "73879a12b963951dabf6c5106ba0ab05010438f7ca8eb99ed7adde8d029fc366",
+      "html_bytes": 8511,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "Pvvtstdej57qS6F",
+      "test_name": "oidcc-ensure-registered-redirect-uri",
+      "source": "ExpectRedirectUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "7850be51c4e0fa41470692c0104b92f8c5abf621e0bea56a421638834b316307",
+      "html_bytes": 185,
+      "content_type": "application/json",
+      "has_png": false,
+      "matched_regexp_sha256": "f11cc9a1b7fcbefe92e9bc4b98258e3842707dbc4217cdaf710132125aa8572e"
+    },
+    {
+      "module_id": "5xZUp3EKIggETOJ",
+      "test_name": "oidcc-response-type-missing",
+      "source": "ExpectResponseTypeMissingErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": true,
+      "has_html": false,
+      "html_sha256": null,
+      "html_bytes": 0,
+      "content_type": null,
+      "has_png": false,
+      "matched_regexp_sha256": null
+    },
+    {
+      "module_id": "zaptXGmlO1NHO57",
+      "test_name": "oidcc-prompt-login",
+      "source": "ExpectSecondLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "73879a12b963951dabf6c5106ba0ab05010438f7ca8eb99ed7adde8d029fc366",
+      "html_bytes": 8511,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "hdq7peZA55RCLZt",
+      "test_name": "oidcc-max-age-1",
+      "source": "ExpectSecondLoginPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "73879a12b963951dabf6c5106ba0ab05010438f7ca8eb99ed7adde8d029fc366",
+      "html_bytes": 8511,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "CHJwcHvOOIuL3tz",
+      "test_name": "oidcc-ensure-registered-redirect-uri",
+      "source": "ExpectRedirectUriErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "7850be51c4e0fa41470692c0104b92f8c5abf621e0bea56a421638834b316307",
+      "html_bytes": 185,
+      "content_type": "application/json",
+      "has_png": false,
+      "matched_regexp_sha256": "f11cc9a1b7fcbefe92e9bc4b98258e3842707dbc4217cdaf710132125aa8572e"
+    },
+    {
+      "module_id": "wekP7XLhmeVakWa",
+      "test_name": "oidcc-rp-initiated-logout-bad-post-logout-redirect-uri",
+      "source": "ExpectPostLogoutRedirectUriNotRegisteredErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "cuCFNe0UwY2cfIe",
+      "test_name": "oidcc-rp-initiated-logout-modified-id-token-hint",
+      "source": "ExpectInvalidIdTokenHintErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "hGkQ6EY0XDJvZ4D",
+      "test_name": "oidcc-rp-initiated-logout-no-id-token-hint",
+      "source": "ExpectIdTokenHintRequiredErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "6zpckol98zgJaGT",
+      "test_name": "oidcc-rp-initiated-logout-no-params",
+      "source": "ExpectSuccessfulLogoutPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "taFCEZSiFmQcxgF",
+      "test_name": "oidcc-rp-initiated-logout-no-post-logout-redirect-uri",
+      "source": "ExpectSuccessfulLogoutPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "krA9uu6UZZLL2JU",
+      "test_name": "oidcc-rp-initiated-logout-only-state",
+      "source": "ExpectSuccessfulLogoutPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "jBXGlkb97wV6YiA",
+      "test_name": "oidcc-rp-initiated-logout-query-added-to-post-logout-redirect-uri",
+      "source": "ExpectPostLogoutRedirectUriNotRegisteredErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    },
+    {
+      "module_id": "7m4wcfzZ8xnvqpp",
+      "test_name": "oidcc-rp-initiated-logout-bad-id-token-hint",
+      "source": "ExpectInvalidIdTokenHintErrorPage",
+      "unfilled": false,
+      "image_no_longer_required": null,
+      "has_html": true,
+      "html_sha256": "354ad735843daa1afe86c0b8d89675395a40fc6c16b09f74d3938765eee74685",
+      "html_bytes": 376,
+      "content_type": "text/html",
+      "has_png": false,
+      "matched_regexp_sha256": "12aca9f6a2a2ddb9a3117dac9db02c9dcbb4ba174233222d77e5de770c5343da"
+    }
+  ],
+  "warnings": [
+    {
+      "module": "openid4vc-vci-p029/oid4vci-1_0-issuer-batch-issuance?variant={\"authorization_request_type\":\"simple\",\"client_auth_type\":\"private_key_jwt\",\"credential_format\":\"mdoc\",\"fapi_profile\":\"vci\",\"fapi_request_method\":\"unsigned\",\"fapi_response_mode\":\"plain_response\",\"openid\":\"plain_oauth\",\"sender_constrain\":\"dpop\",\"vci_authorization_code_flow_variant\":\"wallet_initiated\",\"vci_credential_encryption\":\"encrypted\",\"vci_grant_type\":\"authorization_code\"}",
+      "conditions": [
+        {
+          "source": "VCIEnsureBatchTimeClaimsNotLinkable",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "module": "openid4vc-vci-p031/oid4vci-1_0-issuer-batch-issuance?variant={\"authorization_request_type\":\"simple\",\"client_auth_type\":\"private_key_jwt\",\"credential_format\":\"mdoc\",\"fapi_profile\":\"vci\",\"fapi_request_method\":\"unsigned\",\"fapi_response_mode\":\"plain_response\",\"openid\":\"plain_oauth\",\"sender_constrain\":\"dpop\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\",\"vci_credential_encryption\":\"plain\",\"vci_grant_type\":\"authorization_code\"}",
+      "conditions": [
+        {
+          "source": "VCIEnsureBatchTimeClaimsNotLinkable",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "module": "openid4vc-vci-p033/oid4vci-1_0-issuer-batch-issuance?variant={\"authorization_request_type\":\"simple\",\"client_auth_type\":\"private_key_jwt\",\"credential_format\":\"mdoc\",\"fapi_profile\":\"vci\",\"fapi_request_method\":\"unsigned\",\"fapi_response_mode\":\"plain_response\",\"openid\":\"plain_oauth\",\"sender_constrain\":\"dpop\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\",\"vci_credential_encryption\":\"encrypted\",\"vci_grant_type\":\"pre_authorization_code\"}",
+      "conditions": [
+        {
+          "source": "VCIEnsureBatchTimeClaimsNotLinkable",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "module": "openid4vc-vci-haip-p034/fapi2-security-profile-final-happy-flow?variant={\"authorization_request_type\":\"simple\",\"client_auth_type\":\"client_attestation\",\"credential_format\":\"sd_jwt_vc\",\"fapi_profile\":\"vci_haip\",\"fapi_request_method\":\"unsigned\",\"fapi_response_mode\":\"plain_response\",\"openid\":\"plain_oauth\",\"sender_constrain\":\"dpop\",\"vci_authorization_code_flow_variant\":\"wallet_initiated\",\"vci_credential_encryption\":\"plain\",\"vci_grant_type\":\"authorization_code\"}",
+      "conditions": [
+        {
+          "source": "CheckDiscEndpointScopesSupportedContainsRequestedScopes",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "module": "openid4vc-vci-haip-p035/fapi2-security-profile-final-happy-flow?variant={\"authorization_request_type\":\"simple\",\"client_auth_type\":\"client_attestation\",\"credential_format\":\"mdoc\",\"fapi_profile\":\"vci_haip\",\"fapi_request_method\":\"unsigned\",\"fapi_response_mode\":\"plain_response\",\"openid\":\"plain_oauth\",\"sender_constrain\":\"dpop\",\"vci_authorization_code_flow_variant\":\"wallet_initiated\",\"vci_credential_encryption\":\"plain\",\"vci_grant_type\":\"authorization_code\"}",
+      "conditions": [
+        {
+          "source": "CheckDiscEndpointScopesSupportedContainsRequestedScopes",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "module": "openid4vc-vci-haip-p036/fapi2-security-profile-final-happy-flow?variant={\"authorization_request_type\":\"simple\",\"client_auth_type\":\"client_attestation\",\"credential_format\":\"sd_jwt_vc\",\"fapi_profile\":\"vci_haip\",\"fapi_request_method\":\"unsigned\",\"fapi_response_mode\":\"plain_response\",\"openid\":\"plain_oauth\",\"sender_constrain\":\"dpop\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\",\"vci_credential_encryption\":\"plain\",\"vci_grant_type\":\"authorization_code\"}",
+      "conditions": [
+        {
+          "source": "CheckDiscEndpointScopesSupportedContainsRequestedScopes",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "module": "openid4vc-vci-haip-p037/fapi2-security-profile-final-happy-flow?variant={\"authorization_request_type\":\"simple\",\"client_auth_type\":\"client_attestation\",\"credential_format\":\"mdoc\",\"fapi_profile\":\"vci_haip\",\"fapi_request_method\":\"unsigned\",\"fapi_response_mode\":\"plain_response\",\"openid\":\"plain_oauth\",\"sender_constrain\":\"dpop\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\",\"vci_credential_encryption\":\"plain\",\"vci_grant_type\":\"authorization_code\"}",
+      "conditions": [
+        {
+          "source": "CheckDiscEndpointScopesSupportedContainsRequestedScopes",
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "quality_commands": [
+    {
+      "command": [
+        "cargo",
+        "+1.97.1",
+        "fmt",
+        "--all"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.97.1",
+        "clippy",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.97.1",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "validation_boundary": "Official REVIEW and WARNING unchanged; no certification approval or performance claim.",
+  "ctl_binary_sha256": "daa8bec33f761f9c9318dacf52c5ae59645ac48465561df5af60b9cd99e411ef",
+  "server_binary_sha256": "cf97faf9b6e8f0639aff031ebef2d7870dce5a7f2e2824150d8a1c11e78a0817",
+  "test_commands": [
+    {
+      "command": [
+        "cargo",
+        "+1.97.1",
+        "test",
+        "--release",
+        "--locked",
+        "-p",
+        "nazoauthctl-conformance",
+        "-p",
+        "nazoauthctl"
+      ],
+      "exit_code": 0
+    }
+  ],
+  "cross_library_test": {
+    "command": [
+      "cargo",
+      "+1.97.1",
+      "test",
+      "--release",
+      "--locked",
+      "-p",
+      "nazoauthctl-conformance",
+      "--lib",
+      "start_accepts_server_typed_dcql_digest",
+      "--",
+      "--ignored",
+      "--nocapture"
+    ],
+    "exit_code": 0,
+    "seconds": 73.9971022605896,
+    "server_test_binary_sha256": "734cb6f1ffd70097191b90e8ba8636f7808584f28840993c8e7b7f30a50b6155"
+  },
+  "conformance_final_test": {
+    "command": [
+      "$CONFORMANCE_TEST",
+      "--include-ignored"
+    ],
+    "exit_code": 0,
+    "seconds": 1.3537631034851074,
+    "source_sha": "e46dd90ddd3b8a70c162370b00ef1155323cd400"
+  },
+  "build": {
+    "command": [
+      "cargo",
+      "+1.97.1",
+      "build",
+      "--release",
+      "--locked",
+      "-p",
+      "nazoauthctl",
+      "--features",
+      "pre-release-validation"
+    ],
+    "exit_code": 0,
+    "seconds": 89.26801228523254,
+    "source_sha": "e46dd90ddd3b8a70c162370b00ef1155323cd400"
+  }
+}
