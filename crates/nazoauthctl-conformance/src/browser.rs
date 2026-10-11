@@ -195,6 +195,7 @@ fn png_crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn review_screenshot_path_binds_module(url: &Url, module_id: &str) -> bool {
     if url.query().is_some()
         || url.fragment().is_some()

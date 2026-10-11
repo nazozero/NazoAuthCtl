@@ -1468,5 +1468,39 @@
     "exit_code": 0,
     "seconds": 89.26801228523254,
     "source_sha": "e46dd90ddd3b8a70c162370b00ef1155323cd400"
+  },
+  "platform_follow_up": {
+    "reason": "Windows Clippy unused import and helpers after removal",
+    "failed_job": "https://github.com/nazozero/NazoAuthCtl/actions/runs/38107302513/job/114375400581",
+    "change": "Only conditional compilation for existing Unix-only consumers; URL predicate retained in all-platform tests",
+    "linux_protocol_behavior_changed": false,
+    "checks": [
+      {
+        "command": [
+          "cargo",
+          "+1.97.1",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "exit_code": 0
+      },
+      {
+        "command": [
+          "cargo",
+          "+1.97.1",
+          "clippy",
+          "--locked",
+          "--workspace",
+          "--all-targets",
+          "--all-features",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0
+      }
+    ]
   }
 }

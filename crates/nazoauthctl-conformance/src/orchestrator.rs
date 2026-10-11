@@ -2069,13 +2069,15 @@ fn suite_log_has_upload_placeholder(value: &Value) -> bool {
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use crate::OpenId4VpCompletionOutcome;
+    use crate::ReviewScreenshotReport;
+    #[cfg(unix)]
     use crate::browser::OpenId4VpError;
     use crate::client::ClientConfig;
     use crate::credentials::BearerToken;
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
     use crate::report::DeferredReviewPending;
     use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
-    use crate::{OpenId4VpCompletionOutcome, ReviewScreenshotReport};
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};

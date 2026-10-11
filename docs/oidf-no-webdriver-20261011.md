@@ -2,7 +2,7 @@
 
 **Removal and selected-flow validation: PASS. Certification approval: OPEN.**
 
-Controller source: `e46dd90ddd3b8a70c162370b00ef1155323cd400`.
+Runtime-validated controller source: `e46dd90ddd3b8a70c162370b00ef1155323cd400`.
 Unchanged deployed server source: `8abe4fe33891621ce2659f78d6bc2c224f042e17`.
 Official Suite: **5.3.2**, verified in all retained module records.
 
@@ -119,3 +119,14 @@ is resolved. All other corresponding OpenID4VC official outcomes are unchanged.
 `local_success=true`, while `suite_pass=false` and `acceptance_pass=false` retain
 their existing meaning. No performance claim is made. The installed signed ctl,
 server image and running server binary remain unchanged; no PR was merged.
+
+## Cross-platform CI follow-up
+
+The first Windows job passed its tests but failed Clippy because removal left
+one Unix-only fixture import and three historical-evidence helpers without
+Windows callers. Their compilation is now scoped to their actual consumers:
+the import and secure-publication helpers are Unix-only, while the URL predicate
+also remains available to tests on every platform. No warning is suppressed,
+assertion removed, or protocol/runtime behavior changed. The official Suite
+results above retain their actual tested source SHA; this platform-scoping
+follow-up does not require repeating the unchanged Linux protocol flows.
