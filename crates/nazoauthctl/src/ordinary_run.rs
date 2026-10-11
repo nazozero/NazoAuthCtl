@@ -18,18 +18,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use cliclack::{
-    MultiProgress, ProgressBar, input, log, multi_progress, note, outro, progress_bar, spinner,
+    MultiProgress, ProgressBar, log, multi_progress, note, outro, password, progress_bar, spinner,
 };
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
-    ArtifactMaterializationBinding, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
-    BrowserReviewScreenshotCapture, BrowserTargetOrigin, CibaUserApprovalClient, ClientConfig,
-    ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore, ConformanceRunConfig,
-    ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
-    EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
-    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, GroupProgress,
-    GroupStatus, HttpRequest, HttpTransport, ManagedWebDriver, MatrixSelection, ModuleOutcome,
-    OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
+    ArtifactMaterializationBinding, BearerToken, BrowserTargetOrigin, CibaUserApprovalClient,
+    ClientConfig, ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore,
+    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
+    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
+    EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceRuntimeIdentity,
+    EvidenceSourceIdentity, GroupProgress, GroupStatus, HttpRequest, HttpTransport,
+    MatrixSelection, ModuleOutcome, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget,
     OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
     OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
     ProgressEvent, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
@@ -38,7 +37,7 @@ use nazoauthctl_conformance::{
     TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
     TenantResourceRecoveryPhase, Transport, activity_label, bundled_oidf_matrix,
     current_matrix_label, open_bundled_oidf_driver_plan, recover_suite_resources,
-    write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    write_private_control_evidence_bundle,
 };
 use serde::Serialize;
 use url::Url;
@@ -494,13 +493,14 @@ fn execute_with_progress<S: ProgressSink>(
     progress.activity(&ProgressActivity::OpeningDeployment);
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
-    let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
-        .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
     let deployment = session.deployment_evidence();
     let recovery_directory = session.recovery_directory()?;
     let recovery_store =
         ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
     let _orchestration_lock = recovery_store.acquire_orchestration_lock()?;
+    recover_pending_runs(&session, &recovery_store, None)?;
+    let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
+        .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
 
     progress.activity(&ProgressActivity::LoadingMatrix);
     let now = current_unix_time()?;
@@ -514,22 +514,12 @@ fn execute_with_progress<S: ProgressSink>(
         now,
     )
     .context("bundled OIDF Matrix cannot be opened")?;
-    let requires_browser = driver_plan
-        .plans
-        .iter()
-        .any(|plan| !matches!(plan.driver_handler.automation, OidfDriverAutomation::None));
-    let captures_review_screenshots = driver_plan.plans.iter().any(|plan| {
-        matches!(
-            plan.driver_handler.automation,
-            OidfDriverAutomation::Openid4vp { .. }
-        )
-    });
     let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
 
     progress.activity(&ProgressActivity::AuthenticatingSuite);
     let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language, progress)?;
     progress.activity(&ProgressActivity::RecoveringPreviousRun);
-    let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
+    let recovered_retention = recover_pending_runs(&session, &recovery_store, Some(&suite_client))?;
     if !recovered_retention.is_empty() {
         progress.activity(&ProgressActivity::Finished);
         if invocation.json {
@@ -774,8 +764,12 @@ fn execute_with_progress<S: ProgressSink>(
     // The OpenID4VP client and runner are being generalized in the adjacent
     // slice. Keep this typed boundary ordinary-only: a lease-shaped adapter is
     // deliberately impossible here.
-    let ciba_approver =
-        build_ciba_user_approver(requires_ciba, &ephemeral_tenant.issuer, &run_secrets)?;
+    let ciba_approver = build_ciba_user_approver(
+        requires_ciba,
+        &ephemeral_tenant.issuer,
+        &run_secrets,
+        ordinary.clients().values().cloned().collect(),
+    )?;
     let run_result = run_signed_suite(
         ordinary,
         suite_client.clone(),
@@ -790,9 +784,6 @@ fn execute_with_progress<S: ProgressSink>(
         selected_resource_budget,
         recovery.clone(),
         ciba_approver,
-        &evidence_directory,
-        requires_browser,
-        captures_review_screenshots,
         control,
         Arc::clone(&user_interrupted),
         interrupt_notice,
@@ -811,29 +802,7 @@ fn execute_with_progress<S: ProgressSink>(
     } else {
         Vec::new()
     };
-    // The runner has already uploaded required NazoAuthWeb VP result captures;
-    // this root-private manifest preserves their exact local evidence.
-    let review_screenshot_manifest = if captures_review_screenshots && retention_eligible {
-        match run_result.as_ref() {
-            Ok(report) => match write_review_screenshot_manifest(
-                report,
-                &evidence_directory,
-                recovery.ordinary_binding().run_id.as_str(),
-                &artifact_digest,
-                &ephemeral_tenant.issuer,
-            ) {
-                Ok(manifest) => Some(manifest),
-                Err(error) => {
-                    retention_eligible = false;
-                    errors.push(format!("review-screenshot-manifest={error}"));
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    let review_screenshot_manifest = None;
     if run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
@@ -2269,9 +2238,6 @@ fn run_signed_suite<S: ProgressSink>(
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_approver: Option<Arc<CibaUserApprovalClient>>,
-    evidence_directory: &Path,
-    requires_browser: bool,
-    captures_review_screenshots: bool,
     control: RunControl,
     user_interrupted: Arc<AtomicBool>,
     interrupt_notice: &'static str,
@@ -2289,22 +2255,6 @@ fn run_signed_suite<S: ProgressSink>(
     let openid4vp_management_token = session
         .openid4vp_management_token(&invocation.tenant_id)
         .context("failed to derive the run tenant OpenID4VP management token")?;
-    let review_screenshot_run_jti = recovery
-        .lock()
-        .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))?
-        .ordinary_binding()
-        .run_id
-        .clone();
-    let review_screenshot_capture = captures_review_screenshots
-        .then(|| {
-            BrowserReviewScreenshotCapture::new(
-                evidence_directory.to_path_buf(),
-                &review_screenshot_run_jti,
-            )
-        })
-        .transpose()
-        .context("review screenshot evidence directory must be root-owned and private")?;
-
     let selected = materialized
         .take_matrix()
         .select(&MatrixSelection {
@@ -2321,113 +2271,71 @@ fn run_signed_suite<S: ProgressSink>(
         interrupt.interrupt();
     })
     .context("failed to install the conformance interrupt handler")?;
-    let mut managed_browsers = Vec::with_capacity(invocation.jobs);
-    let run_result = (|| -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
+    if control.is_interrupted() {
+        bail!("run interrupted");
+    }
+    let mut automation = Vec::with_capacity(invocation.jobs);
+    for _ in 0..invocation.jobs {
         if control.is_interrupted() {
             bail!("run interrupted");
         }
-        let mut automation = Vec::with_capacity(invocation.jobs);
-        for index in 0..invocation.jobs {
-            if control.is_interrupted() {
-                bail!("run interrupted");
-            }
-            let browser: Option<Arc<Mutex<dyn BrowserAutomation>>> = if requires_browser {
-                progress.activity(&ProgressActivity::StartingBrowser {
-                    current: index + 1,
-                    total: invocation.jobs,
-                });
-                let managed_browser = build_browser(target_issuer, suite_origin)?;
-                managed_browsers.push(managed_browser.clone());
-                Some(managed_browser)
-            } else {
-                None
-            };
-            let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
-                Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
-                    OpenId4VciIssuerConfig::new(
-                        target_origin.clone(),
-                        suite_origin.clone(),
-                        applicant_id,
-                        secrets.tx_code.clone(),
-                        secrets.applicant_email.clone(),
-                        secrets.applicant_password.clone(),
-                        Duration::from_secs(30),
-                    )?,
-                    openid4vci_management_token.clone(),
-                    token.clone(),
-                )?));
-            let verifier_client = OpenId4VpVerifierClient::new(
-                target_origin.clone(),
-                suite_origin.clone(),
-                openid4vp_management_token.clone(),
-                Duration::from_secs(30),
-                binding.clone(),
-            )?;
-            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
-            automation.push(ConformanceAutomation {
-                browser,
-                review_screenshot_capture: review_screenshot_capture.clone(),
-                verifier: Some(verifier),
-                issuer: Some(issuer),
-                ciba_approver: ciba_approver.clone(),
-            });
-        }
-        let runner = ConformanceRunner::new(ConformanceRunConfig {
-            client: suite_client,
-            matrix: selected,
-            target_origin: Some(target_origin),
-            binding,
-            poll_timeout: invocation.poll_timeout,
-            control: control.clone(),
-            plan_lanes,
-            plan_resource_budgets,
-            selected_resource_budget,
-            jobs: invocation.jobs,
-            upload_review_screenshots: captures_review_screenshots,
-            automation,
-            suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
-                recovery,
-                retain_suite_plans: !invocation.delete_suite_plans,
-            })),
-        })?;
-        let mut report = runner.run(progress).report;
-        report.excluded_plans = invocation.excluded_plans.clone();
-        report.fail_fast = invocation.fail_fast;
-        Ok(report)
-    })();
-    let mut browser_cleanup_errors = Vec::new();
-    for (index, browser) in managed_browsers.iter().enumerate() {
-        match browser.lock() {
-            Ok(mut browser) => {
-                if let Err(error) = browser.driver_mut().shutdown() {
-                    browser_cleanup_errors.push(format!("browser {}: {error}", index + 1));
-                }
-            }
-            Err(_) => browser_cleanup_errors.push(format!("browser {}: lock poisoned", index + 1)),
-        }
+        let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
+            Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
+                OpenId4VciIssuerConfig::new(
+                    target_origin.clone(),
+                    suite_origin.clone(),
+                    applicant_id,
+                    secrets.tx_code.clone(),
+                    secrets.applicant_email.clone(),
+                    secrets.applicant_password.clone(),
+                    Duration::from_secs(30),
+                )?,
+                openid4vci_management_token.clone(),
+                token.clone(),
+            )?));
+        let verifier_client = OpenId4VpVerifierClient::new(
+            target_origin.clone(),
+            suite_origin.clone(),
+            openid4vp_management_token.clone(),
+            Duration::from_secs(30),
+            binding.clone(),
+        )?;
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
+        automation.push(ConformanceAutomation {
+            verifier: Some(verifier),
+            issuer: Some(issuer),
+            ciba_approver: ciba_approver.clone(),
+        });
     }
-    let cleanup_result = if browser_cleanup_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "failed to stop managed browser infrastructure: {}",
-            browser_cleanup_errors.join("; ")
-        ))
-    };
-    match (run_result, cleanup_result) {
-        (Ok(report), Ok(())) => Ok(report),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "managed browser cleanup also failed: {cleanup_error:#}"
-        ))),
-    }
+    let runner = ConformanceRunner::new(ConformanceRunConfig {
+        client: suite_client,
+        matrix: selected,
+        target_origin: Some(target_origin),
+        binding,
+        poll_timeout: invocation.poll_timeout,
+        control: control.clone(),
+        plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget,
+        jobs: invocation.jobs,
+
+        automation,
+        suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
+            recovery,
+            retain_suite_plans: !invocation.delete_suite_plans,
+        })),
+    })?;
+    let mut report = runner.run(progress).report;
+    report.excluded_plans = invocation.excluded_plans.clone();
+    report.fail_fast = invocation.fail_fast;
+    Ok(report)
 }
 
 fn build_ciba_user_approver(
     requires_ciba: bool,
     target_issuer: &str,
     secrets: &RunSecrets,
+    allowed_clients: std::collections::HashSet<String>,
 ) -> anyhow::Result<Option<Arc<CibaUserApprovalClient>>> {
     if !requires_ciba {
         return Ok(None);
@@ -2444,6 +2352,7 @@ fn build_ciba_user_approver(
             secrets.applicant_email.clone(),
             secrets.applicant_password.clone(),
             transport,
+            allowed_clients,
         )
         .context("failed to initialize normal CIBA user approval")?,
     )))
@@ -2613,16 +2522,6 @@ fn pre_suite_requires_resource_cleanup(
     recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> bool {
     recovery.apply_operation().is_some() && recovery.terminal_failure().is_none()
-}
-
-fn build_browser(
-    target_issuer: &str,
-    suite_origin: &Origin,
-) -> anyhow::Result<Arc<Mutex<BrowserExecutor<ManagedWebDriver>>>> {
-    let target = BrowserTargetOrigin::parse(target_issuer)?;
-    let policy = BrowserPolicy::new(target, suite_origin.clone())?;
-    let driver = ManagedWebDriver::start_default(Duration::from_secs(30))?;
-    Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
 }
 
 fn suite_retention_manifest(
@@ -3339,7 +3238,7 @@ fn resume_pending_conformance_operation(
 fn recover_pending_runs(
     session: &nazoauthctl_core::ConformanceSession,
     store: &ConformanceRecoveryStore,
-    suite_client: &SuiteClient,
+    suite_client: Option<&SuiteClient>,
 ) -> anyhow::Result<Vec<SuiteRetentionManifestReceipt>> {
     let mut retained = Vec::new();
     let mut failures = Vec::new();
@@ -3377,6 +3276,10 @@ fn recover_pending_runs(
                 recovery.mark_tenant_absent(directory_revision)?;
             }
             if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
+                if suite_client.is_none() {
+                    cleanup_ephemeral_tenant(session, &mut recovery)?;
+                    return Ok(None);
+                }
                 recovery.publish_committed_suite_retention_manifest()?;
                 let receipt = recovery.suite_retention_manifest_receipt()?;
                 cleanup_ephemeral_tenant(session, &mut recovery)?;
@@ -3420,6 +3323,22 @@ fn recover_pending_runs(
                 )?;
                 successful_control_completion(outcome, "recovery Apply")?;
             }
+            // Each local cleanup remains executable even if the other boundary fails.
+            let proxy_result = (|| -> anyhow::Result<()> {
+                if !recovery.proxy_cleanup_complete() {
+                    if let Some(proxy) = binding.proxy.as_ref() {
+                        ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                    }
+                    recovery.mark_proxy_cleanup_complete()?;
+                }
+                Ok(())
+            })();
+            let target_result = cleanup_run_resources(session, &mut recovery);
+            target_result?;
+            proxy_result?;
+            let Some(suite_client) = suite_client else {
+                return Ok(None);
+            };
             if !recovery.suite_cleanup_complete() {
                 recovery.discard_prepared_suite_retention_staging()?;
                 if let Some(suite) = recovery.suite_recovery() {
@@ -3428,13 +3347,6 @@ fn recover_pending_runs(
                 }
                 recovery.mark_suite_cleanup_complete()?;
             }
-            if !recovery.proxy_cleanup_complete() {
-                if let Some(proxy) = binding.proxy.as_ref() {
-                    ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
-                }
-                recovery.mark_proxy_cleanup_complete()?;
-            }
-            cleanup_run_resources(session, &mut recovery)?;
             let receipt = recovery.suite_retention_manifest_receipt()?;
             if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
                 recovery.finish()?;
@@ -3573,9 +3485,6 @@ fn resolve_token<S: ProgressSink>(
     language: OutputLanguage,
     progress: &mut S,
 ) -> anyhow::Result<(BearerToken, bool)> {
-    if let Some(token) = &invocation.token {
-        return Ok((token.clone(), false));
-    }
     if invocation.token_stdin {
         let mut bytes = Zeroizing::new(Vec::new());
         io::stdin()
@@ -3595,10 +3504,10 @@ fn resolve_token<S: ProgressSink>(
     if !io::stdin().is_terminal() {
         bail!(match language {
             OutputLanguage::Chinese => {
-                "未保存 OIDF Suite API Token；请使用 --token TOKEN 或 --token-stdin 提供"
+                "未保存 OIDF Suite API Token；请使用 --token-stdin 提供"
             }
             OutputLanguage::English => {
-                "no OIDF Suite API token is stored; provide one with --token TOKEN or --token-stdin"
+                "no OIDF Suite API token is stored; provide one with --token-stdin"
             }
         });
     }
@@ -3610,10 +3519,10 @@ fn prompt_token(language: OutputLanguage) -> anyhow::Result<BearerToken> {
     if !io::stderr().is_terminal() {
         bail!(match language {
             OutputLanguage::Chinese => {
-                "无法交互式输入 OIDF Suite Token；请使用 --token TOKEN 或 --token-stdin 提供"
+                "无法交互式输入 OIDF Suite Token；请使用 --token-stdin 提供"
             }
             OutputLanguage::English => {
-                "cannot interactively enter an OIDF Suite token without a terminal; provide one with --token TOKEN or --token-stdin"
+                "cannot interactively enter an OIDF Suite token without a terminal; provide one with --token-stdin"
             }
         });
     }
@@ -3622,8 +3531,8 @@ fn prompt_token(language: OutputLanguage) -> anyhow::Result<BearerToken> {
         OutputLanguage::English => "OIDF Suite API Token: ",
     };
     BearerToken::new(
-        input(prompt)
-            .interact::<String>()
+        password(prompt)
+            .interact()
             .context("OIDF Suite token input was cancelled or failed")?,
     )
     .map_err(Into::into)
@@ -3635,7 +3544,7 @@ fn authenticate_suite<S: ProgressSink>(
     language: OutputLanguage,
     progress: &mut S,
 ) -> anyhow::Result<(SuiteClient, BearerToken)> {
-    let transient_token = invocation.token.is_some() || invocation.token_stdin;
+    let transient_token = invocation.token_stdin;
     let (mut token, mut prompted) = resolve_token(invocation, origin, language, progress)?;
     loop {
         let client = SuiteClient::new(origin.clone(), token.clone(), ClientConfig::default())

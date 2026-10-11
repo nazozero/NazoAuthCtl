@@ -332,6 +332,27 @@ pub struct OneShotTask {
     pub stdin: Vec<u8>,
 }
 
+impl OneShotTask {
+    /// A control receipt describes the durable outcome even when the task exits
+    /// nonzero. The caller still validates and binds it to the submitted operation.
+    pub(crate) fn capture_result(
+        &self,
+        process: crate::process::Process,
+    ) -> anyhow::Result<String> {
+        if self.command != ["nazoauth", "operator-task"] {
+            return process.stdin_stdout(&self.stdin);
+        }
+        let output = process.stdin_output(&self.stdin)?;
+        if !output.status.success() && output.stdout.is_empty() {
+            anyhow::bail!(
+                "operator task exited without a control receipt: {}",
+                output.status
+            );
+        }
+        String::from_utf8(output.stdout).map_err(Into::into)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ManagedPostgresRestore {
     pub network: String,
@@ -673,7 +694,7 @@ pub trait RuntimeBackend {
 }
 
 pub fn safe_environment(values: &[serde_json::Value]) -> BTreeMap<String, String> {
-    const ALLOWED: [&str; 8] = [
+    const ALLOWED: &[&str] = &[
         "ISSUER",
         "PUBLIC_BASE_URL",
         "DATA_DIR",
@@ -682,6 +703,16 @@ pub fn safe_environment(values: &[serde_json::Value]) -> BTreeMap<String, String
         "CONTROL_AUTHORITY",
         "INSTANCE_IDENTITY_DIR",
         "VALKEY_STATE_EPOCH",
+        "NAZOAUTH_SERVER_CONFIG_FILE",
+        "NAZOAUTH_OPERATOR_CONFIG_REVISION_FILE",
+        "MFA_TOTP_ENCRYPTION_KEY_FILE",
+        "SIGNING_KEY_ENCRYPTION_KEY_FILE",
+        "SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_FILE",
+        "CLIENT_SECRET_PEPPER_FILE",
+        "DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN_FILE",
+        "OPENID4VC_DATA_ENCRYPTION_KEY_FILE",
+        "OPENID4VCI_ISSUER_MANAGEMENT_TOKEN_FILE",
+        "OPENID4VP_VERIFIER_MANAGEMENT_TOKEN_FILE",
     ];
     values
         .iter()
@@ -712,6 +743,19 @@ pub fn labels(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
         })
         .unwrap_or_default()
 }
+
+pub const RUNTIME_SECRET_NAMES: &[&str] = &[
+    "database-runtime-url",
+    "valkey-url",
+    "mfa-totp-key",
+    "signing-key-encryption-key",
+    "signing-key-previous-encryption-key",
+    "client-secret-pepper",
+    "dynamic-registration-token",
+    "openid4vc-data-encryption-key",
+    "openid4vci-management-token",
+    "openid4vp-management-token",
+];
 
 #[cfg(test)]
 mod tests {
@@ -749,3 +793,5 @@ mod tests {
         Ok(())
     }
 }
+
+// Runtime secret mounts never include the controller's lifecycle database authority.

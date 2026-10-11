@@ -1023,6 +1023,40 @@ fn ownership_marker_matches(
     std::str::from_utf8(bytes.as_ref()).is_ok_and(|owner| owner.trim() == deployment_id)
 }
 
+fn install_observation_matches(
+    observed: &runtime_backend::RuntimeObservation,
+    expected: &runtime_backend::RuntimeReplacement,
+) -> bool {
+    let mut ports = observed.ports.clone();
+    ports.sort();
+    let mut expected_ports = expected.ports.clone();
+    expected_ports.sort();
+    observed.server_command_verified
+        && match (&observed.artifact, &expected.artifact) {
+            (
+                runtime_backend::ArtifactReference::Oci { digest: actual, .. },
+                runtime_backend::ArtifactReference::Oci {
+                    digest: expected, ..
+                },
+            ) => actual == expected,
+            _ => false,
+        }
+        && expected
+            .labels
+            .iter()
+            .all(|(key, value)| observed.labels.get(key) == Some(value))
+        && observed.safe_environment == expected.environment
+        && ports == expected_ports
+        && observed.mounts.len() == expected.mounts.len()
+        && expected.mounts.iter().all(|mount| {
+            observed.mounts.iter().any(|actual| {
+                actual.source == mount.source
+                    && actual.destination == mount.destination
+                    && actual.read_only == mount.read_only
+            })
+        })
+}
+
 fn start_container_runtime(
     job: &InstallJob<'_>,
     verified: &super::update_exec::VerifiedArtifactFacts,
@@ -1039,35 +1073,6 @@ fn start_container_runtime(
         }
     };
     let backend = runtime_backend::backend(kind);
-    // 5a. Initialize schema and the authoritative system-tenant binding before
-    // activation. Both one-shots are idempotent across crash-retry resumes.
-    run_prestart_database_tasks(job, backend.as_ref(), &runtime_artifact)?;
-
-    let observation = backend.inspect(&job.runtime.object);
-    if let Ok(observed) = &observation {
-        if super::update_exec::observation_digest(observed).as_deref()
-            == Some(verified.digest.as_str())
-        {
-            performed.installed_runtime = true;
-            if !observed.running {
-                backend.start(&job.runtime.object).map_err(|error| {
-                    Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string()))
-                })?;
-            }
-            performed.started_runtime = true;
-            return Ok(());
-        }
-        // An object under our name that is NOT the verified artifact is a
-        // conflict, never a silent replacement target.
-        return Err(Failure::new(
-            TARGET_IDENTITY_MISMATCH,
-            format!(
-                "runtime object '{}' already exists serving a different artifact ({})",
-                job.runtime.object,
-                sanitize(format!("{:?}", observed.artifact))
-            ),
-        ));
-    }
     let mut mounts = vec![
         mount(
             PathBuf::from(job.config_reference),
@@ -1174,6 +1179,33 @@ fn start_container_runtime(
         .collect(),
         container_policy: Some(runtime_backend::ContainerRuntimePolicy::managed_default()),
     };
+    match backend.inspect(&job.runtime.object) {
+        Ok(observed) => {
+            if !install_observation_matches(&observed, &replacement) {
+                return Err(Failure::new(
+                    TARGET_IDENTITY_MISMATCH,
+                    "existing runtime does not match this deployment's installation",
+                ));
+            }
+            run_prestart_database_tasks(job, backend.as_ref(), &runtime_artifact)?;
+            performed.installed_runtime = true;
+            if !observed.running {
+                backend.start(&job.runtime.object).map_err(|error| {
+                    Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string()))
+                })?;
+            }
+            performed.started_runtime = true;
+            return Ok(());
+        }
+        Err(error) if error.to_string().contains("managed object is absent") => {}
+        Err(error) => {
+            return Err(Failure::new(
+                RUNTIME_START_FAILED,
+                sanitize(error.to_string()),
+            ));
+        }
+    }
+    run_prestart_database_tasks(job, backend.as_ref(), &runtime_artifact)?;
     backend
         .replace(&replacement)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
@@ -1532,74 +1564,8 @@ pub(super) fn set_runtime_identity_directory_data(
     path: &Path,
     preserve_owner: bool,
 ) -> Result<(), Failure> {
-    use std::os::unix::fs::{PermissionsExt as _, lchown};
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(node) = stack.pop() {
-        let metadata = fs::symlink_metadata(&node).map_err(|error| {
-            Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                sanitize(format!(
-                    "failed to inspect runtime data node {}: {error}",
-                    node.display()
-                )),
-            )
-        })?;
-
-        if metadata.file_type().is_symlink() {
-            return Err(Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                sanitize(format!(
-                    "runtime data ownership rejects symlink {}",
-                    node.display()
-                )),
-            ));
-        }
-        let is_directory = metadata.is_dir();
-        if !is_directory && !metadata.is_file() {
-            return Err(Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                sanitize(format!(
-                    "runtime data ownership rejects special file {}",
-                    node.display()
-                )),
-            ));
-        }
-
-        if !preserve_owner {
-            lchown(&node, Some(10_001), Some(10_001)).map_err(|error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    sanitize(format!(
-                        "failed to grant runtime ownership of {}: {error}",
-                        node.display()
-                    )),
-                )
-            })?;
-        }
-        if is_directory {
-            fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    sanitize(format!(
-                        "failed to restrict runtime data directory {}: {error}",
-                        node.display()
-                    )),
-                )
-            })?;
-            for entry in std::fs::read_dir(&node).map_err(|error| {
-                Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-            })? {
-                stack.push(
-                    entry
-                        .map_err(|error| {
-                            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-                        })?
-                        .path(),
-                );
-            }
-        }
-    }
-    Ok(())
+    filesystem::set_data_tree_identity(path, 10_001, 10_001, preserve_owner)
+        .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))
 }
 
 /// Read-only secrets directory: the runtime UID needs traverse (`x`) to open
@@ -2320,5 +2286,61 @@ mod install_exec_tests {
         assert_eq!(outside_after.gid(), outside_before.gid());
         assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
         Ok(())
+    }
+    #[test]
+    fn security_cloud_same_image_is_not_installation_ownership() {
+        let artifact = runtime_backend::ArtifactReference::Oci {
+            image_reference: "image".to_owned(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        let expected = runtime_backend::RuntimeReplacement {
+            object_reference: "runtime".to_owned(),
+            artifact: artifact.clone(),
+            local_artifact_id: None,
+            command: vec!["nazoauth".to_owned(), "server".to_owned()],
+            mounts: vec![mount("/config/a".into(), CONTAINER_CONFIG_FILE, true)],
+            environment: [(
+                SERVER_CONFIG_FILE_ENV.to_owned(),
+                CONTAINER_CONFIG_FILE.to_owned(),
+            )]
+            .into(),
+            networks: vec![],
+            ip_address: None,
+            ports: vec!["127.0.0.1:8000:8000/tcp".to_owned()],
+            labels: [(
+                "io.nazoauth.deployment-id".to_owned(),
+                "deploy-a".to_owned(),
+            )]
+            .into(),
+            container_policy: None,
+        };
+        let observed = runtime_backend::RuntimeObservation {
+            backend: RuntimeBackendKind::Docker,
+            object_reference: "runtime".to_owned(),
+            display_name: "runtime".to_owned(),
+            running: false,
+            server_command_verified: true,
+            artifact,
+            local_artifact_id: None,
+            ports: expected.ports.clone(),
+            networks: vec![],
+            mounts: expected.mounts.clone(),
+            safe_environment: expected.environment.clone(),
+            labels: expected.labels.clone(),
+            evidence: vec![],
+            missing: vec![],
+        };
+        assert!(install_observation_matches(&observed, &expected));
+        let mut foreign = observed.clone();
+        foreign.labels.clear();
+        assert!(!install_observation_matches(&foreign, &expected));
+        let mut foreign = observed.clone();
+        foreign.mounts[0].source = "/config/other".into();
+        assert!(!install_observation_matches(&foreign, &expected));
+        let mut foreign = observed;
+        foreign
+            .safe_environment
+            .insert(SERVER_CONFIG_FILE_ENV.to_owned(), "/other".to_owned());
+        assert!(!install_observation_matches(&foreign, &expected));
     }
 }

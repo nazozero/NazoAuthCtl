@@ -125,7 +125,7 @@ def canonical_https(value: str, *, directory: bool) -> str:
 def run_git(repo: pathlib.Path, arguments: list[str]) -> bytes:
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), *arguments],
+            ["git", "--no-replace-objects", "-C", str(repo), *arguments],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -137,7 +137,7 @@ def run_git(repo: pathlib.Path, arguments: list[str]) -> bytes:
 def require_git_clean(repo: pathlib.Path, arguments: list[str], message: str) -> None:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo), *arguments],
+            ["git", "--no-replace-objects", "-C", str(repo), *arguments],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )

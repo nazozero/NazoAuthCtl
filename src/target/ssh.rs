@@ -34,7 +34,7 @@ use std::{
     io::IsTerminal as _,
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Child, Command as StdCommand, Stdio},
+    process::{Child, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -103,7 +103,8 @@ impl RecoverySshForward {
         drop(listener);
 
         let argv = recovery_forward_argv(profile, local_port, remote_port);
-        let mut child = StdCommand::new(SSH_PROGRAM)
+        let mut child = Process::new(SSH_PROGRAM)
+            .command()
             .args(argv)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -479,7 +480,8 @@ impl SshTarget {
             "正在为主机“{}”验证 sudo 权限，请完成终端提示。",
             self.profile
         );
-        let status = StdCommand::new(&self.program)
+        let status = Process::new(&self.program)
+            .command()
             .args(self.sudo_interactive_args())
             .status()
             .context("failed to run the interactive sudo pre-authorization")?;

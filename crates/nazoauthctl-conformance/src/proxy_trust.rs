@@ -253,6 +253,7 @@ fn remove_recovery(path: &Path) -> anyhow::Result<()> {
 }
 
 fn reload(executable: &Path, operation: &str) -> anyhow::Result<()> {
+    validate_reload_executable(executable)?;
     let status = Command::new(executable)
         .env_clear()
         .env(
@@ -271,6 +272,12 @@ fn validate_reload_executable(path: &Path) -> anyhow::Result<()> {
     if !path.is_absolute() {
         bail!("proxy reload executable must be an absolute path");
     }
+    crate::secure_file::validate_directory(
+        path.parent()
+            .context("proxy reload executable has no parent")?,
+        false,
+    )
+    .map_err(|error| anyhow::anyhow!("unsafe proxy reload executable parent: {error:?}"))?;
     let metadata =
         fs::symlink_metadata(path).context("failed to inspect proxy reload executable")?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -322,5 +329,23 @@ mod tests {
                 .is_err()
         );
         assert!(merge_public_trust_bundles(existing.as_bytes(), b"not a certificate").is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn security_cloud_reload_rejects_replaceable_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = std::env::temp_dir().join(format!("reload-parent-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+        let executable = path.join("reload");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            validate_reload_executable(&executable)
+                .unwrap_err()
+                .to_string()
+                .contains("parent")
+        );
+        fs::remove_dir_all(path).unwrap();
     }
 }

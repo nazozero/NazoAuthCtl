@@ -75,11 +75,12 @@ impl Fixture {
         resources: Vec<crate::target::Resource>,
         release: Option<ReleaseVersion>,
     ) -> anyhow::Result<()> {
+        let port = 8000 + u16::try_from(self.target_store()?.list_deployments()?.len())?;
         self.target_store()?.bootstrap(
             deployment_id,
             BootstrapParams {
                 issuer: issuer.to_owned(),
-                runtime: RuntimeSurface::new("podman", runtime_object, 8000)?,
+                runtime: RuntimeSurface::new("podman", runtime_object, port)?,
                 artifact: ArtifactRefs {
                     current: Some(ARTIFACT.to_owned()),
                     previous: None,

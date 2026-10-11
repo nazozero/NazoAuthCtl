@@ -95,8 +95,7 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
     else {
         bail!("Podman replacement requires a digest-bound OCI artifact");
     };
-    remove(command, &replacement.object_reference)
-        .context("removing the stopped Podman runtime before replacement")?;
+    container_shared::remove_replacement_source(command, replacement, "Podman")?;
     let image = replacement.local_artifact_id.clone().unwrap_or_else(|| {
         format!(
             "{}@{}",

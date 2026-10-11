@@ -1500,3 +1500,16 @@ fn public_verification_failure_never_touches_committed_local_state() -> anyhow::
     );
     Ok(())
 }
+
+#[test]
+fn security_cloud_https_install_does_not_assume_a_certificate_sanitizing_proxy()
+-> anyhow::Result<()> {
+    let fixture = LocalFixture::new(None)?;
+    let mut request = fixture.request(Some("secure-proxy-default"));
+    request.issuer = "https://auth.example.com".to_owned();
+    let prepared = prepare_install_operation(&mut request, &test_hello(vec!["docker".to_owned()]))?;
+    let config: std::collections::BTreeMap<String, yaml_serde::Value> =
+        yaml_serde::from_str(&install_order(&prepared.operation).config_content)?;
+    assert_eq!(config["MTLS_CERTIFICATE_SOURCE"].as_str(), Some("disabled"));
+    Ok(())
+}

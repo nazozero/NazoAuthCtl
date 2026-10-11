@@ -397,6 +397,19 @@ fn recovery_mounts(
             true,
         ),
     ];
+    let mut secret_names = std::collections::BTreeSet::new();
+    for mount in &source.mounts {
+        if let Ok(relative) = mount.destination.strip_prefix(CONTAINER_SECRETS_DIR) {
+            let name = relative
+                .to_str()
+                .context("runtime secret destination is not UTF-8")?;
+            ensure!(
+                crate::runtime_backend::RUNTIME_SECRET_NAMES.contains(&name)
+                    && secret_names.insert(name),
+                "recovery source has an unknown or duplicate secret mount"
+            );
+        }
+    }
     for mount in source
         .mounts
         .iter()
@@ -937,6 +950,16 @@ mod tests {
                 .source,
             request.secrets_source.join("client-secret-pepper")
         );
+        for forbidden in [
+            "/run/secrets/database-lifecycle-url",
+            "/run/secrets/nested/secret",
+            "/run/secrets/client-secret-pepper",
+            "/run/secrets",
+        ] {
+            source.mounts.push(mount(forbidden));
+            assert!(recovery_mounts(&source, &request).is_err(), "{forbidden}");
+            source.mounts.pop();
+        }
         source.mounts.push(mount("/etc/nazoauth/tls"));
         source.mounts.push(mount("/etc/unrelated"));
         request.https = true;

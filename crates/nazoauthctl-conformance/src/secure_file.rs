@@ -249,6 +249,7 @@ pub(crate) fn write_new_or_exact(
 /// Same as [`write_new_or_exact`], but tells a paired-file caller whether it
 /// owns the newly published file and may therefore safely remove it if the
 /// companion write fails. An exact pre-existing file is never removed.
+#[cfg(unix)]
 pub(crate) fn write_new_or_exact_with_outcome(
     path: &Path,
     bytes: &[u8],
@@ -357,6 +358,7 @@ pub(crate) fn write_new_or_exact_with_outcome(
 /// Removes a root-private file only after confirming its exact bytes. This is
 /// intentionally narrow: it is used to roll back a just-created PNG/audit
 /// companion, never to replace or clean up evidence of an unknown writer.
+#[cfg(unix)]
 pub(crate) fn remove_private_file_if_exact(
     path: &Path,
     bytes: &[u8],
