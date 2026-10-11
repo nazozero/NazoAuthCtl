@@ -1176,12 +1176,32 @@ impl DescriptorMaterializer {
             binding.artifact_source_digest,
             binding.raw_matrix_sha256,
         )?;
+        // VP certificate profiles use signed matrix facts independently of the
+        // subset of datasets provisioned into the credential issuer.
+        let mdoc_issuing_country = matrix
+            .openid4vc_credential_datasets
+            .get("org.iso.18013.5.1.mDL")
+            .and_then(|dataset| dataset.get("org.iso.18013.5.1"))
+            .and_then(|namespace| namespace.get("issuing_country"))
+            .and_then(Value::as_str);
+        if matrix
+            .groups
+            .iter()
+            .flat_map(|group| &group.plans)
+            .any(|plan| {
+                plan.variant.get("credential_format").map(String::as_str) == Some("iso_mdl")
+            })
+            && mdoc_issuing_country.is_none()
+        {
+            return Err(MaterializerError::InvalidField("mdoc issuing country"));
+        }
         Self::prepare_materialization(
             descriptor,
             binding.target_issuer,
             binding.suite_origin,
             binding.request_jti,
             binding.dynamic_registration_initial_access_token,
+            mdoc_issuing_country,
         )
     }
 
@@ -1245,6 +1265,7 @@ impl DescriptorMaterializer {
         suite_origin: &Origin,
         request_jti: &str,
         dynamic_registration_initial_access_token: Option<&str>,
+        mdoc_issuing_country: Option<&str>,
     ) -> Result<PreparedMaterialization, MaterializerError> {
         validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
@@ -1272,7 +1293,8 @@ impl DescriptorMaterializer {
             .get("org.iso.18013.5.1.mDL")
             .and_then(|dataset| dataset.get("org.iso.18013.5.1"))
             .and_then(|namespace| namespace.get("issuing_country"))
-            .and_then(Value::as_str);
+            .and_then(Value::as_str)
+            .or(mdoc_issuing_country);
         if descriptor
             .openid4vc_credential_datasets
             .contains_key("org.iso.18013.5.1.mDL")
@@ -2708,6 +2730,7 @@ mod tests {
             suite_origin,
             request_jti,
             None,
+            None,
         )
     }
 
@@ -3552,6 +3575,7 @@ mod tests {
             &suite(),
             request_jti(),
             None,
+            None,
         )
         .expect("ordinary CIBA preparation")
     }
@@ -3623,8 +3647,48 @@ mod tests {
             &suite(),
             request_jti(),
             None,
+            None,
         )
         .expect("multiple signed CIBA clients must retain their ordinary roles");
         assert_eq!(prepared.expected_clients().len(), 2);
+    }
+    #[test]
+    fn security_cloud_vp_only_matrix_keeps_mdoc_certificate_profile_without_issuer_datasets() {
+        let mut matrix: crate::artifact::OidfArtifactMatrix =
+            serde_json::from_str(include_str!("../resources/oidf/matrix.json")).unwrap();
+        matrix.groups.retain(|group| group.id == "openid4vc-vp");
+        for group in &mut matrix.groups {
+            group.plans.retain(|plan| {
+                plan.variant.get("credential_format").map(String::as_str) == Some("iso_mdl")
+            });
+        }
+        assert!(matrix.groups.iter().any(|group| !group.plans.is_empty()));
+        let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
+            &matrix,
+            ArtifactMaterializationBinding {
+                artifact_source_release: "test",
+                artifact_source_digest: &"a".repeat(64),
+                raw_matrix_sha256: &"b".repeat(64),
+                target_issuer: "https://issuer.example",
+                suite_origin: &suite(),
+                request_jti: request_jti(),
+                dynamic_registration_initial_access_token: None,
+            },
+        )
+        .unwrap();
+        assert!(prepared.descriptor.openid4vc_credential_datasets.is_empty());
+        let material = prepared.attestation.as_ref().unwrap();
+        let jwk: Value = serde_json::from_str(&material.credential_signing_private_jwk).unwrap();
+        let der = STANDARD.decode(jwk["x5c"][0].as_str().unwrap()).unwrap();
+        let (_, certificate) = parse_x509_certificate(&der).unwrap();
+        assert!(certificate.subject().iter_country().next().is_some());
+        let eku = certificate.extended_key_usage().unwrap().unwrap();
+        assert!(eku.critical);
+        assert!(
+            eku.value
+                .other
+                .iter()
+                .any(|oid| oid.to_id_string() == "1.0.18013.5.1.2")
+        );
     }
 }

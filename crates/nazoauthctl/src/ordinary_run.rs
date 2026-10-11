@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, bail};
 use cliclack::{
-    MultiProgress, ProgressBar, input, log, multi_progress, note, outro, progress_bar, spinner,
+    MultiProgress, ProgressBar, log, multi_progress, note, outro, password, progress_bar, spinner,
 };
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
@@ -493,13 +493,14 @@ fn execute_with_progress<S: ProgressSink>(
     progress.activity(&ProgressActivity::OpeningDeployment);
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
-    let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
-        .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
     let deployment = session.deployment_evidence();
     let recovery_directory = session.recovery_directory()?;
     let recovery_store =
         ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
     let _orchestration_lock = recovery_store.acquire_orchestration_lock()?;
+    recover_pending_runs(&session, &recovery_store, None)?;
+    let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
+        .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
 
     progress.activity(&ProgressActivity::LoadingMatrix);
     let now = current_unix_time()?;
@@ -518,7 +519,7 @@ fn execute_with_progress<S: ProgressSink>(
     progress.activity(&ProgressActivity::AuthenticatingSuite);
     let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language, progress)?;
     progress.activity(&ProgressActivity::RecoveringPreviousRun);
-    let recovered_retention = recover_pending_runs(&session, &recovery_store, &suite_client)?;
+    let recovered_retention = recover_pending_runs(&session, &recovery_store, Some(&suite_client))?;
     if !recovered_retention.is_empty() {
         progress.activity(&ProgressActivity::Finished);
         if invocation.json {
@@ -763,8 +764,12 @@ fn execute_with_progress<S: ProgressSink>(
     // The OpenID4VP client and runner are being generalized in the adjacent
     // slice. Keep this typed boundary ordinary-only: a lease-shaped adapter is
     // deliberately impossible here.
-    let ciba_approver =
-        build_ciba_user_approver(requires_ciba, &ephemeral_tenant.issuer, &run_secrets)?;
+    let ciba_approver = build_ciba_user_approver(
+        requires_ciba,
+        &ephemeral_tenant.issuer,
+        &run_secrets,
+        ordinary.clients().values().cloned().collect(),
+    )?;
     let run_result = run_signed_suite(
         ordinary,
         suite_client.clone(),
@@ -2330,6 +2335,7 @@ fn build_ciba_user_approver(
     requires_ciba: bool,
     target_issuer: &str,
     secrets: &RunSecrets,
+    allowed_clients: std::collections::HashSet<String>,
 ) -> anyhow::Result<Option<Arc<CibaUserApprovalClient>>> {
     if !requires_ciba {
         return Ok(None);
@@ -2346,6 +2352,7 @@ fn build_ciba_user_approver(
             secrets.applicant_email.clone(),
             secrets.applicant_password.clone(),
             transport,
+            allowed_clients,
         )
         .context("failed to initialize normal CIBA user approval")?,
     )))
@@ -3231,7 +3238,7 @@ fn resume_pending_conformance_operation(
 fn recover_pending_runs(
     session: &nazoauthctl_core::ConformanceSession,
     store: &ConformanceRecoveryStore,
-    suite_client: &SuiteClient,
+    suite_client: Option<&SuiteClient>,
 ) -> anyhow::Result<Vec<SuiteRetentionManifestReceipt>> {
     let mut retained = Vec::new();
     let mut failures = Vec::new();
@@ -3269,6 +3276,10 @@ fn recover_pending_runs(
                 recovery.mark_tenant_absent(directory_revision)?;
             }
             if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
+                if suite_client.is_none() {
+                    cleanup_ephemeral_tenant(session, &mut recovery)?;
+                    return Ok(None);
+                }
                 recovery.publish_committed_suite_retention_manifest()?;
                 let receipt = recovery.suite_retention_manifest_receipt()?;
                 cleanup_ephemeral_tenant(session, &mut recovery)?;
@@ -3312,6 +3323,22 @@ fn recover_pending_runs(
                 )?;
                 successful_control_completion(outcome, "recovery Apply")?;
             }
+            // Each local cleanup remains executable even if the other boundary fails.
+            let proxy_result = (|| -> anyhow::Result<()> {
+                if !recovery.proxy_cleanup_complete() {
+                    if let Some(proxy) = binding.proxy.as_ref() {
+                        ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                    }
+                    recovery.mark_proxy_cleanup_complete()?;
+                }
+                Ok(())
+            })();
+            let target_result = cleanup_run_resources(session, &mut recovery);
+            target_result?;
+            proxy_result?;
+            let Some(suite_client) = suite_client else {
+                return Ok(None);
+            };
             if !recovery.suite_cleanup_complete() {
                 recovery.discard_prepared_suite_retention_staging()?;
                 if let Some(suite) = recovery.suite_recovery() {
@@ -3320,13 +3347,6 @@ fn recover_pending_runs(
                 }
                 recovery.mark_suite_cleanup_complete()?;
             }
-            if !recovery.proxy_cleanup_complete() {
-                if let Some(proxy) = binding.proxy.as_ref() {
-                    ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
-                }
-                recovery.mark_proxy_cleanup_complete()?;
-            }
-            cleanup_run_resources(session, &mut recovery)?;
             let receipt = recovery.suite_retention_manifest_receipt()?;
             if recovery.suite_cleanup_complete() && recovery.proxy_cleanup_complete() {
                 recovery.finish()?;
@@ -3465,9 +3485,6 @@ fn resolve_token<S: ProgressSink>(
     language: OutputLanguage,
     progress: &mut S,
 ) -> anyhow::Result<(BearerToken, bool)> {
-    if let Some(token) = &invocation.token {
-        return Ok((token.clone(), false));
-    }
     if invocation.token_stdin {
         let mut bytes = Zeroizing::new(Vec::new());
         io::stdin()
@@ -3487,10 +3504,10 @@ fn resolve_token<S: ProgressSink>(
     if !io::stdin().is_terminal() {
         bail!(match language {
             OutputLanguage::Chinese => {
-                "未保存 OIDF Suite API Token；请使用 --token TOKEN 或 --token-stdin 提供"
+                "未保存 OIDF Suite API Token；请使用 --token-stdin 提供"
             }
             OutputLanguage::English => {
-                "no OIDF Suite API token is stored; provide one with --token TOKEN or --token-stdin"
+                "no OIDF Suite API token is stored; provide one with --token-stdin"
             }
         });
     }
@@ -3502,10 +3519,10 @@ fn prompt_token(language: OutputLanguage) -> anyhow::Result<BearerToken> {
     if !io::stderr().is_terminal() {
         bail!(match language {
             OutputLanguage::Chinese => {
-                "无法交互式输入 OIDF Suite Token；请使用 --token TOKEN 或 --token-stdin 提供"
+                "无法交互式输入 OIDF Suite Token；请使用 --token-stdin 提供"
             }
             OutputLanguage::English => {
-                "cannot interactively enter an OIDF Suite token without a terminal; provide one with --token TOKEN or --token-stdin"
+                "cannot interactively enter an OIDF Suite token without a terminal; provide one with --token-stdin"
             }
         });
     }
@@ -3514,8 +3531,8 @@ fn prompt_token(language: OutputLanguage) -> anyhow::Result<BearerToken> {
         OutputLanguage::English => "OIDF Suite API Token: ",
     };
     BearerToken::new(
-        input(prompt)
-            .interact::<String>()
+        password(prompt)
+            .interact()
             .context("OIDF Suite token input was cancelled or failed")?,
     )
     .map_err(Into::into)
@@ -3527,7 +3544,7 @@ fn authenticate_suite<S: ProgressSink>(
     language: OutputLanguage,
     progress: &mut S,
 ) -> anyhow::Result<(SuiteClient, BearerToken)> {
-    let transient_token = invocation.token.is_some() || invocation.token_stdin;
+    let transient_token = invocation.token_stdin;
     let (mut token, mut prompted) = resolve_token(invocation, origin, language, progress)?;
     loop {
         let client = SuiteClient::new(origin.clone(), token.clone(), ClientConfig::default())

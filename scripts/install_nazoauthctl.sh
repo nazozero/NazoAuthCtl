@@ -80,8 +80,24 @@ if [ -e "$install_path" ] || [ -L "$install_path" ]; then
   }
 fi
 
+# Both staging and installation stay under an administrator-owned chain.
+directory=$parent
+while :; do
+  [ -d "$directory" ] && [ ! -L "$directory" ] &&
+    [ "$(stat -c %u -- "$directory")" -eq 0 ] || {
+      printf '%s\n' 'install directory chain must be root-owned and non-symlink' >&2
+      exit 1
+    }
+  mode=$(stat -c %a -- "$directory")
+  [ "$((0$mode & 0022))" -eq 0 ] || {
+    printf '%s\n' 'install directory chain must not be group/world writable' >&2
+    exit 1
+  }
+  [ "$directory" = / ] && break
+  directory=$(dirname -- "$directory")
+done
 umask 077
-work=$(mktemp -d "${TMPDIR:-/tmp}/nazoauthctl-install.XXXXXX")
+work=$(mktemp -d "$parent/.nazoauthctl-install.XXXXXX")
 staged=""
 cleanup() {
   [ -z "$staged" ] || rm -f -- "$staged"

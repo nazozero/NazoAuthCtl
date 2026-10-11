@@ -34,7 +34,8 @@ pub(crate) use policy::{
     ensure_container, ensure_volume, inspect_document, inspect_document_optional,
     inspect_image_environment, inspect_managed_container_id, is_engine_unavailable_error,
     network_config_digest, network_gateway, prepare_managed_volume_ownership, reconcile_bound_file,
-    remove_managed_container_by_id, remove_managed_container_by_name, require_digest_pinned_image,
+    remove_managed_container_by_id, remove_managed_container_by_name, remove_replacement_source,
+    require_digest_pinned_image,
 };
 pub(crate) use recovery::{cleanup_recovery_candidate, stage_recovery_candidate};
 
@@ -226,7 +227,10 @@ mod tests {
         let arguments = work.path().join("arguments");
         write_shell_executable(
             &engine,
-            &format!("printf '%s\\n' \"$@\" > '{}'", arguments.display()),
+            &format!(
+                "test \"$DATABASE_URL\" = 'test-only-secret' || exit 3; printf '%s\\n' \"$@\" > '{}'",
+                arguments.display()
+            ),
         );
         let image = format!("sha256:{}", "a".repeat(64));
         let digest = image.clone();
@@ -238,7 +242,10 @@ mod tests {
             command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
             network: Some("bridge".to_owned()),
             mounts: Vec::new(),
-            environment: std::collections::BTreeMap::new(),
+            environment: std::collections::BTreeMap::from([(
+                "DATABASE_URL".to_owned(),
+                "test-only-secret".to_owned(),
+            )]),
             working_directory: None,
             service_user: Some(super::NON_ROOT_ONE_SHOT_USER.to_owned()),
             transient_credentials: std::collections::BTreeMap::new(),
@@ -261,6 +268,8 @@ mod tests {
         .unwrap();
 
         let arguments = fs::read_to_string(arguments).unwrap();
+        assert!(!arguments.contains("test-only-secret"));
+        assert!(arguments.contains("DATABASE_URL"));
         let arguments = arguments.lines().collect::<Vec<_>>();
         let mapping = arguments
             .iter()
@@ -271,6 +280,44 @@ mod tests {
             .position(|argument| *argument == image)
             .unwrap_or_else(|| panic!("one-shot image is absent from {arguments:?}"));
         assert!(mapping < image);
+    }
+
+    #[test]
+    fn security_cloud_control_receipt_survives_nonzero_exit_only_for_operator_task() {
+        let work = PrivateTempDir::new("control-receipt-exit").unwrap();
+        let engine = work.path().join("fake-engine");
+        write_shell_executable(&engine, "printf '%s' '{\"outcome\":\"rejected\"}'; exit 7");
+        let image = format!("sha256:{}", "a".repeat(64));
+        let digest = image.clone();
+        let mut task = OneShotTask {
+            artifact: ArtifactReference::Oci {
+                image_reference: image.clone(),
+                digest,
+            },
+            command: vec!["nazoauth".to_owned(), "migrate".to_owned()],
+            network: Some("bridge".to_owned()),
+            mounts: Vec::new(),
+            environment: std::collections::BTreeMap::from([(
+                "DATABASE_URL".to_owned(),
+                "test-only-secret".to_owned(),
+            )]),
+            working_directory: None,
+            service_user: Some(super::NON_ROOT_ONE_SHOT_USER.to_owned()),
+            transient_credentials: std::collections::BTreeMap::new(),
+            read_only_paths: Vec::new(),
+            read_write_paths: Vec::new(),
+            inaccessible_paths: Vec::new(),
+            private_mounts: false,
+            stdin: Vec::new(),
+        };
+        assert!(task.capture_result(Process::new(&engine)).is_err());
+        task.command = vec!["nazoauth".to_owned(), "operator-task".to_owned()];
+        assert_eq!(
+            task.capture_result(Process::new(&engine)).unwrap(),
+            "{\"outcome\":\"rejected\"}"
+        );
+        write_shell_executable(&engine, "exit 7");
+        assert!(task.capture_result(Process::new(&engine)).is_err());
     }
 
     #[test]
@@ -668,7 +715,7 @@ pub(crate) fn one_shot_process(
         process = process.arg("--workdir").arg(directory);
     }
     for (name, value) in &task.environment {
-        process = process.arg("--env").arg(format!("{name}={value}"));
+        process = process.arg("--env").arg(name).env(name, value);
     }
     Ok(append_mounts(process, &task.mounts)
         .arg(image)
@@ -862,5 +909,58 @@ mod policy_tests {
                 .as_deref(),
             Some("10001:10001")
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn security_cloud_replacement_never_force_removes_a_foreign_or_running_object() {
+        use crate::{
+            ArtifactReference, filesystem::PrivateTempDir, test_support::write_shell_executable,
+        };
+        use std::fs;
+        let work = PrivateTempDir::new("replacement-identity").unwrap();
+        let engine = work.path().join("engine");
+        let document = work.path().join("inspect.json");
+        let removed = work.path().join("removed");
+        write_shell_executable(
+            &engine,
+            &format!(
+                "if [ \"$1\" = container ]; then if [ -f '{}' ]; then cat '{}'; else echo 'no such container' >&2; exit 125; fi; else printf '%s\\n' \"$@\" > '{}'; fi",
+                document.display(),
+                document.display(),
+                removed.display()
+            ),
+        );
+        let replacement = super::super::RuntimeReplacement {
+            object_reference: "candidate".to_owned(),
+            artifact: ArtifactReference::Unknown,
+            local_artifact_id: None,
+            command: vec![],
+            mounts: vec![],
+            environment: Default::default(),
+            networks: vec![],
+            ip_address: None,
+            ports: vec![],
+            labels: [(
+                "io.nazoauth.deployment-id".to_owned(),
+                "deploy-a".to_owned(),
+            )]
+            .into(),
+            container_policy: None,
+        };
+        super::remove_replacement_source(engine.as_os_str(), &replacement, "Docker").unwrap();
+        assert!(!removed.exists());
+        let id = "a".repeat(64);
+        for (owner, running) in [("foreign", false), ("deploy-a", true), ("deploy-a", false)] {
+            fs::write(&document, serde_json::json!({"Id": id, "State": {"Running": running}, "Config": {"Labels": {"io.nazoauth.deployment-id": owner}}}).to_string()).unwrap();
+            let result =
+                super::remove_replacement_source(engine.as_os_str(), &replacement, "Docker");
+            if owner == "foreign" || running {
+                assert!(result.is_err());
+                assert!(!removed.exists());
+            } else {
+                result.unwrap();
+                assert_eq!(fs::read_to_string(&removed).unwrap(), format!("rm\n{id}\n"));
+            }
+        }
     }
 }

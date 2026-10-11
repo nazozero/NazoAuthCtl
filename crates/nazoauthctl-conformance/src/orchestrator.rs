@@ -3925,7 +3925,7 @@ mod tests {
                     .expect("CIBA verification path");
                 (
                     Vec::new(),
-                    serde_json::json!({"auth_req_id":auth_req_id,"request":{}}),
+                    serde_json::json!({"auth_req_id":auth_req_id,"request":{"client_id":"client-1"}}),
                 )
             } else {
                 self.decision_ids.lock().expect("decision IDs lock").push(
@@ -3990,6 +3990,7 @@ mod tests {
                     decisions: Arc::clone(&decisions),
                     decision_ids: Arc::clone(&decision_ids),
                 }),
+                std::collections::HashSet::from(["client-1".to_owned()]),
             )
             .expect("approver"),
         );

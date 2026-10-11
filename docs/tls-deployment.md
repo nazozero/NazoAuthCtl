@@ -88,6 +88,11 @@ For an existing deployment, listener publications and mounts must already
 cover the new configuration: config update preserves the installed runtime
 topology. It does not add another TLS root or expose a different public port.
 
+Fresh proxy installations leave `MTLS_CERTIFICATE_SOURCE=disabled`. A loopback
+listener alone cannot authenticate forwarded certificate headers. Enable a
+forwarded-certificate format only with an explicitly configured proxy trust
+boundary that strips incoming headers and authenticates its client certificate.
+
 ## Trusted proxy configuration
 
 For a same-host loopback peer, the transport settings are:

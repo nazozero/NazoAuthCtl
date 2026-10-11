@@ -10,7 +10,7 @@ use std::{
     io::{Cursor, Read as _, Seek as _, SeekFrom, Write as _},
     net::TcpListener,
     path::{Component, Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
     time::{Duration, Instant},
 };
 
@@ -2329,7 +2329,7 @@ fn run_postgres_command<'a>(
     connection: &PostgresConnection,
     extra: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<Output> {
-    let output = Command::new(program)
+    let output = crate::process::Process::new(program)
         .arg("--dbname")
         .arg(connection.url_without_password.as_str())
         .args(extra)
@@ -2339,25 +2339,15 @@ fn run_postgres_command<'a>(
     ensure_postgres_output(program, output)
 }
 
-/// `createdb` and `dropdb` take the database name positionally and have no
-/// `--dbname` connection flag; they receive the connection as flags instead.
+/// Preserve the complete libpq connection policy for maintenance utilities.
 fn run_postgres_util<'a>(
     program: &str,
     connection: &PostgresConnection,
     extra: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<Output> {
-    let url = &connection.url_without_password;
-    let host = url.host_str().context("database URL has no host")?;
-    let port = url.port().unwrap_or(5432);
-    let user = url.username();
-    ensure!(!user.is_empty(), "database URL has no user");
-    let output = Command::new(program)
-        .arg("--host")
-        .arg(host)
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--username")
-        .arg(user)
+    let output = crate::process::Process::new(program)
+        .arg("--maintenance-db")
+        .arg(connection.url_without_password.as_str())
         .args(extra)
         .env("PGPASSWORD", &connection.password)
         .output()
@@ -2367,11 +2357,7 @@ fn run_postgres_util<'a>(
 
 fn ensure_postgres_output(program: &str, output: std::process::Output) -> anyhow::Result<Output> {
     if !output.status.success() {
-        bail!(
-            "{program} failed with {}: {}",
-            output.status,
-            sanitize(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-        );
+        bail!("{program} failed with {}", output.status);
     }
     Ok(output)
 }
@@ -2556,7 +2542,7 @@ fn start_candidate(
     replace_mount(&mut mounts, CONTAINER_DATA_DIR, data, false)?;
     // The runtime mounts each allowlisted secret file individually, never the
     // directory; repoint every one into the restored secrets directory.
-    let mut secret_mounts = 0;
+    let mut secret_mounts = BTreeSet::new();
     let previous_secret_destination =
         Path::new(CONTAINER_SECRETS_DIR).join(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET);
     let mut previous_secret_mount = false;
@@ -2569,11 +2555,15 @@ fn start_candidate(
             Err(_) => continue,
         };
         let name = relative
-            .file_name()
-            .context("secret mount destination has no file name")?;
+            .to_str()
+            .context("secret mount destination is not UTF-8")?;
+        ensure!(
+            runtime_backend::RUNTIME_SECRET_NAMES.contains(&name)
+                && secret_mounts.insert(name.to_owned()),
+            "runtime has an unknown or duplicate secret mount"
+        );
         mount.source = secrets.join(name);
         mount.read_only = true;
-        secret_mounts += 1;
         previous_secret_mount |= mount.destination == previous_secret_destination;
     }
     if previous_signing_key_configured && !previous_secret_mount {
@@ -2585,10 +2575,10 @@ fn start_candidate(
             ownership: Responsibility::Managed,
             scope: crate::runtime_backend::RuntimeResourceScope::Deployment,
         });
-        secret_mounts += 1;
+        secret_mounts.insert(SIGNING_KEY_PREVIOUS_ENCRYPTION_KEY_SECRET.to_owned());
     }
     ensure!(
-        secret_mounts > 0,
+        !secret_mounts.is_empty(),
         "runtime mounts no secrets under {CONTAINER_SECRETS_DIR}"
     );
     replace_mount(&mut mounts, CONTAINER_CONFIG_FILE, config, true)?;
@@ -2944,7 +2934,7 @@ fn cleanup_valkey_namespace(
     url.set_password(None)
         .map_err(|_| anyhow::anyhow!("cannot remove Valkey password"))?;
     let prefix = format!("nazo:state:v1:{deployment_id}:{epoch}:");
-    let output = Command::new("valkey-cli")
+    let output = crate::process::Process::new("valkey-cli")
         .args([
             "--no-auth-warning",
             "-u",
@@ -2971,7 +2961,7 @@ fn cleanup_valkey_namespace(
         "Valkey cleanup returned an invalid key set"
     );
     for batch in keys.chunks(256) {
-        let output = Command::new("valkey-cli")
+        let output = crate::process::Process::new("valkey-cli")
             .args(["--no-auth-warning", "-u", url.as_str(), "UNLINK"])
             .args(batch)
             .env("REDISCLI_AUTH", &password)
@@ -3036,6 +3026,28 @@ fn restore_failure(error: anyhow::Error) -> Failure {
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[cfg(unix)]
+    #[test]
+    fn security_cloud_postgres_util_retains_connection_policy() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = crate::filesystem::PrivateTempDir::new("pg-policy")?;
+        let program = temp.path().join("inspect-args");
+        fs::write(&program, "#!/bin/sh\nprintf '%s\n' \"$@\"\n")?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+        let connection = PostgresConnection {
+            url_without_password: Url::parse(
+                "postgresql://operator@db.example/postgres?sslmode=verify-full&channel_binding=require&sslrootcert=%2Ftrusted%2Fca.pem",
+            )?,
+            password: "not-in-argv".to_owned(),
+        };
+        let result = run_postgres_util(program.to_str().unwrap(), &connection, ["isolated_db"])?;
+        let args = String::from_utf8(result.stdout)?;
+        assert!(args.contains("--maintenance-db\n"));
+        assert!(args.contains(connection.url_without_password.as_str()));
+        assert!(!args.contains("not-in-argv"));
+        Ok(())
+    }
 
     fn write_fixture(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> anyhow::Result<()> {
         crate::filesystem::atomic_write(path.as_ref(), bytes.as_ref(), 0o600)

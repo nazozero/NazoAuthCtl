@@ -671,6 +671,13 @@ fn parse_plan_created(body: Value) -> Result<PlanCreated, SuiteClientError> {
         .get("modules")
         .and_then(Value::as_array)
         .ok_or(SuiteClientError::MalformedResponse)?;
+    if id.len() > 256
+        || name.len() > 512
+        || id.chars().any(char::is_control)
+        || name.chars().any(char::is_control)
+    {
+        return Err(SuiteClientError::MalformedResponse);
+    }
     let mut parsed = Vec::with_capacity(modules.len());
     for raw in modules {
         let module = raw.as_object().ok_or(SuiteClientError::MalformedResponse)?;
@@ -678,6 +685,10 @@ fn parse_plan_created(body: Value) -> Result<PlanCreated, SuiteClientError> {
             .get("testModule")
             .and_then(Value::as_str)
             .ok_or(SuiteClientError::MalformedResponse)?;
+        if test_name.is_empty() || test_name.len() > 256 || test_name.chars().any(char::is_control)
+        {
+            return Err(SuiteClientError::MalformedResponse);
+        }
         let variant = match module.get("variant") {
             None | Some(Value::Null) => BTreeMap::new(),
             Some(Value::Object(entries)) => entries
@@ -758,6 +769,24 @@ mod tests {
                 body: b"{}".to_vec(),
             })
         }
+    }
+
+    #[test]
+    fn security_cloud_rejects_amplifying_module_labels() {
+        for name in ["x".repeat(257), "terminal\nescape".to_owned()] {
+            assert!(
+                parse_plan_created(serde_json::json!({
+                    "id": "plan-1", "name": "plan", "modules": [{"testModule": name}]
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            parse_plan_created(serde_json::json!({
+                "id": "plan-1", "name": "plan", "modules": [{"testModule": "valid-module"}]
+            }))
+            .is_ok()
+        );
     }
 
     #[test]
