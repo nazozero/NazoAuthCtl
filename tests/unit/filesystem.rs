@@ -288,3 +288,64 @@ fn windows_owner_only_acl_strips_inheritance_and_broad_groups() {
         "owner full control missing on the 0600 file: {writable_acl}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn security_cloud_temp_rejects_replaceable_parent() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let parent = PrivateTempDir::new("unsafe-temp-parent").unwrap();
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(PrivateTempDir::new_in("child", parent.path()).is_err());
+    fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(PrivateTempDir::new_in("child", parent.path()).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn security_cloud_removal_never_chmods_a_symlink_target() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let work = PrivateTempDir::new("remove-tree").unwrap();
+    let target = work.path().join("outside");
+    let tree = work.path().join("managed");
+    fs::create_dir(&tree).unwrap();
+    fs::write(&target, b"keep").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+    symlink(&target, tree.join("link")).unwrap();
+    let child = tree.join("immutable");
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o500)).unwrap();
+    make_tree_removable(&tree).unwrap();
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+    assert_eq!(
+        fs::metadata(child).unwrap().permissions().mode() & 0o700,
+        0o700
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn security_cloud_data_ownership_rejects_links_without_touching_targets() -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    let work = PrivateTempDir::new("data-ownership-links")?;
+    let data = work.path().join("data");
+    std::fs::create_dir(&data)?;
+    let outside = work.path().join("outside");
+    std::fs::write(&outside, b"outside")?;
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o400))?;
+    let before = std::fs::metadata(&outside)?;
+    symlink(&outside, data.join("link"))?;
+    assert!(
+        crate::filesystem::set_data_tree_identity(&data, before.uid(), before.gid(), true).is_err()
+    );
+    std::fs::remove_file(data.join("link"))?;
+    std::fs::hard_link(&outside, data.join("hard"))?;
+    assert!(
+        crate::filesystem::set_data_tree_identity(&data, before.uid(), before.gid(), true).is_err()
+    );
+    let after = std::fs::metadata(outside)?;
+    assert_eq!((before.uid(), before.mode()), (after.uid(), after.mode()));
+    Ok(())
+}
