@@ -396,9 +396,9 @@ pub trait OpenId4VpVerifier: Send {
         request: &OpenId4VpStartRequest,
     ) -> Result<OpenId4VpPresentation, OpenId4VpError>;
 
-    /// Deliver the presentation request to the Suite wallet and require the
-    /// one redirect that proves the target transaction completed. This is an
-    /// HTTP protocol step, not an interactive browser session.
+    /// Deliver the presentation request to the Suite wallet, then verify the
+    /// completion endpoint bound to the target transaction. The Suite may
+    /// redirect or display a result page; neither alone proves completion.
     fn complete(
         &mut self,
         presentation: &OpenId4VpPresentation,
@@ -921,23 +921,27 @@ impl OpenId4VpVerifierClient {
         // invalid presentation with 4xx. The Suite then returns a 2xx result
         // page from its authorization endpoint instead of redirecting to the
         // target completion page. Only the named negative tests may terminate
-        // on that Suite 2xx; positive and deferred-verification flows remain
-        // bound to the exact completion redirect.
+        // on that Suite 2xx; positive and deferred-verification flows still require
+        // the target transaction completion endpoint to succeed.
         if (200..300).contains(&response.status) && presentation.immediate_rejection_allowed {
             return Ok(OpenId4VpCompletionOutcome::ExpectedImmediateRejection);
         }
-        if !matches!(response.status, 302 | 303) {
+        if matches!(response.status, 302 | 303) {
+            let location = response
+                .header("Location")
+                .ok_or(OpenId4VpError::UnexpectedAuthorizationRedirect)?;
+            let redirected = delivery_url
+                .join(location)
+                .map_err(|_| OpenId4VpError::UnexpectedAuthorizationRedirect)?;
+            if redirected != presentation.completion_url {
+                return Err(OpenId4VpError::UnexpectedAuthorizationRedirect);
+            }
+        } else if response.status != 200 {
             return Err(OpenId4VpError::UnexpectedAuthorizationRedirect);
         }
-        let location = response
-            .header("Location")
-            .ok_or(OpenId4VpError::UnexpectedAuthorizationRedirect)?;
-        let redirected = delivery_url
-            .join(location)
-            .map_err(|_| OpenId4VpError::UnexpectedAuthorizationRedirect)?;
-        if redirected != presentation.completion_url {
-            return Err(OpenId4VpError::UnexpectedAuthorizationRedirect);
-        }
+        // The Suite can display its result page instead of issuing a redirect.
+        // Its 200 is not completion evidence: visit only the completion URL
+        // bound by start(), whose endpoint succeeds only for a verified result.
 
         let completed = self
             .transport
@@ -2042,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "set NAZO_SERVER_TEST_BINARY to the NazoAuth authorization-server unit-test executable"]
+    #[ignore = "set NAZO_SERVER_TEST_BINARY to the NazoAuth host library unit-test executable"]
     fn start_accepts_server_typed_dcql_digest() {
         struct ServerDigestTransport {
             binary: std::path::PathBuf,
@@ -2812,73 +2816,86 @@ mod tests {
     }
 
     #[test]
-    fn completes_with_one_exact_redirect_without_browser_automation() {
-        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
-        let suite = Origin::parse("https://suite.example").expect("suite");
-        let completion_url = Url::parse(
-            "https://issuer.example/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000",
-        )
-        .expect("completion URL");
-        let transport = Arc::new(CompletionTransport {
-            requests: std::sync::Mutex::new(Vec::new()),
-            responses: std::sync::Mutex::new(VecDeque::from([
-                HttpResponse {
-                    status: 302,
-                    headers: vec![("Location".to_owned(), completion_url.to_string())],
-                    body: Vec::new(),
-                },
-                HttpResponse {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: b"complete".to_vec(),
-                },
-            ])),
-        });
-        let mut client = OpenId4VpVerifierClient::with_transport(
-            target,
-            suite,
-            Zeroizing::new("management-secret".to_owned()),
-            transport.clone(),
-            binding(),
-        )
-        .expect("client");
-        let presentation = OpenId4VpPresentation {
-            authorization_url: Url::parse(
-                "https://suite.example/test/a/vp/authorize?request_uri=urn%3Aexample",
+    fn completes_redirect_or_result_page_only_after_target_transaction_success() {
+        for (suite_status, target_status) in [(302, 200), (303, 200), (200, 200), (200, 400)] {
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse("https://suite.example").expect("suite");
+            let completion_url = Url::parse(
+                "https://issuer.example/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000",
             )
-            .expect("authorization URL"),
-            completion_url: completion_url.clone(),
-            transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
-                .expect("transaction ID"),
-            create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
-            expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
-                &trust_policy_binding(),
-            ),
-            evidence_context: None,
-            evidence_attachment: None,
-            issuance_request_jti: None,
-            immediate_rejection_allowed: false,
-        };
+            .expect("completion URL");
+            let transport = Arc::new(CompletionTransport {
+                requests: std::sync::Mutex::new(Vec::new()),
+                responses: std::sync::Mutex::new(VecDeque::from([
+                    HttpResponse {
+                        status: suite_status,
+                        headers: if suite_status == 200 {
+                            Vec::new()
+                        } else {
+                            vec![("Location".to_owned(), completion_url.to_string())]
+                        },
+                        body: Vec::new(),
+                    },
+                    HttpResponse {
+                        status: target_status,
+                        headers: Vec::new(),
+                        body: b"complete".to_vec(),
+                    },
+                ])),
+            });
+            let mut client = OpenId4VpVerifierClient::with_transport(
+                target,
+                suite,
+                Zeroizing::new("management-secret".to_owned()),
+                transport.clone(),
+                binding(),
+            )
+            .expect("client");
+            let presentation = OpenId4VpPresentation {
+                authorization_url: Url::parse(
+                    "https://suite.example/test/a/vp/authorize?request_uri=urn%3Aexample",
+                )
+                .expect("authorization URL"),
+                completion_url: completion_url.clone(),
+                transaction_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("transaction ID"),
+                create_request_jti: "550e8400-e29b-41d4-a716-446655440006".to_owned(),
+                expected_trust_policy: ExpectedTrustPolicyBinding::from_conformance_binding(
+                    &trust_policy_binding(),
+                ),
+                evidence_context: None,
+                evidence_attachment: None,
+                issuance_request_jti: None,
+                immediate_rejection_allowed: false,
+            };
 
-        let delivery_url =
-            Url::parse("https://suite.example/test/a/module/authorize?request_uri=urn%3Aexample")
-                .expect("delivery URL");
-        assert_eq!(
-            client
-                .complete(&presentation, &delivery_url)
-                .expect("completion"),
-            OpenId4VpCompletionOutcome::Completed
-        );
+            let delivery_url = Url::parse(
+                "https://suite.example/test/a/module/authorize?request_uri=urn%3Aexample",
+            )
+            .expect("delivery URL");
+            let completed = client.complete(&presentation, &delivery_url);
+            if target_status == 200 {
+                assert_eq!(
+                    completed.expect("completion"),
+                    OpenId4VpCompletionOutcome::Completed
+                );
+            } else {
+                assert_eq!(
+                    completed.expect_err("unverified transaction"),
+                    OpenId4VpError::CompletionFailed
+                );
+            }
 
-        let requests = transport.requests.lock().expect("request lock");
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].method(), HttpMethod::Get);
-        assert_eq!(requests[0].url(), &delivery_url);
-        assert_eq!(requests[1].url(), &completion_url);
-        assert_eq!(
-            requests[0].header("Accept"),
-            Some("text/html,application/xhtml+xml")
-        );
+            let requests = transport.requests.lock().expect("request lock");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].method(), HttpMethod::Get);
+            assert_eq!(requests[0].url(), &delivery_url);
+            assert_eq!(requests[1].url(), &completion_url);
+            assert_eq!(
+                requests[0].header("Accept"),
+                Some("text/html,application/xhtml+xml")
+            );
+        }
     }
 
     #[test]
@@ -2933,7 +2950,7 @@ mod tests {
     }
 
     #[test]
-    fn positive_test_rejects_suite_2xx_without_completion_redirect() {
+    fn positive_test_rejects_suite_2xx_without_target_completion() {
         let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
         let suite = Origin::parse("https://suite.example").expect("suite");
         let transport = Arc::new(CompletionTransport {
@@ -2971,12 +2988,12 @@ mod tests {
             immediate_rejection_allowed: false,
         };
 
-        assert_eq!(
+        assert!(matches!(
             client
                 .complete(&presentation, &presentation.authorization_url)
-                .expect_err("positive 4xx"),
-            OpenId4VpError::UnexpectedAuthorizationRedirect
-        );
+                .expect_err("Suite 200 alone cannot prove target completion"),
+            OpenId4VpError::Transport(_)
+        ));
     }
 
     #[test]

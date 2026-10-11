@@ -319,7 +319,7 @@ pub struct OpenId4VciIssuerClient {
     hosted_password: Zeroizing<String>,
     transport: Arc<dyn Transport>,
     max_response_bytes: usize,
-    triggered: HashSet<String>,
+    triggered: HashSet<(String, bool)>,
     completed_browser_urls: HashMap<String, HashSet<String>>,
     anonymous_browser_urls: HashSet<String>,
 }
@@ -708,9 +708,66 @@ impl OpenId4VciIssuerClient {
     }
 
     fn drive_offer(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
-        if self.triggered.contains(&module.module_id) {
+        // The Suite owns the offer phase. A registered browser worker can
+        // complete authorization without populating this HTTP driver's cache.
+        let first_phase = (module.module_id.clone(), false);
+        let second_phase = (module.module_id.clone(), true);
+        if self.triggered.contains(&second_phase) {
             return Ok(());
         }
+        let second_client = if self.triggered.contains(&first_phase) {
+            if module.test_name != MULTIPLE_CLIENTS_MODULE
+                || module.variant.get("vci_grant_type").map(String::as_str)
+                    != Some("authorization_code")
+                || !module
+                    .runner
+                    .pointer("/browser/urls")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            {
+                return Ok(());
+            }
+            let endpoint = self
+                .suite_origin
+                .url(&format!("/api/log/{}", module.module_id))
+                .map_err(|_| OpenId4VciError::InvalidInput)?;
+            let response = self
+                .transport
+                .send(
+                    HttpRequest {
+                        method: HttpMethod::Get,
+                        url: endpoint,
+                        headers: vec![
+                            ("Accept".to_owned(), "application/json".to_owned()),
+                            (
+                                "Authorization".to_owned(),
+                                format!("Bearer {}", self.suite_token.as_str()),
+                            ),
+                        ],
+                        body: None,
+                    },
+                    self.max_response_bytes,
+                )
+                .map_err(OpenId4VciError::Transport)?;
+            if response.status != 200 {
+                return Err(OpenId4VciError::HttpStatus(response.status));
+            }
+            let entries: Vec<Value> = serde_json::from_slice(&response.body)
+                .map_err(|_| OpenId4VciError::InvalidHostedResponse)?;
+            let waits = entries
+                .iter()
+                .filter(|entry| {
+                    entry.get("src").and_then(Value::as_str) == Some("VCIWaitForCredentialOffer")
+                })
+                .count();
+            if waits != 2 {
+                return Ok(());
+            }
+            true
+        } else {
+            false
+        };
+        let offer_phase = (module.module_id.clone(), second_client);
         let exposed = module
             .runner
             .get("exposed")
@@ -770,7 +827,7 @@ impl OpenId4VciIssuerClient {
             let offer = self.create_offer(configuration_id, grant_type, tx_code)?;
             self.deliver_offer(&endpoint, &offer, delivery)?;
         }
-        self.triggered.insert(module.module_id.clone());
+        self.triggered.insert(offer_phase);
         Ok(())
     }
 
@@ -1370,6 +1427,85 @@ mod tests {
         );
         assert!(!format!("{client:?}").contains("issuer-secret"));
         assert!(!format!("{client:?}").contains("suite-secret"));
+    }
+
+    #[test]
+    fn authorization_code_multiple_clients_follows_official_offer_wait_phases() {
+        let offer = || HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: br#"{"credential_offer_uri":"https://target.example/offer/fresh"}"#.to_vec(),
+        };
+        let delivered = || HttpResponse {
+            status: 204,
+            headers: vec![],
+            body: vec![],
+        };
+        let waits = |count| HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: serde_json::to_vec(&vec![
+                serde_json::json!({"src":"VCIWaitForCredentialOffer"});
+                count
+            ])
+            .unwrap(),
+        };
+        let (transport, mut client) = client_with_responses(vec![
+            delivered(),
+            offer(),
+            waits(2),
+            waits(1),
+            delivered(),
+            offer(),
+        ]);
+        let mut module = module_named(
+            MULTIPLE_CLIENTS_MODULE,
+            "issuer_initiated",
+            "authorization_code",
+        );
+        module.plan_config["vci"]
+            .as_object_mut()
+            .unwrap()
+            .remove("static_tx_code");
+        client.drive_offer(&module).expect("first offer");
+        client
+            .drive_offer(&module)
+            .expect("pending browser does not request another offer");
+        assert_eq!(transport.requests.lock().unwrap().len(), 2);
+        // Another registered browser worker may complete the first flow. The
+        // local HTTP driver's completed-URL cache is deliberately empty.
+        module.runner["browser"] = serde_json::json!({"urls":[], "visited":["https://target.example/authorize?state=first"]});
+        client
+            .drive_offer(&module)
+            .expect("first wait cannot trigger a second offer");
+        assert_eq!(transport.requests.lock().unwrap().len(), 3);
+        client
+            .drive_offer(&module)
+            .expect("official second wait triggers fresh offer");
+        client
+            .drive_offer(&module)
+            .expect("second offer is not duplicated");
+        module.runner["browser"] =
+            serde_json::json!({"urls":["https://target.example/authorize?state=second"]});
+        client
+            .drive_offer(&module)
+            .expect("no offer during second browser");
+        module.runner["browser"] = serde_json::json!({"urls":[]});
+        client
+            .drive_offer(&module)
+            .expect("later polls never create a third offer");
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[2].url().path(), "/api/log/module-1");
+        assert_eq!(
+            requests[2].header("Authorization"),
+            Some("Bearer suite-secret")
+        );
+        assert_eq!(requests[4].url().path(), "/openid4vci/offers");
+        assert_eq!(
+            requests[4].header("Authorization"),
+            Some("Bearer issuer-secret")
+        );
     }
 
     #[test]

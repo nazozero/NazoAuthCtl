@@ -2378,16 +2378,36 @@ fn ensure_postgres_output(program: &str, output: std::process::Output) -> anyhow
 fn database_sentinel(database_url_file: &Path) -> anyhow::Result<String> {
     database_sentinel_with_connection(&postgres_connection(database_url_file)?)
 }
+fn database_sentinel_sql(legacy_tokens_present: bool) -> String {
+    if legacy_tokens_present {
+        // Preserve the digest format used by already-created release snapshots.
+        DATABASE_SENTINEL_SQL.to_owned()
+    } else {
+        DATABASE_SENTINEL_SQL.replace("oauth_tokens", "oauth_token_issuances")
+    }
+}
+
 fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow::Result<String> {
-    let output = run_postgres_command(
+    let schema = run_postgres_command(
         "psql",
         connection,
         [
             "--no-align",
             "--tuples-only",
             "--command",
-            DATABASE_SENTINEL_SQL,
+            "SELECT to_regclass('oauth_tokens') IS NOT NULL",
         ],
+    )?;
+    let legacy_tokens_present = match std::str::from_utf8(&schema.stdout)?.trim() {
+        "t" => true,
+        "f" => false,
+        _ => bail!("database token schema probe returned an invalid result"),
+    };
+    let query = database_sentinel_sql(legacy_tokens_present);
+    let output = run_postgres_command(
+        "psql",
+        connection,
+        ["--no-align", "--tuples-only", "--command", query.as_str()],
     )?;
     ensure!(
         output.stdout.len() <= 1024,
@@ -3620,5 +3640,18 @@ mod tests {
         assert_eq!(fs::read(rollback.join("value"))?, b"old");
         assert!(!staged.exists());
         Ok(())
+    }
+    #[test]
+    fn sentinel_preserves_legacy_snapshots_and_uses_current_issuance_evidence() {
+        assert_eq!(database_sentinel_sql(true), DATABASE_SENTINEL_SQL);
+        let current = database_sentinel_sql(false);
+        assert!(!current.contains("oauth_tokens"));
+        assert!(
+            current.contains(
+                "'oauth_token_issuances=' || (SELECT COUNT(*) FROM oauth_token_issuances)"
+            )
+        );
+        assert!(current.contains("controller_registry_slots"));
+        assert!(current.contains("migration_head="));
     }
 }
