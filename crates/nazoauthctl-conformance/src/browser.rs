@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use thiserror::Error;
+#[cfg(any(unix, test))]
 use url::Url;
 use zeroize::Zeroizing;
 
