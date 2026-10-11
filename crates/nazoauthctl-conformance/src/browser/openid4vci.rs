@@ -260,7 +260,7 @@ impl OpenId4VciModule {
 }
 
 /// Narrow hook consumed by the conformance orchestrator.  It is deliberately
-/// separate from `BrowserAutomation`: VCI hosted authorization follows the
+/// independent of local browsers: VCI hosted authorization follows the
 /// Suite's bounded HTTP state machine and owns its short-lived cookie session.
 pub trait OpenId4VciIssuerDriver: Send {
     fn drive(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError>;

@@ -9,7 +9,6 @@ use crate::origin::Origin;
 
 use super::BrowserError;
 
-pub(super) const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const MAX_STEP_TIMEOUT: Duration = Duration::from_secs(300);
 pub(super) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(super) const MAX_STEPS: usize = 256;
@@ -81,7 +80,7 @@ impl fmt::Debug for BrowserTargetOrigin {
 }
 
 /// The only URLs a browser session may visit. Navigation to a third-party
-/// redirect is a hard error, including redirects hidden behind WebDriver.
+/// redirect is a hard error in the HTTP-based protocol drivers.
 #[derive(Clone, Debug)]
 pub struct BrowserPolicy {
     pub target_origin: BrowserTargetOrigin,
@@ -116,26 +115,6 @@ impl BrowserPolicy {
 
     pub(super) fn validate_url(&self, url: &Url) -> Result<(), BrowserError> {
         if self.allows_url(url) {
-            Ok(())
-        } else {
-            Err(BrowserError::CrossOriginNavigation)
-        }
-    }
-
-    /// Validate a navigation used solely to select a cookie store.  The
-    /// ordinary browser policy permits both the target and Suite origins,
-    /// but a cleanup navigation must not jump from one allowed origin to the
-    /// other: WebDriver's delete-all-cookies command applies to the current
-    /// document's domain, so accepting such a redirect could clear the wrong
-    /// store.
-    pub(super) fn validate_cookie_redirect(
-        &self,
-        expected: &Url,
-        actual: &Url,
-    ) -> Result<(), BrowserError> {
-        self.validate_url(expected)?;
-        self.validate_url(actual)?;
-        if same_origin(expected, actual) {
             Ok(())
         } else {
             Err(BrowserError::CrossOriginNavigation)
@@ -201,27 +180,6 @@ pub(super) fn validate_match_pattern(value: &str, max: usize) -> Result<(), Brow
         return Err(BrowserError::InvalidSchema);
     }
     Ok(())
-}
-
-pub(super) fn glob_matches(pattern: &str, value: &str) -> bool {
-    let mut remainder = value;
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    if !remainder.starts_with(first) {
-        return false;
-    }
-    remainder = &remainder[first.len()..];
-    let mut suffixes: Vec<&str> = parts.collect();
-    let last = suffixes.pop().unwrap_or("");
-    for part in suffixes {
-        let Some(index) = remainder.find(part) else {
-            return false;
-        };
-        remainder = &remainder[index + part.len()..];
-    }
-    remainder.ends_with(last)
 }
 
 pub(super) fn redacted_origin(url: &Url) -> String {

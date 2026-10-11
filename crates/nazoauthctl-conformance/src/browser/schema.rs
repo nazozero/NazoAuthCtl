@@ -42,8 +42,8 @@ impl fmt::Debug for BrowserTask {
     }
 }
 
-/// A parsed selector accepted by WebDriver. `contains` is handled by the
-/// parser as text/URL matching and is never passed to a driver.
+/// A parsed selector accepted by the Suite scripted browser. `contains`
+/// is a text/URL matcher rather than an element selector.
 #[derive(Clone, Eq, PartialEq)]
 pub enum BrowserSelector {
     Id(String),

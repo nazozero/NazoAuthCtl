@@ -389,7 +389,7 @@ impl OpenId4VpPresentation {
 }
 
 /// Narrow orchestration hook for an OpenID4VP verifier. Browser protocol
-/// remains in `BrowserAutomation`; this trait only starts a presentation.
+/// executes in the Suite; this trait drives the verifier protocol exchange.
 pub trait OpenId4VpVerifier: Send {
     fn start(
         &mut self,
@@ -560,8 +560,6 @@ impl fmt::Debug for OpenId4VpVerificationReceiptProvenance {
 pub struct OpenId4VpVerificationEvidence {
     pub receipt: OpenId4VpVerificationReceiptProvenance,
     pub context: OpenId4VpEvidenceContext,
-    pub(crate) ui_url_diagnostic: OpenId4VpEvidenceUrlDiagnostic,
-    ui_url: Zeroizing<String>,
 }
 
 impl fmt::Debug for OpenId4VpVerificationEvidence {
@@ -576,15 +574,11 @@ impl fmt::Debug for OpenId4VpVerificationEvidence {
 }
 
 impl OpenId4VpVerificationEvidence {
-    pub(crate) fn ui_url(&self) -> Result<Url, OpenId4VpError> {
-        Url::parse(self.ui_url.as_str()).map_err(|_| OpenId4VpError::MalformedEvidenceResponse)
-    }
-
     #[cfg(all(test, unix))]
     pub(crate) fn test_verified(
         context: OpenId4VpEvidenceContext,
         receipt_sha256: &str,
-        ui_url: &str,
+        _ui_url: &str,
     ) -> Self {
         Self {
             receipt: OpenId4VpVerificationReceiptProvenance {
@@ -608,8 +602,6 @@ impl OpenId4VpVerificationEvidence {
                 expires_at: "2026-01-01T00:05:00Z".to_owned(),
             },
             context,
-            ui_url_diagnostic: issuance_url_diagnostic("verification_ui_url", ui_url),
-            ui_url: Zeroizing::new(ui_url.to_owned()),
         }
     }
 }
@@ -1372,8 +1364,6 @@ fn verify_evidence_response(
             expires_at: response.expires_at,
         },
         context: response.evidence_context,
-        ui_url_diagnostic,
-        ui_url: Zeroizing::new(response.verification_ui_url),
     })
 }
 

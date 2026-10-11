@@ -338,6 +338,7 @@ impl ModuleReport {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_deferred_review_pending(&mut self, pending: DeferredReviewPending) {
         debug_assert!(!self.terminal);
         self.deferred_review_pending = Some(pending);

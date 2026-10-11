@@ -44,6 +44,8 @@ label them as historical captures.
 
 Keep local review decisions separate from official results and certification
 approval. The [2026-10-11 deployment review](oidf-hostinger-20261011.md#follow-up-retained-evidence-review)
-accepted 24 VP image obligations and 12 scope warnings, but found 17 missing OIDC
-screenshots and retained two mdoc privacy warnings. Local success, a filled
-placeholder, or green CI does not close those gaps.
+accepted 24 VP image obligations and 12 scope warnings, but recorded 17 OIDC modules without PNG
+and retained two mdoc privacy warnings. The PNG-based assessment is under
+re-evaluation against the official Suite HTML evidence path; see
+[the browser removal validation](oidf-no-webdriver-20261011.md). Local execution
+success and certification approval remain separate.

@@ -22,14 +22,13 @@ use cliclack::{
 };
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
-    ArtifactMaterializationBinding, BearerToken, BrowserAutomation, BrowserExecutor, BrowserPolicy,
-    BrowserReviewScreenshotCapture, BrowserTargetOrigin, CibaUserApprovalClient, ClientConfig,
-    ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore, ConformanceRunConfig,
-    ConformanceRunner, CredentialStore, DescriptorMaterializer, EvidenceBundleIdentity,
-    EvidenceBundleReceipt, EvidenceControlIdentity, EvidenceControlOperation,
-    EvidenceDeploymentIdentity, EvidenceRuntimeIdentity, EvidenceSourceIdentity, GroupProgress,
-    GroupStatus, HttpRequest, HttpTransport, ManagedWebDriver, MatrixSelection, ModuleOutcome,
-    OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
+    ArtifactMaterializationBinding, BearerToken, BrowserTargetOrigin, CibaUserApprovalClient,
+    ClientConfig, ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore,
+    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
+    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
+    EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceRuntimeIdentity,
+    EvidenceSourceIdentity, GroupProgress, GroupStatus, HttpRequest, HttpTransport,
+    MatrixSelection, ModuleOutcome, OidfArtifactMatrix, OidfDriverLane, OidfPlanResourceBudget,
     OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
     OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
     ProgressEvent, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer, SuiteClient,
@@ -38,7 +37,7 @@ use nazoauthctl_conformance::{
     TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
     TenantResourceRecoveryPhase, Transport, activity_label, bundled_oidf_matrix,
     current_matrix_label, open_bundled_oidf_driver_plan, recover_suite_resources,
-    write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    write_private_control_evidence_bundle,
 };
 use serde::Serialize;
 use url::Url;
@@ -514,16 +513,6 @@ fn execute_with_progress<S: ProgressSink>(
         now,
     )
     .context("bundled OIDF Matrix cannot be opened")?;
-    let requires_browser = driver_plan
-        .plans
-        .iter()
-        .any(|plan| !matches!(plan.driver_handler.automation, OidfDriverAutomation::None));
-    let captures_review_screenshots = driver_plan.plans.iter().any(|plan| {
-        matches!(
-            plan.driver_handler.automation,
-            OidfDriverAutomation::Openid4vp { .. }
-        )
-    });
     let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
 
     progress.activity(&ProgressActivity::AuthenticatingSuite);
@@ -790,9 +779,6 @@ fn execute_with_progress<S: ProgressSink>(
         selected_resource_budget,
         recovery.clone(),
         ciba_approver,
-        &evidence_directory,
-        requires_browser,
-        captures_review_screenshots,
         control,
         Arc::clone(&user_interrupted),
         interrupt_notice,
@@ -811,29 +797,7 @@ fn execute_with_progress<S: ProgressSink>(
     } else {
         Vec::new()
     };
-    // The runner has already uploaded required NazoAuthWeb VP result captures;
-    // this root-private manifest preserves their exact local evidence.
-    let review_screenshot_manifest = if captures_review_screenshots && retention_eligible {
-        match run_result.as_ref() {
-            Ok(report) => match write_review_screenshot_manifest(
-                report,
-                &evidence_directory,
-                recovery.ordinary_binding().run_id.as_str(),
-                &artifact_digest,
-                &ephemeral_tenant.issuer,
-            ) {
-                Ok(manifest) => Some(manifest),
-                Err(error) => {
-                    retention_eligible = false;
-                    errors.push(format!("review-screenshot-manifest={error}"));
-                    None
-                }
-            },
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    let review_screenshot_manifest = None;
     if run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
@@ -2269,9 +2233,6 @@ fn run_signed_suite<S: ProgressSink>(
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
     ciba_approver: Option<Arc<CibaUserApprovalClient>>,
-    evidence_directory: &Path,
-    requires_browser: bool,
-    captures_review_screenshots: bool,
     control: RunControl,
     user_interrupted: Arc<AtomicBool>,
     interrupt_notice: &'static str,
@@ -2289,22 +2250,6 @@ fn run_signed_suite<S: ProgressSink>(
     let openid4vp_management_token = session
         .openid4vp_management_token(&invocation.tenant_id)
         .context("failed to derive the run tenant OpenID4VP management token")?;
-    let review_screenshot_run_jti = recovery
-        .lock()
-        .map_err(|_| anyhow::anyhow!("ordinary recovery lock is poisoned"))?
-        .ordinary_binding()
-        .run_id
-        .clone();
-    let review_screenshot_capture = captures_review_screenshots
-        .then(|| {
-            BrowserReviewScreenshotCapture::new(
-                evidence_directory.to_path_buf(),
-                &review_screenshot_run_jti,
-            )
-        })
-        .transpose()
-        .context("review screenshot evidence directory must be root-owned and private")?;
-
     let selected = materialized
         .take_matrix()
         .select(&MatrixSelection {
@@ -2321,107 +2266,64 @@ fn run_signed_suite<S: ProgressSink>(
         interrupt.interrupt();
     })
     .context("failed to install the conformance interrupt handler")?;
-    let mut managed_browsers = Vec::with_capacity(invocation.jobs);
-    let run_result = (|| -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
+    if control.is_interrupted() {
+        bail!("run interrupted");
+    }
+    let mut automation = Vec::with_capacity(invocation.jobs);
+    for _ in 0..invocation.jobs {
         if control.is_interrupted() {
             bail!("run interrupted");
         }
-        let mut automation = Vec::with_capacity(invocation.jobs);
-        for index in 0..invocation.jobs {
-            if control.is_interrupted() {
-                bail!("run interrupted");
-            }
-            let browser: Option<Arc<Mutex<dyn BrowserAutomation>>> = if requires_browser {
-                progress.activity(&ProgressActivity::StartingBrowser {
-                    current: index + 1,
-                    total: invocation.jobs,
-                });
-                let managed_browser = build_browser(target_issuer, suite_origin)?;
-                managed_browsers.push(managed_browser.clone());
-                Some(managed_browser)
-            } else {
-                None
-            };
-            let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
-                Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
-                    OpenId4VciIssuerConfig::new(
-                        target_origin.clone(),
-                        suite_origin.clone(),
-                        applicant_id,
-                        secrets.tx_code.clone(),
-                        secrets.applicant_email.clone(),
-                        secrets.applicant_password.clone(),
-                        Duration::from_secs(30),
-                    )?,
-                    openid4vci_management_token.clone(),
-                    token.clone(),
-                )?));
-            let verifier_client = OpenId4VpVerifierClient::new(
-                target_origin.clone(),
-                suite_origin.clone(),
-                openid4vp_management_token.clone(),
-                Duration::from_secs(30),
-                binding.clone(),
-            )?;
-            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
-            automation.push(ConformanceAutomation {
-                browser,
-                review_screenshot_capture: review_screenshot_capture.clone(),
-                verifier: Some(verifier),
-                issuer: Some(issuer),
-                ciba_approver: ciba_approver.clone(),
-            });
-        }
-        let runner = ConformanceRunner::new(ConformanceRunConfig {
-            client: suite_client,
-            matrix: selected,
-            target_origin: Some(target_origin),
-            binding,
-            poll_timeout: invocation.poll_timeout,
-            control: control.clone(),
-            plan_lanes,
-            plan_resource_budgets,
-            selected_resource_budget,
-            jobs: invocation.jobs,
-            upload_review_screenshots: captures_review_screenshots,
-            automation,
-            suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
-                recovery,
-                retain_suite_plans: !invocation.delete_suite_plans,
-            })),
-        })?;
-        let mut report = runner.run(progress).report;
-        report.excluded_plans = invocation.excluded_plans.clone();
-        report.fail_fast = invocation.fail_fast;
-        Ok(report)
-    })();
-    let mut browser_cleanup_errors = Vec::new();
-    for (index, browser) in managed_browsers.iter().enumerate() {
-        match browser.lock() {
-            Ok(mut browser) => {
-                if let Err(error) = browser.driver_mut().shutdown() {
-                    browser_cleanup_errors.push(format!("browser {}: {error}", index + 1));
-                }
-            }
-            Err(_) => browser_cleanup_errors.push(format!("browser {}: lock poisoned", index + 1)),
-        }
+        let issuer: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
+            Arc::new(Mutex::new(OpenId4VciIssuerClient::new(
+                OpenId4VciIssuerConfig::new(
+                    target_origin.clone(),
+                    suite_origin.clone(),
+                    applicant_id,
+                    secrets.tx_code.clone(),
+                    secrets.applicant_email.clone(),
+                    secrets.applicant_password.clone(),
+                    Duration::from_secs(30),
+                )?,
+                openid4vci_management_token.clone(),
+                token.clone(),
+            )?));
+        let verifier_client = OpenId4VpVerifierClient::new(
+            target_origin.clone(),
+            suite_origin.clone(),
+            openid4vp_management_token.clone(),
+            Duration::from_secs(30),
+            binding.clone(),
+        )?;
+        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = Arc::new(Mutex::new(verifier_client));
+        automation.push(ConformanceAutomation {
+            verifier: Some(verifier),
+            issuer: Some(issuer),
+            ciba_approver: ciba_approver.clone(),
+        });
     }
-    let cleanup_result = if browser_cleanup_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "failed to stop managed browser infrastructure: {}",
-            browser_cleanup_errors.join("; ")
-        ))
-    };
-    match (run_result, cleanup_result) {
-        (Ok(report), Ok(())) => Ok(report),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "managed browser cleanup also failed: {cleanup_error:#}"
-        ))),
-    }
+    let runner = ConformanceRunner::new(ConformanceRunConfig {
+        client: suite_client,
+        matrix: selected,
+        target_origin: Some(target_origin),
+        binding,
+        poll_timeout: invocation.poll_timeout,
+        control: control.clone(),
+        plan_lanes,
+        plan_resource_budgets,
+        selected_resource_budget,
+        jobs: invocation.jobs,
+
+        automation,
+        suite_resource_observer: Some(Arc::new(DurableSuiteObserver {
+            recovery,
+            retain_suite_plans: !invocation.delete_suite_plans,
+        })),
+    })?;
+    let mut report = runner.run(progress).report;
+    report.excluded_plans = invocation.excluded_plans.clone();
+    report.fail_fast = invocation.fail_fast;
+    Ok(report)
 }
 
 fn build_ciba_user_approver(
@@ -2613,16 +2515,6 @@ fn pre_suite_requires_resource_cleanup(
     recovery: &nazoauthctl_conformance::ConformanceRecoveryGuard,
 ) -> bool {
     recovery.apply_operation().is_some() && recovery.terminal_failure().is_none()
-}
-
-fn build_browser(
-    target_issuer: &str,
-    suite_origin: &Origin,
-) -> anyhow::Result<Arc<Mutex<BrowserExecutor<ManagedWebDriver>>>> {
-    let target = BrowserTargetOrigin::parse(target_issuer)?;
-    let policy = BrowserPolicy::new(target, suite_origin.clone())?;
-    let driver = ManagedWebDriver::start_default(Duration::from_secs(30))?;
-    Ok(Arc::new(Mutex::new(BrowserExecutor::new(driver, policy))))
 }
 
 fn suite_retention_manifest(
