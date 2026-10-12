@@ -412,8 +412,9 @@ fn render_config_yaml(
         // Operators with a dedicated proxy network tighten this via
         // `update --config-file`.
         let cidrs = format!("TRUSTED_PROXY_CIDRS: \"{}\"\n", runtime.trusted_proxy_cidrs);
-        // The managed Angie edge forwards the RFC 9440 Client-Cert field.
-        let mtls = "MTLS_CERTIFICATE_SOURCE: \"rfc9440\"\n";
+        // A generic TLS proxy is not proof of client-certificate verification.
+        // Header-based mTLS requires a separately configured, sanitizing proxy contract.
+        let mtls = "MTLS_CERTIFICATE_SOURCE: \"disabled\"\n";
         format!("TRANSPORT_MODE: \"trusted-proxy\"\n{cidrs}{mtls}")
     } else {
         String::new()

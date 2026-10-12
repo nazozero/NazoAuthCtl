@@ -686,3 +686,46 @@ fn object_member_case_insensitive<'a>(
         .iter()
         .find_map(|(name, value)| name.eq_ignore_ascii_case(expected).then_some(value))
 }
+
+/// Fresh creation must not remove a name that appeared after admission. Updates
+/// remove only a stopped, deployment-owned object by its immutable engine ID.
+pub(crate) fn remove_replacement_source(
+    command: &OsStr,
+    replacement: &super::super::RuntimeReplacement,
+    backend_name: &str,
+) -> anyhow::Result<()> {
+    let Some(document) = inspect_document_optional(
+        command,
+        &["container", "inspect", &replacement.object_reference],
+        backend_name,
+    )?
+    else {
+        return Ok(());
+    };
+    let expected = replacement
+        .labels
+        .get("io.nazoauth.deployment-id")
+        .context("replacement has no deployment ownership")?;
+    if document
+        .pointer("/Config/Labels/io.nazoauth.deployment-id")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected.as_str())
+    {
+        bail!("replacement source belongs to a different deployment");
+    }
+    if document
+        .pointer("/State/Running")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        bail!("replacement source is not confirmed stopped");
+    }
+    let id = document
+        .get("Id")
+        .or_else(|| document.get("ID"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .context("replacement source has no immutable container ID")?;
+    // No --force: a runtime restarted after inspection must not be killed.
+    Process::new(command).args(["rm", id]).run_quiet()
+}

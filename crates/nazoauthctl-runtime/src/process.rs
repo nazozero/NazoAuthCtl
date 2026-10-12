@@ -62,7 +62,9 @@ impl Process {
         self
     }
 
-    fn command(&self) -> Command {
+    /// Prepare a child with the same bounded environment policy for transports
+    /// that must own its terminal or streaming lifetime.
+    pub fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         #[cfg(unix)]
         command.process_group(0);
@@ -102,6 +104,16 @@ impl Process {
                 }
             }
         }
+        // curl reads user-controlled rc files unless this is its first argument.
+        if Path::new(&self.program)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("curl") || name.eq_ignore_ascii_case("curl.exe")
+            })
+        {
+            command.arg("--disable");
+        }
         command.args(&self.args).envs(self.environment.clone());
         command
     }
@@ -121,21 +133,11 @@ impl Process {
     pub fn run_quiet(&self) -> anyhow::Result<()> {
         let output = self.output()?;
         if !output.status.success() {
-            // Bounded stderr echo: daemon rejections (auth, manifest unknown,
-            // platform mismatch) are exactly the operator-actionable facts.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stderr = stderr.trim();
-            let stderr_note = if stderr.is_empty() {
-                String::new()
-            } else {
-                let bounded: String = stderr.chars().take(400).collect();
-                format!(": {bounded}")
-            };
+            // Diagnostics from secret-bearing children are not public error text.
             bail!(
-                "{} failed with status {}{}",
+                "{} failed with status {}",
                 self.display_name(),
-                output.status,
-                stderr_note
+                output.status
             );
         }
         Ok(())
@@ -157,21 +159,11 @@ impl Process {
     pub fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
         let output = self.stdin_output(input)?;
         if !output.status.success() {
-            // Bounded stderr echo, matching run_quiet: one-shot container
-            // failures surface their application error on the engine's stderr.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stderr = stderr.trim();
-            let stderr_note = if stderr.is_empty() {
-                String::new()
-            } else {
-                let bounded: String = stderr.chars().take(400).collect();
-                format!(": {bounded}")
-            };
+            // Diagnostics from secret-bearing children are not public error text.
             bail!(
-                "{} failed with status {}{}",
+                "{} failed with status {}",
                 self.display_name(),
-                output.status,
-                stderr_note
+                output.status
             );
         }
         String::from_utf8(output.stdout)

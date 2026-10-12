@@ -53,7 +53,7 @@ locale, otherwise English, using the first nonempty `LC_ALL`, `LC_MESSAGES`, or
 codes. For example, `LANG=zh_CN.UTF-8 nazoauthctl status --all` selects Chinese
 unless an `LC_*` override takes precedence. Text failures include the underlying
 reason; JSON field names and codes do not change with locale.
-See [v0.2.30 release notes](docs/release-notes-0.2.30.md) and the
+See [v0.3.0 release notes](docs/release-notes-0.3.0.md) and the
 [CLI presentation guide](docs/cli-presentation.md).
 
 Read-only inspection works before controller binding. Mutations use signed
@@ -211,3 +211,14 @@ it; older helpers retain the existing transport. No new flags are required.
 See [operation compatibility](docs/compatibility.md#operation-specific-compatibility),
 [ACME account reuse](docs/tls-acme-http01.md), and
 [selected conformance resources and cleanup](docs/conformance-run-options.md).
+
+### Installed versions
+
+Run `nazoauthctl version` (or `nazoauthctl V`) to show the installed Controller
+and registered NazoAuth versions. `-V` and `--version` are aliases. Without a
+selector it checks all registered instances; use `--instance production` to
+select one, or `--json` for structured output. An empty registry is shown as
+not installed or not detected. Unreachable hosts and unreadable state are
+reported as detection failures, while the Controller version remains visible.
+This command reads installed state; it does not look up available releases,
+update executables, or run self-update recovery.

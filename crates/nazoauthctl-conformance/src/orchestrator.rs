@@ -7,16 +7,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
 use crate::browser::{
-    BrowserAutomation, BrowserPolicy, BrowserReviewModuleIdentity, BrowserReviewScreenshotCapture,
-    BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding, MAX_REVIEW_SCREENSHOTS_PER_RUN,
-    OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpCompletionOutcome,
-    OpenId4VpStartRequest, OpenId4VpVerifier, browser_config_for_module,
-    parse_browser_entries_owned, required_review_screenshot_count,
+    BrowserPolicy, BrowserRunnerState, BrowserTargetOrigin, ConformanceBinding,
+    MAX_REVIEW_SCREENSHOTS_PER_RUN, OpenId4VciError, OpenId4VciIssuerDriver, OpenId4VciModule,
+    OpenId4VpStartRequest, OpenId4VpVerifier,
 };
 use crate::ciba_approval::{CibaUserApprovalClient, ciba_approval_requests};
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
@@ -27,9 +24,9 @@ use crate::progress::{
     redacted_variant,
 };
 use crate::report::{
-    CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleOutcome,
-    ModuleReport, ModuleReportContext, OrchestrationIntegrity, PlanReport, ReviewScreenshotReport,
-    summarize_matrix_expectations, summarize_module_outcomes,
+    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
+    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_matrix_expectations,
+    summarize_module_outcomes,
 };
 use crate::{OidfDriverLane, OidfPlanResourceBudget};
 
@@ -40,28 +37,13 @@ pub const BOUNDED_PLAN_RUNNER_PROTOCOL: &str = "nazoauthctl-bounded-plan-runner-
 pub const MAX_POLL_TIMEOUT_SECONDS: u64 = 86_400;
 pub const MAX_POLL_TIMEOUT: Duration = Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS);
 /// One worker-owned interactive automation lane. A lane is never shared by
-/// concurrent plan workers, so WebDriver cookies/navigation and OpenID4VC
-/// driver state cannot interleave across plans.
+/// concurrent plan workers, so OpenID4VC driver state cannot interleave.
+/// Browser sessions and cookies are owned by each Suite test module.
 #[derive(Clone, Default)]
 pub struct ConformanceAutomation {
-    pub browser: Option<Arc<Mutex<dyn BrowserAutomation>>>,
-    /// Explicit local-only capture capability. It is cloned into worker-owned
-    /// lanes but every resulting filename remains bound to the current module.
-    pub review_screenshot_capture: Option<BrowserReviewScreenshotCapture>,
     pub verifier: Option<Arc<Mutex<dyn OpenId4VpVerifier>>>,
     pub issuer: Option<Arc<Mutex<dyn OpenId4VciIssuerDriver>>>,
     pub ciba_approver: Option<Arc<CibaUserApprovalClient>>,
-}
-
-#[derive(Default)]
-struct BrowserReviewEvidence {
-    screenshots: Vec<ReviewScreenshotReport>,
-    required: usize,
-    required_captured: usize,
-    missing: usize,
-    attempts: usize,
-    decoded_bytes: usize,
-    entered_browser_program: bool,
 }
 
 #[derive(Clone, Default)]
@@ -115,11 +97,6 @@ pub struct ConformanceRunConfig {
     /// automation retain their existing mutex-owned sessions, so parallel
     /// HTTP runners cannot interleave interactive state.
     pub jobs: usize,
-    /// Explicit authorization to transmit each verified, module-bound local
-    /// review PNG to the exact outstanding Suite image placeholder. Without
-    /// this, a nonterminal review module can be retained only when it is the
-    /// final module in its plan.
-    pub upload_review_screenshots: bool,
     /// Worker-owned automation lanes. HTTP-only test fixtures may leave this
     /// empty; production creates one independent lane per configured job.
     pub automation: Vec<ConformanceAutomation>,
@@ -272,33 +249,6 @@ impl ConformanceRunner {
             config.client.origin(),
             config.target_origin.as_ref(),
         )?;
-        if let Some(first_lane) = config.automation.first() {
-            match first_lane.review_screenshot_capture.as_ref() {
-                Some(first_capture) => {
-                    if first_lane.browser.is_none()
-                        || config.automation.iter().any(|lane| {
-                            lane.browser.is_none()
-                                || lane
-                                    .review_screenshot_capture
-                                    .as_ref()
-                                    .is_none_or(|capture| {
-                                        !capture.shares_run_budget_with(first_capture)
-                                    })
-                        })
-                    {
-                        return Err(OrchestrationError::InvalidInput);
-                    }
-                }
-                None if config
-                    .automation
-                    .iter()
-                    .any(|lane| lane.review_screenshot_capture.is_some()) =>
-                {
-                    return Err(OrchestrationError::InvalidInput);
-                }
-                None => {}
-            }
-        }
         Ok(Self { config })
     }
 
@@ -314,22 +264,6 @@ impl ConformanceRunner {
             .checked_add(self.config.poll_timeout)
             .ok_or_else(|| "Suite poll timeout is out of range".to_owned())?;
         self.wait_for_state_until(sink, test, module_id, states, deadline, started)
-    }
-
-    fn reset_browser_session(&self) -> Result<(), String> {
-        let Some(browser) = self
-            .config
-            .automation
-            .first()
-            .and_then(|automation| automation.browser.as_ref())
-        else {
-            return Ok(());
-        };
-        browser
-            .lock()
-            .map_err(|_| "browser automation lock failed".to_owned())?
-            .reset_session()
-            .map_err(|error| error.to_string())
     }
 
     fn wait_for_state_until<S: ProgressSink>(
@@ -626,181 +560,6 @@ impl ConformanceRunner {
         }
     }
 
-    fn drive_browser_waiting_interruptible<S: ProgressSink>(
-        &self,
-        sink: &mut S,
-        browser: &Arc<Mutex<dyn BrowserAutomation>>,
-        plan: &PlannedPlan,
-        module: &ModuleDefinition,
-        module_id: &str,
-        initial: Value,
-    ) -> Result<(Value, BrowserReviewEvidence), String> {
-        let browser_config = browser_config_for_module(&plan.config, &module.test_name)
-            .map_err(|error| error.to_string())?;
-        let entries =
-            parse_browser_entries_owned(browser_config).map_err(|error| error.to_string())?;
-        let target_origin = self.config.target_origin.clone().ok_or_else(|| {
-            "Suite runner is WAITING but the target browser origin is unavailable".to_owned()
-        })?;
-        let policy = BrowserPolicy::new(target_origin, self.config.client.origin().clone())
-            .map_err(|error| error.to_string())?;
-        let started = Instant::now();
-        let deadline = started
-            .checked_add(self.config.poll_timeout)
-            .ok_or_else(|| "browser poll timeout is out of range".to_owned())?;
-        let mut observed = initial;
-        let mut first_round = true;
-        let mut completed_url_digests = BTreeSet::<[u8; 32]>::new();
-        let mut review_evidence = BrowserReviewEvidence::default();
-        let mut last_wait_report = None;
-
-        loop {
-            if self.config.control.is_interrupted() {
-                return Err("run interrupted".to_owned());
-            }
-            if deadline.saturating_duration_since(Instant::now()).is_zero() {
-                return Err("browser WAITING drive timed out".to_owned());
-            }
-            if !first_round {
-                observed = self
-                    .config
-                    .client
-                    .module_info(module_id)
-                    .map_err(|error| safe_error(&error))?;
-                if is_terminal_state(&observed) {
-                    return Ok((observed, review_evidence));
-                }
-                if !is_waiting(&observed) {
-                    observed = self.wait_for_state_until(
-                        sink,
-                        &module.test_name,
-                        module_id,
-                        &["WAITING", "FINISHED", "INTERRUPTED"],
-                        deadline,
-                        started,
-                    )?;
-                    if is_terminal_state(&observed) {
-                        return Ok((observed, review_evidence));
-                    }
-                }
-            }
-            first_round = false;
-            if !is_waiting(&observed) {
-                return Ok((observed, review_evidence));
-            }
-            emit_waiting_activity(sink, &module.test_name, started, &mut last_wait_report);
-
-            let runner = match self.config.client.runner_info(module_id) {
-                Ok(runner) => runner,
-                Err(SuiteClientError::HttpStatus(404)) => {
-                    self.wait_for_runner_refresh(deadline, "browser")?;
-                    continue;
-                }
-                Err(error) => return Err(safe_error(&error)),
-            };
-            let Some(browser_state) = runner.get("browser") else {
-                self.wait_for_runner_refresh(deadline, "browser")?;
-                continue;
-            };
-            let browser_state = BrowserRunnerState::parse(browser_state, &policy)
-                .map_err(|error| error.to_string())?;
-            let pending_url = browser_state.urls().iter().find(|url| {
-                let digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
-                !browser_state
-                    .visited()
-                    .iter()
-                    .any(|visited| visited == *url)
-                    && !completed_url_digests.contains(&digest)
-            });
-            let Some(pending_url) = pending_url else {
-                self.wait_for_runner_refresh(deadline, "browser")?;
-                continue;
-            };
-            {
-                let mut driver = browser
-                    .lock()
-                    .map_err(|_| "browser automation lock failed".to_owned())?;
-                let capture = self
-                    .config
-                    .automation
-                    .first()
-                    .and_then(|automation| automation.review_screenshot_capture.as_ref())
-                    .map(|capture| {
-                        BrowserReviewModuleIdentity::new(
-                            &plan.matrix_plan_id,
-                            &plan.suite_plan_id,
-                            module_id,
-                            &module.test_name,
-                            &effective_module_identity_variant(plan, module),
-                        )
-                        .and_then(|identity| {
-                            capture.context(
-                                identity,
-                                review_evidence
-                                    .screenshots
-                                    .len()
-                                    .saturating_add(review_evidence.missing),
-                            )
-                        })
-                    })
-                    .transpose()
-                    .map_err(|error| error.to_string())?;
-                let report = driver
-                    .execute_with_review_capture(pending_url, &entries, capture.as_ref())
-                    .map_err(|error| error.to_string())?;
-                if report.entry_index >= entries.len() {
-                    return Err("browser returned an invalid selected entry".to_owned());
-                }
-                review_evidence.entered_browser_program = true;
-                let next_attempts = review_evidence
-                    .attempts
-                    .checked_add(report.review_screenshot_attempts)
-                    .ok_or_else(|| "browser review screenshot limit exceeded".to_owned())?;
-                if next_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE {
-                    return Err("browser review screenshot limit exceeded".to_owned());
-                }
-                review_evidence.attempts = next_attempts;
-                review_evidence.required = review_evidence
-                    .required
-                    .checked_add(report.review_screenshots_required)
-                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
-                review_evidence.required_captured = review_evidence
-                    .required_captured
-                    .checked_add(report.review_screenshots_required_captured)
-                    .ok_or_else(|| "browser review screenshot obligation overflow".to_owned())?;
-                for receipt in report.review_screenshots {
-                    if receipt.suite_plan_id != plan.suite_plan_id || receipt.module_id != module_id
-                    {
-                        return Err("browser review evidence context mismatch".to_owned());
-                    }
-                    let next_bytes = review_evidence
-                        .decoded_bytes
-                        .checked_add(receipt.size)
-                        .ok_or_else(|| "browser review screenshot size overflow".to_owned())?;
-                    if review_evidence.screenshots.len() >= MAX_REVIEW_SCREENSHOTS_PER_RUN
-                        || next_bytes > 32 * 1024 * 1024
-                    {
-                        return Err("browser review screenshot limit exceeded".to_owned());
-                    }
-                    review_evidence.decoded_bytes = next_bytes;
-                    review_evidence.screenshots.push(ReviewScreenshotReport {
-                        path: receipt.path,
-                        sha256: receipt.sha256,
-                        size: receipt.size,
-                    });
-                }
-                review_evidence.missing = review_evidence
-                    .missing
-                    .saturating_add(report.review_screenshots_missing);
-                if review_evidence.required != review_evidence.required_captured {
-                    return Err("required browser review screenshot was not captured".to_owned());
-                }
-            }
-            completed_url_digests.insert(Sha256::digest(pending_url.as_str().as_bytes()).into());
-            self.wait_for_runner_refresh(deadline, "browser")?;
-        }
-    }
-
     pub fn run<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
         if self.config.jobs == 1 || self.config.matrix.document.plan_count() <= 1 {
             return self.run_serial(sink);
@@ -1069,11 +828,6 @@ impl ConformanceRunner {
             .suite_resource_observer
             .as_ref()
             .is_some_and(|observer| observer.retain_suite_plans_for_certification());
-        let review_capture_requested = self
-            .config
-            .automation
-            .first()
-            .is_some_and(|automation| automation.review_screenshot_capture.is_some());
 
         // The denominator is now frozen. A plan-creation failure leaves the
         // successfully created subset visible, but no execution is attempted.
@@ -1103,14 +857,9 @@ impl ConformanceRunner {
                     current_variant.clone(),
                     None,
                 );
-                'execute: for (module_index, module) in plan.modules.iter().enumerate() {
+                'execute: for module in &plan.modules {
                     if self.config.control.is_interrupted() {
                         errors.push("run interrupted".to_owned());
-                        groups[group_index].status = GroupStatus::Failed;
-                        break 'execute;
-                    }
-                    if let Err(error) = self.reset_browser_session() {
-                        errors.push(error);
                         groups[group_index].status = GroupStatus::Failed;
                         break 'execute;
                     }
@@ -1201,8 +950,6 @@ impl ConformanceRunner {
                         },
                     };
                     let mut observed = initial;
-                    let mut browser_review_evidence = BrowserReviewEvidence::default();
-                    let mut deferred_review_pending = None;
                     let mut external_review_pending = false;
                     let has_browser_config =
                         match module_has_browser_config(&plan.config, &module.test_name) {
@@ -1307,17 +1054,6 @@ impl ConformanceRunner {
                                 }
                             }
                         } else if is_openid4vp_verifier_plan(plan) {
-                            if review_capture_requested
-                                && !self.config.upload_review_screenshots
-                                && !retention_requested
-                            {
-                                errors.push(
-                                    "OpenID4VP review capture without Suite upload requires explicit Suite plan retention"
-                                        .to_owned(),
-                                );
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            }
                             let Some(verifier) = self
                                 .config
                                 .automation
@@ -1410,332 +1146,18 @@ impl ConformanceRunner {
                                     break 'execute;
                                 }
                             };
-                            // Select the review marker from the same browser entry that
-                            // launched this verifier flow. The screenshot itself comes from
-                            // the verifier's ordinary completion page.
-                            let review_marker_selected = (|| -> Result<bool, String> {
-                                if !review_capture_requested {
-                                    return Ok(false);
-                                }
-                                if !has_browser_config {
-                                    return Ok(false);
-                                }
-                                let config =
-                                    browser_config_for_module(&plan.config, &module.test_name)
-                                        .map_err(|error| error.to_string())?;
-                                let entries = parse_browser_entries_owned(config)
-                                    .map_err(|error| error.to_string())?;
-                                let marker_url = self
-                                    .config
-                                    .client
-                                    .origin()
-                                    .url(&format!("/test/a/{}/verification-evidence", instance.id))
-                                    .map_err(|error| error.to_string())?;
-                                let browser = self
-                                    .config
-                                    .automation
-                                    .first()
-                                    .and_then(|automation| automation.browser.as_ref())
-                                    .ok_or_else(|| {
-                                        "OpenID4VP review browser automation is unavailable"
-                                            .to_owned()
-                                    })?;
-                                let selected = browser
-                                    .lock()
-                                    .map_err(|_| "browser automation lock failed".to_owned())?
-                                    .selected_openid4vp_result_marker(
-                                        &presentation.authorization_url,
-                                        &entries,
-                                        &marker_url,
-                                    )
-                                    .map_err(|error| error.to_string())?;
-                                if !selected {
-                                    return Ok(false);
-                                }
-                                Ok(true)
-                            })();
-                            let review_marker_selected = match review_marker_selected {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    errors.push(error);
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    break 'execute;
-                                }
-                            };
-                            let completion_outcome = match verifier
-                                .complete(&presentation, &presentation_delivery_url)
-                            {
-                                Ok(outcome) => outcome,
+                            match verifier.complete(&presentation, &presentation_delivery_url) {
+                                Ok(_) => {}
                                 Err(error) => {
                                     errors.push(error.to_string());
                                     groups[group_index].status = GroupStatus::Failed;
                                     break 'execute;
                                 }
                             };
-                            if completion_outcome == OpenId4VpCompletionOutcome::Completed
-                                && review_capture_requested
-                                && !review_marker_selected
-                            {
-                                errors.push(
-                                    "deferred review requires one selected required verification-evidence marker"
-                                        .to_owned(),
-                                );
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            }
-                            drop(verifier);
-                            if review_marker_selected
-                                && completion_outcome == OpenId4VpCompletionOutcome::Completed
-                            {
-                                let Some(browser) = self
-                                    .config
-                                    .automation
-                                    .first()
-                                    .and_then(|automation| automation.browser.as_ref())
-                                else {
-                                    errors.push(
-                                        "OpenID4VP review browser automation is unavailable"
-                                            .to_owned(),
-                                    );
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    break 'execute;
-                                };
-                                let captured = (|| -> Result<
-                                    (ReviewScreenshotReport, Option<Vec<u8>>),
-                                    String,
-                                > {
-                                    let capture_owner = self
-                                        .config
-                                        .automation
-                                        .first()
-                                        .and_then(|automation| {
-                                            automation.review_screenshot_capture.as_ref()
-                                        })
-                                        .ok_or_else(|| {
-                                            "OpenID4VP verification-result capture is unavailable"
-                                                .to_owned()
-                                        })?;
-                                    let identity = BrowserReviewModuleIdentity::new(
-                                        &plan.matrix_plan_id,
-                                        &plan.suite_plan_id,
-                                        &instance.id,
-                                        &module.test_name,
-                                        &effective_module_identity_variant(plan, module),
-                                    )
-                                    .map_err(|error| error.to_string())?;
-                                    let capture = capture_owner
-                                        .context(identity, 0)
-                                        .map_err(|error| error.to_string())?;
-                                    let mut browser = browser
-                                        .lock()
-                                        .map_err(|_| "browser automation lock failed".to_owned())?;
-                                    let receipt = browser
-                                        .capture_openid4vp_completion(
-                                            &presentation.completion_url,
-                                            &capture,
-                                            0,
-                                        )
-                                        .map_err(|error| error.to_string())?;
-                                    if receipt.suite_plan_id != plan.suite_plan_id
-                                        || receipt.module_id != instance.id
-                                    {
-                                        return Err("OpenID4VP verification-result evidence context mismatch".to_owned());
-                                    }
-                                    let upload_png = self
-                                        .config
-                                        .upload_review_screenshots
-                                        .then(|| capture_owner.read_captured_png(&receipt))
-                                        .transpose()
-                                        .map_err(|error| error.to_string())?;
-                                    Ok((
-                                        ReviewScreenshotReport {
-                                            path: receipt.path,
-                                            sha256: receipt.sha256,
-                                            size: receipt.size,
-                                        },
-                                        upload_png,
-                                    ))
-                                })();
-                                match captured {
-                                    Ok((screenshot, upload_png)) => {
-                                        browser_review_evidence.entered_browser_program = true;
-                                        browser_review_evidence.required = 1;
-                                        browser_review_evidence.required_captured = 1;
-                                        browser_review_evidence.attempts = 1;
-                                        browser_review_evidence.decoded_bytes = screenshot.size;
-                                        browser_review_evidence.screenshots.push(screenshot);
-                                        // OIDF v5.2.2 MR !2100 leaves the verifier runner
-                                        // WAITING until review evidence is supplied. See
-                                        // https://gitlab.com/openid/conformance-suite/-/merge_requests/2100.
-                                        // Confirm the exact state before either uploading now
-                                        // or retaining the plan for later submission.
-                                        let pending_info =
-                                            match self.config.client.module_info(&instance.id) {
-                                                Ok(info) => info,
-                                                Err(error) => {
-                                                    errors.push(safe_error(&error));
-                                                    groups[group_index].status =
-                                                        GroupStatus::Failed;
-                                                    break 'execute;
-                                                }
-                                            };
-                                        if !is_deferred_review_waiting(&pending_info) {
-                                            errors.push(
-                                                "deferred review requires the Suite module to remain WAITING"
-                                                    .to_owned(),
-                                            );
-                                            groups[group_index].status = GroupStatus::Failed;
-                                            break 'execute;
-                                        }
-                                        let pending_wait = match self.wait_for_state_interruptible(
-                                            sink,
-                                            &module.test_name,
-                                            &instance.id,
-                                            &["WAITING", "FINISHED", "INTERRUPTED"],
-                                        ) {
-                                            Ok(state) => state,
-                                            Err(error) => {
-                                                errors.push(error);
-                                                groups[group_index].status = GroupStatus::Failed;
-                                                break 'execute;
-                                            }
-                                        };
-                                        if !is_deferred_review_waiting(&pending_wait) {
-                                            errors.push(
-                                                "deferred review wait-state is not exact WAITING"
-                                                    .to_owned(),
-                                            );
-                                            groups[group_index].status = GroupStatus::Failed;
-                                            break 'execute;
-                                        }
-                                        if let Some(png) = upload_png {
-                                            if let Err(error) = self
-                                                .config
-                                                .client
-                                                .upload_single_review_screenshot(&instance.id, &png)
-                                            {
-                                                errors.push(safe_error(&error));
-                                                groups[group_index].status = GroupStatus::Failed;
-                                                break 'execute;
-                                            }
-                                            observed = match self.wait_for_state_interruptible(
-                                                sink,
-                                                &module.test_name,
-                                                &instance.id,
-                                                &["FINISHED", "INTERRUPTED"],
-                                            ) {
-                                                Ok(state) => Some(state),
-                                                Err(error) => {
-                                                    errors.push(error);
-                                                    groups[group_index].status =
-                                                        GroupStatus::Failed;
-                                                    break 'execute;
-                                                }
-                                            };
-                                        } else {
-                                            deferred_review_pending = Some(DeferredReviewPending {
-                                                placeholder_path: format!(
-                                                    "/test/a/{}/verification-evidence",
-                                                    instance.id
-                                                ),
-                                                marker: crate::ReviewScreenshotMarker::Required,
-                                                obligation_index: 0,
-                                            });
-                                            observed = Some(pending_wait);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        errors.push(error);
-                                        groups[group_index].status = GroupStatus::Failed;
-                                        break 'execute;
-                                    }
-                                }
-                            } else if has_browser_config
-                                && completion_outcome == OpenId4VpCompletionOutcome::Completed
-                            {
-                                let Some(browser) = self
-                                    .config
-                                    .automation
-                                    .first()
-                                    .and_then(|automation| automation.browser.as_ref())
-                                else {
-                                    errors.push(
-                                        "OpenID4VP review browser automation is unavailable"
-                                            .to_owned(),
-                                    );
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    break 'execute;
-                                };
-                                match self.drive_browser_waiting_interruptible(
-                                    sink,
-                                    browser,
-                                    plan,
-                                    module,
-                                    &instance.id,
-                                    observed.clone().expect("waiting runner state"),
-                                ) {
-                                    Ok((state, evidence)) => {
-                                        observed = Some(state);
-                                        browser_review_evidence = evidence;
-                                    }
-                                    Err(error) => {
-                                        errors.push(error);
-                                        groups[group_index].status = GroupStatus::Failed;
-                                        emit_progress(
-                                            sink,
-                                            &groups,
-                                            current_profile.clone(),
-                                            current_variant.clone(),
-                                            current_test.clone(),
-                                        );
-                                        break 'execute;
-                                    }
-                                }
-                            }
-                        } else if has_browser_config {
-                            let Some(browser) = self
-                                .config
-                                .automation
-                                .first()
-                                .and_then(|automation| automation.browser.as_ref())
-                            else {
-                                errors.push(
-                                    "Suite runner is WAITING but browser automation is unavailable"
-                                        .to_owned(),
-                                );
-                                groups[group_index].status = GroupStatus::Failed;
-                                break 'execute;
-                            };
-                            match self.drive_browser_waiting_interruptible(
-                                sink,
-                                browser,
-                                plan,
-                                module,
-                                &instance.id,
-                                observed.clone().expect("waiting runner state"),
-                            ) {
-                                Ok((state, evidence)) => {
-                                    observed = Some(state);
-                                    browser_review_evidence = evidence;
-                                }
-                                Err(error) => {
-                                    errors.push(error);
-                                    groups[group_index].status = GroupStatus::Failed;
-                                    emit_progress(
-                                        sink,
-                                        &groups,
-                                        current_profile.clone(),
-                                        current_variant.clone(),
-                                        current_test.clone(),
-                                    );
-                                    break 'execute;
-                                }
-                            }
                         }
                     }
 
-                    if deferred_review_pending.is_none()
-                        && !observed.as_ref().is_some_and(is_terminal_state)
+                    if !observed.as_ref().is_some_and(is_terminal_state)
                         && let Err(error) = self.wait_for_state_interruptible(
                             sink,
                             &module.test_name,
@@ -1764,38 +1186,14 @@ impl ConformanceRunner {
                         }
                     };
                     let terminal = is_terminal(&info);
-                    if deferred_review_pending.is_some() && !is_deferred_review_waiting(&info) {
-                        errors.push(
-                            "deferred review module changed state before report collection"
-                                .to_owned(),
-                        );
-                        groups[group_index].status = GroupStatus::Failed;
-                    } else if !terminal
-                        && deferred_review_pending.is_none()
-                        && !external_review_pending
-                    {
+                    if !terminal && !external_review_pending {
                         errors.push("Suite module did not reach a terminal status".to_owned());
                         groups[group_index].status = GroupStatus::Failed;
-                    } else if has_browser_config {
-                        let declared = (|| -> Result<usize, String> {
-                            if is_openid4vp_verifier_plan(plan) {
-                                return Ok(browser_review_evidence.required);
-                            }
-                            let config = browser_config_for_module(&plan.config, &module.test_name)
-                                .map_err(|error| error.to_string())?;
-                            let entries = parse_browser_entries_owned(config)
-                                .map_err(|error| error.to_string())?;
-                            Ok(required_review_screenshot_count(&entries))
-                        })();
-                        match declared.and_then(|declared| {
-                            verify_required_review_screenshots(&browser_review_evidence, declared)
-                        }) {
-                            Ok(()) => {}
-                            Err(error) => {
-                                errors.push(error);
-                                groups[group_index].status = GroupStatus::Failed;
-                            }
-                        }
+                    } else if has_browser_config
+                        && let Err(error) = validate_suite_browser_evidence(&log)
+                    {
+                        errors.push(error);
+                        groups[group_index].status = GroupStatus::Failed;
                     }
                     let mut module_report = ModuleReport::from_info(
                         ModuleReportContext {
@@ -1810,30 +1208,12 @@ impl ConformanceRunner {
                         info,
                         log,
                     );
-                    module_report.review_screenshots = browser_review_evidence.screenshots;
-                    module_report.review_screenshots_required = browser_review_evidence.required;
-                    module_report.review_screenshots_required_captured =
-                        browser_review_evidence.required_captured;
-                    module_report.review_screenshots_missing = browser_review_evidence.missing;
-                    let deferred_blocks_remaining_modules =
-                        deferred_review_blocks_remaining_modules(
-                            deferred_review_pending.is_some(),
-                            module_index,
-                            plan.modules.len(),
-                        );
-                    if let Some(pending) = deferred_review_pending {
-                        module_report.mark_deferred_review_pending(pending);
-                    }
                     if external_review_pending {
                         module_report.mark_external_review_pending();
                     }
                     modules.push(module_report);
                     let module_outcome = modules.last().map(|module| module.outcome);
-                    let module_settled = terminal
-                        || external_review_pending
-                        || modules
-                            .last()
-                            .is_some_and(|module| module.deferred_review_pending.is_some());
+                    let module_settled = terminal || external_review_pending;
                     if module_settled && let Some(module) = modules.last() {
                         record_module_progress(&mut groups[group_index], module);
                     }
@@ -1864,14 +1244,6 @@ impl ConformanceRunner {
                     }
                     if external_review_pending {
                         groups[group_index].status = GroupStatus::Review;
-                        break 'execute;
-                    }
-                    if deferred_blocks_remaining_modules {
-                        errors.push(
-                            "nonterminal deferred review blocks later modules that share the Suite plan alias; upload the captured review screenshot explicitly or stop at this incomplete plan boundary"
-                                .to_owned(),
-                        );
-                        groups[group_index].status = GroupStatus::Failed;
                         break 'execute;
                     }
                 }
@@ -2091,6 +1463,42 @@ impl ConformanceRunner {
     }
 }
 
+fn validate_suite_browser_evidence(log: &Value) -> Result<(), String> {
+    let entries = log
+        .as_array()
+        .ok_or_else(|| "Suite browser log is not an array".to_owned())?;
+    for entry in entries {
+        if entry.get("result").and_then(Value::as_str) != Some("REVIEW") {
+            continue;
+        }
+        if entry.get("upload").is_some() {
+            return Err("Suite browser evidence placeholder remains unfilled".to_owned());
+        }
+        if let Some(source) = entry.get("page_source") {
+            let source = source
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| "Suite browser evidence is empty".to_owned())?;
+            let pattern = entry
+                .get("matched_regexp")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Suite browser evidence has no matched expression".to_owned())?;
+            // The Suite evaluates its expression against element text, not HTML.
+            // Preserve that official assertion; do not re-run it on markup.
+            if pattern.is_empty()
+                || entry
+                    .get("content_type")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || source.len() > 2 * 1024 * 1024
+            {
+                return Err("Suite browser evidence metadata is invalid".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn module_has_browser_config(plan_config: &Value, test_name: &str) -> Result<bool, String> {
     let override_browser = match plan_config.get("override") {
         None => false,
@@ -2110,24 +1518,6 @@ fn module_has_browser_config(plan_config: &Value, test_name: &str) -> Result<boo
 /// suite/test-case exception (and never a p038-specific branch).
 fn is_openid4vp_verifier_plan(plan: &PlannedPlan) -> bool {
     plan.plan_name.starts_with("oid4vp-1final-verifier")
-}
-
-fn verify_required_review_screenshots(
-    evidence: &BrowserReviewEvidence,
-    declared: usize,
-) -> Result<(), String> {
-    // A terminal result before any browser program is entered cannot prove
-    // whether a required signed entry was skipped, so fail closed. Once the
-    // program is entered, obligations arise solely from commands actually
-    // reached after task matching; mutually-exclusive or optional unmatched
-    // tasks do not create phantom capture requirements.
-    if !evidence.entered_browser_program && declared > 0 {
-        return Err("required browser review screenshot was not reached".to_owned());
-    }
-    if evidence.required != evidence.required_captured {
-        return Err("required browser review screenshots are incomplete".to_owned());
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_review_screenshot_run_limit(modules: &[ModuleReport]) -> Result<(), String> {
@@ -2571,36 +1961,6 @@ fn is_waiting(value: &Value) -> bool {
 /// OIDF deferred evidence has a narrower contract than generic interactive
 /// browser waiting: the Suite must still report its exact `WAITING` review
 /// boundary after NazoAuthWeb capture, not another user/browser state.
-fn is_deferred_review_waiting(value: &Value) -> bool {
-    status(value) == Some("WAITING")
-}
-
-fn suite_log_has_upload_placeholder(value: &Value) -> bool {
-    value.as_array().is_some_and(|entries| {
-        entries
-            .iter()
-            .any(|entry| entry.get("upload").and_then(Value::as_str).is_some())
-    })
-}
-
-fn deferred_review_blocks_remaining_modules(
-    review_is_nonterminal: bool,
-    module_index: usize,
-    module_count: usize,
-) -> bool {
-    review_is_nonterminal && module_index.saturating_add(1) < module_count
-}
-
-/// A run may proceed to the ordinary retention handoff once it has either
-/// deleted every observed Suite allocation or fully accounted for them in an
-/// exact candidate. The latter is deliberately not a retention commit.
-pub(super) const fn suite_resources_settled(
-    cleanup_complete: bool,
-    retention_candidate_settled: bool,
-) -> bool {
-    cleanup_complete || retention_candidate_settled
-}
-
 fn is_terminal_state(value: &Value) -> bool {
     matches!(status(value), Some("FINISHED" | "INTERRUPTED"))
 }
@@ -2695,15 +2055,33 @@ fn same_url_origin(origin: &Origin, url: &Url) -> bool {
     origin.as_str() == format!("https://{authority}")
 }
 
+pub(crate) fn suite_resources_settled(
+    cleanup_complete: bool,
+    retention_candidate_settled: bool,
+) -> bool {
+    cleanup_complete || retention_candidate_settled
+}
+
+fn suite_log_has_upload_placeholder(value: &Value) -> bool {
+    value.as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.get("upload").and_then(Value::as_str).is_some())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::BrowserError;
+    #[cfg(unix)]
+    use crate::OpenId4VpCompletionOutcome;
+    use crate::ReviewScreenshotReport;
     #[cfg(unix)]
     use crate::browser::OpenId4VpError;
     use crate::client::ClientConfig;
     use crate::credentials::BearerToken;
     use crate::matrix::{MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix};
+    use crate::report::DeferredReviewPending;
     use crate::transport::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
@@ -2761,12 +2139,6 @@ mod tests {
         completes: usize,
         issuances: usize,
         completion_outcome: OpenId4VpCompletionOutcome,
-    }
-
-    #[cfg(unix)]
-    struct DeferredReviewBrowser {
-        captures: usize,
-        capture_fails: bool,
     }
 
     #[cfg(unix)]
@@ -2992,7 +2364,14 @@ mod tests {
                     self.uploaded.store(true, Ordering::SeqCst);
                     (200, serde_json::json!({"_id":"log-a","img":"stored"}))
                 }
-                (HttpMethod::Get, "/api/log/module-a") => (200, serde_json::json!([])),
+                (HttpMethod::Get, "/api/log/module-a") => (
+                    200,
+                    if self.upload_review {
+                        serde_json::json!([{"result":"REVIEW","page_source":"<html>Deferred verification evidence</html>","content_type":"text/html","matched_regexp":".*Deferred verification evidence.*"}])
+                    } else {
+                        serde_json::json!([])
+                    },
+                ),
                 // Suite cancellation accepts only 200, while plan deletion also
                 // accepts 204. Keep this transport aligned with those distinct
                 // production contracts so the negative cases exercise cleanup.
@@ -3053,60 +2432,6 @@ mod tests {
                     "https://issuer.example/ui/verification-result#receipt=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO12",
                 ),
             )
-        }
-    }
-
-    #[cfg(unix)]
-    impl BrowserAutomation for DeferredReviewBrowser {
-        fn reset_session(&mut self) -> Result<(), BrowserError> {
-            Ok(())
-        }
-
-        fn execute(
-            &mut self,
-            _authorization_url: &Url,
-            _entries: &[crate::browser::BrowserEntry],
-        ) -> Result<crate::browser::BrowserRunReport, BrowserError> {
-            Err(BrowserError::ReviewScreenshotRequired)
-        }
-
-        fn navigate(&mut self, _url: &Url) -> Result<(), BrowserError> {
-            Ok(())
-        }
-
-        fn selected_openid4vp_result_marker(
-            &mut self,
-            authorization_url: &Url,
-            entries: &[crate::browser::BrowserEntry],
-            suite_evidence_url: &Url,
-        ) -> Result<bool, BrowserError> {
-            assert_eq!(authorization_url.host_str(), Some("issuer.example"));
-            assert_eq!(
-                suite_evidence_url.path(),
-                "/test/a/module-a/verification-evidence"
-            );
-            let selected = entries.first().ok_or(BrowserError::InvalidSchema)?;
-            assert_eq!(selected.match_pattern, "https://issuer.example/authorize*");
-            crate::browser::selected_required_review_screenshot_marker(selected, suite_evidence_url)
-        }
-
-        fn capture_openid4vp_completion(
-            &mut self,
-            completion_url: &Url,
-            capture: &crate::browser::BrowserReviewCaptureContext,
-            obligation_index: usize,
-        ) -> Result<crate::browser::BrowserReviewScreenshotReceipt, BrowserError> {
-            self.captures += 1;
-            if self.capture_fails {
-                return Err(BrowserError::ReviewScreenshotRequired);
-            }
-            assert_eq!(completion_url.host_str(), Some("issuer.example"));
-            assert!(completion_url.path().starts_with("/openid4vp/complete/"));
-            use base64::{Engine as _, engine::general_purpose::STANDARD};
-            let png = STANDARD
-                .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
-                .expect("fixed PNG");
-            capture.write_vp_completion_png(&png, completion_url, obligation_index)
         }
     }
 
@@ -3517,7 +2842,7 @@ mod tests {
             plan_resource_budgets,
             selected_resource_budget,
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         };
@@ -3552,107 +2877,12 @@ mod tests {
                 ]),
                 selected_resource_budget: budget(u32::MAX, 2, 120),
                 jobs: 1,
-                upload_review_screenshots: false,
+
                 automation: Vec::new(),
                 suite_resource_observer: None,
             })
             .is_err()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn screenshot_capture_lanes_require_one_shared_browser_budget() {
-        let temp = std::env::temp_dir().canonicalize().expect("resolve temp");
-        let evidence = temp.join(format!("nazoauth-lanes-{}", uuid::Uuid::now_v7()));
-        crate::secure_file::ensure_directory(&evidence, true).expect("evidence root");
-        let client = SuiteClient::with_transport(
-            Origin::parse("https://suite.example").expect("origin"),
-            Some(BearerToken::new("suite-token").expect("token")),
-            Arc::new(FixtureTransport {
-                requests: Mutex::new(Vec::new()),
-            }),
-            ClientConfig::default(),
-        )
-        .expect("client");
-        let browser = || {
-            Arc::new(Mutex::new(CompletingBrowser {
-                completed: Arc::new(AtomicBool::new(false)),
-            })) as Arc<Mutex<dyn BrowserAutomation>>
-        };
-        let config = |automation| ConformanceRunConfig {
-            client: client.clone(),
-            matrix: one_plan_matrix(serde_json::json!({})),
-            target_origin: None,
-            binding: Some(test_binding()),
-            poll_timeout: Duration::from_secs(1),
-            control: RunControl::default(),
-            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
-            plan_resource_budgets: one_plan_budgets(),
-            selected_resource_budget: budget(1, 1, 60),
-            jobs: 2,
-            upload_review_screenshots: false,
-            automation,
-            suite_resource_observer: None,
-        };
-        assert!(ConformanceRunner::new(config(Vec::new())).is_ok());
-        let shared =
-            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-a").expect("shared capture");
-        assert!(
-            ConformanceRunner::new(config(vec![
-                ConformanceAutomation {
-                    browser: Some(browser()),
-                    review_screenshot_capture: Some(shared.clone()),
-                    ..ConformanceAutomation::default()
-                },
-                ConformanceAutomation {
-                    browser: Some(browser()),
-                    review_screenshot_capture: Some(shared),
-                    ..ConformanceAutomation::default()
-                },
-            ]))
-            .is_ok()
-        );
-        let first =
-            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-b").expect("first capture");
-        let second =
-            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-b").expect("second capture");
-        assert!(
-            ConformanceRunner::new(config(vec![
-                ConformanceAutomation {
-                    browser: Some(browser()),
-                    review_screenshot_capture: Some(first),
-                    ..ConformanceAutomation::default()
-                },
-                ConformanceAutomation {
-                    browser: Some(browser()),
-                    review_screenshot_capture: Some(second),
-                    ..ConformanceAutomation::default()
-                },
-            ]))
-            .is_err()
-        );
-        let capture =
-            BrowserReviewScreenshotCapture::new(evidence.clone(), "run-c").expect("capture");
-        assert!(
-            ConformanceRunner::new(config(vec![
-                ConformanceAutomation::default(),
-                ConformanceAutomation {
-                    browser: Some(browser()),
-                    review_screenshot_capture: Some(capture.clone()),
-                    ..ConformanceAutomation::default()
-                },
-            ]))
-            .is_err()
-        );
-        assert!(
-            ConformanceRunner::new(config(vec![ConformanceAutomation {
-                review_screenshot_capture: Some(capture),
-                ..ConformanceAutomation::default()
-            }]))
-            .is_err()
-        );
-        std::fs::remove_dir_all(&evidence).expect("remove evidence");
     }
 
     #[test]
@@ -3682,7 +2912,7 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: Some(observer.clone()),
         })
@@ -3759,7 +2989,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
             selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: vec![ConformanceAutomation {
                 issuer: Some(issuer_driver),
                 ..ConformanceAutomation::default()
@@ -3876,7 +3106,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
             selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: Some(observer.clone()),
         })
@@ -3934,7 +3164,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
             selected_resource_budget: budget(2, 1, 60),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4016,7 +3246,7 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4066,7 +3296,7 @@ mod tests {
                 plan_resource_budgets: one_plan_budgets(),
                 selected_resource_budget: budget(1, 1, 60),
                 jobs: 1,
-                upload_review_screenshots: false,
+
                 automation: Vec::new(),
                 suite_resource_observer: None,
             })
@@ -4289,7 +3519,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4359,7 +3589,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4450,7 +3680,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4540,7 +3770,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4700,7 +3930,7 @@ mod tests {
                     .expect("CIBA verification path");
                 (
                     Vec::new(),
-                    serde_json::json!({"auth_req_id":auth_req_id,"request":{}}),
+                    serde_json::json!({"auth_req_id":auth_req_id,"request":{"client_id":"client-1"}}),
                 )
             } else {
                 self.decision_ids.lock().expect("decision IDs lock").push(
@@ -4751,7 +3981,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4765,6 +3995,7 @@ mod tests {
                     decisions: Arc::clone(&decisions),
                     decision_ids: Arc::clone(&decision_ids),
                 }),
+                std::collections::HashSet::from(["client-1".to_owned()]),
             )
             .expect("approver"),
         );
@@ -4867,7 +4098,7 @@ mod tests {
             plan_resource_budgets: BTreeMap::new(),
             selected_resource_budget: budget(0, 0, 0),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: Vec::new(),
             suite_resource_observer: None,
         })
@@ -4915,230 +4146,9 @@ mod tests {
         assert!(issuer.lock().expect("issuer").drives >= 1);
     }
 
-    struct BrowserWaitingTransport {
-        completed: Arc<AtomicBool>,
-    }
-
-    impl Transport for BrowserWaitingTransport {
-        fn send(
-            &self,
-            request: HttpRequest,
-            _max_response_bytes: usize,
-        ) -> Result<HttpResponse, TransportError> {
-            let body = match request.url().path() {
-                "/api/info/m" if self.completed.load(Ordering::SeqCst) => {
-                    serde_json::json!({"status":"FINISHED","result":"PASSED"})
-                }
-                "/api/info/m" => serde_json::json!({"status":"WAITING"}),
-                "/api/runner/m" => serde_json::json!({
-                    "browser": {
-                        "urls": ["https://target.example/authorize?state=opaque"],
-                        "visited": []
-                    }
-                }),
-                _ => serde_json::json!({}),
-            };
-            Ok(HttpResponse {
-                status: 200,
-                headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("json"),
-            })
-        }
-    }
-
-    struct CompletingBrowser {
-        completed: Arc<AtomicBool>,
-    }
-
-    impl BrowserAutomation for CompletingBrowser {
-        fn reset_session(&mut self) -> Result<(), BrowserError> {
-            Ok(())
-        }
-
-        fn execute(
-            &mut self,
-            authorization_url: &Url,
-            entries: &[crate::browser::BrowserEntry],
-        ) -> Result<crate::browser::BrowserRunReport, BrowserError> {
-            assert_eq!(authorization_url.path(), "/authorize");
-            assert_eq!(entries.len(), 1);
-            self.completed.store(true, Ordering::SeqCst);
-            Ok(crate::browser::BrowserRunReport {
-                steps: 0,
-                tasks: 0,
-                entry_index: 0,
-                final_origin: "https://target.example".into(),
-                review_screenshots: Vec::new(),
-                review_screenshot_attempts: 0,
-                review_screenshots_required: 0,
-                review_screenshots_required_captured: 0,
-                review_screenshots_missing: 0,
-            })
-        }
-
-        fn navigate(&mut self, _url: &Url) -> Result<(), BrowserError> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn generic_waiting_uses_authoritative_runner_browser_url_until_terminal() {
-        let completed = Arc::new(AtomicBool::new(false));
-        let client = SuiteClient::with_transport(
-            Origin::parse("https://suite.example").expect("origin"),
-            Some(BearerToken::new("suite-token").expect("token")),
-            Arc::new(BrowserWaitingTransport {
-                completed: completed.clone(),
-            }),
-            ClientConfig::default(),
-        )
-        .expect("client");
-        let runner = ConformanceRunner::new(ConformanceRunConfig {
-            client,
-            matrix: SelectedMatrix {
-                document: MatrixDocument {
-                    schema: 1,
-                    name: "matrix".into(),
-                    groups: Vec::new(),
-                },
-                digest: "digest".into(),
-            },
-            target_origin: Some(
-                BrowserTargetOrigin::parse("https://target.example").expect("target"),
-            ),
-            binding: Some(test_binding()),
-            poll_timeout: Duration::from_secs(2),
-            control: RunControl::default(),
-            plan_lanes: BTreeMap::new(),
-            plan_resource_budgets: BTreeMap::new(),
-            selected_resource_budget: budget(0, 0, 0),
-            jobs: 1,
-            upload_review_screenshots: false,
-            automation: Vec::new(),
-            suite_resource_observer: None,
-        })
-        .expect("runner");
-        let plan = PlannedPlan {
-            group_index: 0,
-            matrix_plan_id: "matrix-plan".into(),
-            suite_plan_id: "suite-plan".into(),
-            plan_name: "oidcc-basic-certification-test-plan".into(),
-            variant: BTreeMap::new(),
-            runtime_variant: BTreeMap::new(),
-            expected_results: BTreeMap::new(),
-            modules: Vec::new(),
-            config: serde_json::json!({
-                "browser": [{
-                    "match": "https://target.example/authorize*",
-                    "tasks": []
-                }]
-            }),
-            report_index: 0,
-            lane: OidfDriverLane::Parallel,
-        };
-        let browser: Arc<Mutex<dyn BrowserAutomation>> = Arc::new(Mutex::new(CompletingBrowser {
-            completed: completed.clone(),
-        }));
-        let module = ModuleDefinition {
-            test_name: "browser-module".to_owned(),
-            variant: BTreeMap::new(),
-            raw: Value::Null,
-        };
-
-        let (observed, review_evidence) = runner
-            .drive_browser_waiting_interruptible(
-                &mut (),
-                &browser,
-                &plan,
-                &module,
-                "m",
-                serde_json::json!({"status":"WAITING"}),
-            )
-            .expect("browser drive");
-        assert_eq!(status(&observed), Some("FINISHED"));
-        assert!(review_evidence.screenshots.is_empty());
-        assert!(completed.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn running_initial_state_must_reach_an_interactive_or_terminal_boundary() {
-        let running = serde_json::json!({"status":"RUNNING"});
-        let waiting = serde_json::json!({"status":"WAITING"});
-        let finished = serde_json::json!({"status":"FINISHED"});
-        assert!(needs_interactive_or_terminal_wait(None));
-        assert!(needs_interactive_or_terminal_wait(Some(&running)));
-        assert!(!needs_interactive_or_terminal_wait(Some(&waiting)));
-        assert!(!needs_interactive_or_terminal_wait(Some(&finished)));
-    }
-
-    #[test]
-    fn effective_module_identity_variant_merges_plan_and_suite_definition() {
-        let plan = PlannedPlan {
-            group_index: 0,
-            matrix_plan_id: "matrix-plan".into(),
-            suite_plan_id: "suite-plan".into(),
-            plan_name: "plan".into(),
-            variant: BTreeMap::from([
-                ("credential_format".into(), "sd_jwt_vc".into()),
-                ("response_mode".into(), "direct_post".into()),
-            ]),
-            runtime_variant: BTreeMap::new(),
-            expected_results: BTreeMap::new(),
-            modules: Vec::new(),
-            config: Value::Null,
-            report_index: 0,
-            lane: OidfDriverLane::Parallel,
-        };
-        let module = ModuleDefinition {
-            test_name: "happy-flow".into(),
-            variant: BTreeMap::from([
-                ("response_mode".into(), "direct_post.jwt".into()),
-                ("request_method".into(), "url_query".into()),
-            ]),
-            raw: Value::Null,
-        };
-
-        assert_eq!(
-            effective_module_identity_variant(&plan, &module),
-            BTreeMap::from([
-                ("credential_format".into(), "sd_jwt_vc".into()),
-                ("request_method".into(), "url_query".into()),
-                ("response_mode".into(), "direct_post.jwt".into()),
-            ])
-        );
-    }
-
-    #[test]
-    fn terminal_detection_accepts_state_only_suite_responses() {
-        assert!(is_terminal(&serde_json::json!({"state":"FINISHED"})));
-        assert!(is_terminal(&serde_json::json!({"state":"INTERRUPTED"})));
-        assert!(!is_terminal(&serde_json::json!({"state":"RUNNING"})));
-    }
-
-    #[test]
-    fn deferred_review_requires_the_exact_suite_waiting_boundary() {
-        assert!(is_deferred_review_waiting(
-            &serde_json::json!({"status":"WAITING"})
-        ));
-        assert!(!is_deferred_review_waiting(
-            &serde_json::json!({"status":"WAITING_FOR_BROWSER"})
-        ));
-        assert!(!is_deferred_review_waiting(
-            &serde_json::json!({"state":"FINISHED"})
-        ));
-    }
-
-    #[test]
-    fn nonterminal_review_never_settles_a_plan_with_later_alias_sharing_modules() {
-        assert!(deferred_review_blocks_remaining_modules(true, 0, 2));
-        assert!(deferred_review_blocks_remaining_modules(true, 3, 5));
-        assert!(!deferred_review_blocks_remaining_modules(true, 0, 1));
-        assert!(!deferred_review_blocks_remaining_modules(false, 0, 2));
-    }
-
     #[cfg(unix)]
     #[test]
-    fn serial_vp_review_upload_reaches_review_and_cleans_up_on_a_configured_suite() {
+    fn serial_vp_suite_html_review_reaches_terminal_without_local_browser() {
         let root = std::env::temp_dir()
             .canonicalize()
             .expect("temporary root")
@@ -5155,8 +4165,8 @@ mod tests {
                 "response_mode".to_owned(),
                 "direct_post.jwt".to_owned(),
             )]),
-            info_after_capture: serde_json::json!({"status":"WAITING"}),
-            wait_state_after_capture: serde_json::json!({"state":"WAITING"}),
+            info_after_capture: serde_json::json!({"status":"FINISHED","result":"REVIEW"}),
+            wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
             info_calls: AtomicUsize::new(0),
             upload_review: true,
             uploaded: AtomicBool::new(false),
@@ -5187,11 +4197,6 @@ mod tests {
             ("credential_format".to_owned(), "dc+sd-jwt".to_owned()),
             ("response_mode".to_owned(), "direct_post.jwt".to_owned()),
         ]);
-        let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
-            captures: 0,
-            capture_fails: false,
-        }));
-        let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
             attached: None,
             expected_delivery_host: "suite.example",
@@ -5201,11 +4206,6 @@ mod tests {
             completion_outcome: OpenId4VpCompletionOutcome::Completed,
         }));
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
-        let capture = BrowserReviewScreenshotCapture::new(
-            root.clone(),
-            "request-0123456789abcdef0123456789abcdef",
-        )
-        .expect("capture");
         let runner = ConformanceRunner::new(ConformanceRunConfig {
             client,
             matrix,
@@ -5219,10 +4219,8 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
-            upload_review_screenshots: true,
+
             automation: vec![ConformanceAutomation {
-                browser: Some(browser.clone()),
-                review_screenshot_capture: Some(capture),
                 verifier: Some(verifier.clone()),
                 issuer: None,
                 ciba_approver: None,
@@ -5290,13 +4288,13 @@ mod tests {
         let module = &report.modules[0];
         assert_eq!(module.outcome, ModuleOutcome::Review);
         assert!(module.terminal);
-        assert_eq!(module.review_screenshots.len(), 1);
+        assert_eq!(module.review_screenshots.len(), 0);
         assert_eq!(module.variant, effective_variant);
-        assert_eq!(module.review_screenshots_required, 1);
-        assert_eq!(module.review_screenshots_required_captured, 1);
+        assert_eq!(module.review_screenshots_required, 0);
+        assert_eq!(module.review_screenshots_required_captured, 0);
         assert!(module.deferred_review_pending.is_none());
         assert!(integrity.all_modules_terminal, "{fixture_diagnostic}");
-        assert_eq!(browser_state.lock().expect("browser").captures, 1);
+
         let verifier = verifier_state.lock().expect("verifier");
         assert_eq!(
             (verifier.starts, verifier.completes, verifier.issuances),
@@ -5334,7 +4332,7 @@ mod tests {
                     *method == HttpMethod::Post && path == "/api/log/module-a/images/placeholder-a"
                 })
                 .count(),
-            1
+            0
         );
         assert!(report.local_success, "{fixture_diagnostic}");
         drop(requests);
@@ -5379,11 +4377,6 @@ mod tests {
         }));
         matrix.digest = "b".repeat(64);
         matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
-        let browser_state = Arc::new(Mutex::new(DeferredReviewBrowser {
-            captures: 0,
-            capture_fails: false,
-        }));
-        let browser: Arc<Mutex<dyn BrowserAutomation>> = browser_state.clone();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
             attached: None,
             expected_delivery_host: "www.certification.openid.net",
@@ -5393,11 +4386,6 @@ mod tests {
             completion_outcome: OpenId4VpCompletionOutcome::ExpectedImmediateRejection,
         }));
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
-        let capture = BrowserReviewScreenshotCapture::new(
-            root.clone(),
-            "request-0123456789abcdef0123456789abcdef",
-        )
-        .expect("capture");
         let runner = ConformanceRunner::new(ConformanceRunConfig {
             client,
             matrix,
@@ -5411,10 +4399,8 @@ mod tests {
             plan_resource_budgets: one_plan_budgets(),
             selected_resource_budget: budget(1, 1, 60),
             jobs: 1,
-            upload_review_screenshots: false,
+
             automation: vec![ConformanceAutomation {
-                browser: Some(browser),
-                review_screenshot_capture: Some(capture),
                 verifier: Some(verifier),
                 issuer: None,
                 ciba_approver: None,
@@ -5435,7 +4421,7 @@ mod tests {
         assert!(report.modules[0].terminal);
         assert!(report.modules[0].deferred_review_pending.is_none());
         assert!(report.modules[0].review_screenshots.is_empty());
-        assert_eq!(browser_state.lock().expect("browser").captures, 0);
+
         let verifier = verifier_state.lock().expect("verifier");
         assert_eq!(
             (verifier.starts, verifier.completes, verifier.issuances),
@@ -5450,246 +4436,17 @@ mod tests {
         drop(requests);
         std::fs::remove_dir_all(root).expect("remove temporary evidence root");
     }
-
-    #[cfg(unix)]
     #[test]
-    fn serial_vp_deferred_review_failures_close_and_clean_without_suite_placeholder_mutation() {
-        #[derive(Clone, Copy)]
-        enum Case {
-            RetentionDisabled,
-            CaptureDisabled,
-            ZeroRequiredMarker,
-            TwoRequiredMarkers,
-            RequiredMarkerInUnselectedEntry,
-            CaptureFailure,
-            PostCaptureInfoNotWaiting,
-            PostCaptureWaitStateNotWaiting,
-        }
-
-        impl Case {
-            fn name(self) -> &'static str {
-                match self {
-                    Self::RetentionDisabled => "retention-disabled",
-                    Self::CaptureDisabled => "capture-disabled",
-                    Self::ZeroRequiredMarker => "zero-required-marker",
-                    Self::TwoRequiredMarkers => "two-required-markers",
-                    Self::RequiredMarkerInUnselectedEntry => "marker-in-unselected-entry",
-                    Self::CaptureFailure => "capture-failure",
-                    Self::PostCaptureInfoNotWaiting => "post-capture-info-not-waiting",
-                    Self::PostCaptureWaitStateNotWaiting => "post-capture-wait-not-waiting",
-                }
-            }
-
-            fn browser_config(self) -> Value {
-                let required = serde_json::json!([
-                    "wait",
-                    "xpath",
-                    "//*",
-                    1,
-                    "review",
-                    "update-image-placeholder"
-                ]);
-                match self {
-                    Self::ZeroRequiredMarker => serde_json::json!([{
-                        "match":"https://issuer.example/authorize*",
-                        "tasks":[{
-                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
-                            "commands":[]
-                        }]
-                    }]),
-                    Self::TwoRequiredMarkers => serde_json::json!([{
-                        "match":"https://issuer.example/authorize*",
-                        "tasks":[{
-                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
-                            "commands":[required.clone(), required]
-                        }]
-                    }]),
-                    Self::RequiredMarkerInUnselectedEntry => serde_json::json!([
-                        {
-                            "match":"https://issuer.example/authorize*",
-                            "tasks":[{"commands":[]}]
-                        },
-                        {
-                            "match":"https://issuer.example/alternate*",
-                            "tasks":[{
-                                "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
-                                "commands":[required]
-                            }]
-                        }
-                    ]),
-                    _ => serde_json::json!([{
-                        "match":"https://issuer.example/authorize*",
-                        "tasks":[{
-                            "match":"https://www.certification.openid.net/test/a/module-a/verification-evidence",
-                            "commands":[required]
-                        }]
-                    }]),
-                }
-            }
-        }
-
-        for case in [
-            Case::RetentionDisabled,
-            Case::CaptureDisabled,
-            Case::ZeroRequiredMarker,
-            Case::TwoRequiredMarkers,
-            Case::RequiredMarkerInUnselectedEntry,
-            Case::CaptureFailure,
-            Case::PostCaptureInfoNotWaiting,
-            Case::PostCaptureWaitStateNotWaiting,
+    fn suite_html_evidence_accepts_official_snapshot_but_not_pending_or_empty_evidence() {
+        let valid = serde_json::json!([{"result":"REVIEW","page_source":"<html>Login</html>","content_type":"text/html","matched_regexp":".*"}]);
+        assert!(validate_suite_browser_evidence(&valid).is_ok());
+        for invalid in [
+            serde_json::json!([{"result":"REVIEW","upload":"pending"}]),
+            serde_json::json!([{"result":"REVIEW","page_source":"","content_type":"text/html","matched_regexp":".*"}]),
+            serde_json::json!([{"result":"REVIEW","page_source":"<html>Login</html>","matched_regexp":".*"}]),
+            serde_json::json!([{"result":"REVIEW","page_source":"<html>Login</html>","content_type":"text/html"}]),
         ] {
-            let root = std::env::temp_dir()
-                .canonicalize()
-                .expect("temporary root")
-                .join(format!(
-                    "nazoauth-deferred-review-failclosed-{}-{}",
-                    case.name(),
-                    uuid::Uuid::now_v7()
-                ));
-            crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
-            let transport = Arc::new(DeferredReviewTransport {
-                requests: Mutex::new(Vec::new()),
-                suite_origin: "https://www.certification.openid.net",
-                test_name: "happy-flow",
-                module_variant: BTreeMap::new(),
-                info_after_capture: if matches!(case, Case::PostCaptureInfoNotWaiting) {
-                    serde_json::json!({"status":"FINISHED"})
-                } else {
-                    serde_json::json!({"status":"WAITING"})
-                },
-                wait_state_after_capture: if matches!(case, Case::PostCaptureWaitStateNotWaiting) {
-                    serde_json::json!({"state":"FINISHED"})
-                } else {
-                    serde_json::json!({"state":"WAITING"})
-                },
-                info_calls: AtomicUsize::new(0),
-                upload_review: false,
-                uploaded: AtomicBool::new(false),
-            });
-            let client = SuiteClient::with_transport(
-                Origin::parse("https://www.certification.openid.net").expect("official Suite"),
-                Some(BearerToken::new("suite-token").expect("token")),
-                transport.clone(),
-                ClientConfig::default(),
-            )
-            .expect("client");
-            let mut matrix = one_plan_matrix(serde_json::json!({
-                "alias":"vp-alias",
-                "browser":case.browser_config()
-            }));
-            matrix.digest = "b".repeat(64);
-            matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
-            let browser: Arc<Mutex<dyn BrowserAutomation>> =
-                Arc::new(Mutex::new(DeferredReviewBrowser {
-                    captures: 0,
-                    capture_fails: matches!(case, Case::CaptureFailure),
-                }));
-            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> =
-                Arc::new(Mutex::new(DeferredReviewVerifier {
-                    attached: None,
-                    expected_delivery_host: "www.certification.openid.net",
-                    starts: 0,
-                    completes: 0,
-                    issuances: 0,
-                    completion_outcome: OpenId4VpCompletionOutcome::Completed,
-                }));
-            let capture = (!matches!(case, Case::CaptureDisabled)).then(|| {
-                BrowserReviewScreenshotCapture::new(
-                    root.clone(),
-                    "request-0123456789abcdef0123456789abcdef",
-                )
-                .expect("capture")
-            });
-            let runner = ConformanceRunner::new(ConformanceRunConfig {
-                client,
-                matrix,
-                target_origin: Some(
-                    BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
-                ),
-                binding: Some(test_binding()),
-                poll_timeout: Duration::from_secs(1),
-                control: RunControl::default(),
-                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
-                plan_resource_budgets: one_plan_budgets(),
-                selected_resource_budget: budget(1, 1, 60),
-                jobs: 1,
-                upload_review_screenshots: false,
-                automation: vec![ConformanceAutomation {
-                    browser: Some(browser.clone()),
-                    review_screenshot_capture: capture,
-                    verifier: Some(verifier),
-                    issuer: None,
-                    ciba_approver: None,
-                }],
-                suite_resource_observer: (!matches!(case, Case::RetentionDisabled))
-                    .then(|| Arc::new(RetainingObserver) as Arc<dyn SuiteResourceObserver>),
-            })
-            .expect("runner");
-
-            let report = runner.run(&mut ()).report;
-
-            assert!(
-                report
-                    .modules
-                    .iter()
-                    .all(|module| module.outcome != ModuleOutcome::DeferredReviewPending),
-                "{} must not create a deferred review outcome: errors={:?}",
-                case.name(),
-                report.errors
-            );
-            assert!(
-                report
-                    .modules
-                    .iter()
-                    .all(|module| module.deferred_review_pending.is_none()),
-                "{} must not retain a deferred placeholder identity",
-                case.name()
-            );
-            assert!(
-                !report.orchestration_integrity.retention_eligible,
-                "{} must not retain Suite resources",
-                case.name()
-            );
-            assert!(
-                !report.orchestration_integrity.retention_candidate_settled
-                    && !report.local_success,
-                "{} must not turn an incomplete retention candidate into local success",
-                case.name()
-            );
-            assert!(
-                report.orchestration_integrity.cleanup_complete,
-                "{} must complete ordinary cleanup: {:?}",
-                case.name(),
-                report.cleanup
-            );
-            assert!(
-                report
-                    .cleanup
-                    .deleted_plans
-                    .iter()
-                    .any(|plan| plan == "suite-plan"),
-                "{} must delete the unretained Suite plan",
-                case.name()
-            );
-            let requests = transport.requests.lock().expect("deferred review requests");
-            assert!(
-                requests.iter().any(|(method, path)| {
-                    *method == HttpMethod::Delete && path == "/api/plan/suite-plan"
-                }),
-                "{} must use production plan cleanup",
-                case.name()
-            );
-            assert!(
-                requests.iter().all(|(_, path)| {
-                    !path.contains("image")
-                        && !path.contains("update-placeholder")
-                        && !path.contains("visited")
-                }),
-                "{} must never mutate a Suite review placeholder: {requests:?}",
-                case.name()
-            );
-            drop(requests);
-            std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+            assert!(validate_suite_browser_evidence(&invalid).is_err());
         }
     }
 }

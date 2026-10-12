@@ -76,6 +76,11 @@ pub(crate) enum Command {
     Discover {
         host: Option<String>,
     },
+    /// Installed controller and server versions; no release-network lookup.
+    Version {
+        selector: InstanceSelector,
+        all: bool,
+    },
     /// Instance state summary; `--all` fans out over the whole fleet (I03).
     Status {
         selector: InstanceSelector,

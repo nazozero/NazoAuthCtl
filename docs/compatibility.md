@@ -61,14 +61,17 @@ relations, then checks both the migration ledger and the token-storage shape.
 The final SELECT reads every count and the migration head from one statement
 snapshot taken after those locks; it does not reuse the presence probe's snapshot.
 The legacy `oauth_tokens` layout retains its exact historical hash preimage.
-The layout introduced by migration `20260926000100` counts refresh contracts,
-families and spent proofs separately. Missing, mixed or ledger-inconsistent
+The minimal layout introduced by migration `20260926000100` counts refresh
+contracts, families and spent proofs separately. When durable
+`oauth_token_issuances` is present, preserve the released 0.3.0 issuance-count
+preimage so existing backup manifests continue to validate. Both token layouts
+are checked after relation locks. Missing, mixed or ledger-inconsistent
 relations fail closed; an absent table is never treated as an empty table.
 
 This does not change backup manifest 4/5, restore receipt 2, or their checksum
 rules. Published snapshot metadata is not rewritten or rehashed. Restoring an
 old dump selects its legacy database facts before any server migration runs;
-a new dump selects its matching refresh-state facts. Do not add compatibility
+a new dump selects its matching released storage facts. Do not add compatibility
 tables or views to the server to satisfy a controller backup query.
 
 The sentinel is a bounded identity check alongside the immutable dump's byte
@@ -94,9 +97,9 @@ unrelated backup or identity metadata is damaged; healthy results omit this
 field. Admission, snapshot consumption and `self verify-state` still validate
 the facts they actually use.
 
-From controller/helper 0.2.31, backup chunks reuse one bounded SSH helper
+From controller/helper 0.3.1, backup chunks reuse one bounded SSH helper
 session per target. The controller selects this only after the verified helper
-hello advertises 0.2.31 or newer. Older helpers use the existing one-operation
+hello advertises 0.3.1 or newer. Older helpers use the existing one-operation
 transport. Chunk identities, digests, journal replay and interrupted-copy
 semantics remain unchanged; no new command option is needed.
 Imported files receive private permissions and the current user's ownership

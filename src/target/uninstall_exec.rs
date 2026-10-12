@@ -257,6 +257,17 @@ fn safe_managed_path(path: &Path) -> bool {
 /// writable data root. The rootless installer still owns those directories,
 /// so restore owner write/traverse permission before removing the exact
 /// target-state-owned tree. Symlinks are never followed.
+#[cfg(unix)]
+fn make_tree_removable(path: &Path) -> Result<(), Failure> {
+    crate::filesystem::make_tree_removable(path).map_err(|error| {
+        Failure::new(
+            HOST_ERR_OPERATION_INVALID,
+            format!("failed to prepare managed tree: {error}"),
+        )
+    })
+}
+
+#[cfg(not(unix))]
 fn make_tree_removable(path: &Path) -> Result<(), Failure> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         Failure::new(
@@ -266,23 +277,6 @@ fn make_tree_removable(path: &Path) -> Result<(), Failure> {
     })?;
     if metadata.file_type().is_symlink() {
         return Ok(());
-    }
-
-    #[cfg(unix)]
-    if metadata.is_dir() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mode = metadata.permissions().mode();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700)).map_err(
-            |error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    format!(
-                        "failed to make managed directory {} removable: {error}",
-                        path.display()
-                    ),
-                )
-            },
-        )?;
     }
 
     #[cfg(windows)]

@@ -435,13 +435,9 @@ fn materialize_vp_verification_evidence_browser(
         "{}/test/a/*/verification-evidence",
         suite_base_url.trim_end_matches('/')
     );
-    let authorization_url = format!(
-        "{}/test/a/*/authorize*",
-        suite_base_url.trim_end_matches('/')
-    );
     let expected = serde_json::json!([{
-        "comment": "drive the signed VP authorization entry; its required evidence task authorizes a NazoAuth verification-result capture",
-        "match": authorization_url,
+        "comment": "Suite scripted browser records deferred verification evidence; ctl independently checks the target transaction completion",
+        "match": evidence_url,
         "tasks": [{
             "task": "Capture verification evidence",
             "match": evidence_url,
@@ -921,4 +917,28 @@ fn resolve_suite_test_url(
         "{}/test/a/{alias}/{endpoint}",
         suite_origin.trim_end_matches('/')
     ))
+}
+
+#[cfg(test)]
+mod browser_evidence_tests {
+    use super::*;
+    #[test]
+    fn vp_evidence_is_driven_by_the_suite_evidence_url_not_authorization() {
+        let mut root = serde_json::Map::new();
+        materialize_vp_verification_evidence_browser(&mut root, "https://suite.example").unwrap();
+        assert_eq!(
+            root["browser"][0]["match"],
+            "https://suite.example/test/a/*/verification-evidence"
+        );
+        assert_eq!(
+            root["browser"][0]["tasks"][0]["commands"][0][5],
+            "update-image-placeholder"
+        );
+        materialize_vp_verification_evidence_browser(&mut root, "https://suite.example").unwrap();
+        root["browser"][0]["match"] = Value::String("https://other.example/*".into());
+        assert!(
+            materialize_vp_verification_evidence_browser(&mut root, "https://suite.example")
+                .is_err()
+        );
+    }
 }

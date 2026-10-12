@@ -108,8 +108,7 @@ pub(super) fn replace(command: &OsStr, replacement: &RuntimeReplacement) -> anyh
     else {
         bail!("Docker replacement requires a digest-bound OCI artifact");
     };
-    remove(command, &replacement.object_reference)
-        .context("removing the stopped Docker runtime before replacement")?;
+    container_shared::remove_replacement_source(command, replacement, "Docker")?;
     let image = container_shared::runnable_oci_image(
         image_reference,
         digest,

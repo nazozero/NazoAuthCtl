@@ -523,6 +523,32 @@ mod tests {
     };
 
     #[test]
+    fn bundled_haip_clients_require_pushed_authorization() {
+        let matrix: serde_json::Value = serde_json::from_slice(BUNDLED_MATRIX).unwrap();
+        let mut checked = 0;
+        for group in matrix["groups"].as_array().unwrap() {
+            if group["id"] != "openid4vc-vci-haip" {
+                continue;
+            }
+            for plan in group["plans"].as_array().unwrap() {
+                for role in plan["required_roles"].as_array().unwrap() {
+                    let registration = &role["registration_template"];
+                    assert_eq!(
+                        registration["security_policy"]["require_pushed_authorization_requests"],
+                        true
+                    );
+                    assert_eq!(
+                        registration["token_endpoint_auth_method"],
+                        "attest_jwt_client_auth"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 8);
+    }
+
+    #[test]
     fn bundled_matrix_resolves_public_aliases_and_exact_ids() {
         assert_eq!(
             resolve_bundled_oidf_selection(None).unwrap(),

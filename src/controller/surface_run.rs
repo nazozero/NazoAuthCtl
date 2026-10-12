@@ -29,7 +29,8 @@ use crate::registry::{HostTransport, RegistryStore};
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     if !matches!(
         cli.command,
-        Command::SelfVerifyState
+        Command::Version { .. }
+            | Command::SelfVerifyState
             | Command::RemoteExec
             | Command::RemoteTransferStream
             | Command::SelfUpdate { .. }
@@ -76,6 +77,10 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let report = crate::discover_adopt::run_discover(&context, DiscoverRequest { host })?;
             crate::ui::print_report(&report);
             Ok(())
+        }
+        Command::Version { selector, all } => {
+            let merged = merge(&selector, instance_flag, "version")?;
+            crate::fleet::fleet_read::run_version(merged.as_deref(), all, json_mode)
         }
         Command::Status { selector, all } => {
             selector_scoped(&selector, instance_flag, "status", |merged| {

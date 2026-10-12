@@ -21,6 +21,7 @@ pub struct CibaUserApprovalClient {
     email: Zeroizing<String>,
     password: Zeroizing<String>,
     transport: Arc<dyn Transport>,
+    allowed_clients: HashSet<String>,
 }
 
 impl std::fmt::Debug for CibaUserApprovalClient {
@@ -45,6 +46,7 @@ impl CibaUserApprovalClient {
         email: Zeroizing<String>,
         password: Zeroizing<String>,
         transport: Arc<dyn Transport>,
+        allowed_clients: HashSet<String>,
     ) -> Result<Self, CibaUserApprovalError> {
         if issuer.scheme() != "https"
             || issuer.host_str().is_none()
@@ -64,6 +66,7 @@ impl CibaUserApprovalClient {
             email,
             password,
             transport,
+            allowed_clients,
         })
     }
 
@@ -117,7 +120,10 @@ impl CibaUserApprovalClient {
             .get("auth_req_id")
             .and_then(Value::as_str)
             != Some(auth_req_id)
-            || verification_value.get("request").is_none_or(Value::is_null)
+            || !verification_value
+                .pointer("/request/client_id")
+                .and_then(Value::as_str)
+                .is_some_and(|client_id| self.allowed_clients.contains(client_id))
         {
             return Err(CibaUserApprovalError::VerificationRejected(403));
         }
@@ -379,8 +385,33 @@ mod tests {
             Zeroizing::new("applicant@example.invalid".to_owned()),
             Zeroizing::new("correct horse battery staple".to_owned()),
             fake,
+            HashSet::from(["client-1".to_owned()]),
         )
         .expect("client")
+    }
+
+    #[test]
+    fn security_cloud_ciba_foreign_client_never_reaches_decision() {
+        let fake = Arc::new(FakeTransport::new(vec![
+            response(
+                200,
+                &[
+                    ("Set-Cookie", "session=opaque; Path=/; HttpOnly"),
+                    ("Set-Cookie", "csrf=csrf-value; Path=/"),
+                ],
+                json!({"csrf_token":"csrf-value","mfa_required":false}),
+            ),
+            response(
+                200,
+                &[],
+                json!({"auth_req_id":"request-1","request":{"client_id":"foreign-client"}}),
+            ),
+        ]));
+        assert!(matches!(
+            client(fake.clone()).decide("request-1", true),
+            Err(CibaUserApprovalError::VerificationRejected(403))
+        ));
+        assert_eq!(fake.requests.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -482,6 +513,7 @@ mod tests {
                 Zeroizing::new("applicant@example.invalid".to_owned()),
                 Zeroizing::new("password".to_owned()),
                 fake.clone(),
+                HashSet::from(["client-1".to_owned()]),
             ),
             Err(CibaUserApprovalError::InvalidIssuer)
         ));
@@ -491,6 +523,7 @@ mod tests {
                 Zeroizing::new("applicant@example.invalid".to_owned()),
                 Zeroizing::new("password".to_owned()),
                 fake,
+                HashSet::from(["client-1".to_owned()]),
             ),
             Err(CibaUserApprovalError::InvalidIssuer)
         ));

@@ -85,10 +85,6 @@ pub enum ProgressActivity {
         issuer: String,
     },
     ApplyingResources,
-    StartingBrowser {
-        current: usize,
-        total: usize,
-    },
     CreatingSuitePlan {
         current: usize,
         total: usize,
@@ -358,12 +354,6 @@ pub fn activity_label(activity: &ProgressActivity, language: OutputLanguage) -> 
         }
         (OutputLanguage::English, ProgressActivity::ApplyingResources) => {
             "Applying tenant test resources".to_owned()
-        }
-        (OutputLanguage::Chinese, ProgressActivity::StartingBrowser { current, total }) => {
-            format!("正在启动浏览器 {current}/{total}")
-        }
-        (OutputLanguage::English, ProgressActivity::StartingBrowser { current, total }) => {
-            format!("Starting browser {current}/{total}")
         }
         (
             OutputLanguage::Chinese,

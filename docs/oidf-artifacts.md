@@ -29,7 +29,10 @@ an ordinary tenant user. NazoAuth exposes no conformance-only route. On the
 first interactive run ctl securely
 prompts for the selected Suite API token and stores it in the platform
 credential store. Non-interactive jobs may pipe the token with
-`--token-stdin`.
+`--token-stdin`. Tokens are never accepted as command-line values, and the
+interactive prompt hides input. Recovery of local tenant and proxy resources
+runs before Suite authentication; Suite cleanup remains journaled for a later
+retry when the remote Suite is unavailable.
 
 Ordinary Suite module failures are collected while later selected work continues
 by default; the final run still fails when any module failed. `--fail-fast`

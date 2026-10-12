@@ -763,6 +763,9 @@ impl TargetStateStore {
             resources,
             current_release,
         } = params;
+        // Port reservations are persisted in DeploymentState, including stopped
+        // deployments. Serialize admission across deployment IDs before writing.
+        let _port_guard = StateLock::acquire(self.root.join("runtime-ports.lock"))?;
         let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
         if let Ok(existing) = self.load_existing(deployment_id) {
             if existing
@@ -787,6 +790,19 @@ impl TargetStateStore {
                     "a DeploymentState already exists for '{deployment_id}' at revision {}; \
                      bootstrap never overwrites existing state",
                     existing.config.revision
+                ),
+            ));
+        }
+        if let Some(owner) = self
+            .list_deployments()?
+            .into_iter()
+            .find(|state| state.runtime.loopback_port == runtime.loopback_port)
+        {
+            return Err(Failure::new(
+                super::wire::HOST_ERR_OPERATION_INVALID,
+                format!(
+                    "loopback port {} is reserved by deployment '{}'",
+                    runtime.loopback_port, owner.deployment_id
                 ),
             ));
         }
@@ -1782,7 +1798,11 @@ mod tests {
         let store = TargetStateStore::open(temp.path().join("state"))?;
         store.bootstrap(
             "deploy-alpha",
-            sample_params("https://a.example", "nz-a"),
+            {
+                let mut params = sample_params("https://a.example", "nz-a");
+                params.runtime.loopback_port = 8001;
+                params
+            },
             "bootstrap",
         )?;
         let facts = recovery_facts(
@@ -1812,7 +1832,11 @@ mod tests {
         let store = TargetStateStore::open(temp.path().join("state"))?;
         store.bootstrap(
             "deploy-alpha",
-            sample_params("https://a.example", "nz-a"),
+            {
+                let mut params = sample_params("https://a.example", "nz-a");
+                params.runtime.loopback_port = 8001;
+                params
+            },
             "bootstrap",
         )?;
         let facts = recovery_facts(
@@ -1850,7 +1874,11 @@ mod tests {
         )?;
         store.bootstrap(
             "deploy-alpha",
-            sample_params("https://a.example", "nz-a"),
+            {
+                let mut params = sample_params("https://a.example", "nz-a");
+                params.runtime.loopback_port = 8001;
+                params
+            },
             "op",
         )?;
         let host_scope = temp.path().join("state").join("deployments").join("host");
@@ -1878,6 +1906,27 @@ mod tests {
         crate::filesystem::atomic_write(&broken_dir.join("state.json"), b"{ not json", 0o600)?;
         let error = store.list_deployments().expect_err("corrupt document");
         assert_eq!(error.code, crate::error_codes::STATE_RESET_REQUIRED);
+        Ok(())
+    }
+    #[test]
+    fn security_cloud_stopped_deployment_keeps_its_persisted_port_reservation() -> anyhow::Result<()>
+    {
+        let temp = crate::filesystem::PrivateTempDir::new("port-reservation")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        store.bootstrap(
+            "deploy-a",
+            sample_params("https://a.example", "runtime-a"),
+            "a",
+        )?;
+        let failure = store
+            .bootstrap(
+                "deploy-b",
+                sample_params("https://b.example", "runtime-b"),
+                "b",
+            )
+            .unwrap_err();
+        assert!(failure.detail.contains("reserved"));
+        assert!(store.load_existing("deploy-b").is_err());
         Ok(())
     }
 }

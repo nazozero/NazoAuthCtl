@@ -24,7 +24,17 @@ pub struct PrivateTempDir {
 
 impl PrivateTempDir {
     pub fn new(prefix: &str) -> anyhow::Result<Self> {
-        let root = std::env::temp_dir();
+        Self::new_in(prefix, &std::env::temp_dir())
+    }
+
+    fn new_in(prefix: &str, root: &Path) -> anyhow::Result<Self> {
+        if prefix.is_empty() || prefix.contains(['/', '\\']) || matches!(prefix, "." | "..") {
+            bail!("temporary directory prefix must be a single name");
+        }
+        // Resolve the parent before creating anything, then reject parents
+        // another identity can rename. Never canonicalize the created leaf.
+        let root = fs::canonicalize(root)?;
+        validate_secure_ancestors(&root, "temporary directory")?;
         for _ in 0..32 {
             let suffix = hex(&rand::random::<[u8; 12]>());
             let path = root.join(format!("{prefix}.{suffix}"));
@@ -35,24 +45,20 @@ impl PrivateTempDir {
                 }
                 #[cfg(not(windows))]
                 {
-                    fs::create_dir(&path).map_err(anyhow::Error::from)
+                    let mut builder = fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt as _;
+                        builder.mode(0o700);
+                    }
+                    builder.create(&path).map_err(anyhow::Error::from)
                 }
             };
             match create_result {
                 Ok(()) => {
                     #[cfg(not(windows))]
                     set_mode(&path, 0o700)?;
-                    let canonical = fs::canonicalize(&path)
-                        .inspect_err(|_| {
-                            let _ = fs::remove_dir(&path);
-                        })
-                        .with_context(|| {
-                            format!(
-                                "failed to canonicalize private temporary directory {}",
-                                path.display()
-                            )
-                        })?;
-                    return Ok(Self { path: canonical });
+                    return Ok(Self { path });
                 }
                 Err(error)
                     if error
@@ -83,6 +89,110 @@ impl Drop for PrivateTempDir {
 #[cfg(windows)]
 pub(crate) fn promote_private_file_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
     windows::promote_private_file_no_replace(from, to)
+}
+
+/// Restore directory permissions through descriptors; never follow a child
+/// symlink in a runtime-writable tree.
+#[cfg(unix)]
+pub fn make_tree_removable(path: &Path) -> anyhow::Result<()> {
+    use rustix::fs::{Dir, Mode, OFlags, fchmod, open, openat};
+    use std::os::fd::OwnedFd;
+
+    fn visit(directory: OwnedFd) -> anyhow::Result<()> {
+        let metadata = rustix::fs::fstat(&directory)?;
+        fchmod(&directory, Mode::from_raw_mode(metadata.st_mode | 0o700))?;
+        for entry in Dir::read_from(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            match openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(child) => visit(child)?,
+                Err(
+                    rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP | rustix::io::Errno::NOENT,
+                ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    validate_secure_ancestors(
+        path.parent().context("managed tree has no parent")?,
+        "managed tree",
+    )?;
+    match open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => visit(directory),
+        Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Hand a managed data tree to its runtime identity without following mutable
+/// pathnames. Only root or that runtime may own nodes; hard links are rejected.
+#[cfg(unix)]
+pub fn set_data_tree_identity(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    preserve_owner: bool,
+) -> anyhow::Result<()> {
+    use rustix::fs::{Dir, FileType, Mode, OFlags, fchmod, fchown, fstat, open, openat};
+    use rustix::fs::{Gid, Uid};
+    use std::os::fd::OwnedFd;
+    fn visit(node: OwnedFd, uid: u32, gid: u32, preserve_owner: bool) -> anyhow::Result<()> {
+        let metadata = fstat(&node)?;
+        let kind = FileType::from_raw_mode(metadata.st_mode);
+        if kind != FileType::Directory && kind != FileType::RegularFile {
+            bail!("runtime data tree contains a special file");
+        }
+        if !preserve_owner && metadata.st_uid != 0 && metadata.st_uid != uid {
+            bail!("runtime data tree contains a foreign owner");
+        }
+        if kind == FileType::RegularFile && metadata.st_nlink != 1 {
+            bail!("runtime data tree contains a hard link");
+        }
+        if !preserve_owner {
+            fchown(&node, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+        }
+        if kind == FileType::Directory {
+            fchmod(&node, Mode::from_raw_mode(0o700))?;
+            for entry in Dir::read_from(&node)? {
+                let entry = entry?;
+                if matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                    continue;
+                }
+                let child = openat(
+                    &node,
+                    entry.file_name(),
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                visit(child, uid, gid, preserve_owner)?;
+            }
+        }
+        Ok(())
+    }
+    validate_secure_ancestors(
+        path.parent().context("runtime data tree has no parent")?,
+        "runtime data tree",
+    )?;
+    let directory = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    visit(directory, uid, gid, preserve_owner)
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {

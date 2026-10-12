@@ -413,7 +413,7 @@ impl RuntimeBackend for SystemdBackend {
     }
 
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String> {
-        systemd_one_shot_process(task)?.stdin_stdout(&task.stdin)
+        task.capture_result(systemd_one_shot_process(task)?)
     }
 
     fn pull_image(&self, _image_reference: &str) -> anyhow::Result<()> {
@@ -842,7 +842,7 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
         } else {
             value.to_owned()
         };
-        process = process.arg(format!("--setenv={name}={value}"));
+        process = process.arg(format!("--setenv={name}")).env(name, value);
     }
     for (name, source) in &task.transient_credentials {
         process = process.arg(format!(

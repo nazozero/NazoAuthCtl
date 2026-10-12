@@ -34,7 +34,7 @@ use std::{
     io::IsTerminal as _,
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Child, Command as StdCommand, Stdio},
+    process::{Child, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -103,7 +103,8 @@ impl RecoverySshForward {
         drop(listener);
 
         let argv = recovery_forward_argv(profile, local_port, remote_port);
-        let mut child = StdCommand::new(SSH_PROGRAM)
+        let mut child = Process::new(SSH_PROGRAM)
+            .command()
             .args(argv)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -306,7 +307,7 @@ impl SshTarget {
                 | super::wire::HostOperationBody::BackupTransferWrite { .. }
         ) && self.handshake.borrow().as_ref().is_some_and(|hello| {
             semver::Version::parse(hello.version.trim_start_matches('v'))
-                .is_ok_and(|version| version >= semver::Version::new(0, 2, 31))
+                .is_ok_and(|version| version >= semver::Version::new(0, 3, 1))
         });
         let stdout = if streaming {
             self.transmit_transfer_frame(payload)?
@@ -520,7 +521,8 @@ impl SshTarget {
             "正在为主机“{}”验证 sudo 权限，请完成终端提示。",
             self.profile
         );
-        let status = StdCommand::new(&self.program)
+        let status = Process::new(&self.program)
+            .command()
             .args(self.sudo_interactive_args())
             .status()
             .context("failed to run the interactive sudo pre-authorization")?;
@@ -952,7 +954,8 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
 
     #[test]
     fn backup_chunks_reuse_new_helpers_and_keep_old_helpers_compatible() {
-        for (version, expected_calls) in [("0.2.30", 3), ("0.2.31", 2)] {
+        for (version, expected_calls) in [("0.2.30", 3), ("0.2.31", 3), ("0.3.0", 3), ("0.3.1", 2)]
+        {
             let stub = SshStub::install_with_hello(
                 &StubScenario {
                     response_json: &ping_response_json("transport-fixture"),
@@ -982,7 +985,7 @@ exit "$(cat "$(dirname "$0")/exitcode.txt")"
                     .iter()
                     .filter(|args| args.ends_with("transfer-stream"))
                     .count(),
-                usize::from(version == "0.2.31")
+                usize::from(version == "0.3.1")
             );
         }
     }

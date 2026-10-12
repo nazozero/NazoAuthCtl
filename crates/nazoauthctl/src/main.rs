@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use cliclack::{intro, log, note, outro};
 use nazoauthctl_conformance::{
-    ArtifactTrustPolicy, BearerToken, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS,
-    OidfPlanSelection, OutputLanguage, bundled_oidf_selection_choices, open_cached_oidf_artifact,
+    ArtifactTrustPolicy, MAX_PARALLEL_JOBS, MAX_POLL_TIMEOUT_SECONDS, OidfPlanSelection,
+    OutputLanguage, bundled_oidf_selection_choices, open_cached_oidf_artifact,
     open_cached_oidf_driver_plan, read_artifact_driver, read_artifact_matrix,
     read_compact_manifest, resolve_bundled_oidf_plan_id, resolve_bundled_oidf_selection,
     resolve_oidf_artifact, verify_oidf_artifact,
@@ -676,7 +676,6 @@ fn exit_with_error(error: &anyhow::Error, json: bool) -> ! {
 pub(crate) struct RunInvocation {
     pub(crate) instance: Option<String>,
     pub(crate) tenant_id: String,
-    pub(crate) token: Option<BearerToken>,
     pub(crate) token_stdin: bool,
     pub(crate) json: bool,
     pub(crate) delete_suite_plans: bool,
@@ -697,7 +696,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         std::process::exit(0);
     }
 
-    let mut token = None;
     let mut token_stdin = false;
     let mut json = false;
     let mut delete_suite_plans = false;
@@ -710,7 +708,7 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     while index < values.len() {
         let option = values[index].as_str();
         match option {
-            "--poll-timeout" | "--jobs" | "--token" => {
+            "--poll-timeout" | "--jobs" => {
                 let value = values
                     .get(index + 1)
                     .with_context(|| {
@@ -734,18 +732,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                                     "--jobs must be an integer",
                                     "--jobs 必须为整数",
                                 ))?;
-                    }
-                    "--token" => {
-                        set_once(
-                            &mut token,
-                            BearerToken::new(value).context(
-                                nazoauthctl_core::presentation_text(
-                                    "--token is invalid",
-                                    "--token 的内容无效",
-                                ),
-                            )?,
-                            "--token",
-                        )?;
                     }
                     _ => unreachable!(),
                 }
@@ -848,12 +834,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let tenant_id = uuid::Uuid::now_v7().to_string();
-    if token.is_some() && token_stdin {
-        localized_bail!(
-            "--token and --token-stdin cannot be used together",
-            "--token 和 --token-stdin 不能同时使用"
-        );
-    }
     if poll_timeout.is_zero()
         || poll_timeout > Duration::from_secs(MAX_POLL_TIMEOUT_SECONDS)
         || !(1..=MAX_PARALLEL_JOBS).contains(&jobs)
@@ -866,7 +846,6 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
     Ok(RunInvocation {
         instance,
         tenant_id,
-        token,
         token_stdin,
         json,
         delete_suite_plans,
@@ -919,10 +898,10 @@ fn output_language() -> OutputLanguage {
 fn run_help(language: OutputLanguage) -> &'static str {
     match language {
         OutputLanguage::Chinese => {
-            "用法：\n  nazoauthctl [--instance 实例] oidf configure --tenant-domain 域名 --suite HTTPS地址\n  nazoauthctl [--instance 实例] oidf run [分组或计划] [选项]\n\nconfigure 只需设置一次临时租户所用的通配域名后缀和 OIDF Suite 地址。未指定分组或计划时运行完整矩阵。可用别名：oidc、ciba、fapi、openid4vci、openid4vp、openid4vc；也可使用内置分组或计划的完整 ID。\n\n每次运行都会创建新的临时租户、生成新的测试资料，并仅在所选计划需要时启动浏览器任务。Suite 测试记录默认保留。\n\n选项：\n  --token TOKEN                  本次运行直接使用 Token，不保存\n  --token-stdin                  从标准输入读取 Token，不保存\n  --json                         输出完整 JSON 报告；默认仅输出简洁摘要\n  --delete-suite-plans           运行结束后删除本次创建的 Suite 测试记录\n  --exclude-plan ID              明确排除计划，接受完整 ID 或 p040 形式，可重复指定\n  --fail-fast                    首个错误后停止后续测试（默认继续收集）\n  --jobs N                       并行计划数，1-4（默认：4）\n  --poll-timeout 秒数            单个模块等待 Suite 的最长时间（默认：1800）"
+            "用法：\n  nazoauthctl [--instance 实例] oidf configure --tenant-domain 域名 --suite HTTPS地址\n  nazoauthctl [--instance 实例] oidf run [分组或计划] [选项]\n\nconfigure 只需设置一次临时租户所用的通配域名后缀和 OIDF Suite 地址。未指定分组或计划时运行完整矩阵。可用别名：oidc、ciba、fapi、openid4vci、openid4vp、openid4vc；也可使用内置分组或计划的完整 ID。\n\n每次运行都会创建新的临时租户、生成新的测试资料，并仅在所选计划需要时启动浏览器任务。Suite 测试记录默认保留。\n\n选项：\n  --token-stdin                  从标准输入读取 Token，不保存\n  --json                         输出完整 JSON 报告；默认仅输出简洁摘要\n  --delete-suite-plans           运行结束后删除本次创建的 Suite 测试记录\n  --exclude-plan ID              明确排除计划，接受完整 ID 或 p040 形式，可重复指定\n  --fail-fast                    首个错误后停止后续测试（默认继续收集）\n  --jobs N                       并行计划数，1-4（默认：4）\n  --poll-timeout 秒数            单个模块等待 Suite 的最长时间（默认：1800）"
         }
         OutputLanguage::English => {
-            "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the wildcard tenant-domain suffix and OIDF Suite origin once. Without a selector, the complete bundled Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant and test material, and starts browser workers only when the selected plan needs them. Suite test records are retained by default.\n\nOptions:\n  --token TOKEN                  Use a token for this run only; do not save it\n  --token-stdin                  Read a token from stdin; do not save it\n  --json                         Print the full JSON report; the default is a concise summary\n  --delete-suite-plans           Delete Suite test records created by the run when it finishes\n  --exclude-plan ID              Explicitly exclude a full plan ID or p040 suffix; repeatable\n  --fail-fast                    Stop after the first error (default: continue collecting)\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
+            "Usage:\n  nazoauthctl [--instance SELECTOR] oidf configure --tenant-domain DOMAIN --suite HTTPS_ORIGIN\n  nazoauthctl [--instance SELECTOR] oidf run [GROUP_OR_PLAN] [options]\n\nConfigure stores the wildcard tenant-domain suffix and OIDF Suite origin once. Without a selector, the complete bundled Matrix runs. Aliases: oidc, ciba, fapi, openid4vci, openid4vp, openid4vc. Exact bundled group and plan IDs are also accepted.\n\nEach run creates a fresh temporary tenant and test material, and starts browser workers only when the selected plan needs them. Suite test records are retained by default.\n\nOptions:\n  --token-stdin                  Read a token from stdin; do not save it\n  --json                         Print the full JSON report; the default is a concise summary\n  --delete-suite-plans           Delete Suite test records created by the run when it finishes\n  --exclude-plan ID              Explicitly exclude a full plan ID or p040 suffix; repeatable\n  --fail-fast                    Stop after the first error (default: continue collecting)\n  --jobs N                       Parallel plan workers, 1-4 (default: 4)\n  --poll-timeout SECONDS         Per-module Suite wait bound (default: 1800)"
         }
     }
 }
@@ -1499,43 +1478,16 @@ mod tests {
     }
 
     #[test]
-    fn direct_token_is_transient_and_redacted() {
-        let parsed = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--token",
-            "temporary-secret",
-        ]))
-        .expect("parse")
-        .expect("run");
-
-        assert!(parsed.token.is_some());
-        assert_eq!(
-            format!("{:?}", parsed.token.as_ref().expect("token")),
-            "BearerToken(REDACTED)"
-        );
-        assert!(!parsed.token_stdin);
-    }
-
-    #[test]
-    fn direct_token_and_stdin_are_mutually_exclusive() {
-        let error = routed_run(&args(&[
-            "nazoauthctl",
-            "oidf",
-            "run",
-            "--token",
-            "temporary-secret",
-            "--token-stdin",
-        ]))
-        .err()
-        .expect("ambiguous token source must fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("--token and --token-stdin cannot be used together")
-        );
+    fn security_cloud_rejects_argv_token_without_echoing_secret() {
+        for suffix in [vec![], vec!["--token-stdin"]] {
+            let mut values = vec!["nazoauthctl", "oidf", "run", "--token", "temporary-secret"];
+            values.extend(suffix);
+            let error = routed_run(&args(&values))
+                .err()
+                .expect("argv token must fail");
+            assert!(!error.to_string().contains("temporary-secret"));
+            assert!(error.to_string().contains("--token"));
+        }
     }
 
     #[test]
@@ -1554,7 +1506,7 @@ mod tests {
     #[test]
     fn run_help_is_localized() {
         assert!(run_help(OutputLanguage::Chinese).contains("用法："));
-        assert!(run_help(OutputLanguage::Chinese).contains("本次运行直接使用 Token，不保存"));
+        assert!(run_help(OutputLanguage::Chinese).contains("从标准输入读取 Token，不保存"));
         assert!(run_help(OutputLanguage::English).contains("Usage:"));
     }
 }

@@ -1,0 +1,31 @@
+{
+  "before-all": {
+    "exit_code": 101
+  },
+  "after-initial": {
+    "exit_code": 0
+  },
+  "ctl-final-tests": {
+    "exit_code": 0
+  },
+  "ctl-final-clippy": {
+    "exit_code": 0
+  },
+  "generator": {
+    "exit_code": 0
+  },
+  "installer-regression": [
+    {
+      "phase": "before",
+      "exit_code": 0,
+      "staging_parent": "/var/lib/nazoauthctl/evidence/security-cloud-20261011/installer-fixture/untrusted-temp",
+      "attestation_called": true
+    },
+    {
+      "phase": "after",
+      "exit_code": 0,
+      "staging_parent": "/var/lib/nazoauthctl/evidence/security-cloud-20261011/installer-fixture/install",
+      "attestation_called": true
+    }
+  ]
+}
