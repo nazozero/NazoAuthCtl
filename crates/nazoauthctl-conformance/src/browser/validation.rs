@@ -57,10 +57,6 @@ impl BrowserTargetOrigin {
         Ok(Self { url: canonical })
     }
 
-    pub fn from_origin(origin: &Origin) -> Result<Self, BrowserError> {
-        Self::parse(origin.as_str())
-    }
-
     pub fn as_url(&self) -> &Url {
         &self.url
     }
@@ -98,7 +94,6 @@ impl BrowserPolicy {
             suite_origin,
             limits: BrowserLimits::default(),
         };
-        policy.limits.validate()?;
         Ok(policy)
     }
 

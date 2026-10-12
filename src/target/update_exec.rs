@@ -486,7 +486,7 @@ impl HostLifecycleExecutor {
                 job.runtime_object,
                 &verified.runtime_artifact,
             )?;
-            replacement.local_artifact_id = verified.local_artifact_id.clone();
+            replacement.local_artifact_id = None;
             Ok::<_, Failure>(replacement)
         })
         .transpose()?;
@@ -717,7 +717,7 @@ impl HostLifecycleExecutor {
             job.expected_revision,
             super::deployment_state::UpdateCommit {
                 artifact: format!("sha256:{new_digest}"),
-                release: verified.release.clone(),
+                release: Some(verified.release.clone()),
                 config: staged_config_change(job.config_reference, job.config),
                 operation_id: job.operation_id.to_owned(),
             },
@@ -725,7 +725,7 @@ impl HostLifecycleExecutor {
         )?;
         Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
-            release: verified.release,
+            release: Some(verified.release),
             migration_result,
         }))
     }
@@ -1666,7 +1666,7 @@ pub(crate) fn verify_pinned_artifact_facts(
             )
         })?;
         let backend = runtime_backend::backend(kind);
-        let (digest, runtime_artifact, local_artifact_id) = match kind {
+        let (digest, runtime_artifact) = match kind {
             RuntimeBackendKind::Host => {
                 let runtime_root = runtime_root.ok_or_else(|| {
                     Failure::new(
@@ -1705,7 +1705,6 @@ pub(crate) fn verify_pinned_artifact_facts(
                         path: cached,
                         sha256: observed_digest,
                     },
-                    None,
                 )
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
@@ -1729,7 +1728,6 @@ pub(crate) fn verify_pinned_artifact_facts(
                         image_reference: oci_image.to_owned(),
                         digest: oci_runtime_digest.to_owned(),
                     },
-                    None,
                 )
             }
         };
@@ -1742,8 +1740,7 @@ pub(crate) fn verify_pinned_artifact_facts(
         return Ok(VerifiedArtifactFacts {
             digest,
             runtime_artifact,
-            local_artifact_id,
-            release: Some(release),
+            release,
         });
     }
     let release = VerifiedRelease::verify(ReleaseRequest {
@@ -1757,7 +1754,7 @@ pub(crate) fn verify_pinned_artifact_facts(
             sanitize(error.to_string()),
         )
     })?;
-    let (digest, runtime_artifact, local_artifact_id) = match kind {
+    let (digest, runtime_artifact) = match kind {
         RuntimeBackendKind::Host => {
             let runtime_root = runtime_root.ok_or_else(|| {
                 Failure::new(
@@ -1789,7 +1786,6 @@ pub(crate) fn verify_pinned_artifact_facts(
                     path: cached,
                     sha256: digest,
                 },
-                None,
             )
         }
         RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
@@ -1824,19 +1820,15 @@ pub(crate) fn verify_pinned_artifact_facts(
                     image_reference: release.manifest.oci.repository.clone(),
                     digest: format!("sha256:{digest}"),
                 },
-                None,
             )
         }
     };
     Ok(VerifiedArtifactFacts {
         digest,
         runtime_artifact,
-        local_artifact_id,
-        release: Some(
-            super::deployment_state::ReleaseVersion::new(&release.manifest.version).map_err(
-                |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
-            )?,
-        ),
+        release: super::deployment_state::ReleaseVersion::new(&release.manifest.version).map_err(
+            |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
+        )?,
     })
 }
 
@@ -1845,8 +1837,7 @@ pub(crate) fn verify_pinned_artifact_facts(
 pub(crate) struct VerifiedArtifactFacts {
     pub(crate) digest: String,
     pub(crate) runtime_artifact: runtime_backend::ArtifactReference,
-    pub(crate) local_artifact_id: Option<String>,
-    pub(crate) release: Option<super::deployment_state::ReleaseVersion>,
+    pub(crate) release: super::deployment_state::ReleaseVersion,
 }
 
 /// Rebuild the runtime replacement from the LIVE observation, changing only

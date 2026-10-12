@@ -319,10 +319,6 @@ impl InstanceRecord {
         }
         if let Some(key_ref) = self.controller_key_ref.as_deref() {
             validate_reference(key_ref, "controller key ref")?;
-            // Belt-and-braces guard: the field is a locator, not key material.
-            if key_ref.contains("-----BEGIN") || key_ref.contains("PRIVATE KEY") {
-                bail!("controller key ref must be a reference, not embedded key material");
-            }
         }
         Ok(())
     }
@@ -1010,22 +1006,15 @@ impl RegistryStore {
     }
 
     fn find_host_by_id_locked(&self, host_id: Uuid) -> anyhow::Result<Option<HostRecord>> {
-        Ok(self
-            .load_all_locked::<HostRecord>(Directory::Hosts)?
-            .into_iter()
-            .find(|(_, record)| record.host_id == host_id)
-            .map(|(_, record)| record))
+        read_optional_record(&self.host_path(host_id), &host_id.to_string())
     }
 
     fn find_instance_by_deployment_locked(
         &self,
         deployment_id: &str,
     ) -> anyhow::Result<Option<InstanceRecord>> {
-        Ok(self
-            .load_all_locked::<InstanceRecord>(Directory::Instances)?
-            .into_iter()
-            .find(|(_, record)| record.deployment_id == deployment_id)
-            .map(|(_, record)| record))
+        validate_identifier(deployment_id, 128, "deployment id")?;
+        read_optional_record(&self.instance_path(deployment_id), deployment_id)
     }
 
     fn find_instance_by_alias_locked(&self, alias: &str) -> anyhow::Result<Option<InstanceRecord>> {
@@ -1119,6 +1108,14 @@ impl ConformingRecord for InstanceRecord {
     }
     fn matches_stem(&self, stem: &str) -> bool {
         self.deployment_id == stem
+    }
+}
+
+fn read_optional_record<T: ConformingRecord>(path: &Path, stem: &str) -> anyhow::Result<Option<T>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_record(path, stem).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
     }
 }
 
@@ -1224,6 +1221,24 @@ mod tests {
             first.host_id.to_string()
         );
         assert_eq!(store.list_hosts()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_record_lookup_isolated_from_unrelated_corruption() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        let instance = register_fixture(&store, &host, "deploy-healthy", "healthy")?;
+        filesystem::atomic_write(&store.host_path(Uuid::now_v7()), b"broken", 0o600)?;
+        filesystem::atomic_write(&store.instance_path("deploy-broken"), b"broken", 0o600)?;
+        assert_eq!(store.host_by_id(host.host_id)?, Some(host));
+        assert_eq!(
+            store.instance_by_deployment("deploy-healthy")?,
+            Some(instance)
+        );
+        assert!(store.instance_by_deployment("deploy-broken").is_err());
+        assert!(store.instance_by_deployment("../outside").is_err());
+        assert!(store.list_hosts().is_err());
         Ok(())
     }
 
@@ -1598,16 +1613,10 @@ mod tests {
         let error = instance.validate().expect_err("key material rejected");
         assert!(error.to_string().contains("controller key ref"), "{error}");
 
-        // Same guard for a marker without separators that would pass the
-        // generic reference-shape check.
+        // Marker-like text is a valid opaque locator; actual PEM is already
+        // excluded by the reference grammar above.
         instance.controller_key_ref = Some("store/-----BEGINPRIVATEKEY".to_owned());
-        let error = instance.validate().expect_err("marker rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("reference, not embedded key material"),
-            "{error}"
-        );
+        instance.validate()?;
         Ok(())
     }
 

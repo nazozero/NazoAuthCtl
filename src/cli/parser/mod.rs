@@ -53,6 +53,10 @@ impl Cli {
                 }
             }
             "bind" => Command::Bind(parse_bind(values)?),
+            "version" | "V" | "--version" | "-V" => {
+                let (selector, all) = parse_read_view_selector(values, "version")?;
+                Command::Version { selector, all }
+            }
             "status" => {
                 let (selector, all) = parse_read_view_selector(values, "status")?;
                 Command::Status { selector, all }
@@ -104,6 +108,7 @@ impl Cli {
             // ---- final-model maintenance surface ---------------------------
             "admin" => Command::Admin(parse_admin(values)?),
             "tls" => Command::Tls(parse_tls(values)?),
+            "remote" if values.as_slice() == ["transfer-stream"] => Command::RemoteTransferStream,
             "remote" if values.first().is_some_and(|value| value == "exec") => {
                 values.remove(0);
                 no_arguments(&values, "remote exec")?;
@@ -149,7 +154,13 @@ fn parse_limited_selector(
     maximum: usize,
 ) -> anyhow::Result<(InstanceSelector, usize)> {
     let parsed = fleet::parse_options(values, &["--limit"], &[], command)?;
-    let selector = surface::selector_from_parsed(&parsed)?;
+    if parsed.positionals.len() > 1 {
+        crate::ui::fail!(
+            "{command} accepts at most one selector argument",
+            "{command} 最多接受一个实例选择参数"
+        );
+    }
+    let selector = surface::selector_from_parsed(&parsed);
     let limit = match parsed.values.get("--limit") {
         Some(raw) => raw.parse::<usize>().with_context(|| {
             crate::ui::message!(
@@ -260,6 +271,27 @@ mod tests {
             )
             .is_ok(),
             "permanent deployment deletion keeps the explicit confirmation boundary"
+        );
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    #[test]
+    fn version_aliases_accept_instance_and_json_without_changing_other_commands() {
+        for alias in ["version", "V", "--version", "-V"] {
+            let cli = Cli::parse(
+                ["nazoauthctl", "--json", "--instance", "production", alias].map(str::to_owned),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(cli.json);
+            assert_eq!(cli.instance.as_deref(), Some("production"));
+            assert!(matches!(cli.command, Command::Version { all: false, .. }));
+        }
+        assert!(
+            Cli::parse(["nazoauthctl", "version", "--to", "v9.0.0"].map(str::to_owned)).is_err()
         );
     }
 }

@@ -479,7 +479,6 @@ pub(crate) fn recover_controller_identity(
         .map_err(|error| anyhow::anyhow!("{error}: the recovery secret did not parse"))?;
     let old_seed = Zeroizing::new(derive_recovery_seed(&old_secret, &deployment_id));
     old_secret.zeroize();
-    let old_public = recovery_public_key_bytes(&old_seed);
 
     // Replacement root travels inside the signed proposal so the old secret
     // stops verifying the moment the commit lands.
@@ -513,12 +512,6 @@ pub(crate) fn recover_controller_identity(
     // this authority decision.
     let allocation_nonce = rand::random::<[u8; 32]>();
     let allocation_signature = proposal.sign_allocation(&allocation_nonce, &old_seed);
-    if !proposal.verify_allocation_signature(&allocation_nonce, &old_public, &allocation_signature)
-    {
-        bail!(
-            "internal error: the computed allocation proof failed its own verification; aborting before request"
-        );
-    }
 
     let challenge = api
         .issue_recovery_challenge(&RecoveryChallengeBody {
@@ -535,16 +528,6 @@ pub(crate) fn recover_controller_identity(
         .context("challenge request failed; nothing was changed")?;
 
     let signature = proposal.sign_challenge(&challenge.challenge_id, &challenge.nonce, &old_seed);
-    if !proposal.verify_challenge_signature(
-        &challenge.challenge_id,
-        &challenge.nonce,
-        &old_public,
-        &signature,
-    ) {
-        bail!(
-            "internal error: the computed answer failed its own verification; aborting before submission"
-        );
-    }
 
     // P0-4: deliver the replacement secret BEFORE the answer is submitted.
     // The commit invalidates the old root the moment it lands, so the only

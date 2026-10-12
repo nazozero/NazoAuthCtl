@@ -905,3 +905,106 @@ fn contains_stable_token(rendered: &str, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// Show installed facts through the existing read-only target boundary. Never
+/// contact release registries or repair/update either executable for this view.
+pub(crate) fn run_version(
+    selector: Option<&str>,
+    all: bool,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    if all && selector.is_some() {
+        anyhow::bail!("version --all covers every registered instance; drop --instance");
+    }
+    let observed = (|| -> anyhow::Result<Vec<FleetItemOutcome>> {
+        let store = RegistryStore::open_default()?;
+        let instances = if let Some(selector) = selector {
+            vec![crate::fleet::resolve_instance(
+                &store,
+                Some(selector),
+                "version",
+            )?]
+        } else {
+            store.list_instances()?
+        };
+        let mut items = Vec::new();
+        for instance in instances {
+            let host = store
+                .host_by_id(instance.host_id)?
+                .context("registered instance host is missing")?;
+            items.push((instance, host));
+        }
+        Ok(FleetReadRunner::production().run(items, Arc::new(status_job)))
+    })();
+    let document = match observed {
+        Ok(outcomes) => version_document(&outcomes),
+        Err(error) => json!({
+            "ctl": env!("CARGO_PKG_VERSION"),
+            "nazoauth": [{"instance": selector, "version": null, "state": "detection_error", "detail": format!("{error:#}")}],
+        }),
+    };
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&document)?);
+    } else {
+        println!("{}", version_text(&document, crate::chinese_output()));
+    }
+    Ok(())
+}
+
+fn version_document(outcomes: &[FleetItemOutcome]) -> Value {
+    let servers = outcomes.iter().map(|outcome| match &outcome.result {
+        Ok(payload) => json!({
+            "instance": outcome.instance.alias,
+            "version": payload.get("version").cloned().unwrap_or(Value::Null),
+            "state": if payload.get("version").and_then(Value::as_str).is_some() { "installed" } else { "not_detected" },
+        }),
+        Err((code, detail)) => json!({"instance": outcome.instance.alias, "version": null, "state": "detection_error", "code": code, "detail": detail}),
+    }).collect::<Vec<_>>();
+    json!({"ctl": env!("CARGO_PKG_VERSION"), "nazoauth": servers})
+}
+
+fn version_text(document: &Value, chinese: bool) -> String {
+    let mut lines = vec![format!(
+        "NazoAuthCtl: {}",
+        document["ctl"].as_str().unwrap_or("unknown")
+    )];
+    let servers = document["nazoauth"]
+        .as_array()
+        .expect("version document has server array");
+    if servers.is_empty() {
+        lines.push(
+            if chinese {
+                "NazoAuth: 未安装或未检测到（尚未注册实例）"
+            } else {
+                "NazoAuth: not installed or not detected (no registered instances)"
+            }
+            .to_owned(),
+        );
+    }
+    for server in servers {
+        let state = match server["state"].as_str() {
+            Some("installed") => server["version"].as_str().unwrap_or("unknown").to_owned(),
+            Some("detection_error") => format!(
+                "{}: {}",
+                if chinese {
+                    "检测失败"
+                } else {
+                    "detection failed"
+                },
+                server["detail"].as_str().unwrap_or("unknown")
+            ),
+            _ => if chinese {
+                "未检测到版本"
+            } else {
+                "version not detected"
+            }
+            .to_owned(),
+        };
+        let name = server["instance"]
+            .as_str()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        lines.push(format!("NazoAuth{name}: {state}"));
+    }
+    lines.join("\n")
+}

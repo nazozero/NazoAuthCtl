@@ -352,13 +352,7 @@ impl TargetJournal {
                     super::wire::HostOutcome::Completed { .. } => JournalStatus::Completed,
                     super::wire::HostOutcome::Failed { .. } => JournalStatus::Failed,
                 },
-                result: if operation.operation.is_ephemeral_backup_read()
-                    && matches!(result.outcome, super::wire::HostOutcome::Completed { .. })
-                {
-                    None
-                } else {
-                    Some(result.clone())
-                },
+                result: Some(result.clone()),
             },
         )?;
         self.compact_if_needed(&path)?;

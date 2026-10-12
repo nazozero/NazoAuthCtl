@@ -1,5 +1,3 @@
-#[cfg(all(test, unix))]
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -41,15 +39,6 @@ impl BearerToken {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// Read a token from an owner-only regular file using the shared bounded
-    /// secure-file primitive.  The token value is never included in errors.
-    pub fn read_file(path: &Path) -> Result<Self, CredentialStoreError> {
-        let bytes = crate::secure_file::read_bounded(path, MAX_TOKEN_BYTES, true)
-            .map_err(map_secure_file_error)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| CredentialStoreError::InvalidToken)?;
-        Self::new(text).map_err(|_| CredentialStoreError::InvalidToken)
     }
 }
 
@@ -165,28 +154,6 @@ impl CredentialStore {
         }
     }
 
-    /// Read a token from an inherited descriptor without putting the value in
-    /// argv or an environment variable. The descriptor is reopened and its
-    /// resulting object is checked as a regular owner-only file. Anonymous
-    /// pipes are intentionally unsupported here; callers should use a private
-    /// file or pass an already parsed token from the CLI's channel layer.
-    #[cfg(unix)]
-    pub fn read_descriptor(fd: u32) -> Result<BearerToken, CredentialStoreError> {
-        if fd < 3 {
-            return Err(CredentialStoreError::InvalidDescriptor);
-        }
-        let bytes = crate::secure_file::read_descriptor(fd, MAX_TOKEN_BYTES, true)
-            .map(Zeroizing::new)
-            .map_err(map_secure_file_error)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| CredentialStoreError::InvalidToken)?;
-        BearerToken::new(text).map_err(|_| CredentialStoreError::InvalidToken)
-    }
-
-    #[cfg(not(unix))]
-    pub fn read_descriptor(_fd: u32) -> Result<BearerToken, CredentialStoreError> {
-        Err(CredentialStoreError::UnsupportedPlatform)
-    }
-
     #[cfg(unix)]
     fn path_for(&self, origin: &Origin) -> PathBuf {
         self.root
@@ -198,7 +165,6 @@ impl CredentialStore {
 pub enum CredentialStoreError {
     UnsupportedPlatform,
     InvalidToken,
-    InvalidDescriptor,
     NotFound,
     OriginMismatch,
     Oversize,
@@ -215,7 +181,6 @@ impl std::fmt::Display for CredentialStoreError {
                 "secure credential persistence is unavailable on this platform"
             }
             Self::InvalidToken => "bearer token is invalid",
-            Self::InvalidDescriptor => "credential descriptor is invalid",
             Self::NotFound => "credential was not found",
             Self::OriginMismatch => "credential origin does not match the requested Suite origin",
             Self::Oversize => "credential exceeds the size limit",
@@ -305,6 +270,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), CredentialStoreError> {
     }
 }
 
+#[cfg(unix)]
 fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> CredentialStoreError {
     match error {
         crate::secure_file::SecureFileError::UnsupportedPlatform => {
@@ -328,23 +294,112 @@ mod tests {
         assert!(!format!("{token}").contains("top-secret"));
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn windows_credential_namespace_matches_published_service_and_user() {
+        // Construct only: no existing Credential Manager values are read or written.
+        let root = Path::new(r"C:\NazoAuthCtlCredentialFixture");
+        let origin = Origin::parse("https://suite.example").expect("origin");
+        let entry = windows_entry(root, &origin).expect("entry");
+        assert_eq!(
+            entry.inner.get_specifiers(),
+            Some((
+                "nazoauthctl-conformance-609f14757e8864afb5a194282c0d9993d78d235981255bdee1e3a3a40933ab4a".to_owned(),
+                "origin-4d15bdf5a6cabec09a37e1ce891726fdb4f9f83ba7c70ac27a86245a414396b9".to_owned(),
+            ))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reads_native_legacy_format_credentials_and_isolates_origins() {
+        let work = nazoauthctl_runtime::filesystem::PrivateTempDir::new("legacy-credential")
+            .expect("private temporary namespace");
+        let store = CredentialStore::new(work.path()).expect("store");
+        let first = Origin::parse("https://legacy-suite.example").expect("origin");
+        let second = Origin::parse("https://other-suite.example").expect("origin");
+        // The product initializes Keyring's native store; both names are unique to this fixture.
+        assert!(store.load(&first).expect("new namespace").is_none());
+        let service = format!(
+            "nazoauthctl-conformance-{}",
+            digest_hex(work.path().to_string_lossy().as_bytes())
+        );
+        let user = format!("origin-{}", digest_hex(first.as_str().as_bytes()));
+        // Keyring 3.6.3 used user.service, Generic/Enterprise and UTF-16LE password bytes.
+        let target = format!("{user}.{service}");
+        let modifiers = std::collections::HashMap::from([
+            ("target", target.as_str()),
+            ("persistence", "Enterprise"),
+        ]);
+        let legacy = keyring_core::Entry::new_with_modifiers(&service, &user, &modifiers)
+            .expect("native legacy-format entry");
+        assert!(matches!(
+            legacy.get_secret(),
+            Err(keyring_core::Error::NoEntry)
+        ));
+        struct Cleanup(keyring_core::Entry);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.delete_credential();
+            }
+        }
+        let legacy = Cleanup(legacy);
+        let mut bytes = Zeroizing::new(
+            "legacy-token"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        legacy
+            .0
+            .set_secret(&bytes)
+            .expect("write frozen legacy encoding");
+        bytes.zeroize();
+        assert_eq!(
+            store
+                .load(&first)
+                .expect("load legacy entry")
+                .expect("token")
+                .as_str(),
+            "legacy-token"
+        );
+        assert!(store.load(&second).expect("other origin").is_none());
+        store.remove(&first).expect("remove legacy entry");
+        assert!(matches!(
+            legacy.0.get_secret(),
+            Err(keyring_core::Error::NoEntry)
+        ));
+        assert!(store.load(&first).expect("removed entry").is_none());
+        store.remove(&first).expect("remove missing entry");
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn origin_isolation_uses_distinct_records() {
-        let root = fs::canonicalize(std::env::temp_dir())
-            .expect("canonical temporary root")
-            .join(format!("nazo-conformance-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let store = CredentialStore::new(&root).expect("store");
+        let work = nazoauthctl_runtime::filesystem::PrivateTempDir::new("credential-upgrade")
+            .expect("private temporary namespace");
+        let store = CredentialStore::new(work.path()).expect("store");
         let first = Origin::parse("https://suite-one.example").expect("origin");
         let second = Origin::parse("https://suite-two.example").expect("origin");
+        struct Cleanup<'a>(&'a CredentialStore, &'a Origin, &'a Origin);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.remove(self.1);
+                let _ = self.0.remove(self.2);
+            }
+        }
+        let _cleanup = Cleanup(&store, &first, &second);
+        assert!(store.load(&first).expect("missing entry").is_none());
+        store.remove(&first).expect("remove missing entry");
         let token = BearerToken::new("token-one").expect("token");
         store.save(&first, &token).expect("save");
-        assert!(store.load(&second).expect("load").is_none());
+        assert!(store.load(&second).expect("other origin").is_none());
         assert_eq!(
             store.load(&first).expect("load").expect("token").as_str(),
             "token-one"
         );
-        let _ = fs::remove_dir_all(root);
+        store.remove(&first).expect("remove stored entry");
+        assert!(store.load(&first).expect("removed entry").is_none());
+        store.remove(&first).expect("repeated remove");
     }
 }

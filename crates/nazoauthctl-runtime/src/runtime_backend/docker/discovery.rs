@@ -17,10 +17,19 @@ pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation
     )?;
     let mut observations = Vec::new();
     for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
-        match inspect(command, id) {
-            Ok(observation) if observation.server_command_verified => {
-                observations.push(observation)
+        let candidate = container_shared::inspect_document_optional(
+            command,
+            &["container", "inspect", id],
+            "Docker",
+        )
+        .and_then(|value| match value {
+            Some(value) if is_server_document(&value) => {
+                observation_from_document(command, &value).map(Some)
             }
+            _ => Ok(None),
+        });
+        match candidate {
+            Ok(Some(observation)) => observations.push(observation),
             Ok(_) => {}
             Err(error) if container_shared::is_engine_unavailable_error(&error) => {
                 return Err(error);
@@ -34,18 +43,7 @@ pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation
     Ok(observations)
 }
 
-pub(super) fn inspect(
-    command: &OsStr,
-    object_reference: &str,
-) -> anyhow::Result<RuntimeObservation> {
-    let value = container_shared::inspect_document(
-        command,
-        &["container", "inspect", object_reference],
-        "Docker",
-    )?;
-    let config = value
-        .get("Config")
-        .context("Docker inspect omitted Config")?;
+fn is_server_document(value: &serde_json::Value) -> bool {
     let mut command_values = value
         .get("Path")
         .and_then(serde_json::Value::as_str)
@@ -60,7 +58,29 @@ pub(super) fn inspect(
             .filter_map(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
     );
-    let server_command_verified = server_command_verified(&command_values);
+    server_command_verified(&command_values)
+}
+
+pub(super) fn inspect(
+    command: &OsStr,
+    object_reference: &str,
+) -> anyhow::Result<RuntimeObservation> {
+    let value = container_shared::inspect_document(
+        command,
+        &["container", "inspect", object_reference],
+        "Docker",
+    )?;
+    observation_from_document(command, &value)
+}
+
+pub(super) fn observation_from_document(
+    command: &OsStr,
+    value: &serde_json::Value,
+) -> anyhow::Result<RuntimeObservation> {
+    let config = value
+        .get("Config")
+        .context("Docker inspect omitted Config")?;
+    let server_command_verified = is_server_document(value);
     let image_reference = config
         .get("Image")
         .and_then(serde_json::Value::as_str)
@@ -87,13 +107,13 @@ pub(super) fn inspect(
                 Some("trusted OCI digest could not be resolved".to_owned()),
             ),
         };
-    let ports = parse_ports(&value)?;
+    let ports = parse_ports(value)?;
     let networks = value
         .pointer("/NetworkSettings/Networks")
         .and_then(serde_json::Value::as_object)
         .map(|networks| networks.keys().cloned().collect())
         .unwrap_or_default();
-    let mounts = parse_mounts(&value)?;
+    let mounts = parse_mounts(value)?;
     let safe_environment = safe_environment(
         config
             .get("Env")
@@ -248,16 +268,13 @@ pub(super) fn inspect_optional(
     command: &OsStr,
     object_reference: &str,
 ) -> anyhow::Result<Option<RuntimeObservation>> {
-    if container_shared::inspect_document_optional(
+    container_shared::inspect_document_optional(
         command,
         &["container", "inspect", object_reference],
         "Docker",
     )?
-    .is_none()
-    {
-        return Ok(None);
-    }
-    Ok(Some(inspect(command, object_reference)?))
+    .map(|value| observation_from_document(command, &value))
+    .transpose()
 }
 
 /// Whether any locally cached image carries exactly the repository digest

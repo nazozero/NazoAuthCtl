@@ -76,6 +76,11 @@ pub(crate) enum Command {
     Discover {
         host: Option<String>,
     },
+    /// Installed controller and server versions; no release-network lookup.
+    Version {
+        selector: InstanceSelector,
+        all: bool,
+    },
     /// Instance state summary; `--all` fans out over the whole fleet (I03).
     Status {
         selector: InstanceSelector,
@@ -128,6 +133,7 @@ pub(crate) enum Command {
     /// §3.2): one bounded HostOperation JSON on stdin, one HostResult JSON on
     /// stdout, no daemon. Invoked only through OpenSSH by the control side.
     RemoteExec,
+    RemoteTransferStream,
     /// Controller self-maintenance: signed NazoAuthCtl releases only.
     SelfCheck(Option<String>),
     SelfUpdate {

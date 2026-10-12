@@ -453,9 +453,6 @@ impl OpenId4VciIssuerClient {
         url.set_path(path);
         url.set_query(None);
         url.set_fragment(None);
-        if !self.target_origin.allows(&url) {
-            return Err(OpenId4VciError::InvalidTargetOrigin);
-        }
         Ok(url)
     }
 

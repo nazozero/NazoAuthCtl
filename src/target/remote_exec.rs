@@ -13,7 +13,7 @@
 //! to stdout and explains the protocol failure on stderr, so the control side
 //! can treat non-zero exits strictly as transport errors.
 
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _};
 
 use anyhow::{Context, bail};
 
@@ -28,6 +28,49 @@ pub(crate) fn run_stdio() -> anyhow::Result<()> {
     let raw = read_bounded_stdin()?;
     let mut stdout = std::io::stdout().lock();
     serve(&raw, &mut stdout, &target_state_root()?)
+}
+
+pub(crate) const STREAM_GREETING: &[u8] = b"nazoauthctl-transfer-stream-1\n";
+
+pub(crate) fn run_stream_stdio() -> anyhow::Result<()> {
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    serve_stream(&mut stdin, &mut stdout, &target_state_root()?)
+}
+
+fn serve_stream(
+    input: &mut impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    state_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    let journal = TargetJournal::open(state_root)?;
+    let target = LocalTarget::with_state_root(state_root);
+    output.write_all(STREAM_GREETING)?;
+    output.flush()?;
+    loop {
+        let mut frame = Vec::new();
+        input
+            .take(super::wire::MAX_HOST_OPERATION_BYTES as u64 + 1)
+            .read_until(b'\n', &mut frame)?;
+        if frame.is_empty() {
+            return Ok(());
+        }
+        if frame.len() > super::wire::MAX_HOST_OPERATION_BYTES || !frame.ends_with(b"\n") {
+            bail!("invalid transfer stream frame");
+        }
+        let operation = parse_host_operation(&frame)?;
+        if !matches!(
+            operation.operation,
+            super::wire::HostOperationBody::BackupTransferRead { .. }
+                | super::wire::HostOperationBody::BackupTransferWrite { .. }
+        ) {
+            bail!("transfer stream only accepts backup chunks");
+        }
+        let result = target.execute_journaled_validated(&operation, &journal)?;
+        output.write_all(&encode_host_result(&result)?)?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+    }
 }
 
 /// Answer exactly one HostOperation from `input` with one HostResult on
@@ -92,6 +135,38 @@ mod tests {
             nonce,
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn transfer_stream_answers_multiple_chunks_and_rejects_other_operations() -> anyhow::Result<()>
+    {
+        let (_temp, root) = temp_state()?;
+        let mut input = Vec::new();
+        let mut ids = Vec::new();
+        for offset in [0, 256] {
+            let id = Uuid::now_v7().to_string();
+            let operation = crate::target::HostOperation::backup_transfer_read(
+                &id,
+                "missing-deployment",
+                Uuid::now_v7().to_string(),
+                "deployment.tar",
+                offset,
+            );
+            input.extend(serde_json::to_vec(&operation)?);
+            input.push(b'\n');
+            ids.push(id);
+        }
+        let mut output = Vec::new();
+        serve_stream(&mut std::io::Cursor::new(input), &mut output, &root)?;
+        let frames = output.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+        assert_eq!(frames.len(), 4);
+        for (frame, id) in frames[1..3].iter().zip(ids) {
+            assert_eq!(parse_host_result(frame)?.operation_id, id);
+        }
+        let mut ping = ping_input("rejected");
+        ping.push(b'\n');
+        assert!(serve_stream(&mut std::io::Cursor::new(ping), &mut Vec::new(), &root).is_err());
+        Ok(())
     }
 
     #[test]

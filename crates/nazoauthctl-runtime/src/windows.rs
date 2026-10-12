@@ -396,10 +396,6 @@ fn validate_descriptor(
         },
         "GetAclInformation",
     )?;
-    if private && size_info.AceCount != sids.len() as u32 {
-        bail!("secure object DACL must contain only trusted ACEs");
-    }
-    let mut trusted_seen = [false; 3];
     for index in 0..size_info.AceCount {
         let mut ace_ptr: *mut std::ffi::c_void = null_mut();
         check_bool(
@@ -415,15 +411,11 @@ fn validate_descriptor(
                 bail!("secure object DACL contains a non-trusted or empty ACE");
             }
             let ace_sid = (&ace.SidStart as *const u32).cast::<std::ffi::c_void>() as PSID;
-            let Some(index) = sids.iter().position(|candidate| unsafe {
+            if !sids.iter().any(|candidate| unsafe {
                 EqualSid(ace_sid, candidate.as_ptr() as PSID) != 0
-            }) else {
+            }) {
                 bail!("secure object DACL contains an untrusted principal");
-            };
-            if trusted_seen[index] {
-                bail!("secure object DACL contains duplicate trusted ACEs");
             }
-            trusted_seen[index] = true;
         } else if ace.Header.AceType == 0 && ace.Header.AceFlags & (INHERIT_ONLY_ACE as u8) == 0 {
             // A broad write ACE on an ancestor lets another account replace a
             // child between validation and open.  SYSTEM/Administrators are
@@ -756,7 +748,12 @@ fn stage_path(target: &Path) -> anyhow::Result<std::path::PathBuf> {
     Ok(target.with_file_name(format!(".{name}.nazoauth-{}.tmp", uuid::Uuid::now_v7())))
 }
 
-fn rename_replace(file: &File, parent: &File, target: &Path) -> anyhow::Result<()> {
+fn rename_file(
+    file: &File,
+    parent: &File,
+    target: &Path,
+    replace_existing: bool,
+) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     // Keep the destination directory handle open without FILE_SHARE_DELETE.
     // SetFileInformationByHandle on the local Windows provider rejects a
@@ -787,7 +784,7 @@ fn rename_replace(file: &File, parent: &File, target: &Path) -> anyhow::Result<(
         unsafe {
             ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len());
             (*info).Anonymous = FILE_RENAME_INFO_0 {
-                ReplaceIfExists: true,
+                ReplaceIfExists: replace_existing,
             };
             (*info).RootDirectory = null_mut();
             (*info).FileNameLength = (name.len() * 2) as u32;
@@ -818,6 +815,21 @@ fn rename_replace(file: &File, parent: &File, target: &Path) -> anyhow::Result<(
     bail!("SetFileInformationByHandle(FileRenameInfo) exhausted path forms")
 }
 
+pub fn promote_private_file_no_replace(from: &Path, to: &Path) -> anyhow::Result<()> {
+    let parent_path = from.parent().context("staged private file has no parent")?;
+    if to.parent() != Some(parent_path) {
+        bail!("private file promotion requires the same directory");
+    }
+    let parent = open_directory_handle(
+        parent_path,
+        FILE_ADD_FILE | FILE_DELETE_CHILD | READ_CONTROL,
+    )?;
+    validate_acl_handle_as_directory(&parent, true)?;
+    let source = open_handle(from, FILE_GENERIC_READ | READ_CONTROL | DELETE, OPEN_EXISTING)?;
+    validate_acl_handle(&source, true)?;
+    rename_file(&source, &parent, to, false)
+}
+
 fn commit_staged(
     staged: File,
     stage: &Path,
@@ -835,7 +847,7 @@ fn commit_staged(
         staged
             .sync_all()
             .with_context(|| format!("failed to persist staged {}", target.display()))?;
-        rename_replace(&staged, parent, target)
+        rename_file(&staged, parent, target, true)
     })();
     if let Err(error) = result {
         drop(staged);
@@ -965,6 +977,26 @@ pub fn open_append_file(path: &Path, label: &str) -> anyhow::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_acl_accepts_current_user_only_and_rejects_foreign_readers() {
+        with_security_attributes(0o600, false, 0, |attributes, _acl| {
+            let descriptor = unsafe { (*attributes).lpSecurityDescriptor };
+            let mut present = 0;
+            let mut defaulted = 0;
+            let mut acl = null_mut();
+            check_bool(unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted) }, "GetSecurityDescriptorDacl(test)")?;
+            // The creator includes SYSTEM and Administrators. A user-only ACL
+            // is also private and must not require granting extra access.
+            check_bool(unsafe { windows_sys::Win32::Security::DeleteAce(acl, 1) }, "DeleteAce")?;
+            check_bool(unsafe { windows_sys::Win32::Security::DeleteAce(acl, 1) }, "DeleteAce")?;
+            validate_descriptor(descriptor, true, true)?;
+            let everyone = well_known_sid(windows_sys::Win32::Security::WinWorldSid)?;
+            check_bool(unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, 0, FILE_GENERIC_READ, everyone.as_ptr() as PSID) }, "AddAccessAllowedAceEx")?;
+            assert!(validate_descriptor(descriptor, true, true).is_err());
+            Ok(())
+        }).unwrap();
+    }
 
     #[test]
     fn staged_file_is_private_before_secret_bytes_are_written() {

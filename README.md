@@ -185,3 +185,40 @@ attestation inputs supplied by that workflow.
 </details>
 
 Licensed under [AGPL-3.0-or-later](Cargo.toml).
+
+## Documentation maintenance
+
+Keep command contracts, deployment/recovery guides, and versioned release notes
+with the code they describe. Put one-time task plans, finding lists, suite
+investigations, and acceptance reports in CI artifacts or the associated
+issue/PR. Update affected guides and links when behavior or paths change.
+
+
+### Automatic operation and recovery
+
+Direct registry lookups by deployment/host ID validate only that record.
+CLI alias/deployment selection retains its existing matching rules. Status
+inspection retains readable facts when historical backup metadata is damaged
+and reports diagnostics. Continue using the existing commands:
+
+```sh
+nazoauthctl --json status --instance INSTANCE
+nazoauthctl self verify-state
+```
+
+Backup copy automatically reuses a transfer session with helpers that support
+it; older helpers retain the existing transport. No new flags are required.
+See [operation compatibility](docs/compatibility.md#operation-specific-compatibility),
+[ACME account reuse](docs/tls-acme-http01.md), and
+[selected conformance resources and cleanup](docs/conformance-run-options.md).
+
+### Installed versions
+
+Run `nazoauthctl version` (or `nazoauthctl V`) to show the installed Controller
+and registered NazoAuth versions. `-V` and `--version` are aliases. Without a
+selector it checks all registered instances; use `--instance production` to
+select one, or `--json` for structured output. An empty registry is shown as
+not installed or not detected. Unreachable hosts and unreadable state are
+reported as detection failures, while the Controller version remains visible.
+This command reads installed state; it does not look up available releases,
+update executables, or run self-update recovery.

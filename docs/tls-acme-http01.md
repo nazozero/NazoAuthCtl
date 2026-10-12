@@ -4,8 +4,8 @@ Human output follows the CLI locale and uses readable fields. Place `--json`
 before the command to obtain the complete structured result. See
 [language and presentation](cli-presentation.md).
 
-This contract is the certificate-issuance part of NazoAuthCtl issue #31. It
-creates deployment-owned public-server certificate material without changing a
+This contract creates deployment-owned public-server certificate material
+without changing a
 TLS consumer. Installation, reload, public verification, and rollback remain the
 separate `tls certificate` transaction. A stopped controller is therefore not
 on the authentication serving path.
@@ -94,7 +94,7 @@ nazoauthctl tls acme recover \
    capability, JTI, configuration/trust digests, allowed ACME origins, and
    expiry in a durable journal;
 2. persists and journal-binds the ACME account key before network use, then
-   creates or restores the configuration-bound account with that same key;
+   creates or restores the deployment/CA account with that same key;
 3. creates or resumes one exact-identifier order by its server-issued URL;
 4. journals the HTTP-01 path and digest before atomically publishing it;
 5. persists the server key and CSR before finalizing the order;
@@ -141,7 +141,15 @@ not claim that any live endpoint changed certificates.
 The ACME server performs the authoritative public HTTP-01 fetch. This phase does
 not claim a local loopback request proves public reachability. It also does not
 configure Direct TLS, Nginx/Angie, trusted proxy headers, or NazoAuth transport
-capabilities. NazoAuth #127's closed Direct TLS baseline does not provide the
-atomic reload or authenticated controller protocol for those operations; they
-still require the ordinary dynamically negotiated capabilities tracked by
-NazoAuth #128/#129 and parent #130.
+capabilities. Install and activate issued material through the existing
+[certificate transaction](tls-certificate-provider.md) and
+[deployment lifecycle](tls-deployment.md); issuance does not configure the
+consumer or prove that a live endpoint uses the new certificate.
+
+The deployment reuses one account per CA directory across hostname, webroot,
+polling and contact changes. Contact changes update that account. The current
+configuration still controls allowed HTTPS origins for every request. Account
+migration is automatic and retains old account files for receipt verification.
+Issuing a new certificate does not require the previous certificate/key files
+to remain present. `show`, installation and completed-operation recovery verify
+the actual material referenced by the receipt they consume.

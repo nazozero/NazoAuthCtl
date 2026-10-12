@@ -160,12 +160,13 @@ fn side_effect_hints_distinguish_conflict_from_precondition() {
 }
 
 #[test]
-fn operation_ids_are_lifted_out_of_the_chain() {
+fn identifiers_and_pending_words_do_not_create_execution_facts() {
     let id = "01970000-0000-7000-8000-000000000001";
     let error = anyhow::anyhow!("the migration outcome is unknown; resume operation {id}");
     let rendered = render_failure("update", &EnvelopeContext::default(), &error, true);
     let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-    assert_eq!(value["operation_id"], serde_json::json!(id));
+    assert!(value["operation_id"].is_null());
+    assert!(value["checkpoint"].is_null());
 
     let without = anyhow::anyhow!("no identifier here at all");
     let rendered = render_failure("update", &EnvelopeContext::default(), &without, true);
@@ -214,7 +215,7 @@ fn signing_key_migration_refusal_keeps_the_target_code() {
         value["code"],
         crate::target::update_exec::SIGNING_KEY_MIGRATION_REQUIRED
     );
-    assert_eq!(value["side_effects"], "none");
+    assert_eq!(value["side_effects"], "unknown");
 }
 
 #[test]
@@ -234,6 +235,6 @@ fn target_install_failure_keeps_remote_code_and_does_not_suggest_host_check() {
 
     assert_eq!(value["code"], crate::target::SECRET_PROVISION_FAILED);
     assert_eq!(value["detail"], detail);
-    assert_eq!(value["side_effects"], "none");
+    assert_eq!(value["side_effects"], "unknown");
     assert_eq!(value["next_command"], serde_json::Value::Null);
 }

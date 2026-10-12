@@ -288,41 +288,79 @@ pub fn backup_projection(
     scope_dir: &Path,
     state: &DeploymentState,
 ) -> anyhow::Result<BackupProjection> {
-    let local_rollback_ready = state.artifact.previous.is_some();
-    let Some(manifest) = load_manifest(scope_dir)? else {
-        return Ok(BackupProjection {
-            local_rollback_ready,
-            snapshot: None,
-        });
-    };
-    if manifest.deployment_id != state.deployment_id {
-        bail!("backup manifest deployment does not match DeploymentState");
+    let mut diagnostics = Vec::new();
+    let projection = inspect_backup(scope_dir, state, &mut diagnostics);
+    if !diagnostics.is_empty() {
+        bail!("{}", diagnostics.join("; "));
     }
-    let receipt = load_receipt(scope_dir)?;
-    let restore_tested_at = match receipt {
-        Some(receipt) => {
-            receipt.validate_against(&manifest)?;
-            Some(receipt.restored_at)
-        }
-        None => None,
+    Ok(projection)
+}
+
+/// Diagnostic reads expose each independently verified fact; failed evidence
+/// remains absent and explicit. Admission still uses the strict projection.
+pub(super) fn inspect_backup(
+    scope_dir: &Path,
+    state: &DeploymentState,
+    diagnostics: &mut Vec<String>,
+) -> BackupProjection {
+    let mut projection = BackupProjection {
+        local_rollback_ready: state.artifact.previous.is_some(),
+        snapshot: None,
     };
-    let off_host_verified_at = match load_off_host_receipt(scope_dir)? {
-        Some(receipt) => {
-            receipt.validate_against(&manifest)?;
-            Some(receipt.verified_at)
+    let manifest = match load_manifest(scope_dir).and_then(|manifest| {
+        if manifest
+            .as_ref()
+            .is_some_and(|m| m.deployment_id != state.deployment_id)
+        {
+            bail!("backup manifest deployment does not match DeploymentState");
         }
-        None => None,
+        Ok(manifest)
+    }) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return projection,
+        Err(error) => {
+            diagnostics.push(super::wire::sanitize(format!("backup manifest: {error}")));
+            return projection;
+        }
     };
-    Ok(BackupProjection {
-        local_rollback_ready,
-        snapshot: Some(SnapshotProjection {
-            snapshot_id: manifest.snapshot_id,
-            created_at: manifest.created_at,
-            manifest_sha256: manifest.manifest_sha256,
-            restore_tested_at,
-            off_host_verified_at,
-        }),
-    })
+    let restore_tested_at = match load_receipt(scope_dir).and_then(|receipt| {
+        receipt
+            .map(|r| {
+                r.validate_against(&manifest)?;
+                Ok(r.restored_at)
+            })
+            .transpose()
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(super::wire::sanitize(format!(
+                "restore-test receipt: {error}"
+            )));
+            None
+        }
+    };
+    let off_host_verified_at = match load_off_host_receipt(scope_dir).and_then(|receipt| {
+        receipt
+            .map(|r| {
+                r.validate_against(&manifest)?;
+                Ok(r.verified_at)
+            })
+            .transpose()
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(super::wire::sanitize(format!("off-host receipt: {error}")));
+            None
+        }
+    };
+    projection.snapshot = Some(SnapshotProjection {
+        snapshot_id: manifest.snapshot_id,
+        created_at: manifest.created_at,
+        manifest_sha256: manifest.manifest_sha256,
+        restore_tested_at,
+        off_host_verified_at,
+    });
+    projection
 }
 
 pub fn manifest_path(scope_dir: &Path) -> PathBuf {

@@ -130,6 +130,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::Bind(_) => "bind",
         cli::Command::Install(_) => "install",
         cli::Command::Discover { .. } => "discover",
+        cli::Command::Version { .. } => "version",
         cli::Command::Status { .. } => "status",
         cli::Command::Logs { .. } => "logs",
         cli::Command::Doctor { .. } => "doctor",
@@ -144,6 +145,7 @@ fn command_action(command: &cli::Command) -> &'static str {
         cli::Command::Admin(_) => "admin",
         cli::Command::Tls(_) => "tls",
         cli::Command::RemoteExec => "remote exec",
+        cli::Command::RemoteTransferStream => "remote transfer-stream",
         cli::Command::SelfCheck(_) => "self check",
         cli::Command::SelfUpdate { .. } => "self update",
         cli::Command::SelfRollback => "self rollback",
@@ -204,6 +206,7 @@ Commands:
   install     Fresh install of one instance onto one host
   discover    Read-only sweep of every NazoAuth deployment on one target
   bind        Initial Controller Key enrollment for one instance
+  version     Installed CTL and NazoAuth versions (alias: V; --instance supported)
   status      Instance state summary (--all for the whole fleet)
   logs        Bounded, redacted application log tail (--limit 1-500)
   doctor      Health and security diagnostics (--all supported)

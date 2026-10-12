@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use sha2::{Digest as _, Sha256};
 
-use crate::oidf_protocol as nazo_operator_protocol;
-use crate::oidf_protocol::{ControlResultData, TenantResourceIdentity};
+use nazo_operator_protocol::{ControlResultData, TenantResourceIdentity};
 use uuid::Uuid;
 #[cfg(unix)]
 use zeroize::Zeroizing;
@@ -523,7 +522,7 @@ fn verify_control_vp_receipt(
     let Ok(variant_bytes) = serde_json::to_vec(context.variant) else {
         return false;
     };
-    let context = nazo_operator_protocol::Openid4vpEvidenceContext {
+    let context = crate::oidf_protocol::Openid4vpEvidenceContext {
         run_jti: binding.run_id.clone(),
         artifact_sha256: context.artifact_digest.to_owned(),
         matrix_sha256: context.matrix_sha256.to_owned(),
@@ -533,7 +532,7 @@ fn verify_control_vp_receipt(
         variant_sha256: sha256(&variant_bytes),
     };
     let Ok(context_sha256) =
-        nazo_operator_protocol::canonical_openid4vp_evidence_context_sha256(&context)
+        crate::oidf_protocol::canonical_openid4vp_evidence_context_sha256(&context)
     else {
         return false;
     };
@@ -551,7 +550,7 @@ fn verify_control_vp_receipt(
     }
     let receipt_id = receipt.receipt_id.to_string();
     let transaction_id = receipt.transaction_id.to_string();
-    let expected = nazo_operator_protocol::Openid4vpVerificationReceiptExpectations {
+    let expected = crate::oidf_protocol::Openid4vpVerificationReceiptExpectations {
         issuer: &anchor.target_issuer,
         audience: &receipt.receipt_api_url,
         deployment_id: &anchor.deployment_id,
@@ -566,7 +565,7 @@ fn verify_control_vp_receipt(
         intent_sha256: &receipt.intent_sha256,
         capability_sha256: &receipt.capability_sha256,
     };
-    let Ok(verified) = nazo_operator_protocol::verify_openid4vp_verification_receipt(
+    let Ok(verified) = crate::oidf_protocol::verify_openid4vp_verification_receipt(
         &receipt.receipt_jws,
         &expected,
         &key,
@@ -916,7 +915,7 @@ pub fn validate_ordinary_control_identity(
     validate_identity(report, identity)
 }
 
-/// Retention evidence must target an existing root-owned safe directory before
+/// Retention evidence must target an existing controller-owned safe directory before
 /// Suite allocation begins; unlike ordinary evidence this preflight never
 /// creates an operator-selected path.
 pub fn validate_private_evidence_directory(root: &Path) -> Result<(), EvidenceError> {
@@ -937,12 +936,7 @@ pub fn validate_private_evidence_directory(root: &Path) -> Result<(), EvidenceEr
     }
 }
 
-#[cfg(all(unix, not(test)))]
-fn private_evidence_owner_is_allowed(uid: u32) -> bool {
-    uid == 0
-}
-
-#[cfg(all(unix, test))]
+#[cfg(unix)]
 fn private_evidence_owner_is_allowed(uid: u32) -> bool {
     uid == 0 || uid == rustix::process::geteuid().as_raw()
 }

@@ -25,7 +25,7 @@ mod progress;
 mod proxy_trust;
 mod recovery;
 mod report;
-mod secure_file;
+use nazoauthctl_runtime::secure_file;
 mod transport;
 
 pub use artifact::{

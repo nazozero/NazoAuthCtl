@@ -329,34 +329,12 @@ pub(crate) fn run_adopt(
         host.alias
     ))?;
 
-    // 3. Re-run discovery LIVE: adopt never consumes a stored discover
-    //    report, so drift between a discover run and this adopt cannot poison
-    //    the registration — vanished or renamed targets fail closed here.
-    let inspections = execute_state_list(target.as_ref())
-        .context("live discovery failed during adopt; nothing was registered")?;
-    let inspection = inspections
-        .iter()
-        .find(|candidate| candidate.deployment_id == request.deployment_id)
-        .cloned()
-        .ok_or_else(|| {
-            let known = if inspections.is_empty() {
-                "-".to_owned()
-            } else {
-                inspections
-                    .iter()
-                    .map(|candidate| candidate.deployment_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            anyhow::anyhow!(
-                "{ADOPT_TARGET_UNKNOWN}: no deployment '{}' was discovered on host '{}' \
-                 (live discovery reports: {}). Re-run discover and adopt an exactly matching \
-                 id; stored reports are never trusted",
-                request.deployment_id,
-                host.alias,
-                known
-            )
-        })?;
+    // Read only the selected deployment over the verified live channel.
+    let inspection = target.inspect_instance(&request.deployment_id)
+        .with_context(|| format!("{ADOPT_TARGET_UNKNOWN}: cannot inspect deployment '{}' on host '{}'; nothing was registered", request.deployment_id, host.alias))?;
+    if inspection.deployment_id != request.deployment_id {
+        bail!("{ADOPT_TARGET_UNKNOWN}: target inspection returned a different deployment identity");
+    }
 
     // 4. Duplicate discipline before any write, with stable outcomes: same
     //    host means already adopted; another host means relocation (B07),

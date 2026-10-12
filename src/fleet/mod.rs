@@ -223,7 +223,7 @@ pub(crate) fn summarize_inspection(inspection: &InstanceInspection) -> String {
             )
         },
     );
-    format!(
+    let mut summary = format!(
         "rev={} runtime={}/{} config={} artifacts={} resources={} managed={} health={health} backup={backup}",
         inspection.revision,
         inspection.runtime.kind,
@@ -232,7 +232,12 @@ pub(crate) fn summarize_inspection(inspection: &InstanceInspection) -> String {
         artifacts,
         inspection.resources.len(),
         managed,
-    )
+    );
+    if !inspection.diagnostics.is_empty() {
+        summary.push_str(" diagnostics=");
+        summary.push_str(&inspection.diagnostics.join("; "));
+    }
+    summary
 }
 
 /// Bound a failure diagnostic for storage in the free-text cache summary.
@@ -957,6 +962,7 @@ mod tests {
                 Scenario::Offline(text) => bail!("{text}"),
                 Scenario::ForeignDeployment => Ok(InstanceInspection {
                     current_release: None,
+                    diagnostics: Vec::new(),
                     current_instance_identity: None,
                     deployment_id: format!("elsewhere-{deployment_id}"),
                     issuer: "https://auth.example.com".to_owned(),
@@ -978,6 +984,7 @@ mod tests {
                 }),
                 _ => Ok(InstanceInspection {
                     current_release: None,
+                    diagnostics: Vec::new(),
                     current_instance_identity: None,
                     deployment_id: deployment_id.to_owned(),
                     issuer: "https://auth.example.com".to_owned(),

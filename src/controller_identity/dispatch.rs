@@ -28,7 +28,7 @@ use nazo_operator_protocol::{
     validate_control_result,
 };
 
-use crate::controller_identity::journal::{JournalState, OperationJournal, OperationJournalEntry};
+use crate::controller_identity::journal::{OperationJournal, OperationJournalEntry};
 use crate::controller_identity::operation::{
     ControlOperationInput, SignedControlOperation, build_control_operation_with_id_and_kid,
     build_signed_control_operation_for_record,
@@ -445,14 +445,6 @@ pub fn settle_journal(
             journal.clear_if_matches(&expected)
         }
     }
-}
-
-/// True when the journal currently holds an accepted operation that has not
-/// been superseded — surfaced by doctor/status style commands.
-pub fn has_accepted_pending_result(journal: &OperationJournal) -> anyhow::Result<bool> {
-    Ok(journal
-        .load()?
-        .is_some_and(|entry| entry.state == JournalState::Accepted))
 }
 
 #[cfg(test)]

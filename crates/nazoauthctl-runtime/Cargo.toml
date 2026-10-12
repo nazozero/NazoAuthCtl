@@ -11,18 +11,18 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.103"
-atomic-write-file = "0.3.0"
-libc = "0.2.189"
+anyhow = "1.0.104"
+atomic-write-file = "0.3.1"
+libc = "0.2.190"
 nazo-operator-protocol.workspace = true
-rand = "0.10.1"
-rustix = { version = "1.1.4", features = ["fs", "process"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+rand = "0.10.3"
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 wait-timeout = "0.2.1"
-zeroize = { version = "1.8.2", features = ["derive"] }
-uuid = { version = "1.24.1", features = ["v7"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
+uuid = { version = "1.27.0", features = ["v7"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

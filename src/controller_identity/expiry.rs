@@ -19,10 +19,6 @@ pub const WARNING_WINDOW_DAYS: i64 = 7;
 /// Urgent threshold in hours (D02/D09).
 pub const URGENT_WINDOW_HOURS: i64 = 24;
 
-/// Fixed controller key lifetime per goal plan 04 §2 (30 days, not a natural
-/// month, not configurable).
-pub const KEY_LIFETIME_SECONDS: i64 = 2_592_000;
-
 /// Classification of remaining validity relative to `now`.
 ///
 /// The thresholds follow the task table exactly:
@@ -133,18 +129,6 @@ pub fn render_slot_line(slot: &ControllerSlotView, now: DateTime<Utc>) -> String
     .trim_end()
     .to_owned()
         + &crate::ui::message!("\n  expiry: {}", "\n  有效期：{}", status.render())
-}
-
-/// Slots of one snapshot restricted to active entries (helper shared by
-/// flows).
-pub fn active_slot_for_controller_id<'a>(
-    snapshot: &'a SlotsSnapshot,
-    controller_id: &str,
-) -> Option<&'a ControllerSlotView> {
-    snapshot
-        .active_slots()
-        .into_iter()
-        .find(|slot| slot.controller_id == controller_id)
 }
 
 /// True when any active slot exists for the deployment (bind/add decisions).

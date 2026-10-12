@@ -491,7 +491,7 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
     {
         bail!("staged controller candidate digest differs from its journal binding");
     }
-    let mut installed = current_digest.as_deref() == Some(journal.to_sha256.as_str());
+    let installed = current_digest.as_deref() == Some(journal.to_sha256.as_str());
     if !installed {
         if current_digest.is_some()
             && current_digest.as_deref() != Some(journal.from_sha256.as_str())
@@ -531,7 +531,6 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
                 &journal.to_sha256,
                 "installed controller",
             )?;
-            installed = true;
             journal.phase = SelfUpdatePhase::Installed;
             persist_self_update_journal(directory, journal)?;
         } else if current_digest.as_deref() == Some(journal.from_sha256.as_str())
@@ -548,9 +547,6 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
         } else {
             bail!("controller self-update journal cannot recover its candidate");
         }
-    }
-    if !installed {
-        bail!("controller self-update did not reach an installed candidate");
     }
     if let Err(error) = verify_candidate_state(&journal.install_path) {
         restore_rejected_update(directory, journal)?;

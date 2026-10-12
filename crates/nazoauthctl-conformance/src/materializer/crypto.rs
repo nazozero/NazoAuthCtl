@@ -65,25 +65,39 @@ impl Zeroize for GeneratedAttestationMaterial {
 
 pub(super) fn generate_client_crypto(
     policy: &super::CryptoPolicy,
+    needs_rsa: bool,
+    needs_ec: bool,
+    needs_mtls: bool,
 ) -> Result<GeneratedClientCrypto, MaterializerError> {
     let client_secret = Zeroizing::new(random_secret(32));
-    let rsa = RsaKeyPair::generate(rsa_key_size(policy.rsa_bits)?)
-        .map_err(|_| MaterializerError::Crypto)?;
-    let rsa_pkcs8 = Zeroizing::new(
-        rsa.as_der()
-            .map_err(|_| MaterializerError::Crypto)?
-            .as_ref()
-            .to_vec(),
-    );
-    let (rsa_private_jwks, rsa_public_jwks) = rsa_jwks(rsa_pkcs8.as_slice())?;
-    let ec = SigningKey::generate();
-    let (ec_private_jwks, ec_public_jwks) = ec_jwks(&ec)?;
+    let (rsa_private_jwks, rsa_public_jwks) = if needs_rsa {
+        let rsa = RsaKeyPair::generate(rsa_key_size(policy.rsa_bits)?)
+            .map_err(|_| MaterializerError::Crypto)?;
+        let rsa_pkcs8 = Zeroizing::new(
+            rsa.as_der()
+                .map_err(|_| MaterializerError::Crypto)?
+                .as_ref()
+                .to_vec(),
+        );
+        rsa_jwks(rsa_pkcs8.as_slice())?
+    } else {
+        (Zeroizing::new(String::new()), String::new())
+    };
+    let (ec_private_jwks, ec_public_jwks) = if needs_ec {
+        ec_jwks(&SigningKey::generate())?
+    } else {
+        (String::new(), String::new())
+    };
     let (
         mtls_ca_certificate,
         mtls_client_certificate,
         mtls_client_key,
         mtls_client_certificate_sha256,
-    ) = generate_mtls()?;
+    ) = if needs_mtls {
+        generate_mtls()?
+    } else {
+        (String::new(), String::new(), String::new(), String::new())
+    };
     Ok(GeneratedClientCrypto {
         client_secret,
         rsa_private_jwks,
@@ -668,7 +682,8 @@ mod tests {
 
     #[test]
     fn generated_rsa_jwk_has_complete_ps256_two_prime_components() {
-        let material = generate_client_crypto(&CryptoPolicy::default()).expect("client crypto");
+        let material = generate_client_crypto(&CryptoPolicy::default(), true, true, true)
+            .expect("client crypto");
         let private: Value = serde_json::from_str(material.rsa_private_jwks.as_str())
             .expect("private RSA JWKS JSON");
         let public: Value =

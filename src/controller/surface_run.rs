@@ -29,8 +29,10 @@ use crate::registry::{HostTransport, RegistryStore};
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     if !matches!(
         cli.command,
-        Command::SelfVerifyState
+        Command::Version { .. }
+            | Command::SelfVerifyState
             | Command::RemoteExec
+            | Command::RemoteTransferStream
             | Command::SelfUpdate { .. }
             | Command::SelfRollback
             | Command::SelfCheck(_)
@@ -75,6 +77,10 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let report = crate::discover_adopt::run_discover(&context, DiscoverRequest { host })?;
             crate::ui::print_report(&report);
             Ok(())
+        }
+        Command::Version { selector, all } => {
+            let merged = merge(&selector, instance_flag, "version")?;
+            crate::fleet::fleet_read::run_version(merged.as_deref(), all, json_mode)
         }
         Command::Status { selector, all } => {
             selector_scoped(&selector, instance_flag, "status", |merged| {
@@ -148,6 +154,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Admin(command) => run_admin(command, instance_flag),
         Command::Tls(command) => crate::tls::run(instance_flag, command, super::require_root),
         Command::RemoteExec => crate::target::remote_exec::run_stdio(),
+        Command::RemoteTransferStream => crate::target::remote_exec::run_stream_stdio(),
         Command::SelfCheck(version) => super::self_update::controller_check(version.as_deref()),
         Command::SelfVerifyState => super::state_check::run(),
         Command::SelfUpdate { version } => {

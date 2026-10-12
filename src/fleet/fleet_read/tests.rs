@@ -25,6 +25,7 @@ impl ScriptedTarget {
         }
         Ok(InstanceInspection {
             current_release: None,
+            diagnostics: Vec::new(),
             current_instance_identity: None,
             deployment_id: deployment_id.to_owned(),
             issuer: "https://auth.example.com".to_owned(),
@@ -439,4 +440,37 @@ fn stable_code_preserves_target_failures() {
             code
         );
     }
+}
+
+#[test]
+fn installed_versions_keep_ctl_when_server_is_absent_unknown_or_unreachable() -> anyhow::Result<()>
+{
+    let empty = version_document(&[]);
+    assert_eq!(empty["ctl"], env!("CARGO_PKG_VERSION"));
+    assert!(version_text(&empty, true).contains("未安装或未检测到"));
+    let record = InstanceRecord::new(
+        "deployment-version",
+        "production",
+        Uuid::now_v7(),
+        "https://auth.example.com",
+    )?;
+    let mut outcomes = vec![FleetItemOutcome {
+        instance: record,
+        host_alias: "local".into(),
+        result: Ok(json!({"version":"v0.3.1"})),
+    }];
+    let installed = version_document(&outcomes);
+    assert_eq!(installed["nazoauth"][0]["version"], "v0.3.1");
+    assert!(version_text(&installed, false).contains("NazoAuth (production): v0.3.1"));
+    outcomes[0].result = Ok(json!({"version":null}));
+    assert_eq!(
+        version_document(&outcomes)["nazoauth"][0]["state"],
+        "not_detected"
+    );
+    outcomes[0].result = Err(("HOST_UNREACHABLE".into(), "connection refused".into()));
+    let failed = version_document(&outcomes);
+    assert_eq!(failed["nazoauth"][0]["state"], "detection_error");
+    assert!(version_text(&failed, true).contains("检测失败"));
+    assert!(!version_text(&failed, true).contains("未安装"));
+    Ok(())
 }

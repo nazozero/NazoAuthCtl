@@ -15,19 +15,19 @@ path = "src/main.rs"
 pre-release-validation = ["nazoauthctl-core/pre-release-validation"]
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 base64 = "0.23.1"
 ctrlc = "3.5.2"
 cliclack = "0.5.6"
 nazoauthctl-core = { path = "../.." }
 nazoauthctl-conformance = { path = "../nazoauthctl-conformance" }
 nazo-operator-protocol.workspace = true
-rand = "0.10.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 url = "2.5.8"
-uuid = "1.24.1"
-zeroize = "1.8.2"
+uuid = "1.27.0"
+zeroize = "1.9.0"
 
 [lints.rust]
 unsafe_code = "forbid"

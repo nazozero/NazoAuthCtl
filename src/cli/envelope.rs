@@ -38,6 +38,10 @@ pub(crate) struct EnvelopeContext {
 /// attempt may have landed something and resuming (never restarting) is safe.
 fn side_effects_hint(code: &str) -> &'static str {
     match code {
+        error_codes::INPUT_INVALID
+        | error_codes::INSTANCE_AMBIGUOUS
+        | error_codes::INSTANCE_NOT_REGISTERED
+        | error_codes::HOST_NOT_REGISTERED => "none",
         error_codes::TLS_RECOVERY_REQUIRED => {
             "possible; run tls certificate recover for the same deployment, tenant and hostname"
         }
@@ -47,7 +51,7 @@ fn side_effects_hint(code: &str) -> &'static str {
         | crate::target::INSTALL_OUTCOME_UNKNOWN => {
             "possible from an earlier attempt; re-run the SAME command to resume idempotently"
         }
-        _ => "none",
+        _ => "unknown",
     }
 }
 
@@ -160,28 +164,6 @@ fn chinese_next(code: &str) -> Option<&'static str> {
     })
 }
 
-/// Extract a plausible UUIDv7 operation id from the rendered chain without a
-/// regex dependency.
-fn extract_operation_id(rendered: &str) -> Option<String> {
-    let bytes = rendered.as_bytes();
-    if bytes.len() < 36 {
-        return None;
-    }
-    for start in 0..=bytes.len() - 36 {
-        let window = &bytes[start..start + 36];
-        let hyphens_ok =
-            window[8] == b'-' && window[13] == b'-' && window[18] == b'-' && window[23] == b'-';
-        let hex_ok = window
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit());
-        if hyphens_ok && hex_ok && window[14] == b'7' {
-            return Some(rendered[start..start + 36].to_owned());
-        }
-    }
-    None
-}
-
 /// Build and render the envelope for one failed command.
 pub(crate) fn render_failure(
     action: &str,
@@ -191,10 +173,6 @@ pub(crate) fn render_failure(
 ) -> String {
     let rendered = format!("{error:#}");
     let code = crate::fleet::fleet_read::stable_code(&rendered);
-    let operation_id = extract_operation_id(&rendered);
-    let checkpoint = rendered
-        .contains("pending")
-        .then(|| "a pending journal entry exists for this deployment".to_owned());
 
     if json_mode {
         return serde_json::to_string_pretty(&json!({
@@ -203,14 +181,14 @@ pub(crate) fn render_failure(
             "action": action,
             "host": context.host,
             "instance": context.instance,
-            "operation_id": operation_id,
-            "checkpoint": checkpoint,
+            "operation_id": null,
+            "checkpoint": null,
             "side_effects": side_effects_hint(&code),
             "code": code,
             "detail": rendered,
             "next_command": next_command(&code),
         }))
-        .unwrap_or_else(|_| format!("{{\"code\":\"{code}\"}}"));
+        .expect("serde_json::Value always serializes");
     }
 
     let mut pairs: Vec<(&str, String)> = vec![("action", action.to_owned())];
@@ -220,22 +198,10 @@ pub(crate) fn render_failure(
     if let Some(instance) = context.instance.as_ref() {
         pairs.push(("instance", instance.clone()));
     }
-    if let Some(operation_id) = operation_id {
-        pairs.push(("operation_id", operation_id));
-    }
-    if let Some(checkpoint) = checkpoint {
-        pairs.push((
-            "checkpoint",
-            if crate::chinese_output() {
-                "此部署有待完成的操作记录".to_owned()
-            } else {
-                checkpoint
-            },
-        ));
-    }
     let side_effects = if crate::chinese_output() {
         match side_effects_hint(&code) {
             "none" => "无",
+            "unknown" => "未知",
             _ if code == error_codes::TLS_RECOVERY_REQUIRED => {
                 "证书可能已启用；请先恢复待完成的证书操作"
             }

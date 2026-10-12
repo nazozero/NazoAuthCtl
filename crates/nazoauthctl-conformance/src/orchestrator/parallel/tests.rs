@@ -351,7 +351,7 @@ fn parallel_fixture_with_lanes(
             digest: "digest".into(),
         },
         target_origin: None,
-        binding: test_binding(),
+        binding: Some(test_binding()),
         poll_timeout: Duration::from_secs(2),
         control: RunControl::default(),
         plan_lanes,

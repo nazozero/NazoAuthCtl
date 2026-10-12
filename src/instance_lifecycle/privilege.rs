@@ -21,70 +21,28 @@ use anyhow::Context as _;
 
 use crate::error_codes::PRIVILEGE_REQUIRED;
 
-/// The closed set of steps whose privilege requirements this module owns.
+/// Privileged operations actually performed by the lifecycle executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivilegeStep {
-    /// Reading the local instance/host registry.
-    #[cfg(test)]
-    RegistryRead,
-    /// Reading one deployment's target-side DeploymentState.
-    #[cfg(test)]
-    DeploymentStateRead,
-    /// Probing the runtime readiness endpoint on loopback.
-    #[cfg(test)]
-    HealthProbe,
-    /// Talking to the container engine socket (podman/docker info or any
-    /// engine mutation).
     EngineSocketAccess,
-    /// Starting/stopping/installing systemd units.
     SystemdUnitManagement,
-    /// Binding a privileged (<1024) host port.
-    #[cfg(test)]
-    PrivilegedPortBind,
 }
 
 impl PrivilegeStep {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            #[cfg(test)]
-            Self::RegistryRead => "registry read",
-            #[cfg(test)]
-            Self::DeploymentStateRead => "deployment state read",
-            #[cfg(test)]
-            Self::HealthProbe => "local health probe",
             Self::EngineSocketAccess => "container engine socket access",
             Self::SystemdUnitManagement => "systemd unit management",
-            #[cfg(test)]
-            Self::PrivilegedPortBind => "privileged port bind",
         }
     }
-
-    /// The matrix itself, pinned by the unit tests below. Everything not
-    /// listed here is unprivileged by construction — adding a step means
-    /// extending this match, never gating a command up front.
-    #[cfg(test)]
-    pub(crate) fn requires_elevation(self) -> bool {
-        matches!(
-            self,
-            Self::EngineSocketAccess | Self::SystemdUnitManagement | Self::PrivilegedPortBind
-        )
-    }
-
     fn remedy(self) -> &'static str {
         match self {
             Self::EngineSocketAccess => {
-                "run the operation as a user in the engine's socket group (e.g. `podman` or \
-                 `docker`), or establish sudo once with `sudo -v` / configure NOPASSWD"
+                "run the operation as a user with access to the selected engine socket, or establish sudo once with `sudo -v` / configure NOPASSWD"
             }
             Self::SystemdUnitManagement => {
                 "establish sudo once (`sudo -v` or NOPASSWD) so unit management can run"
             }
-            #[cfg(test)]
-            Self::PrivilegedPortBind => {
-                "grant CAP_NET_BIND_SERVICE to the runtime or use an unprivileged port"
-            }
-            #[cfg(test)]
-            _ => "no elevation is required for this step",
         }
     }
 }
