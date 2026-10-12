@@ -739,15 +739,15 @@ mod tests {
             )?;
             #[cfg(unix)]
             let program = {
-                use std::os::unix::fs::PermissionsExt as _;
-
                 let script = root.join("ssh");
-                // This is a disposable test executable, not durable state.
-                // Close its write handle before Command::spawn; executing an
-                // atomically renamed, still-open script can race with Linux
-                // overlay filesystems and fail with ETXTBSY.
-                fs::write(&script, unix_stub_script().as_bytes())?;
-                fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+                // Execute an immutable fixture inode. A freshly written script
+                // can still be held writable by another concurrently spawning
+                // test process even after this thread closes its own handle.
+                // The symlink keeps $0 in this test's isolated data directory.
+                std::os::unix::fs::symlink(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssh-stub.sh"),
+                    &script,
+                )?;
                 script
             };
             #[cfg(windows)]
@@ -782,36 +782,44 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn unix_stub_script() -> String {
-        r#"#!/bin/sh
-printf '%s\n' "$*" >> "$(dirname "$0")/argv.txt"
-case "$*" in
-  *'remote transfer-stream')
-    printf 'nazoauthctl-transfer-stream-1\n'
-    while IFS= read -r input; do
-      caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
-      sed "s/__OPERATION_ID__/${caller:-none}/g" "$(dirname "$0")/response.json"
-      printf '\n'
-    done
-    exit 0 ;;
-esac
-input=$(cat)
-printf '%s' "$input" > "$(dirname "$0")/stdin.json"
-caller=$(printf '%s' "$input" | sed -n 's/.*"operation_id":"\([0-9a-fA-F-]*\)".*/\1/p')
-response="$(dirname "$0")/response.json"
-case "$input" in
-  *'"kind":"hello"'*)
-    if [ -f "$(dirname "$0")/hello-response.json" ]; then
-      response="$(dirname "$0")/hello-response.json"
-    fi ;;
-esac
-sed "s/__OPERATION_ID__/${caller:-none}/g" "$response"
-if [ -f "$(dirname "$0")/stderr.txt" ]; then
-  cat "$(dirname "$0")/stderr.txt" >&2
-fi
-exit "$(cat "$(dirname "$0")/exitcode.txt")"
-"#
-        .to_owned()
+    #[test]
+    fn concurrent_ssh_stubs_execute_shared_fixture_with_isolated_data() {
+        std::thread::scope(|scope| {
+            let workers = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let stub = SshStub::install(&StubScenario {
+                            response_json: &ping_response_json("isolated"),
+                            stderr_text: None,
+                            exit_code: 0,
+                        })
+                        .unwrap();
+                        assert!(
+                            fs::symlink_metadata(&stub.program)
+                                .unwrap()
+                                .file_type()
+                                .is_symlink()
+                        );
+                        assert_eq!(
+                            fs::canonicalize(&stub.program).unwrap(),
+                            fs::canonicalize(
+                                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                                    .join("tests/fixtures/ssh-stub.sh")
+                            )
+                            .unwrap(),
+                        );
+                        let target = ssh_target(HostPrivilege::Sudo, &stub).unwrap();
+                        for _ in 0..8 {
+                            assert_eq!(target.probe_sudo().unwrap(), SudoPreflight::Ready);
+                        }
+                        assert_eq!(stub.argv_invocations().len(), 8);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
     }
 
     #[cfg(windows)]
