@@ -254,6 +254,16 @@ impl SshTarget {
         &self.profile
     }
 
+    fn process(&self) -> Process {
+        let mut process = Process::new(self.program.clone()).timeout(self.timeout);
+        // The agent socket belongs to the local OpenSSH authentication boundary.
+        // Do not pass it to unrelated host commands or the remote helper.
+        if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
+            process = process.env("SSH_AUTH_SOCK", socket);
+        }
+        process
+    }
+
     /// The fixed remote command tokens. User input never joins this vector.
     pub(crate) fn remote_command_argv(&self) -> Vec<String> {
         let mut command = Vec::with_capacity(5);
@@ -312,9 +322,9 @@ impl SshTarget {
         let stdout = if streaming {
             self.transmit_transfer_frame(payload)?
         } else {
-            let output = Process::new(self.program.clone())
+            let output = self
+                .process()
                 .args(self.exec_args())
-                .timeout(self.timeout)
                 .stdin_output(&payload)
                 .map_err(|error| {
                     self.process_failure(
@@ -350,9 +360,9 @@ impl SshTarget {
         if session.is_none() {
             let mut args = self.exec_args();
             *args.last_mut().context("missing remote command")? = "transfer-stream".into();
-            let mut opened = Process::new(self.program.clone())
+            let mut opened = self
+                .process()
                 .args(args)
-                .timeout(self.timeout)
                 .line_session(super::wire::MAX_HOST_RESULT_BYTES + 1)?;
             if opened.exchange(Vec::new())? != super::remote_exec::STREAM_GREETING {
                 bail!("remote helper returned an invalid transfer stream greeting");
@@ -479,9 +489,9 @@ impl SshTarget {
         if self.privilege != HostPrivilege::Sudo {
             bail!("host privilege is direct; sudo preflight does not apply");
         }
-        let output = Process::new(self.program.clone())
+        let output = self
+            .process()
             .args(self.sudo_probe_args())
-            .timeout(self.timeout)
             .stdin_output(b"")
             .map_err(|error| self.process_failure(error, "OpenSSH sudo probe failed"))?;
         if output.status.success() {
@@ -685,6 +695,34 @@ mod tests {
         );
         assert!(is_safe_ssh_profile("hostinger"));
         assert!(!is_safe_ssh_profile("-oProxyCommand=bad"));
+    }
+
+    #[test]
+    fn ssh_preserves_local_agent_socket_with_a_clean_child_environment() {
+        const CHILD_MARKER: &str = "NAZOAUTHCTL_AGENT_ENV_TEST";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let target = SshTarget::from_record(
+                &HostRecord::new_ssh("server-a", PROFILE, HostPrivilege::Direct, Uuid::now_v7())
+                    .unwrap(),
+            )
+            .unwrap();
+            let command = target.process().command();
+            let socket = command
+                .get_envs()
+                .find(|(name, _)| *name == "SSH_AUTH_SOCK");
+            assert_eq!(
+                socket.and_then(|(_, value)| value),
+                Some(std::ffi::OsStr::new("/tmp/nazo-agent-test.sock"))
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "target::ssh::tests::ssh_preserves_local_agent_socket_with_a_clean_child_environment"])
+            .env(CHILD_MARKER, "1")
+            .env("SSH_AUTH_SOCK", "/tmp/nazo-agent-test.sock")
+            .env_remove("NAZOAUTHCTL_TESTING")
+            .status().unwrap();
+        assert!(status.success());
     }
 
     // ---------- fixture stub transport ----------

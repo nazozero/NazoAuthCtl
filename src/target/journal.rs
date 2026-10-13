@@ -249,9 +249,12 @@ impl TargetJournal {
         let _lock = JournalLock::acquire(&path)?;
         // Bounding first: an oversized leftover from a crash between append
         // and compaction must shrink before strict parsing, never wedge.
-        self.compact_if_needed(&path)?;
+        let compacted = self.compact_if_needed(&path)?;
         let operation_hash = canonical_operation_hash(operation)?;
-        let lines = read_lines_with(&path, self.bounds.read_cap)?;
+        let lines = match compacted {
+            Some(lines) => lines,
+            None => read_lines_with(&path, self.bounds.read_cap)?,
+        };
 
         let mut latest: Option<JournalLine> = None;
         for line in lines
@@ -412,26 +415,29 @@ impl TargetJournal {
     /// [`keep_mask`] selects. Compaction runs under the exclusive journal lock
     /// and commits through the platform-atomic write path, so a crash leaves
     /// either the old or the new complete journal — never a torn mixture.
-    fn compact_if_needed(&self, path: &Path) -> anyhow::Result<()> {
+    fn compact_if_needed(&self, path: &Path) -> anyhow::Result<Option<Vec<JournalLine>>> {
         let Ok(metadata) = fs::metadata(path) else {
-            return Ok(());
+            return Ok(None);
         };
         if metadata.len() <= self.bounds.max_bytes {
-            return Ok(());
+            return Ok(None);
         }
-        let lines = read_lines_with(path, self.bounds.read_cap)?;
+        let mut lines = read_lines_with(path, self.bounds.read_cap)?;
         let mask = keep_mask(&lines, &self.bounds);
+        let mut keep = mask.into_iter();
+        lines.retain(|_| {
+            keep.next()
+                .expect("one retention decision per journal line")
+        });
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        for (line, keep) in lines.iter().zip(mask) {
-            if !keep {
-                continue;
-            }
+        for line in &lines {
             serde_json::to_writer(&mut bytes, line)
                 .with_context(|| format!("failed to re-encode the journal {}", path.display()))?;
             bytes.push(b'\n');
         }
         filesystem::atomic_write(path, &bytes, 0o600)
-            .with_context(|| format!("failed to compact the journal {}", path.display()))
+            .with_context(|| format!("failed to compact the journal {}", path.display()))?;
+        Ok(Some(lines))
     }
 
     /// Read-only operation-log view for one deployment (H04): most recent

@@ -5,11 +5,14 @@
 //! isolated restore, its receipt.  Everything shown by status is derived from
 //! those two documents plus the live [`DeploymentState`].
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, bail};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct as _};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -57,7 +60,7 @@ impl SnapshotFile {
 /// The authoritative, target-owned statement for one completed snapshot.
 /// It is not a policy assertion: every byte required for a restore is named
 /// and checksummed here.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotManifest {
     pub schema: u32,
@@ -70,7 +73,7 @@ pub struct SnapshotManifest {
     /// Verified release version paired with the current artifact.
     pub release: ReleaseVersion,
     /// Schema 4 includes this field in its immutable checksum. Never discard or rehash it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub rollback_policy: Option<super::persistence::LegacyRollbackPolicy>,
     /// Configuration schema paired with the archived config bytes. Recovery
     /// advances the live revision monotonically; it never restores a revision.
@@ -91,13 +94,43 @@ pub struct SnapshotManifest {
     /// Sorted active signing-key ids returned by the source runtime's JWKS.
     /// Restore-test must obtain the same set from the isolated candidate.
     pub oidc_signing_key_ids: Vec<String>,
-    /// Hash over the exact manifest bytes with this field omitted.  This makes
+    /// Hash over the exact manifest bytes with this field set to an empty string. This makes
     /// the restore receipt bind one immutable manifest, not a status label.
     pub manifest_sha256: String,
 }
 
 impl SnapshotManifest {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    // The wire document and its digest share one field order and encoding.
+    fn serialize_with_hash<S: Serializer>(
+        &self,
+        serializer: S,
+        hash: &str,
+    ) -> Result<S::Ok, S::Error> {
+        let mut value = serializer.serialize_struct(
+            "SnapshotManifest",
+            14 + usize::from(self.rollback_policy.is_some()),
+        )?;
+        value.serialize_field("schema", &self.schema)?;
+        value.serialize_field("deployment_id", &self.deployment_id)?;
+        value.serialize_field("snapshot_id", &self.snapshot_id)?;
+        value.serialize_field("created_at", &self.created_at)?;
+        value.serialize_field("runtime_artifact", &self.runtime_artifact)?;
+        value.serialize_field("release", &self.release)?;
+        if let Some(policy) = &self.rollback_policy {
+            value.serialize_field("rollback_policy", policy)?;
+        }
+        value.serialize_field("config_schema", &self.config_schema)?;
+        value.serialize_field("files", &self.files)?;
+        value.serialize_field("archive_files", &self.archive_files)?;
+        value.serialize_field("database_sentinel_sha256", &self.database_sentinel_sha256)?;
+        value.serialize_field("mfa_key_sha256", &self.mfa_key_sha256)?;
+        value.serialize_field("runtime_instance_key_id", &self.runtime_instance_key_id)?;
+        value.serialize_field("oidc_signing_key_ids", &self.oidc_signing_key_ids)?;
+        value.serialize_field("manifest_sha256", hash)?;
+        value.end()
+    }
+
+    pub(super) fn validate_contents(&self) -> anyhow::Result<()> {
         if self.schema != BACKUP_MANIFEST_SCHEMA && self.schema != 4 {
             bail!("unsupported backup manifest schema {}", self.schema);
         }
@@ -114,24 +147,21 @@ impl SnapshotManifest {
         if self.files.len() != 2 {
             bail!("backup manifest must name exactly the database dump and deployment archive");
         }
-        let mut paths = Vec::with_capacity(self.files.len());
         for file in &self.files {
             file.validate()?;
-            if paths.contains(&file.path) {
-                bail!("backup manifest contains duplicate file paths");
-            }
-            paths.push(file.path.clone());
+        }
+        if self.files[0].path == self.files[1].path {
+            bail!("backup manifest contains duplicate file paths");
         }
         if self.archive_files.is_empty() || self.archive_files.len() > MAX_ARCHIVE_FILES {
             bail!("backup manifest must name 1-{MAX_ARCHIVE_FILES} archived files");
         }
-        let mut archive_paths = Vec::with_capacity(self.archive_files.len());
+        let mut archive_paths = HashSet::with_capacity(self.archive_files.len());
         for file in &self.archive_files {
             file.validate()?;
-            if archive_paths.contains(&file.path) {
+            if !archive_paths.insert(file.path.as_str()) {
                 bail!("backup manifest contains duplicate archive paths");
             }
-            archive_paths.push(file.path.clone());
         }
         for (value, label) in [
             (&self.database_sentinel_sha256, "database sentinel sha256"),
@@ -155,6 +185,11 @@ impl SnapshotManifest {
             }
             previous = Some(key_id);
         }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_contents()?;
         validate_sha256(&self.manifest_sha256, "backup manifest sha256")?;
         if self.manifest_sha256 != self.computed_sha256()? {
             bail!("backup manifest hash does not bind its contents");
@@ -163,10 +198,15 @@ impl SnapshotManifest {
     }
 
     pub fn computed_sha256(&self) -> anyhow::Result<String> {
-        let mut unsigned = self.clone();
-        unsigned.manifest_sha256.clear();
-        let bytes = serde_json::to_vec(&unsigned)?;
+        let mut bytes = Vec::new();
+        self.serialize_with_hash(&mut serde_json::Serializer::new(&mut bytes), "")?;
         Ok(hex_digest(&bytes))
+    }
+}
+
+impl Serialize for SnapshotManifest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_with_hash(serializer, &self.manifest_sha256)
     }
 }
 
@@ -408,7 +448,8 @@ pub fn write_manifest(scope_dir: &Path, manifest: &SnapshotManifest) -> anyhow::
 }
 
 pub(crate) fn write_manifest_at(path: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
-    manifest.validate()?;
+    // Creation validates contents before hashing; loaders validate stored digests.
+    // Persistence does not revalidate the same unchanged in-memory manifest.
     write_evidence(path, manifest)
 }
 
@@ -491,3 +532,7 @@ fn validate_runtime_artifact(artifact: &ArtifactReference) -> anyhow::Result<()>
         ArtifactReference::Unknown => bail!("backup runtime artifact is unknown"),
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/target/backup.rs"]
+mod tests;

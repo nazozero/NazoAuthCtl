@@ -37,6 +37,17 @@ checks local readability without contacting services or rewriting stored bytes;
 self-update and installer replacement must pass it before changing the installed
 executable. Keep supported readers and frozen fixtures when a writer changes.
 
+## Child process and SSH boundaries
+
+Captured child processes share one elapsed-time budget across stdin writing,
+process waiting and stdout/stderr collection. Input and output pipes make progress
+concurrently. A child that stops reading stdin cannot postpone timeout handling;
+expiry terminates and reaps the process tree using the platform cleanup primitive.
+
+The SSH transport preserves the local `SSH_AUTH_SOCK` value for OpenSSH agent
+authentication while retaining the cleaned child environment. This does not enable
+remote agent forwarding or expose the socket to unrelated host commands.
+
 ## Target capabilities
 
 The target helper advertises usable runtimes. Clean install currently accepts

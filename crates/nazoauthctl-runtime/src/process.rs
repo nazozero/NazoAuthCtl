@@ -8,7 +8,7 @@ use std::{
     process::{Command, Output, Stdio},
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
@@ -311,6 +311,7 @@ impl Process {
         mut child: std::process::Child,
         input: Option<&[u8]>,
     ) -> anyhow::Result<Output> {
+        let deadline = Instant::now() + self.timeout;
         let stdout = child
             .stdout
             .take()
@@ -325,21 +326,38 @@ impl Process {
         spawn_reader(stderr, stderr_sender);
         if let Some(input) = input {
             let mut stdin = child.stdin.take().context("child stdin was unavailable")?;
-            if let Err(error) = stdin.write_all(input) {
+            let input = zeroize::Zeroizing::new(input.to_vec());
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let result = stdin.write_all(&input);
+                drop(stdin);
+                let _ = sender.send(result);
+            });
+            let result = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .context("child timed out writing stdin")
+                .and_then(|result| result.context("failed to write bounded child stdin"));
+            if let Err(error) = result {
                 terminate_and_reap(&mut child);
                 drain_reader(stdout_receiver);
                 drain_reader(stderr_receiver);
-                return Err(error).context("failed to write bounded child stdin");
+                return Err(error);
             }
         }
-        let status = wait_or_kill(&mut child, self.timeout, &self.display_name());
-        let stdout = receive_reader(stdout_receiver);
-        let stderr = receive_reader(stderr_receiver);
-        Ok(Output {
-            status: status?,
-            stdout: stdout?,
-            stderr: stderr?,
-        })
+        let result = (|| {
+            let status = child
+                .wait_timeout(deadline.saturating_duration_since(Instant::now()))?
+                .with_context(|| format!("{} timed out", self.display_name()))?;
+            Ok(Output {
+                status,
+                stdout: receive_reader(stdout_receiver, deadline)?,
+                stderr: receive_reader(stderr_receiver, deadline)?,
+            })
+        })();
+        if result.is_err() {
+            terminate_and_reap(&mut child);
+        }
+        result
     }
 
     fn display_name(&self) -> String {
@@ -438,9 +456,12 @@ fn spawn_reader(
     });
 }
 
-fn receive_reader(receiver: Receiver<anyhow::Result<Vec<u8>>>) -> anyhow::Result<Vec<u8>> {
+fn receive_reader(
+    receiver: Receiver<anyhow::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> anyhow::Result<Vec<u8>> {
     receiver
-        .recv_timeout(OUTPUT_DRAIN_TIMEOUT)
+        .recv_timeout(OUTPUT_DRAIN_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
         .map_err(|error| anyhow::anyhow!("child output drain exceeded bound: {error}"))?
 }
 
@@ -541,6 +562,39 @@ mod descendant_tests {
 #[cfg(test)]
 mod process_tests {
     use super::Process;
+
+    #[test]
+    fn timeout_covers_stdin_when_child_does_not_read() {
+        #[cfg(windows)]
+        let process =
+            Process::new("pwsh").args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        #[cfg(unix)]
+        let process = Process::new("sh").args(["-c", "exec sleep 60"]);
+        let started = std::time::Instant::now();
+        let error = process
+            .timeout(std::time::Duration::from_millis(100))
+            .stdin_output(&vec![b'x'; 4 * 1024 * 1024])
+            .expect_err("a full stdin pipe must obey the process deadline");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stdin_and_output_are_drained_concurrently() {
+        #[cfg(windows)]
+        let process = Process::new("pwsh").args([
+            "-NoProfile", "-Command",
+            "[Console]::Out.Write(('y' * 131072)); [Console]::Out.Flush(); [Console]::Out.Write([Console]::In.ReadToEnd().Length)",
+        ]);
+        #[cfg(unix)]
+        let process = Process::new("sh").args(["-c", "head -c 131072 /dev/zero; wc -c"]);
+        let output = process
+            .timeout(std::time::Duration::from_secs(10))
+            .stdin_output(&vec![b'x'; 262144])
+            .expect("both pipes must make progress");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout[131072..]).contains("262144"));
+    }
 
     #[test]
     fn line_session_timeout_reaps_the_child() {

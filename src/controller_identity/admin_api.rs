@@ -519,7 +519,7 @@ pub struct ApprovalRequestBody {
 }
 
 /// Body of `POST /slots` (bind/add commit).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlotCommitBody {
     pub approval_token: String,
@@ -537,7 +537,7 @@ pub struct SlotCommitBody {
 }
 
 /// Body of `POST /slots/rotate`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RotateCommitBody {
     pub approval_token: String,
@@ -549,7 +549,7 @@ pub struct RotateCommitBody {
 }
 
 /// Body of `POST /slots/revoke`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeCommitBody {
     pub approval_token: String,
@@ -634,7 +634,10 @@ impl std::error::Error for AdminApiError {}
 
 /// Short public fingerprint used in human-facing output (first 12 chars).
 pub fn short_kid(kid: &str) -> &str {
-    &kid[..kid.len().min(12)]
+    &kid[..kid
+        .char_indices()
+        .nth(12)
+        .map_or(kid.len(), |(index, _)| index)]
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,7 +1338,7 @@ pub struct RecoveryRootApprovalBody {
 }
 
 /// Body of `POST /admin/controller-registry/recovery-root/rotate`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryRootRotateBody {
     pub approval_token: String,
@@ -2068,5 +2071,7 @@ mod tests {
     fn short_kid_bounds_public_fingerprint() {
         assert_eq!(short_kid("abcdefghij12rest"), "abcdefghij12");
         assert_eq!(short_kid("short"), "short");
+        assert_eq!(short_kid("abcdefghijk界rest"), "abcdefghijk界");
+        assert_eq!(short_kid("🔑密钥"), "🔑密钥");
     }
 }
