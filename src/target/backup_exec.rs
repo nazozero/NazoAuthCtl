@@ -292,8 +292,8 @@ fn create_snapshot(
         oidc_signing_key_ids,
         manifest_sha256: String::new(),
     };
+    manifest.validate_contents()?;
     manifest.manifest_sha256 = manifest.computed_sha256()?;
-    manifest.validate()?;
     Ok(manifest)
 }
 
@@ -392,7 +392,6 @@ pub(crate) fn prepare_export(
         .join("backup")
         .join("snapshots")
         .join(&manifest.snapshot_id);
-    verify_snapshot_files(&snapshot_dir, &manifest).map_err(backup_failure)?;
     let directory = scope_dir
         .join("backup")
         .join("transfers")
@@ -1918,7 +1917,8 @@ fn snapshot_file(path: &Path, root: &Path) -> anyhow::Result<SnapshotFile> {
 }
 
 fn verify_snapshot_files(root: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
-    manifest.validate()?;
+    // Every caller holds a manifest validated by load_manifest[_at]. The files
+    // remain mutable filesystem state and must be checked at this boundary.
     let expected: BTreeSet<&str> = ["postgresql.dump", "deployment.tar"].into_iter().collect();
     let actual = manifest
         .files
@@ -1936,7 +1936,6 @@ fn verify_snapshot_files(root: &Path, manifest: &SnapshotManifest) -> anyhow::Re
 }
 
 fn verify_file(root: &Path, expected: &SnapshotFile) -> anyhow::Result<()> {
-    expected.validate()?;
     let path = root.join(&expected.path);
     let metadata = fs::symlink_metadata(&path)?;
     if metadata.file_type().is_symlink()
@@ -3642,6 +3641,10 @@ mod tests {
         );
         assert_eq!(diagnostics.len(), 1);
         assert!(backup::backup_projection(&scope_dir, &state).is_err());
+        // Export verifies the final hard-linked files before returning its plan.
+        // Same-length corruption must still fail the digest check.
+        write_fixture(final_dir.join("postgresql.dump"), b"tampered")?;
+        assert!(prepare_export(&scope_dir, &state, &Uuid::now_v7().to_string()).is_err());
         Ok(())
     }
 
