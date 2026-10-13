@@ -1791,14 +1791,6 @@ fn malformed(code: RejectionCode, error: &serde_json::Error) -> MessageRejection
     MessageRejection::new(code, sanitize(error.to_string()))
 }
 
-fn canonical_bytes(value: &impl Serialize) -> anyhow::Result<Vec<u8>> {
-    // serde_json maps use sorted keys by default (no `preserve_order`
-    // feature), so `to_value` yields a canonical key order independent of
-    // construction order. That byte form is the journal hash input.
-    let json = serde_json::to_value(value)?;
-    serde_json::to_vec(&json).map_err(std::convert::Into::into)
-}
-
 const ADMIN_CREATE_CREDENTIALS_REDACTED: &str = "<redacted>";
 
 fn canonical_operation_value(operation: &HostOperation) -> anyhow::Result<serde_json::Value> {
@@ -1827,9 +1819,10 @@ fn canonical_operation_value(operation: &HostOperation) -> anyhow::Result<serde_
 /// journal (C07) uses `operation_id + hash` to distinguish replays from
 /// conflicts.
 pub fn canonical_operation_hash(operation: &HostOperation) -> anyhow::Result<String> {
-    Ok(hex_sha256(&canonical_bytes(&canonical_operation_value(
-        operation,
-    )?)?))
+    // The projection already has sorted map keys (no `preserve_order` feature).
+    Ok(hex_sha256(&serde_json::to_vec(
+        &canonical_operation_value(operation)?,
+    )?))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -2759,7 +2752,7 @@ mod tests {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         *object = rotated.into_iter().collect();
-        let reordered_hash = hex_sha256(&canonical_bytes(&reordered)?);
+        let reordered_hash = hex_sha256(&serde_json::to_vec(&reordered)?);
         assert_eq!(reordered_hash, direct, "hash must ignore key order");
 
         let other = ping_operation("other-nonce");
@@ -2788,7 +2781,8 @@ mod tests {
             canonical_operation_hash(&second)?,
             "password changes must not change the admin-create journal hash"
         );
-        let canonical = String::from_utf8(canonical_bytes(&canonical_operation_value(&first)?)?)?;
+        let canonical =
+            String::from_utf8(serde_json::to_vec(&canonical_operation_value(&first)?)?)?;
         assert!(canonical.contains(ADMIN_CREATE_CREDENTIALS_REDACTED));
         assert!(canonical.contains("admin@example.com"));
         assert!(!canonical.contains("first-secret"));
