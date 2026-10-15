@@ -276,12 +276,12 @@ impl ControllerKeyStore {
         let kid = controller_key_id(&verifying_key);
         let record = KeyRecord {
             schema: CONTROLLER_KEY_STORE_SCHEMA,
-            kid: kid.clone(),
+            kid,
             public_key: URL_SAFE_NO_PAD.encode(verifying_key.to_bytes()),
             private_key: private_text,
             created_at: Utc::now(),
         };
-        let path = Self::key_path(dir, &kid);
+        let path = Self::key_path(dir, &record.kid);
         if fs::symlink_metadata(&path).is_ok() {
             bail!(
                 "controller key record already exists; refusing to overwrite ({})",
@@ -295,7 +295,10 @@ impl ControllerKeyStore {
         filesystem::atomic_write(&path, &bytes, 0o600)
             .with_context(|| format!("failed to persist controller key {}", path.display()))?;
         Ok(ValidatedKeyRecord {
-            loaded: LoadedControllerKey { kid, signing_key },
+            loaded: LoadedControllerKey {
+                kid: record.kid,
+                signing_key,
+            },
             public_key: record.public_key,
             created_at: record.created_at,
         })
