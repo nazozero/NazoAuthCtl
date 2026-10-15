@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-#[path = "filesystem/windows.rs"]
 mod windows;
 
 pub struct PrivateTempDir {
