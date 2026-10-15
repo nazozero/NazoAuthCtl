@@ -1243,7 +1243,7 @@ impl Serialize for BackupTransferBytes {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&STANDARD.encode(&self.0))
+        serializer.collect_str(&base64::display::Base64Display::new(&self.0, &STANDARD))
     }
 }
 
@@ -1320,7 +1320,7 @@ impl Serialize for SecretMaterial {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&STANDARD.encode(&self.0))
+        serializer.collect_str(&base64::display::Base64Display::new(&self.0, &STANDARD))
     }
 }
 
