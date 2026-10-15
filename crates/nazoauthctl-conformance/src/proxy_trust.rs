@@ -121,23 +121,16 @@ impl ProxyTrustGuard {
 }
 
 fn merge_public_trust_bundles(original: &[u8], run_bundle: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let bundles = [
+        parse_public_ca_bundle(original, "active proxy trust bundle")?,
+        parse_public_ca_bundle(run_bundle, "run-scoped proxy trust bundle")?,
+    ];
     let mut certificates = BTreeSet::new();
-    let mut ordered = Vec::new();
-    for (bytes, label) in [
-        (original, "active proxy trust bundle"),
-        (run_bundle, "run-scoped proxy trust bundle"),
-    ] {
-        for certificate in parse_public_ca_bundle(bytes, label)? {
-            if certificates.insert(certificate.clone()) {
-                ordered.push(certificate);
-            }
-        }
-    }
-    if ordered.is_empty() {
-        bail!("combined proxy trust bundle contains no CA certificate");
-    }
     let mut merged = Vec::new();
-    for certificate in ordered {
+    for certificate in bundles.iter().flatten() {
+        if !certificates.insert(certificate) {
+            continue;
+        }
         merged.extend_from_slice(b"-----BEGIN CERTIFICATE-----\n");
         let encoded = STANDARD.encode(certificate);
         for line in encoded.as_bytes().chunks(64) {
@@ -145,6 +138,9 @@ fn merge_public_trust_bundles(original: &[u8], run_bundle: &[u8]) -> anyhow::Res
             merged.push(b'\n');
         }
         merged.extend_from_slice(b"-----END CERTIFICATE-----\n");
+    }
+    if merged.is_empty() {
+        bail!("combined proxy trust bundle contains no CA certificate");
     }
     if merged.len() > MAX_PROXY_TRUST_BUNDLE_BYTES {
         bail!("combined proxy trust bundle is oversized");
@@ -317,8 +313,7 @@ mod tests {
         let merged = merge_public_trust_bundles(existing.as_bytes(), run_bundle.as_bytes())
             .expect("merged trust bundle");
         let merged = String::from_utf8(merged).expect("UTF-8 PEM");
-        assert_eq!(merged.matches("-----BEGIN CERTIFICATE-----").count(), 2);
-        assert!(!merged.contains("PRIVATE KEY"));
+        assert_eq!(merged, format!("{existing}{run}").replace("\r\n", "\n"));
     }
 
     #[test]
