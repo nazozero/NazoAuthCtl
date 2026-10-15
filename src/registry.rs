@@ -646,10 +646,7 @@ impl RegistryStore {
 
     pub fn list_hosts(&self) -> anyhow::Result<Vec<HostRecord>> {
         let _lock = self.lock()?;
-        let mut hosts = Vec::new();
-        for (_, record) in self.load_all_locked::<HostRecord>(Directory::Hosts)? {
-            hosts.push(record);
-        }
+        let mut hosts = self.load_all_locked::<HostRecord>(Directory::Hosts)?;
         hosts.sort_by(|left, right| left.alias.cmp(&right.alias));
         Ok(hosts)
     }
@@ -720,7 +717,6 @@ impl RegistryStore {
             .with_context(|| format!("unknown deployment id '{deployment_id}'"))?;
         record.oidf_tenant_domain = Some(tenant_domain.to_owned());
         record.oidf_suite_origin = Some(suite_origin.trim_end_matches('/').to_owned());
-        record.validate()?;
         let path = self.instance_path(&record.deployment_id);
         write_record(&path, "instance record", &record)?;
         Ok(record)
@@ -756,10 +752,7 @@ impl RegistryStore {
 
     pub fn list_instances(&self) -> anyhow::Result<Vec<InstanceRecord>> {
         let _lock = self.lock()?;
-        let mut instances = Vec::new();
-        for (_, record) in self.load_all_locked::<InstanceRecord>(Directory::Instances)? {
-            instances.push(record);
-        }
+        let mut instances = self.load_all_locked::<InstanceRecord>(Directory::Instances)?;
         instances.sort_by(|left, right| left.alias.cmp(&right.alias));
         Ok(instances)
     }
@@ -842,7 +835,7 @@ impl RegistryStore {
             );
         }
         let mut referencing = Vec::new();
-        for (_, record) in self.load_all_locked::<InstanceRecord>(Directory::Instances)? {
+        for record in self.load_all_locked::<InstanceRecord>(Directory::Instances)? {
             if record.host_id == host.host_id {
                 referencing.push(record);
             }
@@ -898,7 +891,6 @@ impl RegistryStore {
             .find_host_by_id_locked(host_id)?
             .with_context(|| format!("unknown host {host_id}"))?;
         host.last_observation = Some(observation);
-        host.validate()?;
         self.write_host_locked(&host)
     }
 
@@ -914,7 +906,6 @@ impl RegistryStore {
             .find_instance_by_deployment_locked(deployment_id)?
             .with_context(|| format!("unknown instance '{deployment_id}'"))?;
         record.last_observation = Some(observation);
-        record.validate()?;
         write_record(
             &self.instance_path(deployment_id),
             "instance record",
@@ -961,7 +952,6 @@ impl RegistryStore {
             .find_instance_by_deployment_locked(deployment_id)?
             .with_context(|| format!("unknown instance '{deployment_id}'"))?;
         record.backup_before_update = policy;
-        record.validate()?;
         write_record(
             &self.instance_path(deployment_id),
             "instance record",
@@ -1016,8 +1006,7 @@ impl RegistryStore {
         Ok(self
             .load_all_locked::<HostRecord>(Directory::Hosts)?
             .into_iter()
-            .find(|(_, record)| record.alias == alias)
-            .map(|(_, record)| record))
+            .find(|record| record.alias == alias))
     }
 
     fn find_host_by_id_locked(&self, host_id: Uuid) -> anyhow::Result<Option<HostRecord>> {
@@ -1036,8 +1025,7 @@ impl RegistryStore {
         Ok(self
             .load_all_locked::<InstanceRecord>(Directory::Instances)?
             .into_iter()
-            .find(|(_, record)| record.alias == alias)
-            .map(|(_, record)| record))
+            .find(|record| record.alias == alias))
     }
 
     /// Load every record of one directory. Filenames other than `*.json`
@@ -1049,7 +1037,7 @@ impl RegistryStore {
     fn load_all_locked<T: ConformingRecord>(
         &self,
         _directory: Directory,
-    ) -> anyhow::Result<Vec<(String, T)>> {
+    ) -> anyhow::Result<Vec<T>> {
         let dir = match _directory {
             Directory::Hosts => self.hosts_dir(),
             Directory::Instances => self.instances_dir(),
@@ -1068,9 +1056,8 @@ impl RegistryStore {
             let stem = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .with_context(|| format!("unreadable record name {}", path.display()))?
-                .to_owned();
-            records.push((stem.clone(), read_record::<T>(&path, &stem)?));
+                .with_context(|| format!("unreadable record name {}", path.display()))?;
+            records.push(read_record::<T>(&path, stem)?);
         }
         Ok(records)
     }
@@ -1818,6 +1805,41 @@ mod tests {
                 .set_instance_observation("missing", ObservationCache::now(true, "x"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn backup_policy_updates_validate_new_values_and_preserve_the_record() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        let original = register_fixture(&store, &host, "deploy-alpha", "production")?;
+        for max_age_seconds in [0, 31_536_001] {
+            assert!(
+                store
+                    .set_backup_before_update(
+                        "deploy-alpha",
+                        BackupBeforeUpdatePolicy::Require { max_age_seconds },
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                store.instance_by_deployment("deploy-alpha")?,
+                Some(original.clone())
+            );
+        }
+        let policy = BackupBeforeUpdatePolicy::Require {
+            max_age_seconds: 3600,
+        };
+        let mut expected = original;
+        expected.backup_before_update = policy.clone();
+        assert_eq!(
+            store.set_backup_before_update("deploy-alpha", policy)?,
+            expected
+        );
+        assert_eq!(
+            store.instance_by_deployment("deploy-alpha")?,
+            Some(expected)
+        );
+        Ok(())
     }
 
     #[test]

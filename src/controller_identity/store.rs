@@ -398,15 +398,9 @@ impl ControllerKeyStore {
             let stem = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .with_context(|| format!("unreadable key record name {}", path.display()))?
-                .to_owned();
-            let validated = self.read_key_record(&dir, &stem)?;
-            summaries.push(ControllerKeySummary {
-                kid: validated.loaded.kid().to_owned(),
-                public_key: validated.public_key,
-                created_at: validated.created_at,
-                active: active_kid.as_deref() == Some(stem.as_str()),
-            });
+                .with_context(|| format!("unreadable key record name {}", path.display()))?;
+            let validated = self.read_key_record(&dir, stem)?;
+            summaries.push(validated.into_summary(active_kid.as_deref() == Some(stem)));
         }
         summaries.sort_by_key(|summary| summary.created_at);
         Ok(summaries)
