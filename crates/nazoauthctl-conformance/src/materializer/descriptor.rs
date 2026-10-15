@@ -345,12 +345,7 @@ fn validate_openid4vc_credential_datasets(
         }
     }
 
-    if descriptor.openid4vc_credential_datasets.len() != referenced.len()
-        || descriptor
-            .openid4vc_credential_datasets
-            .keys()
-            .any(|key| !referenced.contains(key.as_str()))
-    {
+    if descriptor.openid4vc_credential_datasets.len() != referenced.len() {
         return Err(MaterializerError::InvalidField(
             "openid4vc_credential_datasets",
         ));

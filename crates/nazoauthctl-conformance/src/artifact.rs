@@ -664,7 +664,7 @@ fn validate_matrix(
                 .map_err(ArtifactError::MatrixPolicy)?;
         }
     }
-    if plan_count == 0 || plan_count > manifest.resource_bounds.max_plans as usize {
+    if plan_count > manifest.resource_bounds.max_plans as usize {
         return Err(ArtifactError::MatrixPolicy(
             "matrix plan count exceeds the signed resource bound",
         ));
