@@ -871,39 +871,6 @@ fn push_manifest_resource(
     Ok(())
 }
 
-fn stable_resource_id(prefix: &str, value: &str) -> Result<String, MaterializerError> {
-    if prefix.is_empty() || value.is_empty() {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.resource_id",
-        ));
-    }
-    let normalized = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || ".:+-".contains(character) {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let mut candidate = format!(
-        "{}-{}{}",
-        prefix,
-        normalized.trim_matches('-'),
-        if normalized == value {
-            String::new()
-        } else {
-            format!("-{}", &digest_hex(value.as_bytes())[..16])
-        }
-    );
-    if candidate.len() > MAX_TENANT_RESOURCE_ID_BYTES {
-        candidate = format!("{}-{}", prefix, &digest_hex(value.as_bytes())[..32]);
-    }
-    validate_resource_id(&candidate)?;
-    Ok(candidate)
-}
-
 fn run_namespace_suffix(run_namespace: &str) -> String {
     digest_hex(run_namespace.as_bytes())[..32].to_owned()
 }
@@ -922,22 +889,38 @@ fn run_scoped_resource_id(
             "tenant_resource_manifest.run_namespace",
         ));
     }
-    let suffix = format!("-run-{run_suffix}");
-    let available_base_bytes = MAX_TENANT_RESOURCE_ID_BYTES
-        .checked_sub(suffix.len())
-        .ok_or(MaterializerError::InvalidField(
-            "tenant_resource_manifest.resource_id",
-        ))?;
-    let mut base = stable_resource_id(prefix, value)?;
-    if base.len() > available_base_bytes {
-        base = format!("{}-{}", prefix, &digest_hex(value.as_bytes())[..32]);
-    }
-    if base.len() > available_base_bytes {
+    if prefix.is_empty() || value.is_empty() {
         return Err(MaterializerError::InvalidField(
             "tenant_resource_manifest.resource_id",
         ));
     }
-    let candidate = format!("{base}{suffix}");
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || ".:+-".contains(character) {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let needs_hash_suffix = normalized != value;
+    let normalized = normalized.trim_matches('-');
+    let available_base_bytes = MAX_TENANT_RESOURCE_ID_BYTES - "-run-".len() - run_suffix.len();
+    let base_length = prefix.len() + 1 + normalized.len() + if needs_hash_suffix { 17 } else { 0 };
+    let candidate = if base_length > available_base_bytes {
+        format!(
+            "{prefix}-{}-run-{run_suffix}",
+            &digest_hex(value.as_bytes())[..32]
+        )
+    } else if needs_hash_suffix {
+        format!(
+            "{prefix}-{normalized}-{}-run-{run_suffix}",
+            &digest_hex(value.as_bytes())[..16]
+        )
+    } else {
+        format!("{prefix}-{normalized}-run-{run_suffix}")
+    };
     validate_resource_id(&candidate)?;
     Ok(candidate)
 }
@@ -1795,6 +1778,45 @@ mod tests {
 
     use super::*;
     use crate::materializer::crypto::generate_mtls;
+
+    #[test]
+    fn scoped_resource_ids_preserve_existing_bytes_at_length_and_normalization_boundaries() {
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let boundary = "a".repeat(78);
+        let cases = [
+            ("client".to_owned(), "oauth-client-client".to_owned()),
+            (
+                "client bad".to_owned(),
+                "oauth-client-client-bad-0f5b0b0575d09479".to_owned(),
+            ),
+            (boundary.clone(), format!("oauth-client-{boundary}")),
+            (
+                "a".repeat(79),
+                "oauth-client-daa76b4d16679957833226a884450609".to_owned(),
+            ),
+            (
+                format!("{} bad", "a".repeat(100)),
+                "oauth-client-c62229478d6097202dee780bff7fc745".to_owned(),
+            ),
+            ("客".repeat(70), "oauth-client--9ba568dccb565324".to_owned()),
+        ];
+        for (value, expected_base) in cases {
+            assert_eq!(
+                run_scoped_resource_id("oauth-client", &value, suffix).unwrap(),
+                format!("{expected_base}-run-{suffix}")
+            );
+        }
+        for (prefix, value, suffix) in [
+            ("", "client", suffix),
+            ("oauth-client", "", suffix),
+            ("invalid/prefix", "client", suffix),
+            ("oauth-client", "client", "short"),
+            ("oauth-client", "client", "0123456789ABCDEF0123456789ABCDEF"),
+        ] {
+            assert!(run_scoped_resource_id(prefix, value, suffix).is_err());
+        }
+        assert!(run_scoped_resource_id(&"p".repeat(100), "client", suffix).is_err());
+    }
 
     #[test]
     fn mdoc_dataset_binary_elements_are_materialized_as_base64url() {

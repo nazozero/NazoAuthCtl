@@ -1030,15 +1030,14 @@ fn load_provider(
     )?;
     let config: ProviderConfig =
         serde_json::from_slice(&bytes).context("TLS provider configuration is invalid")?;
-    validate_provider_config(store, &config, requested_tenant, requested_hostname)?;
+    let public_url =
+        validate_provider_config(store, &config, requested_tenant, requested_hostname)?;
     let trust_anchors = read_secure_regular_file(
         &config.trust_anchors,
         "TLS trust anchors",
         false,
         MAX_TRUST_ANCHOR_BYTES,
     )?;
-    let public_url =
-        Url::parse(&config.public_url).context("TLS provider public_url is invalid")?;
     Ok(LoadedProvider {
         config,
         config_sha256: sha256(&bytes),
@@ -1052,7 +1051,7 @@ fn loaded_provider_from_transaction(
     store: &TlsStore,
     transaction: &CertificateTransaction,
 ) -> anyhow::Result<LoadedProvider> {
-    validate_provider_config(
+    let public_url = validate_provider_config(
         store,
         &transaction.provider,
         &transaction.tenant,
@@ -1065,8 +1064,6 @@ fn loaded_provider_from_transaction(
         bail!("TLS transaction trust anchors do not match their bound digest");
     }
     root_store_from_pem(&trust_anchors)?;
-    let public_url =
-        Url::parse(&transaction.provider.public_url).context("TLS public URL is invalid")?;
     Ok(LoadedProvider {
         config: transaction.provider.clone(),
         config_sha256: transaction.provider_config_sha256.clone(),
@@ -1081,7 +1078,7 @@ fn validate_provider_config(
     config: &ProviderConfig,
     requested_tenant: &str,
     requested_hostname: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Url> {
     ensure_provider_platform_support()?;
     if config.schema != PROVIDER_SCHEMA || config.protocol != PROVIDER_PROTOCOL {
         bail!("unsupported TLS provider schema or protocol");
@@ -1150,7 +1147,7 @@ fn validate_provider_config(
             "native proxy",
         )?;
     }
-    Ok(())
+    Ok(url)
 }
 
 #[cfg(unix)]
@@ -1663,9 +1660,7 @@ fn ensure_provider_not_pending(
     let mut inspected_bindings = 0_u32;
     for deployment in deployments {
         let deployment = deployment?;
-        inspected_deployments = inspected_deployments
-            .checked_add(1)
-            .context("too many deployment state entries")?;
+        inspected_deployments += 1;
         if inspected_deployments > 1024 {
             bail!("too many deployment state entries while fencing TLS provider");
         }
@@ -1682,9 +1677,7 @@ fn ensure_provider_not_pending(
         };
         for entry in entries {
             let entry = entry?;
-            inspected_bindings = inspected_bindings
-                .checked_add(1)
-                .context("too many TLS transaction bindings")?;
+            inspected_bindings += 1;
             if inspected_bindings > 4096 {
                 bail!("too many TLS transaction bindings");
             }

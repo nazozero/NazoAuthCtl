@@ -1536,7 +1536,7 @@ fn load_provider_snapshot(
     }
     let config: super::ProviderConfig =
         serde_json::from_slice(&bytes).context("TLS provider configuration snapshot is invalid")?;
-    super::validate_provider_config(store, &config, tenant, hostname)?;
+    let public_url = super::validate_provider_config(store, &config, tenant, hostname)?;
     let trust_anchors = read_secure_regular_file(
         &transaction.workspace.join("provider-trust-anchors.pem"),
         "TLS provider trust anchor snapshot",
@@ -1547,8 +1547,6 @@ fn load_provider_snapshot(
         bail!("TLS provider trust anchor snapshot differs from the ACME journal binding");
     }
     super::material::root_store_from_pem(&trust_anchors)?;
-    let public_url =
-        Url::parse(&config.public_url).context("TLS provider public URL is invalid")?;
     Ok(LoadedProvider {
         config,
         config_sha256: transaction.provider_config_sha256.clone(),
