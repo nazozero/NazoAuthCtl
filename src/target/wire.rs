@@ -1320,11 +1320,6 @@ impl Serialize for SecretMaterial {
     where
         S: Serializer,
     {
-        if self.0.len() > MAX_CONTROL_CHANGE_SET_BYTES {
-            return Err(serde::ser::Error::custom(
-                "secret material exceeds the 4 MiB limit",
-            ));
-        }
         serializer.serialize_str(&STANDARD.encode(&self.0))
     }
 }
@@ -1342,11 +1337,6 @@ impl<'de> Deserialize<'de> for SecretMaterial {
             ));
         }
         let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
-        if bytes.len() > MAX_CONTROL_CHANGE_SET_BYTES {
-            return Err(serde::de::Error::custom(
-                "secret material exceeds the 4 MiB limit",
-            ));
-        }
         Self::try_new(bytes).map_err(|error| serde::de::Error::custom(error.detail))
     }
 }
@@ -2305,6 +2295,17 @@ mod tests {
         assert!(std::mem::needs_drop::<SecretMaterial>());
 
         assert!(SecretMaterial::try_new(vec![0; MAX_CONTROL_CHANGE_SET_BYTES + 1]).is_err());
+        assert!(serde_json::from_str::<SecretMaterial>("\"\"").is_err());
+        // One extra raw byte still fits the encoded-length ceiling. The
+        // constructor must enforce the decoded limit on this path as well.
+        let oversized = STANDARD.encode(vec![0; MAX_CONTROL_CHANGE_SET_BYTES + 1]);
+        assert_eq!(
+            oversized.len(),
+            MAX_CONTROL_CHANGE_SET_BYTES.div_ceil(3) * 4
+        );
+        assert!(
+            serde_json::from_value::<SecretMaterial>(serde_json::Value::String(oversized)).is_err()
+        );
         Ok(())
     }
 

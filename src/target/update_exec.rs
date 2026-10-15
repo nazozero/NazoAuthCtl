@@ -296,7 +296,7 @@ pub(crate) struct PerformedSteps {
     pub(crate) snapshotted_config: bool,
     pub(crate) wrote_config: bool,
     pub(crate) replaced_runtime: bool,
-    pub(crate) config_before_rollback: Option<Vec<u8>>,
+    pub(crate) config_before_rollback: Option<zeroize::Zeroizing<Vec<u8>>>,
     pub(crate) migration_applied: bool,
     pub(crate) migration_outcome_unknown: bool,
     pub(crate) migration_result: Option<nazo_operator_protocol::ControlResult>,
@@ -827,8 +827,7 @@ impl HostLifecycleExecutor {
                         super::install_exec::CONFIG_INVALID,
                         sanitize(error.to_string()),
                     )
-                })?
-                .to_vec(),
+                })?,
             );
             filesystem::atomic_write(Path::new(job.config_reference), bytes, 0o600).map_err(
                 |error| {
@@ -2037,7 +2036,7 @@ fn snapshot_config(
 fn read_restorable_snapshot(
     scope_dir: &Path,
     live_schema: &str,
-) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+) -> anyhow::Result<Option<(zeroize::Zeroizing<Vec<u8>>, String)>> {
     let meta_path = scope_dir.join(SNAPSHOT_META_FILE);
     let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
     if !meta_path.exists() || !bytes_path.exists() {
@@ -2072,7 +2071,7 @@ fn read_restorable_snapshot(
     if sha256_hex(&bytes) != meta.content_sha256 {
         anyhow::bail!("config snapshot bytes no longer match their recorded digest");
     }
-    Ok(Some((bytes.to_vec(), meta.config_schema)))
+    Ok(Some((bytes, meta.config_schema)))
 }
 
 fn staged_config_change(
