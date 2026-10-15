@@ -597,12 +597,11 @@ pub(crate) fn resolve_instance(
     explicit: Option<&str>,
     action: &str,
 ) -> anyhow::Result<InstanceRecord> {
-    let instances = store.list_instances()?;
+    let mut instances = store.list_instances()?;
     if let Some(selector) = explicit {
         return instances
-            .iter()
+            .into_iter()
             .find(|record| record.alias == selector || record.deployment_id == selector)
-            .cloned()
             .with_context(|| {
                 format!(
                     "{INSTANCE_NOT_REGISTERED}: no registered instance matches '{selector}' \
@@ -616,7 +615,7 @@ pub(crate) fn resolve_instance(
             "{INSTANCE_NOT_REGISTERED}: no instances are registered yet",
             "{INSTANCE_NOT_REGISTERED}：尚未注册实例，请先安装或注册部署"
         ),
-        [single] => Ok(single.clone()),
+        [_] => Ok(instances.pop().expect("one registered instance")),
         many => {
             let candidates = many
                 .iter()

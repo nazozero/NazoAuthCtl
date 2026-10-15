@@ -24,8 +24,7 @@ use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{
     ControlOperationPayload, ControlOutcome, ControlResult, ControlResultData,
-    canonical_control_operation_bytes, constant_time_eq, control_operation_request_hash,
-    validate_control_result,
+    canonical_control_operation_bytes, control_operation_request_hash, validate_control_result,
 };
 
 use crate::controller_identity::journal::{OperationJournal, OperationJournalEntry};
@@ -126,17 +125,6 @@ pub enum DispatchVerdict {
     Terminal(ControlResult),
 }
 
-/// Resolve a selector exactly like the signing helper does.
-fn resolve_instance(registry: &RegistryStore, selector: &str) -> anyhow::Result<InstanceRecord> {
-    if let Some(record) = registry.instance_by_deployment(selector)? {
-        return Ok(record);
-    }
-    if let Some(record) = registry.instance_by_alias(selector)? {
-        return Ok(record);
-    }
-    bail!("unknown instance selector '{selector}' (no registered deployment id or alias matches)")
-}
-
 /// Prepare one control operation for `instance_selector`, resuming the
 /// journaled operation when the current command maps to its exact hash.
 ///
@@ -149,7 +137,7 @@ pub fn prepare_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<PreparedOperation> {
-    let record = resolve_instance(registry, instance_selector)?;
+    let record = registry.resolve_control_instance(instance_selector)?;
 
     let journaled = journal.load()?;
     if let Some(entry) = &journaled {
@@ -193,7 +181,7 @@ pub fn prepare_pending_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
-    let record = resolve_instance(registry, instance_selector)?;
+    let record = registry.resolve_control_instance(instance_selector)?;
     let Some(entry) = journal.load()? else {
         return Ok(None);
     };
@@ -216,11 +204,12 @@ fn prepare_entry_resume(
 ) -> anyhow::Result<Option<PreparedOperation>> {
     let operation =
         build_control_operation_with_id_and_kid(record, input, &entry.operation_id, &entry.kid);
-    let request_hash = control_operation_request_hash(&operation)?;
+    let canonical = canonical_control_operation_bytes(&operation)?;
+    let request_hash = control_operation_request_hash(&canonical);
     if request_hash != entry.request_hash {
         return Ok(None);
     }
-    if !journaled_payload_matches(entry, &operation)? {
+    if !journaled_payload_matches(entry, &canonical)? {
         bail!(
             "journaled compact JWS payload does not match the stored operation identity; refusing to replay it"
         );
@@ -245,7 +234,7 @@ fn prepare_entry_resume(
 /// valid after a successful server-side acceptance and local key retirement.
 fn journaled_payload_matches(
     entry: &OperationJournalEntry,
-    operation: &nazo_operator_protocol::ControlOperation,
+    canonical: &[u8],
 ) -> anyhow::Result<bool> {
     let payload = entry
         .compact_jws
@@ -255,9 +244,7 @@ fn journaled_payload_matches(
     let payload = URL_SAFE_NO_PAD
         .decode(payload.as_bytes())
         .map_err(|_| anyhow::anyhow!("journaled compact JWS has an invalid payload encoding"))?;
-    let canonical = canonical_control_operation_bytes(operation)
-        .map_err(|error| anyhow::anyhow!("could not canonicalize recovery operation: {error}"))?;
-    Ok(constant_time_eq(&payload, &canonical))
+    Ok(payload == canonical)
 }
 
 /// Send one prepared operation through an execution target and classify the
@@ -341,10 +328,7 @@ pub fn validate_control_result_binding(
             expected_operation_id
         );
     }
-    if !constant_time_eq(
-        result.request_hash.as_bytes(),
-        expected_request_hash.as_bytes(),
-    ) {
+    if result.request_hash != expected_request_hash {
         bail!(
             "ControlResult request hash does not match prepared operation '{}'",
             expected_operation_id
@@ -600,7 +584,10 @@ mod tests {
         ControlResult {
             schema: CONTROL_RESULT_SCHEMA,
             operation_id: operation.operation_id.clone(),
-            request_hash: control_operation_request_hash(operation).expect("valid operation"),
+            request_hash: control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(operation)
+                    .expect("valid operation"),
+            ),
             outcome,
             error: (outcome == ControlOutcome::Failed).then_some(ControlErrorCode::ExecutionFailed),
             accepted_at: 100,

@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "nazo-crypto"
 version = "0.3.1"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=5abc2d1a291c42e17416b07323d9f6d80b5c6cbc#5abc2d1a291c42e17416b07323d9f6d80b5c6cbc"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=7e4baebe756a0835f3e6954f3355a7e781b762e2#7e4baebe756a0835f3e6954f3355a7e781b762e2"
 dependencies = [
  "ed25519-dalek",
  "thiserror",
@@ -1657,7 +1657,7 @@ dependencies = [
 [[package]]
 name = "nazo-operator-protocol"
 version = "0.3.1"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=5abc2d1a291c42e17416b07323d9f6d80b5c6cbc#5abc2d1a291c42e17416b07323d9f6d80b5c6cbc"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=7e4baebe756a0835f3e6954f3355a7e781b762e2#7e4baebe756a0835f3e6954f3355a7e781b762e2"
 dependencies = [
  "base64 0.23.1",
  "chrono",

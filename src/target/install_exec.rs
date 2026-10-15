@@ -386,7 +386,8 @@ impl InstallOrder {
         }
         let mut seen = Vec::with_capacity(self.secrets.len());
         for secret in &self.secrets {
-            if !SECRET_PURPOSES.contains(&secret.purpose.as_str()) || seen.contains(&secret.purpose)
+            if !SECRET_PURPOSES.contains(&secret.purpose.as_str())
+                || seen.contains(&secret.purpose.as_str())
             {
                 return Err(super::wire::MessageRejection::new(
                     super::wire::RejectionCode::OperationMalformed,
@@ -426,7 +427,7 @@ impl InstallOrder {
                     )
                 })?;
             }
-            seen.push(secret.purpose.clone());
+            seen.push(secret.purpose.as_str());
         }
         // The runtime mounts exactly one read-only secrets directory; the
         // rendered configuration references every file through it.

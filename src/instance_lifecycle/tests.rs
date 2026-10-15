@@ -72,8 +72,14 @@ impl ControlOperationExecutor for ScriptedControl {
                 .map_err(|_| Failure::new("CONTROL_OUTCOME_UNKNOWN", "scripted malformed JWS"))?,
         )
         .map_err(|_| Failure::new("CONTROL_OUTCOME_UNKNOWN", "scripted malformed JWS"))?;
-        let request_hash = nazo_operator_protocol::control_operation_request_hash(&operation)
-            .map_err(|_| Failure::new("CONTROL_OUTCOME_UNKNOWN", "scripted request hash failed"))?;
+        let canonical = nazo_operator_protocol::canonical_control_operation_bytes(&operation)
+            .map_err(|_| {
+                Failure::new(
+                    "CONTROL_OUTCOME_UNKNOWN",
+                    "scripted request encoding failed",
+                )
+            })?;
+        let request_hash = nazo_operator_protocol::control_operation_request_hash(&canonical);
         if *self.fail_business.lock().unwrap() {
             // Durable terminal FAILED result, exactly like a real operator
             // whose migration executed and failed (P0-5).

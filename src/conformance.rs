@@ -563,7 +563,9 @@ mod tests {
                 serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
             let outcome = *self.outcome.borrow();
             let accepted = *self.accepted.borrow();
-            let request_hash = nazo_operator_protocol::control_operation_request_hash(&operation)?;
+            let request_hash = nazo_operator_protocol::control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(&operation)?,
+            );
             Ok(ControlOperationReceipt {
                 operation_id: request.operation_id.clone(),
                 accepted,

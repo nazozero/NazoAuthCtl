@@ -446,10 +446,10 @@ impl DeploymentState {
         let mut seen = Vec::with_capacity(self.resources.len());
         for resource in &self.resources {
             resource.validate()?;
-            if seen.contains(&resource.resource_id) {
+            if seen.contains(&resource.resource_id.as_str()) {
                 bail!("duplicate resource id '{}'", resource.resource_id);
             }
-            seen.push(resource.resource_id.clone());
+            seen.push(resource.resource_id.as_str());
         }
         if self.local_health.summary.len() > 512 {
             bail!("health summary must be at most 512 characters");

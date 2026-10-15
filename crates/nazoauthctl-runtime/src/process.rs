@@ -114,7 +114,9 @@ impl Process {
         {
             command.arg("--disable");
         }
-        command.args(&self.args).envs(self.environment.clone());
+        command
+            .args(&self.args)
+            .envs(self.environment.iter().map(|(key, value)| (key, value)));
         command
     }
 

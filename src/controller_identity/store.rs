@@ -102,18 +102,6 @@ struct KeyRecord {
     created_at: DateTime<Utc>,
 }
 
-impl KeyRecord {
-    /// Public-material view for diagnostics; never includes the seed.
-    fn summary(&self, active: bool) -> ControllerKeySummary {
-        ControllerKeySummary {
-            kid: self.kid.clone(),
-            public_key: self.public_key.clone(),
-            created_at: self.created_at,
-            active,
-        }
-    }
-}
-
 /// Public-material diagnostics for one stored key. Safe to print: no
 /// private bytes exist on this type by construction.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -162,12 +150,22 @@ impl std::fmt::Debug for LoadedControllerKey {
     }
 }
 
-/// A key record after full load-time validation: usable signing identity
-/// plus its public diagnostics.
+/// A freshly persisted or validated on-disk key, plus its public diagnostics.
 struct ValidatedKeyRecord {
     loaded: LoadedControllerKey,
     public_key: String,
     created_at: DateTime<Utc>,
+}
+
+impl ValidatedKeyRecord {
+    fn into_summary(self, active: bool) -> ControllerKeySummary {
+        ControllerKeySummary {
+            kid: self.loaded.kid,
+            public_key: self.public_key,
+            created_at: self.created_at,
+            active,
+        }
+    }
 }
 
 /// Exclusive per-instance lock held across a store operation.
@@ -262,13 +260,13 @@ impl ControllerKeyStore {
             "controller key material directory",
         )?;
         let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
-        self.generate_candidate_locked(&dir)
+        Ok(self.generate_candidate_locked(&dir)?.into_summary(false))
     }
 
     fn generate_candidate_locked(
         &self,
         dir: &std::path::Path,
-    ) -> anyhow::Result<ControllerKeySummary> {
+    ) -> anyhow::Result<ValidatedKeyRecord> {
         // rand's ThreadRng is reseeded from the OS entropy source; the code
         // base uses the same generator for persisted secrets.
         let seed = Zeroizing::new(rand::random::<[u8; 32]>());
@@ -296,8 +294,11 @@ impl ControllerKeyStore {
         );
         filesystem::atomic_write(&path, &bytes, 0o600)
             .with_context(|| format!("failed to persist controller key {}", path.display()))?;
-        drop(signing_key);
-        Ok(record.summary(false))
+        Ok(ValidatedKeyRecord {
+            loaded: LoadedControllerKey { kid, signing_key },
+            public_key: record.public_key,
+            created_at: record.created_at,
+        })
     }
 
     /// Atomically point the instance at `kid`. The target key must already be
@@ -305,16 +306,14 @@ impl ControllerKeyStore {
     /// will reuse; no ceremony lives here.
     pub fn set_active_kid(&self, deployment_id: &str, kid: &str) -> anyhow::Result<()> {
         validate_instance_identifier(deployment_id)?;
-        validate_kid_shape(kid)?;
         let dir = self.instance_dir_unchecked(deployment_id);
         let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
-        self.set_active_kid_locked(&dir, kid)
+        // Existing material must be checked before changing the pointer.
+        let key = self.read_key_record(&dir, kid)?;
+        self.write_active_pointer(&dir, key.loaded.kid())
     }
 
-    fn set_active_kid_locked(&self, dir: &std::path::Path, kid: &str) -> anyhow::Result<()> {
-        // Load the full record so an invalid or missing target fails before
-        // the pointer moves.
-        self.read_key_record(dir, kid)?;
+    fn write_active_pointer(&self, dir: &std::path::Path, kid: &str) -> anyhow::Result<()> {
         let pointer = ActivePointer {
             schema: CONTROLLER_KEY_STORE_SCHEMA,
             active_kid: kid.to_owned(),
@@ -343,7 +342,6 @@ impl ControllerKeyStore {
     /// Read the selected key without depending on unrelated key records.
     pub(crate) fn public_key(&self, deployment_id: &str, kid: &str) -> anyhow::Result<String> {
         validate_instance_identifier(deployment_id)?;
-        validate_kid_shape(kid)?;
         let dir = self.instance_dir_unchecked(deployment_id);
         let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
         Ok(self.read_key_record(&dir, kid)?.public_key)
@@ -353,30 +351,22 @@ impl ControllerKeyStore {
     /// activating exactly one new key iff none exists. Repeated calls return
     /// the same identity.
     pub fn get_or_create_active(&self, deployment_id: &str) -> anyhow::Result<LoadedControllerKey> {
-        if let Some(loaded) = self.load_active(deployment_id)? {
-            return Ok(loaded);
-        }
         validate_instance_identifier(deployment_id)?;
         let dir = self.instance_dir_unchecked(deployment_id);
+        let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
+        if let Some(pointer) = self.read_active_pointer(&dir)? {
+            return self
+                .read_key_record(&dir, &pointer.active_kid)
+                .map(|key| key.loaded);
+        }
         filesystem::ensure_private_directory(&dir, "controller key directory")?;
         filesystem::ensure_private_directory(
             &Self::keys_dir(&dir),
             "controller key material directory",
         )?;
-        let _lock = InstanceKeyLock::acquire(&Self::lock_path(&dir))?;
-        // Re-check under the lock: a concurrent creator may have finished
-        // between the unlocked probe and now.
-        if let Some(pointer) = self.read_active_pointer(&dir)? {
-            return self
-                .read_key_record(&dir, &pointer.active_kid)
-                .map(|validated| validated.loaded);
-        }
         let candidate = self.generate_candidate_locked(&dir)?;
-        self.set_active_kid_locked(&dir, &candidate.kid)?;
-        let pointer = self
-            .read_active_pointer(&dir)?
-            .expect("active pointer was just written");
-        Ok(self.read_key_record(&dir, &pointer.active_kid)?.loaded)
+        self.write_active_pointer(&dir, candidate.loaded.kid())?;
+        Ok(candidate.loaded)
     }
 
     /// List all stored keys of an instance with public material only,

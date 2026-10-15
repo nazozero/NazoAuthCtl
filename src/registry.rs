@@ -731,6 +731,21 @@ impl RegistryStore {
         self.find_instance_by_alias_locked(alias)
     }
 
+    /// Resolve a control-operation selector under one registry lock: an exact
+    /// deployment id takes precedence over an alias with the same spelling.
+    pub(crate) fn resolve_control_instance(
+        &self,
+        selector: &str,
+    ) -> anyhow::Result<InstanceRecord> {
+        let _lock = self.lock()?;
+        if let Some(record) = self.find_instance_by_deployment_locked(selector)? {
+            return Ok(record);
+        }
+        self.find_instance_by_alias_locked(selector)?.with_context(|| {
+            format!("unknown instance selector '{selector}' (no registered deployment id or alias matches)")
+        })
+    }
+
     pub fn instance_by_deployment(
         &self,
         deployment_id: &str,
@@ -1234,11 +1249,26 @@ mod tests {
         assert_eq!(store.host_by_id(host.host_id)?, Some(host));
         assert_eq!(
             store.instance_by_deployment("deploy-healthy")?,
-            Some(instance)
+            Some(instance.clone())
         );
+        assert_eq!(store.resolve_control_instance("deploy-healthy")?, instance);
         assert!(store.instance_by_deployment("deploy-broken").is_err());
         assert!(store.instance_by_deployment("../outside").is_err());
         assert!(store.list_hosts().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn control_selector_prefers_deployment_id_then_resolves_alias() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        let first = register_fixture(&store, &host, "deploy-first", "first")?;
+        let second = register_fixture(&store, &host, "deploy-second", "deploy-first")?;
+        assert_eq!(store.resolve_control_instance("deploy-first")?, first);
+        assert_eq!(store.resolve_control_instance("first")?, first);
+        assert_eq!(store.resolve_control_instance("deploy-second")?, second);
+        assert!(store.resolve_control_instance("missing").is_err());
+        assert!(store.resolve_control_instance("../outside").is_err());
         Ok(())
     }
 

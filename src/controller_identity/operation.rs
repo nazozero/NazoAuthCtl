@@ -14,8 +14,7 @@
 
 use anyhow::{Context, bail};
 use nazo_operator_protocol::{
-    CONTROL_OPERATION_SCHEMA, ControlOperation, ControlOperationPayload,
-    control_operation_request_hash, sign_control_operation,
+    CONTROL_OPERATION_SCHEMA, ControlOperation, ControlOperationPayload, sign_control_operation,
 };
 use uuid::Uuid;
 
@@ -62,25 +61,9 @@ pub fn deployment_from_key_ref(key_ref: &str) -> anyhow::Result<&str> {
         .with_context(|| {
             format!("controller key ref must start with '{CONTROLLER_KEY_REF_PREFIX}'")
         })?;
-    if rest.contains('\\') {
-        bail!("controller key ref must not contain path separators");
-    }
     super::store::validate_instance_identifier(rest)
         .with_context(|| "controller key ref must address exactly one instance key directory")?;
     Ok(rest)
-}
-
-/// Resolve a selector to its registry record: exact deployment id first,
-/// then unique alias. Both namespaces are unique, so at most one fallback
-/// candidate can exist.
-fn resolve_instance(registry: &RegistryStore, selector: &str) -> anyhow::Result<InstanceRecord> {
-    if let Some(record) = registry.instance_by_deployment(selector)? {
-        return Ok(record);
-    }
-    if let Some(record) = registry.instance_by_alias(selector)? {
-        return Ok(record);
-    }
-    bail!("unknown instance selector '{selector}' (no registered deployment id or alias matches)")
 }
 
 /// Build, hash, and sign one ControlOperation for the selected instance.
@@ -93,7 +76,7 @@ pub fn build_signed_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<SignedControlOperation> {
-    let record = resolve_instance(registry, instance_selector)?;
+    let record = registry.resolve_control_instance(instance_selector)?;
     build_signed_control_operation_for_record(keys, &record, input)
 }
 
@@ -115,8 +98,7 @@ pub(crate) fn build_signed_control_operation_for_record(
     let operation_id = Uuid::now_v7().to_string();
     let operation =
         build_control_operation_with_id_and_kid(record, input, &operation_id, loaded.kid());
-    let request_hash = control_operation_request_hash(&operation)?;
-    let compact_jws = sign_control_operation(&operation, loaded.signing_key())?;
+    let (compact_jws, request_hash) = sign_control_operation(&operation, loaded.signing_key())?;
     Ok(SignedControlOperation {
         operation_id: operation.operation_id.clone(),
         kid: operation.kid.clone(),
@@ -178,7 +160,9 @@ fn validate_record_key_ref(record: &InstanceRecord) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use nazo_operator_protocol::{ProtocolError, verify_control_operation_signature};
+    use nazo_operator_protocol::{
+        ProtocolError, control_operation_request_hash, verify_control_operation_signature,
+    };
 
     use super::*;
     use crate::controller_identity::store::controller_key_ref_for;
@@ -247,11 +231,13 @@ mod tests {
             b"{\"config_revision\":\"config-revision-1\",\"deployment_id\":\"deployment-1\",\"kid\":\"43q81579CNuUUYqQOVL_6fivfotGhLY1kWMc746Iccg\",\"operation\":{\"name\":\"migrate-apply\"},\"operation_id\":\"019c8ca2-30a6-7000-8000-000000000005\",\"schema\":3}".to_vec(),
         );
         assert_eq!(
-            control_operation_request_hash(&operation)?,
+            control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(&operation)?
+            ),
             "8261e7f3ece52ee7b063689c98ead4265f2f4e5e5b40c09b2fe3909af31eceff",
         );
         let compact = "eyJhbGciOiJFZERTQSIsImtpZCI6IjQzcTgxNTc5Q051VVVZcVFPVkxfNmZpdmZvdEdoTFkxa1dNYzc0NkljY2ciLCJ0eXAiOiJuYXpvYXV0aC1jb250cm9sLW9wZXJhdGlvbitqd3QifQ.eyJjb25maWdfcmV2aXNpb24iOiJjb25maWctcmV2aXNpb24tMSIsImRlcGxveW1lbnRfaWQiOiJkZXBsb3ltZW50LTEiLCJraWQiOiI0M3E4MTU3OUNOdVVVWXFRT1ZMXzZmaXZmb3RHaExZMWtXTWM3NDZJY2NnIiwib3BlcmF0aW9uIjp7Im5hbWUiOiJtaWdyYXRlLWFwcGx5In0sIm9wZXJhdGlvbl9pZCI6IjAxOWM4Y2EyLTMwYTYtNzAwMC04MDAwLTAwMDAwMDAwMDAwNSIsInNjaGVtYSI6M30.__QjcrIzfNFJTfMmihviVhgwtlKJLsTPad71ZWHrpJmh_u99c4Qh0J9BphS1CedkdPLKRUFjDD6BCAcRFHYCBA";
-        assert_eq!(sign_control_operation(&operation, &key)?, compact);
+        assert_eq!(sign_control_operation(&operation, &key)?.0, compact);
         assert_eq!(
             verify_control_operation_signature(compact, &operation.kid, &key.verifying_key())?,
             operation,
@@ -274,7 +260,9 @@ mod tests {
         assert_eq!(signed.deployment_id, "deploy-alpha");
         assert_eq!(
             signed.request_hash,
-            control_operation_request_hash(&signed.operation)?
+            control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(&signed.operation)?
+            )
         );
 
         let store_key = f.keys.load_active("deploy-alpha")?.expect("active");
@@ -370,15 +358,19 @@ mod tests {
             operation: ControlOperationPayload::MigrateApply,
         };
 
-        let first = sign_control_operation(&build("rev-1"), store_key.signing_key())?;
-        let second = sign_control_operation(&build("rev-1"), store_key.signing_key())?;
+        let first = sign_control_operation(&build("rev-1"), store_key.signing_key())?.0;
+        let second = sign_control_operation(&build("rev-1"), store_key.signing_key())?.0;
         assert_eq!(first, second, "Ed25519 signs deterministically");
 
-        let changed = sign_control_operation(&build("rev-2"), store_key.signing_key())?;
+        let changed = sign_control_operation(&build("rev-2"), store_key.signing_key())?.0;
         assert_ne!(first, changed, "any envelope change alters the JWS");
         assert_ne!(
-            control_operation_request_hash(&build("rev-1"))?,
-            control_operation_request_hash(&build("rev-2"))?
+            control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(&build("rev-1"))?
+            ),
+            control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(&build("rev-2"))?
+            )
         );
         Ok(())
     }
@@ -459,6 +451,7 @@ mod tests {
             "keys/deploy-alpha",
             "controller-keys/",
             "controller-keys/a/b",
+            "controller-keys/a\\b",
             "controller-keys/../secret",
             "controller-keys/with space",
             "",
