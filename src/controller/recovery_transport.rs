@@ -132,7 +132,7 @@ impl AdminApiTransport for RecoveryCeremonyTransport {
     fn send(&self, request: AdminHttpRequest) -> anyhow::Result<AdminHttpResponse> {
         let output = self
             .command(&request)?
-            .stdin_output(request.body.as_deref().unwrap_or_default())
+            .stdin_output(request.body.unwrap_or_default())
             .context("recovery ceremony loopback request failed")?;
         if !output.status.success() {
             bail!("recovery ceremony loopback transport failed");

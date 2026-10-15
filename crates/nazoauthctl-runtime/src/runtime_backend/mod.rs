@@ -326,9 +326,9 @@ impl OneShotTask {
         process: crate::process::Process,
     ) -> anyhow::Result<String> {
         if self.command != ["nazoauth", "operator-task"] {
-            return process.stdin_stdout(&self.stdin);
+            return process.stdin_stdout(self.stdin.as_slice());
         }
-        let output = process.stdin_output(&self.stdin)?;
+        let output = process.stdin_output(self.stdin.as_slice())?;
         if !output.status.success() && output.stdout.is_empty() {
             anyhow::bail!(
                 "operator task exited without a control receipt: {}",

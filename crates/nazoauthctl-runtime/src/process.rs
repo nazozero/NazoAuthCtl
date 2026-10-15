@@ -156,7 +156,7 @@ impl Process {
             .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))
     }
 
-    pub fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
+    pub fn stdin_stdout(&self, input: impl Into<Vec<u8>>) -> anyhow::Result<String> {
         let output = self.stdin_output(input)?;
         if !output.status.success() {
             // Diagnostics from secret-bearing children are not public error text.
@@ -173,7 +173,8 @@ impl Process {
     /// Feeds `input` on stdin and captures the complete bounded output,
     /// including stderr, for protocol transports that classify failures from
     /// the child's diagnostic stream (for example OpenSSH exec wrappers).
-    pub fn stdin_output(&self, input: &[u8]) -> anyhow::Result<Output> {
+    pub fn stdin_output(&self, input: impl Into<Vec<u8>>) -> anyhow::Result<Output> {
+        let input = zeroize::Zeroizing::new(input.into());
         let mut command = self.command();
         command
             .stdin(Stdio::piped())
@@ -309,7 +310,7 @@ impl Process {
     fn collect_output(
         &self,
         mut child: std::process::Child,
-        input: Option<&[u8]>,
+        input: Option<zeroize::Zeroizing<Vec<u8>>>,
     ) -> anyhow::Result<Output> {
         let deadline = Instant::now() + self.timeout;
         let stdout = child
@@ -326,7 +327,6 @@ impl Process {
         spawn_reader(stderr, stderr_sender);
         if let Some(input) = input {
             let mut stdin = child.stdin.take().context("child stdin was unavailable")?;
-            let input = zeroize::Zeroizing::new(input.to_vec());
             let (sender, receiver) = mpsc::sync_channel(1);
             thread::spawn(move || {
                 let result = stdin.write_all(&input);
@@ -573,7 +573,7 @@ mod process_tests {
         let started = std::time::Instant::now();
         let error = process
             .timeout(std::time::Duration::from_millis(100))
-            .stdin_output(&vec![b'x'; 4 * 1024 * 1024])
+            .stdin_output(vec![b'x'; 4 * 1024 * 1024])
             .expect_err("a full stdin pipe must obey the process deadline");
         assert!(error.to_string().contains("timed out"), "{error:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -590,7 +590,7 @@ mod process_tests {
         let process = Process::new("sh").args(["-c", "head -c 131072 /dev/zero; wc -c"]);
         let output = process
             .timeout(std::time::Duration::from_secs(10))
-            .stdin_output(&vec![b'x'; 262144])
+            .stdin_output(vec![b'x'; 262144])
             .expect("both pipes must make progress");
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout[131072..]).contains("262144"));

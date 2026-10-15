@@ -34,7 +34,7 @@ use std::{
     io::IsTerminal as _,
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Child, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -58,6 +58,15 @@ use super::{
 
 /// Production OpenSSH client binary name.
 pub const SSH_PROGRAM: &str = "ssh";
+
+fn ssh_process(program: impl Into<OsString>) -> Process {
+    let mut process = Process::new(program);
+    // Only OpenSSH needs the local authentication agent socket.
+    if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
+        process = process.env("SSH_AUTH_SOCK", socket);
+    }
+    process
+}
 
 /// Fixed helper basename used by every SSH target.
 pub const DEFAULT_REMOTE_EXEC_BASENAME: &str = "nazoauthctl";
@@ -102,10 +111,7 @@ impl RecoverySshForward {
             .port();
         drop(listener);
 
-        let argv = recovery_forward_argv(profile, local_port, remote_port);
-        let mut child = Process::new(SSH_PROGRAM)
-            .command()
-            .args(argv)
+        let mut child = recovery_forward_command(profile, local_port, remote_port)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -160,15 +166,17 @@ fn is_safe_ssh_profile(profile: &str) -> bool {
         })
 }
 
-fn recovery_forward_argv(profile: &str, local_port: u16, remote_port: u16) -> Vec<String> {
-    vec![
+fn recovery_forward_command(profile: &str, local_port: u16, remote_port: u16) -> Command {
+    let mut command = ssh_process(SSH_PROGRAM).command();
+    command.args([
         "-N".to_owned(),
         "-o".to_owned(),
         "ExitOnForwardFailure=yes".to_owned(),
         "-L".to_owned(),
         format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
         profile.to_owned(),
-    ]
+    ]);
+    command
 }
 
 /// An SSH-attached host reached through the system OpenSSH client.
@@ -255,13 +263,7 @@ impl SshTarget {
     }
 
     fn process(&self) -> Process {
-        let mut process = Process::new(self.program.clone()).timeout(self.timeout);
-        // The agent socket belongs to the local OpenSSH authentication boundary.
-        // Do not pass it to unrelated host commands or the remote helper.
-        if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
-            process = process.env("SSH_AUTH_SOCK", socket);
-        }
-        process
+        ssh_process(self.program.clone()).timeout(self.timeout)
     }
 
     /// The fixed remote command tokens. User input never joins this vector.
@@ -299,13 +301,10 @@ impl SshTarget {
     }
 
     /// Interactive pre-authorization argv. Options precede the destination.
-    pub(crate) fn sudo_interactive_args(&self) -> Vec<OsString> {
-        vec![
-            "-t".into(),
-            self.profile.clone().into(),
-            "sudo".into(),
-            "-v".into(),
-        ]
+    fn sudo_interactive_command(&self) -> Command {
+        let mut command = self.process().command();
+        command.args(["-t", &self.profile, "sudo", "-v"]);
+        command
     }
 
     /// One bounded stdin→stdout round trip through the fixed argv.
@@ -325,7 +324,7 @@ impl SshTarget {
             let output = self
                 .process()
                 .args(self.exec_args())
-                .stdin_output(&payload)
+                .stdin_output(payload)
                 .map_err(|error| {
                     self.process_failure(
                         error,
@@ -531,9 +530,8 @@ impl SshTarget {
             "正在为主机“{}”验证 sudo 权限，请完成终端提示。",
             self.profile
         );
-        let status = Process::new(&self.program)
-            .command()
-            .args(self.sudo_interactive_args())
+        let status = self
+            .sudo_interactive_command()
             .status()
             .context("failed to run the interactive sudo pre-authorization")?;
         if !status.success() {
@@ -683,7 +681,10 @@ mod tests {
     #[test]
     fn recovery_forward_is_loopback_only_and_exit_on_forward_failure() {
         assert_eq!(
-            recovery_forward_argv("hostinger", 43123, 42123),
+            recovery_forward_command("hostinger", 43123, 42123)
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect::<Vec<_>>(),
             [
                 "-N",
                 "-o",
@@ -706,14 +707,19 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            let command = target.process().command();
-            let socket = command
-                .get_envs()
-                .find(|(name, _)| *name == "SSH_AUTH_SOCK");
-            assert_eq!(
-                socket.and_then(|(_, value)| value),
-                Some(std::ffi::OsStr::new("/tmp/nazo-agent-test.sock"))
-            );
+            for command in [
+                target.process().command(),
+                target.sudo_interactive_command(),
+                recovery_forward_command(PROFILE, 43123, 42123),
+            ] {
+                let socket = command
+                    .get_envs()
+                    .find(|(name, _)| *name == "SSH_AUTH_SOCK");
+                assert_eq!(
+                    socket.and_then(|(_, value)| value),
+                    Some(std::ffi::OsStr::new("/tmp/nazo-agent-test.sock"))
+                );
+            }
             return;
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -993,7 +999,12 @@ mod tests {
             sudo.sudo_probe_args(),
             [PROFILE, "--", "sudo", "-n", "true"]
         );
-        assert_eq!(sudo.sudo_interactive_args(), ["-t", PROFILE, "sudo", "-v"]);
+        assert_eq!(
+            sudo.sudo_interactive_command()
+                .get_args()
+                .collect::<Vec<_>>(),
+            ["-t", PROFILE, "sudo", "-v"]
+        );
     }
 
     // ---------- behavior over the stub transport ----------
