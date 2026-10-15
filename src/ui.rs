@@ -114,13 +114,12 @@ pub(crate) fn fields(title: &str, values: &[(&str, String)]) -> String {
 }
 
 pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let rows: Vec<Vec<String>> = std::iter::once(headers.iter().map(|s| (*s).to_owned()).collect())
-        .chain(rows.iter().cloned())
-        .map(|row: Vec<String>| {
-            row.into_iter()
-                .map(|s| s.replace(['\r', '\n', '\t'], " "))
-                .collect()
-        })
+    let clean = |value: &str| value.replace(['\r', '\n', '\t'], " ");
+    let rows: Vec<Vec<String>> = std::iter::once(headers.iter().copied().map(clean).collect())
+        .chain(
+            rows.iter()
+                .map(|row| row.iter().map(|value| clean(value)).collect()),
+        )
         .collect();
     let widths: Vec<usize> = (0..headers.len())
         .map(|column| {

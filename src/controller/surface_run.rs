@@ -1242,7 +1242,7 @@ fn read_password_file_inner(
     flag: &str,
 ) -> anyhow::Result<crate::target::SecretMaterial> {
     const MAX_PASSWORD_FILE_BYTES: u64 = 4096;
-    let raw =
+    let mut raw =
         crate::filesystem::read_secure_regular_file(path, flag, true, MAX_PASSWORD_FILE_BYTES)
             .with_context(|| format!("{flag}: failed to read {}", path.display()))?;
     let mut end = raw.len();
@@ -1252,7 +1252,8 @@ fn read_password_file_inner(
     if end == 0 {
         bail!("{flag}: {} is empty", path.display());
     }
-    crate::target::SecretMaterial::try_new(raw[..end].to_vec())
+    raw.truncate(end);
+    crate::target::SecretMaterial::try_new(std::mem::take(&mut *raw))
         .map_err(|error| anyhow::anyhow!(error.detail))
 }
 
@@ -1268,7 +1269,7 @@ fn read_recovery_secret_file(path: &Path) -> anyhow::Result<zeroize::Zeroizing<S
         MAX_SECRET_FILE_BYTES,
     )
     .with_context(|| format!("--recovery-secret-file: failed to read {}", path.display()))?;
-    let value = String::from_utf8(bytes.to_vec()).with_context(|| {
+    let value = std::str::from_utf8(&bytes).with_context(|| {
         format!(
             "--recovery-secret-file: {} is not valid UTF-8",
             path.display()
@@ -1469,6 +1470,24 @@ mod admin_create_tests {
 #[cfg(test)]
 mod install_input_tests {
     use super::read_password_file;
+
+    #[test]
+    fn password_file_preserves_bytes_and_removes_only_trailing_line_endings() -> anyhow::Result<()>
+    {
+        let work = crate::filesystem::PrivateTempDir::new("password-input")?;
+        let path = work.path().join("password");
+        for (bytes, expected) in [
+            (b" secret \r\n\n".as_slice(), b" secret ".as_slice()),
+            (b"\xff\x80\r\n".as_slice(), b"\xff\x80".as_slice()),
+        ] {
+            crate::filesystem::atomic_write(&path, bytes, 0o600)?;
+            let secret = read_password_file(&path, "--database-runtime-password-file")?;
+            assert_eq!(secret.as_bytes(), expected);
+        }
+        crate::filesystem::atomic_write(&path, b"\r\n", 0o600)?;
+        assert!(read_password_file(&path, "--database-runtime-password-file").is_err());
+        Ok(())
+    }
 
     #[test]
     fn local_password_file_failures_are_typed_as_invalid_input() {

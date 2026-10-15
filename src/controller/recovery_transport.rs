@@ -130,7 +130,7 @@ impl RecoveryCeremonyTransport {
 
 impl AdminApiTransport for RecoveryCeremonyTransport {
     fn send(&self, request: AdminHttpRequest) -> anyhow::Result<AdminHttpResponse> {
-        let output = self
+        let mut output = self
             .command(&request)?
             .stdin_output(request.body.unwrap_or_default())
             .context("recovery ceremony loopback request failed")?;
@@ -144,9 +144,10 @@ impl AdminApiTransport for RecoveryCeremonyTransport {
             .context("recovery ceremony loopback response status is not UTF-8")?
             .parse::<u16>()
             .context("recovery ceremony loopback response status is invalid")?;
+        output.stdout.truncate(marker);
         Ok(AdminHttpResponse {
             status,
-            body: output.stdout[..marker].to_vec(),
+            body: output.stdout,
             set_cookie_headers: Vec::new(),
         })
     }

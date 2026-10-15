@@ -316,7 +316,7 @@ fn status_table(outcomes: &[FleetItemOutcome], chinese: bool) -> String {
     } else {
         ["Instance", "Host", "Version", "Health", "Last backup (UTC)"]
     };
-    let mut rows = vec![headers.map(str::to_owned)];
+    let mut rows = Vec::with_capacity(outcomes.len());
     for item in outcomes {
         let (version, health, backup) = match &item.result {
             Ok(payload) => (
@@ -347,7 +347,7 @@ fn status_table(outcomes: &[FleetItemOutcome], chinese: bool) -> String {
                 "-".to_owned(),
             ),
         };
-        rows.push([
+        rows.push(vec![
             item.instance.alias.clone(),
             item.host_alias.clone(),
             version,
@@ -355,8 +355,7 @@ fn status_table(outcomes: &[FleetItemOutcome], chinese: bool) -> String {
             backup,
         ]);
     }
-    let body: Vec<Vec<String>> = rows.iter().skip(1).map(|row| row.to_vec()).collect();
-    let mut lines = vec![crate::ui::table(&headers, &body)];
+    let mut lines = vec![crate::ui::table(&headers, &rows)];
     for item in outcomes {
         if let Err((code, detail)) = &item.result {
             let explanation = if chinese {

@@ -1370,8 +1370,7 @@ fn read_recovery_secret(path: Option<&std::path::Path>) -> anyhow::Result<String
     if let Some(path) = path {
         let bytes =
             filesystem::read_secure_regular_file(path, "recovery secret", true, MAX_SECRET_BYTES)?;
-        let text =
-            String::from_utf8(bytes.to_vec()).context("recovery secret is not valid UTF-8")?;
+        let text = std::str::from_utf8(&bytes).context("recovery secret is not valid UTF-8")?;
         return Ok(text.trim().to_owned());
     }
     use std::io::IsTerminal as _;

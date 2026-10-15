@@ -1195,7 +1195,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             Some(("deployment_id", deployment_id)),
             None,
         )?;
-        decode_recovery_root_view(raw)
+        decode_recovery_root_view(serde_json::from_slice(&raw).map_err(malformed_response)?)
     }
 
     fn issue_recovery_root_approval(
@@ -1229,23 +1229,22 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        let value: serde_json::Value = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        let mut value: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&raw).map_err(malformed_response)?;
         // The commit response wraps the root object without the `present`
         // discriminant (it is implicitly present); normalize before decoding.
-        let mut inner = value
-            .get("recovery_root")
-            .cloned()
-            .and_then(|inner| inner.as_object().cloned())
-            .ok_or_else(|| malformed_response(anyhow::anyhow!("missing 'recovery_root'")))?;
+        let Some(serde_json::Value::Object(mut inner)) = value.remove("recovery_root") else {
+            return Err(malformed_response(anyhow::anyhow!(
+                "missing 'recovery_root'"
+            )));
+        };
         if inner.contains_key("present") {
             return Err(malformed_response(anyhow::anyhow!(
                 "recovery_root must not carry 'present'"
             )));
         }
         inner.insert("present".to_owned(), serde_json::Value::Bool(true));
-        decode_recovery_root_view(
-            serde_json::to_vec(&serde_json::Value::Object(inner)).map_err(malformed_response)?,
-        )
+        decode_recovery_root_view(inner)
     }
 
     fn issue_recovery_challenge(
@@ -1403,12 +1402,9 @@ fn malformed_response(error: impl Into<anyhow::Error>) -> AdminApiError {
     AdminApiError::MalformedResponse(error.into())
 }
 
-fn decode_recovery_root_view(raw: Vec<u8>) -> Result<RecoveryRootView, AdminApiError> {
-    let mut object =
-        match serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&raw) {
-            Ok(object) => object,
-            Err(error) => return Err(malformed_response(error)),
-        };
+fn decode_recovery_root_view(
+    mut object: serde_json::Map<String, serde_json::Value>,
+) -> Result<RecoveryRootView, AdminApiError> {
     let present = object
         .get("present")
         .and_then(serde_json::Value::as_bool)
@@ -1797,6 +1793,49 @@ mod tests {
             body_text,
             r#"{"approval_token":"tok","action":"bind","deployment_id":"deploy-alpha","label":"ops","public_key":"pk","kid":"k","recovery_public_key":"rpk","recovery_kid":"rkid"}"#
         );
+    }
+
+    #[test]
+    fn recovery_root_rotation_decodes_the_owned_object_and_rejects_contract_drift() {
+        let root = serde_json::json!({
+            "deployment_id": "deploy-alpha", "recovery_kid": "key-2",
+            "kdf": "argon2id", "generation": 2
+        });
+        let transport = CannedTransport::default();
+        let client = HttpControllerRegistryApi::with_transport(
+            "https://auth.example.com",
+            AdminAccess::new(None, None),
+            Box::new(transport.clone()),
+        )
+        .unwrap();
+        let body = RecoveryRootRotateBody {
+            approval_token: "approval".to_owned(),
+            deployment_id: "deploy-alpha".to_owned(),
+            recovery_public_key: "public-key".to_owned(),
+            kid: "key-2".to_owned(),
+        };
+        transport.push(200, &serde_json::json!({"recovery_root": root}).to_string());
+        let view = client.rotate_recovery_root(&body).unwrap();
+        assert!(view.present);
+        assert_eq!(view.recovery_kid.as_deref(), Some("key-2"));
+        assert_eq!(view.generation, Some(2));
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"recovery_root": []}),
+            serde_json::json!({"recovery_root": {"present": true}}),
+            {
+                let mut invalid = root.clone();
+                invalid["unexpected"] = serde_json::json!(true);
+                serde_json::json!({"recovery_root": invalid})
+            },
+        ] {
+            transport.push(200, &invalid.to_string());
+            assert!(matches!(
+                client.rotate_recovery_root(&body),
+                Err(AdminApiError::MalformedResponse(_))
+            ));
+        }
     }
 
     #[test]
