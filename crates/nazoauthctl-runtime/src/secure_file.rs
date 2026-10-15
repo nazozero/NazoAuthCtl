@@ -170,7 +170,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), Secu
         for _ in 0..16 {
             rng.try_fill_bytes(&mut random)
                 .map_err(|_| SecureFileError::Io)?;
-            let temp_name = format!(".{file_name}.tmp-{}", hex_suffix(&random));
+            let temp_name = format!(".{file_name}.tmp-{}", hex::encode(random));
             let owned = match rustix::fs::openat(
                 &parent_file,
                 &temp_name,
@@ -260,7 +260,7 @@ pub fn write_new_or_exact_with_outcome(
         for _ in 0..16 {
             rng.try_fill_bytes(&mut random)
                 .map_err(|_| SecureFileError::Io)?;
-            let temp_name = format!(".{file_name}.new-{}", hex_suffix(&random));
+            let temp_name = format!(".{file_name}.new-{}", hex::encode(random));
             let owned = match rustix::fs::openat(
                 &parent_file,
                 &temp_name,
@@ -662,11 +662,6 @@ fn validate_file_metadata(metadata: &fs::Metadata, private: bool) -> Result<(), 
 #[cfg(unix)]
 fn owner_is_current_or_root(uid: u32) -> bool {
     uid == 0 || rustix::process::geteuid().as_raw() == uid
-}
-
-#[cfg(unix)]
-fn hex_suffix(bytes: &[u8; 16]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(windows)]

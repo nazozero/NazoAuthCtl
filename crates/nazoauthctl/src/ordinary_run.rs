@@ -579,7 +579,7 @@ fn execute_with_progress<S: ProgressSink>(
     // without changing the plan identity. Bound the run by the artifact-wide
     // module ceiling instead of treating an old per-plan count as immutable.
     selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
-    let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
+    let request_jti = format!("request-{}", hex::encode(rand::random::<[u8; 16]>()));
     let evidence_directory = create_evidence_directory(&recovery_directory, &request_jti)?;
     let ephemeral_tenant = EphemeralTenant::new(
         &invocation.tenant_id,
@@ -3566,14 +3566,6 @@ fn current_unix_time() -> anyhow::Result<i64> {
         .context("system clock is before the Unix epoch")?
         .as_secs();
     i64::try_from(seconds).context("system clock exceeds the supported range")
-}
-
-fn hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn select_artifact_matrix_for_run(

@@ -35,7 +35,7 @@ impl PrivateTempDir {
         let root = fs::canonicalize(root)?;
         validate_secure_ancestors(&root, "temporary directory")?;
         for _ in 0..32 {
-            let suffix = hex(&rand::random::<[u8; 12]>());
+            let suffix = hex::encode(rand::random::<[u8; 12]>());
             let path = root.join(format!("{prefix}.{suffix}"));
             let create_result: anyhow::Result<()> = {
                 #[cfg(windows)]
@@ -958,7 +958,7 @@ pub fn generate_secret(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>
             Ok(zeroize::Zeroizing::new(value))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let value = zeroize::Zeroizing::new(hex(&rand::random::<[u8; 32]>()));
+            let value = zeroize::Zeroizing::new(hex::encode(rand::random::<[u8; 32]>()));
             atomic_write(path, value.as_bytes(), 0o440)?;
             Ok(value)
         }
@@ -992,7 +992,7 @@ pub fn sha256_file(file: &mut File, description: &str) -> anyhow::Result<String>
         }
         digest.update(&buffer[..read]);
     }
-    Ok(hex(&digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 #[cfg(unix)]
@@ -1061,16 +1061,6 @@ fn create_symlink(target: &Path, link: &Path) -> anyhow::Result<()> {
         std::os::windows::fs::symlink_file(target, link)
     }
     .with_context(|| format!("failed to create symlink {}", link.display()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]

@@ -740,10 +740,7 @@ fn build_install_order(
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn deployment_loopback_port(deployment_id: &str) -> u16 {

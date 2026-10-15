@@ -529,8 +529,5 @@ fn validate_lower_hex(value: &str, length: usize) -> Result<(), ProtocolError> {
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }

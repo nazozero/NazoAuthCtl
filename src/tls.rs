@@ -2164,13 +2164,7 @@ fn validate_absolute_normalized(path: &Path, label: &str) -> anyhow::Result<()> 
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    output
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn valid_sha256(value: &str) -> bool {

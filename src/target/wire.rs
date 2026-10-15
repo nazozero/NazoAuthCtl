@@ -1816,12 +1816,7 @@ pub fn canonical_operation_hash(operation: &HostOperation) -> anyhow::Result<Str
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn is_uuid_v7(value: &str) -> bool {

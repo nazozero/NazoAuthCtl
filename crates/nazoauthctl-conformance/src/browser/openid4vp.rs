@@ -227,10 +227,7 @@ fn valid_lower_hex(value: &str) -> bool {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Inputs required to start one OpenID4VP verifier presentation. Matrix

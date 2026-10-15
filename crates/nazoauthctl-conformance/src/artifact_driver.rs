@@ -90,10 +90,7 @@ pub(crate) fn validate_oidf_driver(
 }
 
 fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

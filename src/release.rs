@@ -461,14 +461,15 @@ pub(crate) fn enforce_release_trust_floor(
     Ok(())
 }
 
+pub(crate) fn parse_release_version(value: &str) -> anyhow::Result<semver::Version> {
+    let value = value
+        .strip_prefix('v')
+        .context("Release version has no v prefix")?;
+    semver::Version::parse(value).context("Release version is not semantic")
+}
+
 pub(crate) fn compare_versions(left: &str, right: &str) -> anyhow::Result<std::cmp::Ordering> {
-    fn parse(value: &str) -> anyhow::Result<semver::Version> {
-        let value = value
-            .strip_prefix('v')
-            .context("Release version has no v prefix")?;
-        semver::Version::parse(value).context("Release version is not semantic")
-    }
-    Ok(parse(left)?.cmp_precedence(&parse(right)?))
+    Ok(parse_release_version(left)?.cmp_precedence(&parse_release_version(right)?))
 }
 
 fn bounded_https_curl_arguments(max_time: u64, max_filesize: u64) -> Vec<String> {
@@ -797,6 +798,21 @@ fn verify_artifact(path: &Path, artifact: &Artifact) -> anyhow::Result<()> {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn release_version_parsing_preserves_tag_and_precedence_rules() {
+        for invalid in ["1.2.3", "v", "v1.2", "v01.2.3"] {
+            assert!(parse_release_version(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            compare_versions("v1.2.3+build-a", "v1.2.3+build-b").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("v1.2.3-rc.1", "v1.2.3").unwrap(),
+            std::cmp::Ordering::Less
+        );
+    }
 
     #[test]
     fn release_fetch_failures_distinguish_missing_from_transport() {

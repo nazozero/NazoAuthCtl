@@ -503,10 +503,7 @@ fn selection_set(values: &[String]) -> Result<BTreeSet<String>, OidfPlanError> {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use crate::filesystem::{
     read_secure_regular_file, remove_file_durable, sha256_file,
 };
 use crate::process::Process;
-use crate::release::compare_versions;
+use crate::release::{compare_versions, parse_release_version};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -273,7 +273,7 @@ pub(super) fn controller_trust_state() -> anyhow::Result<Option<ControllerTrustS
     }
     let state: ControllerTrustState = read_current_self_state(&path, "controller trust state")?;
     validate_digest(&state.sha256, "controller trust state digest")?;
-    compare_versions(&state.version, &state.version)?;
+    parse_release_version(&state.version)?;
     Ok(Some(state))
 }
 
@@ -403,7 +403,7 @@ pub(super) fn validate_self_state(directory: &Path) -> anyhow::Result<()> {
         let state: ControllerTrustState =
             read_current_self_state(&trust, "controller trust state")?;
         validate_digest(&state.sha256, "controller trust digest")?;
-        compare_versions(&state.version, &state.version)?;
+        parse_release_version(&state.version)?;
     }
     let rollback = directory.join("rollback.json");
     if current_self_state_is_present(&rollback, "controller rollback state")? {

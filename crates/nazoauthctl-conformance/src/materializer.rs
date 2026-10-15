@@ -1215,10 +1215,10 @@ impl DescriptorMaterializer {
                 .collect(),
             raw_sha256: Some(raw_matrix_sha256.to_owned()),
         };
-        let referenced_datasets = referenced_openid4vc_credential_dataset_ids(&descriptor)?;
+        let referenced_datasets = referenced_openid4vc_credential_dataset_ids(&descriptor.groups)?;
         descriptor
             .openid4vc_credential_datasets
-            .retain(|configuration_id, _| referenced_datasets.contains(configuration_id));
+            .retain(|configuration_id, _| referenced_datasets.contains(configuration_id.as_str()));
         validate_descriptor(&descriptor)?;
         Ok(descriptor)
     }
@@ -3408,6 +3408,34 @@ mod tests {
             .expect("conflicting dataset must fail"),
             MaterializerError::InvalidField("nazo.credential_dataset")
         );
+    }
+
+    #[test]
+    fn shared_vci_dataset_keeps_its_node_limit() {
+        let mut descriptor = descriptor_with_openid4vc_plan(
+            "oid4vci-1_0-issuer-test-plan",
+            BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]),
+            serde_json::json!({
+                "alias": "nazo-vci-dataset",
+                "vci": {"credential_configuration_id": "eu.example.pid"},
+                "nazo": {"openid4vc_role": "issuer", "credential_format": "sd_jwt_vc"}
+            }),
+        );
+        let mut second = descriptor.groups[0].plans[0].clone();
+        second.id = "second-vci-plan".to_owned();
+        descriptor.groups[0].plans.push(second);
+        for (children, valid) in [(510, true), (511, false)] {
+            descriptor.openid4vc_credential_datasets.insert(
+                "eu.example.pid".to_owned(),
+                serde_json::json!({"claims": vec![Value::Null; children]}),
+            );
+            let result = validate_descriptor(&descriptor);
+            if valid {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err(), MaterializerError::Oversize);
+            }
+        }
     }
 
     #[test]

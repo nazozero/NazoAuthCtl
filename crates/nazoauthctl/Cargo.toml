@@ -15,6 +15,7 @@ path = "src/main.rs"
 pre-release-validation = ["nazoauthctl-core/pre-release-validation"]
 
 [dependencies]
+hex.workspace = true
 anyhow = "1.0.104"
 base64 = "0.23.1"
 ctrlc = "3.5.2"

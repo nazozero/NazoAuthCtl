@@ -603,7 +603,7 @@ fn validate_matrix(
             ));
         }
         for plan in &group.plans {
-            plan_count = plan_count.saturating_add(1);
+            plan_count += 1;
             validate_identifier(&plan.id, 128).map_err(ArtifactError::MatrixPolicy)?;
             validate_identifier(&plan.plan, 256).map_err(ArtifactError::MatrixPolicy)?;
             validate_identifier(&plan.driver_handler, 128).map_err(ArtifactError::MatrixPolicy)?;
@@ -706,7 +706,7 @@ fn validate_template(
     depth: usize,
     nodes: &mut usize,
 ) -> Result<(), &'static str> {
-    *nodes = nodes.saturating_add(1);
+    *nodes += 1;
     if depth > 16 || *nodes > 4096 {
         return Err("matrix template structure is too large");
     }
@@ -911,10 +911,7 @@ fn key_id(key: &VerifyingKey) -> String {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> ArtifactError {
@@ -1374,6 +1371,20 @@ mod tests {
             ),
             Err(ArtifactError::ManifestPolicy(_))
         ));
+    }
+
+    #[test]
+    fn template_node_limit_accepts_the_boundary_and_rejects_the_next_node() {
+        for (children, valid) in [(4095, true), (4096, false)] {
+            let mut nodes = 0;
+            let result = validate_template(
+                &Value::Array(vec![Value::Null; children]),
+                &Default::default(),
+                0,
+                &mut nodes,
+            );
+            assert_eq!(result.is_ok(), valid);
+        }
     }
 
     #[test]

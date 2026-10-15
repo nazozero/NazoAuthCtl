@@ -11,6 +11,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+hex.workspace = true
 anyhow = "1.0.104"
 atomic-write-file = "0.3.1"
 libc = "0.2.190"

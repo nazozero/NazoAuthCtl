@@ -315,7 +315,7 @@ fn validate_openid4vc_credential_datasets(
     if descriptor.openid4vc_credential_datasets.len() > MAX_OPENID4VC_DATASETS {
         return Err(MaterializerError::Oversize);
     }
-    let referenced = referenced_openid4vc_credential_dataset_ids(descriptor)?;
+    let mut referenced = BTreeSet::new();
     for group in &descriptor.groups {
         for plan in &group.plans {
             if !plan.plan.starts_with("oid4vci-") {
@@ -324,11 +324,11 @@ fn validate_openid4vc_credential_datasets(
             let configuration_id = descriptor_vci_configuration_id(plan)?;
             let dataset = descriptor
                 .openid4vc_credential_datasets
-                .get(&configuration_id)
+                .get(configuration_id)
                 .ok_or(MaterializerError::InvalidField(
                     "openid4vc_credential_datasets",
                 ))?;
-            validate_public_credential_dataset(dataset)?;
+            referenced.insert(configuration_id);
 
             // The plan-local value is not authoritative.  If present, it is
             // required to match the descriptor map byte-for-byte so an
@@ -349,7 +349,7 @@ fn validate_openid4vc_credential_datasets(
         || descriptor
             .openid4vc_credential_datasets
             .keys()
-            .any(|key| !referenced.contains(key))
+            .any(|key| !referenced.contains(key.as_str()))
     {
         return Err(MaterializerError::InvalidField(
             "openid4vc_credential_datasets",
@@ -357,12 +357,7 @@ fn validate_openid4vc_credential_datasets(
     }
     let mut total_bytes = 0usize;
     for dataset in descriptor.openid4vc_credential_datasets.values() {
-        let encoded_len = serde_json::to_vec(dataset)
-            .map_err(|_| MaterializerError::Encoding)?
-            .len();
-        total_bytes = total_bytes
-            .checked_add(encoded_len)
-            .ok_or(MaterializerError::Oversize)?;
+        total_bytes += validate_public_credential_dataset(dataset)?;
         if total_bytes > MAX_OPENID4VC_DATASET_TOTAL_BYTES {
             return Err(MaterializerError::Oversize);
         }
@@ -371,10 +366,10 @@ fn validate_openid4vc_credential_datasets(
 }
 
 pub(super) fn referenced_openid4vc_credential_dataset_ids(
-    descriptor: &MatrixDescriptor,
-) -> Result<BTreeSet<String>, MaterializerError> {
+    groups: &[DescriptorGroup],
+) -> Result<BTreeSet<&str>, MaterializerError> {
     let mut referenced = BTreeSet::new();
-    for group in &descriptor.groups {
+    for group in groups {
         for plan in &group.plans {
             if plan.plan.starts_with("oid4vci-") {
                 referenced.insert(descriptor_vci_configuration_id(plan)?);
@@ -384,7 +379,7 @@ pub(super) fn referenced_openid4vc_credential_dataset_ids(
     Ok(referenced)
 }
 
-fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<String, MaterializerError> {
+fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<&str, MaterializerError> {
     let configured = plan
         .config_template
         .get("vci")
@@ -415,38 +410,24 @@ fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<String, Mate
         ));
     }
     validate_name(value, "vci.credential_configuration_id")?;
-    Ok(value.to_owned())
+    Ok(value)
 }
 
-fn validate_public_credential_dataset(value: &Value) -> Result<(), MaterializerError> {
-    let object = value
-        .as_object()
-        .filter(|object| !object.is_empty())
-        .ok_or(MaterializerError::InvalidField(
+fn validate_public_credential_dataset(value: &Value) -> Result<usize, MaterializerError> {
+    if value.as_object().is_none_or(|object| object.is_empty()) {
+        return Err(MaterializerError::InvalidField(
             "openid4vc_credential_datasets",
-        ))?;
-    let bytes = serde_json::to_vec(value).map_err(|_| MaterializerError::Encoding)?;
-    if bytes.len() > MAX_OPENID4VC_DATASET_BYTES {
+        ));
+    }
+    let encoded_len = serde_json::to_vec(value)
+        .map_err(|_| MaterializerError::Encoding)?
+        .len();
+    if encoded_len > MAX_OPENID4VC_DATASET_BYTES {
         return Err(MaterializerError::Oversize);
     }
     let mut nodes = 0;
-    validate_public_dataset_object(object, 0, &mut nodes)
-}
-
-fn validate_public_dataset_object(
-    object: &serde_json::Map<String, Value>,
-    depth: usize,
-    nodes: &mut usize,
-) -> Result<(), MaterializerError> {
-    *nodes = (*nodes).checked_add(1).ok_or(MaterializerError::Oversize)?;
-    if depth > MAX_OPENID4VC_DATASET_DEPTH || *nodes > MAX_OPENID4VC_DATASET_NODES {
-        return Err(MaterializerError::Oversize);
-    }
-    for (key, value) in object {
-        validate_public_dataset_key(key)?;
-        validate_public_dataset_value(value, depth + 1, nodes)?;
-    }
-    Ok(())
+    validate_public_dataset_value(value, 0, &mut nodes)?;
+    Ok(encoded_len)
 }
 
 fn validate_public_dataset_value(
@@ -454,7 +435,7 @@ fn validate_public_dataset_value(
     depth: usize,
     nodes: &mut usize,
 ) -> Result<(), MaterializerError> {
-    *nodes = (*nodes).checked_add(1).ok_or(MaterializerError::Oversize)?;
+    *nodes += 1;
     if depth > MAX_OPENID4VC_DATASET_DEPTH || *nodes > MAX_OPENID4VC_DATASET_NODES {
         return Err(MaterializerError::Oversize);
     }

@@ -72,10 +72,7 @@ impl UpdateRequest {
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// The G03 entry point. Delivery boundary: wired into the CLI by the I wave.

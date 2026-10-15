@@ -1142,10 +1142,7 @@ fn lower_hex(value: &str, length: usize) -> bool {
 
 #[cfg(unix)]
 fn sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> EvidenceError {

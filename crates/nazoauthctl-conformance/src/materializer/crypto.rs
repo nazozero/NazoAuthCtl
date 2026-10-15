@@ -124,7 +124,7 @@ pub(super) fn random_hex(bytes: usize) -> String {
     SysRng
         .try_fill_bytes(&mut random)
         .expect("operating-system CSPRNG unavailable");
-    random.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex::encode(random)
 }
 
 pub(super) fn random_tx_code() -> String {
@@ -575,10 +575,7 @@ pub(super) fn b64<T: AsRef<[u8]>>(value: T) -> String {
 }
 
 pub(super) fn digest_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub(super) fn validate_materialized_mtls_registration(
