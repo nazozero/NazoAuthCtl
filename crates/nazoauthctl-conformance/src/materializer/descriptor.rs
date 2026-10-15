@@ -127,7 +127,14 @@ fn default_mtls_signature() -> String {
     "ECDSA-P256-SHA256".to_owned()
 }
 
-pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), MaterializerError> {
+pub(super) struct ClientRegistration<'a> {
+    pub(super) policy: &'a CryptoPolicy,
+    pub(super) template: &'a Value,
+}
+
+pub(super) fn validate_descriptor(
+    descriptor: &MatrixDescriptor,
+) -> Result<BTreeMap<&str, ClientRegistration<'_>>, MaterializerError> {
     if descriptor.schema != DESCRIPTOR_SCHEMA_VERSION {
         return Err(MaterializerError::UnsupportedSchema(descriptor.schema));
     }
@@ -146,10 +153,10 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
         validate_name(&group.id, "group.id")?;
         validate_name(&group.profile, "group.profile")?;
         validate_name(&group.variant.id, "variant.id")?;
-        if !groups.insert(group.id.clone()) {
+        if !groups.insert(group.id.as_str()) {
             return Err(MaterializerError::DuplicateId(group.id.clone()));
         }
-        role_names(&group.required_roles)?;
+        validate_role_names(&group.required_roles)?;
         if group.plans.is_empty() {
             return Err(MaterializerError::InvalidField("group.plans"));
         }
@@ -159,7 +166,7 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
             if !plan.config_template.is_object() {
                 return Err(MaterializerError::InvalidField("plan.config_template"));
             }
-            if !plans.insert(plan.id.clone()) {
+            if !plans.insert(plan.id.as_str()) {
                 return Err(MaterializerError::DuplicateId(plan.id.clone()));
             }
             if plan.expected_results.len() > 64 {
@@ -173,33 +180,31 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
                     ));
                 }
             }
-            role_names(&plan.required_roles)?;
+            validate_role_names(&plan.required_roles)?;
             validate_crypto_policy(&plan.crypto)?;
             validate_bindings(plan)?;
             validate_value_template(&plan.config_template)?;
             validate_vci_dynamic_policy(plan)?;
             validate_template_references(&plan.config_template, &plan.secret_bindings)?;
-            validate_role_refs(plan, group, &group.required_roles, &plan.required_roles)?;
+            validate_role_refs(plan, &group.required_roles, &plan.required_roles)?;
         }
     }
     validate_openid4vc_credential_datasets(descriptor)?;
-    let clients = collect_client_policies(descriptor)?
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let clients = collect_client_registrations(descriptor)?;
     for group in &descriptor.groups {
         for plan in &group.plans {
             validate_template_clients(&plan.config_template, &plan.secret_bindings, &clients)?;
             for template in plan.secret_bindings.values() {
-                validate_template_clients(
-                    &Value::String(template.clone()),
+                validate_reference_client(
+                    parse_placeholder(template)?,
                     &plan.secret_bindings,
                     &clients,
+                    &mut BTreeSet::new(),
                 )?;
             }
         }
     }
-    Ok(())
+    Ok(clients)
 }
 
 /// Parse and validate one trust anchor used by the OpenID4VC mdoc verifier.
@@ -526,15 +531,14 @@ fn validate_vci_dynamic_policy(plan: &DescriptorPlan) -> Result<(), Materializer
 
 fn validate_role_refs(
     plan: &DescriptorPlan,
-    group: &DescriptorGroup,
     group_roles: &[RoleRequirement],
     plan_roles: &[RoleRequirement],
 ) -> Result<(), MaterializerError> {
     let mut roles = BTreeSet::new();
     for requirement in group_roles.iter().chain(plan_roles) {
-        let logical = logical_client_id(requirement)?;
-        if !roles.insert(logical.clone()) {
-            return Err(MaterializerError::DuplicateRole(logical));
+        let logical = logical_client_id(requirement);
+        if !roles.insert(logical) {
+            return Err(MaterializerError::DuplicateRole(logical.to_owned()));
         }
         for reference in &requirement.secret_refs {
             validate_binding_reference(reference, &plan.secret_bindings, &mut BTreeSet::new())?;
@@ -543,74 +547,58 @@ fn validate_role_refs(
             validate_registration_template(template)?;
         }
     }
-    let _ = group;
     Ok(())
 }
 
-pub(super) fn collect_client_policies(
+fn collect_client_registrations(
     descriptor: &MatrixDescriptor,
-) -> Result<BTreeMap<String, CryptoPolicy>, MaterializerError> {
-    let mut policies = BTreeMap::new();
-    for group in &descriptor.groups {
-        for plan in &group.plans {
-            for role in group.required_roles.iter().chain(&plan.required_roles) {
-                if role.registration_template.is_none() {
-                    continue;
-                }
-                let logical = logical_client_id(role)?;
-                if let Some(previous) = policies.get(&logical)
-                    && previous != &plan.crypto
-                {
-                    return Err(MaterializerError::InvalidField("client crypto policy"));
-                }
-                policies.insert(logical, plan.crypto.clone());
-            }
-        }
-    }
-    Ok(policies)
-}
-
-pub(super) fn collect_registrations(
-    descriptor: &MatrixDescriptor,
-) -> Result<BTreeMap<String, Value>, MaterializerError> {
-    let mut registrations = BTreeMap::new();
+) -> Result<BTreeMap<&str, ClientRegistration<'_>>, MaterializerError> {
+    let mut clients: BTreeMap<&str, ClientRegistration<'_>> = BTreeMap::new();
     for group in &descriptor.groups {
         for plan in &group.plans {
             for role in group.required_roles.iter().chain(&plan.required_roles) {
                 let Some(template) = &role.registration_template else {
                     continue;
                 };
-                let logical = logical_client_id(role)?;
-                if let Some(previous) = registrations.get(&logical)
-                    && previous != template
-                {
-                    return Err(MaterializerError::InvalidField("registration_template"));
+                let logical = logical_client_id(role);
+                match clients.entry(logical) {
+                    std::collections::btree_map::Entry::Occupied(previous) => {
+                        if previous.get().policy != &plan.crypto {
+                            return Err(MaterializerError::InvalidField("client crypto policy"));
+                        }
+                        if previous.get().template != template {
+                            return Err(MaterializerError::InvalidField("registration_template"));
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(ClientRegistration {
+                            policy: &plan.crypto,
+                            template,
+                        });
+                    }
                 }
-                registrations.insert(logical, template.clone());
             }
         }
     }
-    Ok(registrations)
+    Ok(clients)
 }
 
-fn logical_client_id(role: &RoleRequirement) -> Result<String, MaterializerError> {
-    let value = role.logical_client_id.as_deref().unwrap_or(&role.role);
-    validate_name(value, "logical_client_id")?;
-    Ok(value.to_owned())
+fn logical_client_id(role: &RoleRequirement) -> &str {
+    role.logical_client_id.as_deref().unwrap_or(&role.role)
 }
 
-fn role_names(roles: &[RoleRequirement]) -> Result<BTreeSet<String>, MaterializerError> {
+fn validate_role_names(roles: &[RoleRequirement]) -> Result<(), MaterializerError> {
     let mut names = BTreeSet::new();
     for role in roles {
         validate_name(&role.role, "role")?;
-        if !names.insert(role.role.clone()) {
+        if !names.insert(role.role.as_str()) {
             return Err(MaterializerError::DuplicateRole(role.role.clone()));
         }
         if let Some(logical) = &role.logical_client_id {
             validate_name(logical, "logical_client_id")?;
         }
     }
-    Ok(names)
+    Ok(())
 }
 
 fn validate_bindings(plan: &DescriptorPlan) -> Result<(), MaterializerError> {
@@ -744,7 +732,7 @@ fn validate_template_references(
 fn validate_template_clients(
     value: &Value,
     bindings: &BTreeMap<String, String>,
-    clients: &BTreeSet<String>,
+    clients: &BTreeMap<&str, ClientRegistration<'_>>,
 ) -> Result<(), MaterializerError> {
     match value {
         Value::Array(values) => values
@@ -766,7 +754,7 @@ fn validate_template_clients(
 fn validate_reference_client(
     name: &str,
     bindings: &BTreeMap<String, String>,
-    clients: &BTreeSet<String>,
+    clients: &BTreeMap<&str, ClientRegistration<'_>>,
     stack: &mut BTreeSet<String>,
 ) -> Result<(), MaterializerError> {
     if let Some(binding_name) = name.strip_prefix("secret.") {
@@ -790,7 +778,7 @@ fn validate_reference_client(
             .split_once('.')
             .map(|(logical, _)| logical)
             .ok_or_else(|| MaterializerError::UnknownClientReference(rest.to_owned()))?;
-        if !clients.contains(logical) {
+        if !clients.contains_key(logical) {
             return Err(MaterializerError::UnknownClientReference(
                 logical.to_owned(),
             ));

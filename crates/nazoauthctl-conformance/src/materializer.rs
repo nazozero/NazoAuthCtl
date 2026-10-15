@@ -57,10 +57,9 @@ pub use descriptor::{
     DescriptorVariant, MAX_DESCRIPTOR_BYTES, MatrixDescriptor, RoleRequirement,
 };
 use descriptor::{
-    collect_client_policies, collect_registrations, descriptor_requires_reference,
-    extract_single_mdoc_trust_anchor_from_bundle, is_placeholder, parse_placeholder,
-    referenced_openid4vc_credential_dataset_ids, validate_binding_reference, validate_descriptor,
-    validate_digest, validate_single_mdoc_trust_anchor,
+    descriptor_requires_reference, extract_single_mdoc_trust_anchor_from_bundle, is_placeholder,
+    parse_placeholder, referenced_openid4vc_credential_dataset_ids, validate_binding_reference,
+    validate_descriptor, validate_digest, validate_single_mdoc_trust_anchor,
 };
 use template::{
     materialize_registration_template, materialize_value, materialize_vci_config,
@@ -1182,7 +1181,7 @@ impl DescriptorMaterializer {
                 release: artifact_source_release.to_owned(),
                 digest: artifact_source_digest.to_owned(),
             },
-            openid4vc_credential_datasets: matrix.openid4vc_credential_datasets.clone(),
+            openid4vc_credential_datasets: BTreeMap::new(),
             openid4vc_suite_mdoc_trust_anchor_pem: matrix
                 .openid4vc_suite_mdoc_trust_anchor_pem
                 .clone(),
@@ -1216,30 +1215,30 @@ impl DescriptorMaterializer {
             raw_sha256: Some(raw_matrix_sha256.to_owned()),
         };
         let referenced_datasets = referenced_openid4vc_credential_dataset_ids(&descriptor.groups)?;
-        descriptor
+        descriptor.openid4vc_credential_datasets = matrix
             .openid4vc_credential_datasets
-            .retain(|configuration_id, _| referenced_datasets.contains(configuration_id.as_str()));
-        validate_descriptor(&descriptor)?;
+            .iter()
+            .filter(|(configuration_id, _)| referenced_datasets.contains(configuration_id.as_str()))
+            .map(|(configuration_id, claims)| (configuration_id.clone(), claims.clone()))
+            .collect();
         Ok(descriptor)
     }
 
     fn prepare_materialization(
-        descriptor: MatrixDescriptor,
+        mut descriptor: MatrixDescriptor,
         target_issuer: &str,
         suite_origin: &Origin,
         request_jti: &str,
         dynamic_registration_initial_access_token: Option<&str>,
         mdoc_issuing_country: Option<&str>,
     ) -> Result<PreparedMaterialization, MaterializerError> {
-        validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
         validate_request_jti(request_jti)?;
         let matrix_sha256 = descriptor
             .raw_sha256
-            .clone()
+            .take()
             .ok_or(MaterializerError::InvalidField("matrix_sha256"))?;
-        let policies = collect_client_policies(&descriptor)?;
-        let registrations = collect_registrations(&descriptor)?;
+        let registrations = validate_descriptor(&descriptor)?;
         let applicant_password = Zeroizing::new(random_secret(32));
         let applicant_email = Zeroizing::new(format!("oidf-{}@example.invalid", random_hex(16)));
         let tx_code = descriptor_requires_pre_authorized_vci(&descriptor)
@@ -1271,17 +1270,14 @@ impl DescriptorMaterializer {
             .then(|| generate_attestation_material(suite_origin.as_str(), issuing_country))
             .transpose()?;
         let mut clients = BTreeMap::new();
-        for (logical_client_id, policy) in policies {
-            let registration = registrations
-                .get(&logical_client_id)
-                .ok_or(MaterializerError::InvalidField("registration_template"))?;
+        for (logical_client_id, registration) in registrations {
             clients.insert(
-                logical_client_id.clone(),
+                logical_client_id.to_owned(),
                 PreparedClient::new(
-                    logical_client_id,
+                    logical_client_id.to_owned(),
                     &descriptor,
-                    &policy,
-                    registration,
+                    registration.policy,
+                    registration.template,
                     target_issuer,
                     suite_origin.as_str(),
                     request_jti,
@@ -3151,13 +3147,56 @@ mod tests {
     }
 
     #[test]
+    fn shared_clients_borrow_one_registration_and_reject_conflicts() {
+        let mut descriptor = descriptor();
+        let mut second = descriptor.groups[0].plans[0].clone();
+        second.id = "second-plan".to_owned();
+        descriptor.groups[0].plans.push(second);
+        let clients = validate_descriptor(&descriptor).expect("shared client");
+        assert_eq!(clients.len(), 1);
+        let client = &clients["web"];
+        assert!(std::ptr::eq(
+            client.policy,
+            &descriptor.groups[0].plans[0].crypto
+        ));
+        assert!(std::ptr::eq(
+            client.template,
+            descriptor.groups[0].required_roles[0]
+                .registration_template
+                .as_ref()
+                .unwrap(),
+        ));
+
+        descriptor.groups[0].plans[1].crypto.rsa_bits = 4096;
+        assert!(matches!(
+            validate_descriptor(&descriptor),
+            Err(MaterializerError::InvalidField("client crypto policy"))
+        ));
+        descriptor.groups[0].plans[1].crypto.rsa_bits = 2048;
+        let mut second_group = descriptor.groups[0].clone();
+        second_group.id = "second-group".to_owned();
+        for plan in &mut second_group.plans {
+            plan.id = format!("other-{}", plan.id);
+        }
+        second_group.required_roles[0]
+            .registration_template
+            .as_mut()
+            .unwrap()["client_name"] = serde_json::json!("conflicting client");
+        descriptor.groups.push(second_group);
+        assert!(matches!(
+            validate_descriptor(&descriptor),
+            Err(MaterializerError::InvalidField("registration_template"))
+        ));
+    }
+
+    #[test]
     fn review_cannot_be_preapproved_by_the_signed_matrix() {
         let mut descriptor = descriptor();
         descriptor.groups[0].plans[0]
             .expected_results
             .insert("oidcc-review".to_owned(), "REVIEW".to_owned());
         assert_eq!(
-            validate_descriptor(&descriptor),
+            validate_descriptor(&descriptor).map(|_| ()),
             Err(MaterializerError::InvalidField(
                 "plan.expected_results.result"
             ))
@@ -3429,7 +3468,7 @@ mod tests {
                 "eu.example.pid".to_owned(),
                 serde_json::json!({"claims": vec![Value::Null; children]}),
             );
-            let result = validate_descriptor(&descriptor);
+            let result = validate_descriptor(&descriptor).map(|_| ());
             if valid {
                 result.unwrap();
             } else {
