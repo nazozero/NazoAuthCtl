@@ -2693,7 +2693,7 @@ fn start_candidate(
         command: vec!["nazoauth".to_owned(), "server".to_owned()],
         mounts,
         environment,
-        networks: live.networks.clone(),
+        networks: live.networks,
         ip_address: None,
         ports: vec![format!("127.0.0.1:{port}:8000/tcp")],
         // Never copy reverse-proxy/ingress labels from the production object.

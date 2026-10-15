@@ -489,7 +489,7 @@ pub(crate) fn decode_operator_answer(
             HOST_ERR_OPERATION_INVALID,
             format!(
                 "the operator answered operation '{}' while '{}' was presented",
-                sanitize(result.operation_id.clone()),
+                sanitize(result.operation_id),
                 sanitize(operation_id.to_owned())
             ),
         ));

@@ -239,7 +239,7 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
         operation: SelfUpdateOperation::Rollback,
         phase: SelfUpdatePhase::Intent,
         install_path: install_path.clone(),
-        from_version: from_version.clone(),
+        from_version,
         from_sha256,
         to_version: state.version.clone(),
         to_sha256: state.sha256.clone(),

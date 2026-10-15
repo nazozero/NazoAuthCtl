@@ -638,7 +638,7 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
             validate_label(label)?;
             label.to_owned()
         }
-        None => ours.label.clone(),
+        None => ours.label,
     };
 
     let kid = match select_pending_candidate(keys, &deployment, &snapshot)? {
@@ -832,7 +832,7 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
         action: "revoke",
         alias: record.alias.clone(),
         deployment_id: deployment.clone(),
-        issuer: record.issuer.clone(),
+        issuer: record.issuer,
         label: target.label.clone(),
         controller_id: Some(target.controller_id.clone()),
         kid: target.kid.clone(),
@@ -845,7 +845,7 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
     let revoked = api.revoke_slot(&RevokeCommitBody {
         approval_token: token,
         deployment_id: deployment.clone(),
-        controller_id: target.controller_id.clone(),
+        controller_id: target.controller_id,
     })?;
     if revoked.status != SlotStatus::Revoked {
         bail!(

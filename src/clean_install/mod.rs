@@ -573,14 +573,14 @@ fn build_install_order(
     let runtime = if runtime_kind == RuntimeBackendKind::Host {
         RuntimeSeedConfig {
             data_dir: config_path(target_os, &paths.data_root),
-            database_url: database_runtime_url.clone(),
-            valkey_url: valkey_url.clone(),
+            database_url: database_runtime_url,
+            valkey_url,
             mfa_totp_key_file: config_path(target_os, &mfa_totp_key_file),
             signing_key_encryption_key_file: config_path(
                 target_os,
                 &signing_key_encryption_key_file,
             ),
-            signing_key_encryption_key_id: signing_key_encryption_key_id.clone(),
+            signing_key_encryption_key_id,
             client_secret_pepper_file: config_path(target_os, &client_secret_pepper_file),
             dynamic_registration_token_file: config_path(
                 target_os,
@@ -1063,7 +1063,7 @@ pub(crate) fn run_clean_install(
                 &security_roots,
             )?;
             let plan = install_journal::PreparedInstallPlan::new(
-                request_hash.clone(),
+                request_hash,
                 host_record.host_id.to_string(),
                 deployment_id,
                 operation_id.to_string(),

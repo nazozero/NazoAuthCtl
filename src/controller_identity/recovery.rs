@@ -460,7 +460,7 @@ pub(crate) fn recover_controller_identity(
 ) -> anyhow::Result<RecoveredIdentity> {
     let action = "controller recovery";
     let record = resolve_instance(registry, selector, action)?;
-    let deployment_id = record.deployment_id.clone();
+    let deployment_id = record.deployment_id;
     let instance_dir = keys.instance_dir(&deployment_id)?;
     filesystem::ensure_private_directory(&instance_dir, "controller key directory")?;
     let _recovery_lock = FileLock::acquire(&instance_dir.join("recovery.lock"))?;

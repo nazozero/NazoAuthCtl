@@ -748,8 +748,8 @@ impl OpenId4VpVerifierClient {
             request_method: request_method.to_owned(),
             response_mode: response_mode.clone(),
             transaction_data: None,
-            openid4vc_trust_policy_resource_id: trust_policy_resource_id.clone(),
-            openid4vc_trust_policy_digest: trust_policy_digest.clone(),
+            openid4vc_trust_policy_resource_id: trust_policy_resource_id,
+            openid4vc_trust_policy_digest: trust_policy_digest,
         };
         let (_, create_request_sha256) =
             nazo_operator_protocol::canonical_openid4vp_normalized_create_request(&normalized)

@@ -1380,8 +1380,8 @@ fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Resu
     let operation_id = admin_operation_id();
     let operation = crate::target::HostOperation::admin_create(
         operation_id,
-        inspection.deployment_id.clone(),
-        credentials.email.clone(),
+        inspection.deployment_id,
+        credentials.email,
         password,
     );
     let result = target.execute_host_operation(&operation)?;

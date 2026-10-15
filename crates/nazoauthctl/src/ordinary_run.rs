@@ -982,19 +982,19 @@ fn execute_with_progress<S: ProgressSink>(
         progress.activity(&ProgressActivity::WritingEvidence);
         let runtime = evidence_runtime(&deployment.runtime);
         let identity = EvidenceBundleIdentity {
-            run_jti: request_jti.clone(),
+            run_jti: request_jti,
             deployment: EvidenceDeploymentIdentity {
                 deployment_id: deployment.deployment_id.clone(),
                 target_issuer: ephemeral_tenant.issuer.clone(),
                 release: deployment.release.clone(),
-                runtime: runtime.clone(),
+                runtime,
             },
             source: EvidenceSourceIdentity {
                 suite_origin: suite_origin.to_string(),
-                artifact: Box::new(driver_plan.artifact.clone()),
+                artifact: Box::new(driver_plan.artifact),
             },
             control: EvidenceControlIdentity {
-                deployment_id: deployment.deployment_id.clone(),
+                deployment_id: deployment.deployment_id,
                 tenant_id: invocation.tenant_id.clone(),
                 operations: cleanup_operations.clone(),
                 cleanup_complete,
@@ -2352,7 +2352,7 @@ fn run_signed_suite<S: ProgressSink>(
         target_origin: Some(target_origin),
         binding,
         poll_timeout: invocation.poll_timeout,
-        control: control.clone(),
+        control,
         plan_lanes,
         plan_resource_budgets,
         selected_resource_budget,

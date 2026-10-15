@@ -321,7 +321,7 @@ pub(crate) fn run_update(
             ),
             (
                 crate::ui::text("Configuration revision", "配置修订"),
-                applied_revision.to_string(),
+                applied_revision,
             ),
             (
                 crate::ui::text("Artifact rollback", "程序回滚"),

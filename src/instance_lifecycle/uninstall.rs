@@ -128,12 +128,12 @@ fn prepare_uninstall(
     Ok((
         UninstallPlan {
             deployment_id: inspection.deployment_id.clone(),
-            alias: record.alias.clone(),
-            host_alias: host.alias.clone(),
+            alias: record.alias,
+            host_alias: host.alias,
             revision: inspection.revision,
             managed_deletions,
             runtime_object: inspection.runtime.object.clone(),
-            config_reference: inspection.config_reference.clone(),
+            config_reference: inspection.config_reference,
             kept_external,
         },
         target,

@@ -348,7 +348,7 @@ impl TargetJournal {
             &JournalLine {
                 schema: JOURNAL_SCHEMA,
                 operation_id: operation.operation_id.clone(),
-                operation_hash: operation_hash.clone(),
+                operation_hash,
                 action,
                 recorded_at: Utc::now(),
                 status: match result.outcome {

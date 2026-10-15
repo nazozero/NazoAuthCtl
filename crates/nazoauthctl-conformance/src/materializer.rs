@@ -1436,7 +1436,7 @@ impl DescriptorMaterializer {
             applied_revision: apply_output.revision(),
             resource_manifest_sha256: apply_output.resource_manifest_sha256().to_owned(),
             applicant_id: applicant_uuid,
-            clients: bindings.clients.clone(),
+            clients: bindings.clients,
             trust_policy_identity,
         })
     }
