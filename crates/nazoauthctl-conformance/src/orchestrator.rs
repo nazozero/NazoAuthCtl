@@ -25,8 +25,7 @@ use crate::progress::{
 };
 use crate::report::{
     CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
-    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_matrix_expectations,
-    summarize_module_outcomes,
+    ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_module_outcomes,
 };
 use crate::{OidfDriverLane, OidfPlanResourceBudget};
 
@@ -1393,10 +1392,9 @@ impl ConformanceRunner {
         let retention_candidate_settled =
             !retained_suite_plan_ids.is_empty() && cleanup.failures.is_empty();
         let cleanup_complete = retained_suite_plan_ids.is_empty() && cleanup.failures.is_empty();
-        let matrix_expectations = summarize_matrix_expectations(&modules);
         let matrix_expectations_satisfied = matrix_expectations_satisfied
             && all_selected_plan_definitions_enumerated
-            && matrix_expectations.unexpected_skipped_modules.is_empty()
+            && outcomes.unexpected_skipped_modules.is_empty()
             && unknown_declared_skip_modules.is_empty();
         let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
         let orchestration_integrity = OrchestrationIntegrity {
@@ -1422,7 +1420,7 @@ impl ConformanceRunner {
             && orchestration_integrity.all_modules_settled
             && orchestration_integrity.suite_resources_settled;
         let human_review_required = !outcomes.human_review_modules.is_empty();
-        let snapshot = snapshot(&groups, current_profile, current_variant, current_test);
+        let snapshot = snapshot(groups, current_profile, current_variant, current_test);
         let report = ConformanceReport {
             excluded_plans: Vec::new(),
             fail_fast: self.config.control.is_fail_fast(),
@@ -1441,8 +1439,8 @@ impl ConformanceRunner {
             warning_modules: outcomes.warning_modules,
             deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
-            expected_skipped_modules: matrix_expectations.expected_skipped_modules,
-            unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
+            expected_skipped_modules: outcomes.expected_skipped_modules,
+            unexpected_skipped_modules: outcomes.unexpected_skipped_modules,
             unknown_declared_skip_modules,
             retained_suite_plan_ids,
             matrix_expectations_satisfied,
@@ -1647,74 +1645,54 @@ fn emit_progress(
     current_test: Option<String>,
 ) {
     sink.update(&ProgressEvent {
-        snapshot: snapshot(groups, current_profile, current_variant, current_test),
+        snapshot: snapshot(
+            groups.to_vec(),
+            current_profile,
+            current_variant,
+            current_test,
+        ),
     });
 }
 
 fn snapshot(
-    groups: &[GroupProgress],
+    groups: Vec<GroupProgress>,
     current_profile: Option<String>,
     current_variant: Option<BTreeMap<String, String>>,
     current_test: Option<String>,
 ) -> ProgressSnapshot {
-    let groups = groups
-        .iter()
-        .cloned()
-        .map(|mut group| {
-            if group.status == GroupStatus::Failed && group.failed == 0 {
-                group.status = GroupStatus::Incomplete;
-            }
-            group
-        })
-        .collect::<Vec<_>>();
-    ProgressSnapshot {
-        completed: groups.iter().map(|group| group.completed).sum(),
-        total: groups.iter().map(|group| group.total).sum(),
-        groups: groups.clone(),
-        passed_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Passed)
-            .count(),
-        review_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Review)
-            .count(),
-        warning_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Warning)
-            .count(),
-        skipped_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Skipped)
-            .count(),
-        failed_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Failed)
-            .count(),
-        incomplete_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Incomplete)
-            .count(),
-        running_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Running)
-            .count(),
-        remaining_groups: groups
-            .iter()
-            .filter(|group| group.status == GroupStatus::Remaining)
-            .count(),
-        passed: groups.iter().map(|group| group.passed).sum(),
-        reviewed: groups.iter().map(|group| group.reviewed).sum(),
-        warnings: groups.iter().map(|group| group.warnings).sum(),
-        skipped: groups.iter().map(|group| group.skipped).sum(),
-        failed: groups.iter().map(|group| group.failed).sum(),
-        incomplete: groups.iter().map(|group| group.incomplete).sum(),
-        running: groups.iter().map(|group| group.running).sum(),
-        remaining: groups.iter().map(|group| group.remaining).sum(),
+    let mut snapshot = ProgressSnapshot {
+        groups,
         current_profile,
         current_variant,
         current_test,
+        ..ProgressSnapshot::default()
+    };
+    for group in &mut snapshot.groups {
+        if group.status == GroupStatus::Failed && group.failed == 0 {
+            group.status = GroupStatus::Incomplete;
+        }
+        snapshot.completed += group.completed;
+        snapshot.total += group.total;
+        snapshot.passed += group.passed;
+        snapshot.reviewed += group.reviewed;
+        snapshot.warnings += group.warnings;
+        snapshot.skipped += group.skipped;
+        snapshot.failed += group.failed;
+        snapshot.incomplete += group.incomplete;
+        snapshot.running += group.running;
+        snapshot.remaining += group.remaining;
+        match group.status {
+            GroupStatus::Passed => snapshot.passed_groups += 1,
+            GroupStatus::Review => snapshot.review_groups += 1,
+            GroupStatus::Warning => snapshot.warning_groups += 1,
+            GroupStatus::Skipped => snapshot.skipped_groups += 1,
+            GroupStatus::Failed => snapshot.failed_groups += 1,
+            GroupStatus::Incomplete => snapshot.incomplete_groups += 1,
+            GroupStatus::Running => snapshot.running_groups += 1,
+            GroupStatus::Remaining => snapshot.remaining_groups += 1,
+        }
     }
+    snapshot
 }
 
 fn record_module_progress(group: &mut GroupProgress, module: &ModuleReport) {
@@ -2085,7 +2063,7 @@ mod tests {
     #[test]
     fn progress_does_not_report_orchestration_gaps_as_failed_tests() {
         let progress = snapshot(
-            &[GroupProgress {
+            vec![GroupProgress {
                 id: "vp".to_owned(),
                 profile: "openid4vc".to_owned(),
                 completed: 0,

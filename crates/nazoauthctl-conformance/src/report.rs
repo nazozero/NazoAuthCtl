@@ -286,8 +286,14 @@ impl ModuleReport {
             &mut advisory_log_count,
             &mut advisory_conditions,
         );
-        let blocking_log_results = blocking_log_results.into_iter().collect::<Vec<_>>();
-        let advisory_log_results = advisory_log_results.into_iter().collect::<Vec<_>>();
+        let blocking_log_results = blocking_log_results
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let advisory_log_results = advisory_log_results
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
         let outcome =
             if !blocking_log_results.is_empty() || official_result.as_deref() == Some("FAILED") {
                 ModuleOutcome::Failed
@@ -325,7 +331,10 @@ impl ModuleReport {
             advisory_log_count,
             advisory_conditions: advisory_conditions
                 .into_iter()
-                .map(|(source, count)| WarningCondition { source, count })
+                .map(|(source, count)| WarningCondition {
+                    source: source.to_owned(),
+                    count,
+                })
                 .collect(),
             review_screenshots: Vec::new(),
             review_screenshots_required: 0,
@@ -373,6 +382,8 @@ pub(crate) struct ModuleOutcomeSummary {
     pub warning_modules: Vec<WarningModule>,
     pub deferred_review_modules: Vec<String>,
     pub skipped_modules: Vec<String>,
+    pub expected_skipped_modules: Vec<String>,
+    pub unexpected_skipped_modules: Vec<String>,
     pub failed_modules: Vec<String>,
     pub incomplete_modules: Vec<String>,
 }
@@ -400,11 +411,6 @@ pub struct WarningCondition {
     pub count: usize,
 }
 
-pub(crate) struct MatrixExpectationSummary {
-    pub expected_skipped_modules: Vec<String>,
-    pub unexpected_skipped_modules: Vec<String>,
-}
-
 pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutcomeSummary {
     let mut summary = ModuleOutcomeSummary {
         all_passed: !modules.is_empty(),
@@ -413,15 +419,22 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
         warning_modules: Vec::new(),
         deferred_review_modules: Vec::new(),
         skipped_modules: Vec::new(),
+        expected_skipped_modules: Vec::new(),
+        unexpected_skipped_modules: Vec::new(),
         failed_modules: Vec::new(),
         incomplete_modules: Vec::new(),
     };
     for module in modules {
+        let has_warning = module.has_warning();
+        if module.outcome == ModuleOutcome::Passed && !module.human_review_required && !has_warning
+        {
+            continue;
+        }
         let identity = module_identity(module);
         if module.human_review_required {
             summary.human_review_modules.push(identity.clone());
         }
-        if module.has_warning() {
+        if has_warning {
             summary.warning_modules.push(WarningModule {
                 module: identity.clone(),
                 official_status: module.official_status.clone(),
@@ -433,11 +446,7 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
         }
         match module.outcome {
             ModuleOutcome::Passed => {}
-            ModuleOutcome::Review => {
-                summary.all_passed = false;
-                summary.acceptance_pass = false;
-            }
-            ModuleOutcome::Warning => {
+            ModuleOutcome::Review | ModuleOutcome::Warning => {
                 summary.all_passed = false;
                 summary.acceptance_pass = false;
             }
@@ -448,10 +457,14 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
             }
             ModuleOutcome::Skipped => {
                 summary.all_passed = false;
-                summary.skipped_modules.push(identity);
-                if module.expected_result.as_deref() != Some("SKIPPED")
-                    || module.human_review_required
-                {
+                summary.skipped_modules.push(identity.clone());
+                if module.expected_result.as_deref() == Some("SKIPPED") {
+                    summary.expected_skipped_modules.push(identity);
+                    if module.human_review_required {
+                        summary.acceptance_pass = false;
+                    }
+                } else {
+                    summary.unexpected_skipped_modules.push(identity);
                     summary.acceptance_pass = false;
                 }
             }
@@ -470,25 +483,6 @@ pub(crate) fn summarize_module_outcomes(modules: &[ModuleReport]) -> ModuleOutco
     summary
 }
 
-pub(crate) fn summarize_matrix_expectations(modules: &[ModuleReport]) -> MatrixExpectationSummary {
-    let mut summary = MatrixExpectationSummary {
-        expected_skipped_modules: Vec::new(),
-        unexpected_skipped_modules: Vec::new(),
-    };
-    for module in modules {
-        if module.outcome != ModuleOutcome::Skipped {
-            continue;
-        }
-        let identity = module_identity(module);
-        if module.expected_result.as_deref() == Some("SKIPPED") {
-            summary.expected_skipped_modules.push(identity);
-        } else {
-            summary.unexpected_skipped_modules.push(identity);
-        }
-    }
-    summary
-}
-
 pub(crate) fn module_identity(module: &ModuleReport) -> String {
     if module.variant.is_empty() {
         return format!("{}/{}", module.matrix_plan_id, module.test_name);
@@ -501,12 +495,12 @@ pub(crate) fn module_identity(module: &ModuleReport) -> String {
     )
 }
 
-fn collect_condition_log_results(
-    value: &Value,
-    blocking: &mut BTreeSet<String>,
-    advisory: &mut BTreeSet<String>,
+fn collect_condition_log_results<'a>(
+    value: &'a Value,
+    blocking: &mut BTreeSet<&'a str>,
+    advisory: &mut BTreeSet<&'a str>,
     advisory_count: &mut usize,
-    advisory_conditions: &mut BTreeMap<String, usize>,
+    advisory_conditions: &mut BTreeMap<&'a str, usize>,
 ) {
     match value {
         Value::Array(values) => {
@@ -524,10 +518,10 @@ fn collect_condition_log_results(
             if let Some(result) = values.get("result").and_then(Value::as_str) {
                 match result {
                     "FAILURE" => {
-                        blocking.insert(result.to_owned());
+                        blocking.insert(result);
                     }
                     "WARNING" => {
-                        advisory.insert(result.to_owned());
+                        advisory.insert(result);
                         *advisory_count += 1;
                         *advisory_conditions
                             .entry(public_warning_condition_source(values))
@@ -550,14 +544,14 @@ fn collect_condition_log_results(
     }
 }
 
-fn public_warning_condition_source(values: &Map<String, Value>) -> String {
+fn public_warning_condition_source(values: &Map<String, Value>) -> &str {
     let Some(source) = values.get("src").and_then(Value::as_str) else {
-        return "WARNING".to_owned();
+        return "WARNING";
     };
     if source.len() <= 128 && !source.bytes().any(|byte| byte.is_ascii_control()) {
-        source.to_owned()
+        source
     } else {
-        "<invalid warning source>".to_owned()
+        "<invalid warning source>"
     }
 }
 
@@ -832,11 +826,11 @@ mod tests {
             ),
         ];
 
-        let summary = summarize_matrix_expectations(&modules);
+        let summary = summarize_module_outcomes(&modules);
 
         assert_eq!(summary.expected_skipped_modules, ["p/expected-skip"]);
         assert_eq!(summary.unexpected_skipped_modules, ["p/unexpected-skip"]);
-        assert!(!summarize_module_outcomes(&modules).acceptance_pass);
+        assert!(!summary.acceptance_pass);
 
         let expected_only = summarize_module_outcomes(&modules[..1]);
         assert!(expected_only.acceptance_pass);

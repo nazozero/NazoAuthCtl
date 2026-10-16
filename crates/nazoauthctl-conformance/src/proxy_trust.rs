@@ -128,11 +128,10 @@ fn validate_reload_executable(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     #[ignore = "requires root-owned proxy recovery files and executable"]
     fn legacy_recovery_retains_material_until_reload_succeeds() {
@@ -163,7 +162,6 @@ mod tests {
         assert_eq!(fs::read(&bundle).unwrap(), b"original bundle");
         fs::remove_dir_all(directory).unwrap();
     }
-    #[cfg(unix)]
     #[test]
     fn security_cloud_reload_rejects_replaceable_parent() {
         use std::os::unix::fs::PermissionsExt as _;

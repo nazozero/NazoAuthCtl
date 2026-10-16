@@ -68,7 +68,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     let prepared = runner.prepare_run(sink);
     sink.update(&ProgressEvent {
         snapshot: snapshot(
-            &prepared.groups,
+            prepared.groups.clone(),
             prepared.current_profile.clone(),
             prepared.current_variant.clone(),
             None,
@@ -81,9 +81,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     let mut prepared = prepared;
     let work = plan_work(&mut prepared);
     let worker_count = runner.config.jobs.min(work.len());
-    let queue = Arc::new(Mutex::new(VecDeque::from(
-        (0..work.len()).collect::<Vec<_>>(),
-    )));
+    let queue = Arc::new(Mutex::new(VecDeque::from_iter(0..work.len())));
     let stop_launching = Arc::new(AtomicBool::new(false));
     let mut snapshots = vec![None::<ProgressSnapshot>; work.len()];
     let mut finished = vec![false; work.len()];
@@ -276,7 +274,8 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
     let mut report = work.report.clone();
     report.created_instances = 0;
     PreparedRun {
-        groups: vec![group.clone()],
+        current_profile: Some(group.profile.clone()),
+        groups: vec![group],
         plans: vec![report],
         planned: vec![plan],
         // Workers cancel their runner modules, while the phase-1 owner
@@ -287,7 +286,6 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
         matrix_expectations_satisfied: true,
         all_selected_plan_definitions_enumerated: true,
         auth_probe: None,
-        current_profile: Some(group.profile),
         current_variant: Some(redacted_variant(&work.plan.variant)),
     }
 }
@@ -332,46 +330,34 @@ fn aggregate_progress(
         group.remaining = group
             .total
             .saturating_sub(group.completed.saturating_add(group.running));
-        let indices = work
-            .iter()
-            .filter(|work| work.group_index == group_index)
-            .map(|work| work.index)
-            .collect::<Vec<_>>();
-        let any_failed = indices.iter().any(|index| {
-            snapshots[*index]
-                .as_ref()
-                .and_then(|snapshot| snapshot.groups.first())
-                .is_some_and(|group| group.status == GroupStatus::Failed)
-        });
-        let any_incomplete = indices.iter().any(|index| {
-            snapshots[*index]
-                .as_ref()
-                .and_then(|snapshot| snapshot.groups.first())
-                .is_some_and(|group| group.status == GroupStatus::Incomplete)
-        });
-        let any_review = indices.iter().any(|index| {
-            snapshots[*index]
-                .as_ref()
-                .and_then(|snapshot| snapshot.groups.first())
-                .is_some_and(|group| group.status == GroupStatus::Review)
-        });
-        let any_warning = indices.iter().any(|index| {
-            snapshots[*index]
-                .as_ref()
-                .and_then(|snapshot| snapshot.groups.first())
-                .is_some_and(|group| group.status == GroupStatus::Warning)
-        });
-        let any_skipped = indices.iter().any(|index| {
-            snapshots[*index]
-                .as_ref()
-                .and_then(|snapshot| snapshot.groups.first())
-                .is_some_and(|group| group.status == GroupStatus::Skipped)
-        });
+        let mut any_failed = false;
+        let mut any_incomplete = false;
+        let mut any_review = false;
+        let mut any_warning = false;
+        let mut any_skipped = false;
+        let mut all_finished = true;
+        let mut any_started = false;
+        for work in work.iter().filter(|work| work.group_index == group_index) {
+            all_finished &= finished[work.index];
+            if let Some(snapshot) = &snapshots[work.index] {
+                any_started = true;
+                if let Some(group) = snapshot.groups.first() {
+                    match group.status {
+                        GroupStatus::Failed => any_failed = true,
+                        GroupStatus::Incomplete => any_incomplete = true,
+                        GroupStatus::Review => any_review = true,
+                        GroupStatus::Warning => any_warning = true,
+                        GroupStatus::Skipped => any_skipped = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
         group.status = if any_failed {
             GroupStatus::Failed
         } else if any_incomplete {
             GroupStatus::Incomplete
-        } else if indices.iter().all(|index| finished[*index]) {
+        } else if all_finished {
             if any_review {
                 GroupStatus::Review
             } else if any_warning {
@@ -381,7 +367,7 @@ fn aggregate_progress(
             } else {
                 GroupStatus::Passed
             }
-        } else if indices.iter().any(|index| snapshots[*index].is_some()) {
+        } else if any_started {
             GroupStatus::Running
         } else {
             GroupStatus::Remaining
@@ -393,7 +379,7 @@ fn aggregate_progress(
         .find(|(index, snapshot)| !finished[*index] && snapshot.is_some())
         .and_then(|(_, snapshot)| snapshot.as_ref());
     snapshot(
-        &groups,
+        groups,
         current.and_then(|snapshot| snapshot.current_profile.clone()),
         current.and_then(|snapshot| snapshot.current_variant.clone()),
         current.and_then(|snapshot| snapshot.current_test.clone()),
@@ -531,10 +517,9 @@ fn merge_reports(
     let retention_eligible = retention_candidate_settled;
     let cleanup_complete =
         retained_suite_plan_ids.is_empty() && !worker_panicked && cleanup.failures.is_empty();
-    let matrix_expectations = summarize_matrix_expectations(&modules);
     let matrix_expectations_satisfied = prepared.matrix_expectations_satisfied
         && prepared.all_selected_plan_definitions_enumerated
-        && matrix_expectations.unexpected_skipped_modules.is_empty()
+        && outcomes.unexpected_skipped_modules.is_empty()
         && prepared.unknown_declared_skip_modules.is_empty();
     let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
     let orchestration_integrity = OrchestrationIntegrity {
@@ -578,8 +563,8 @@ fn merge_reports(
             warning_modules: outcomes.warning_modules,
             deferred_review_modules: outcomes.deferred_review_modules,
             skipped_modules: outcomes.skipped_modules,
-            expected_skipped_modules: matrix_expectations.expected_skipped_modules,
-            unexpected_skipped_modules: matrix_expectations.unexpected_skipped_modules,
+            expected_skipped_modules: outcomes.expected_skipped_modules,
+            unexpected_skipped_modules: outcomes.unexpected_skipped_modules,
             unknown_declared_skip_modules: prepared.unknown_declared_skip_modules,
             retained_suite_plan_ids,
             matrix_expectations_satisfied,
