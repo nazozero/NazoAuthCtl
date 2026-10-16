@@ -977,6 +977,21 @@ mod tests {
     const OPERATION_ID: &str = "01900000-0000-7000-8000-000000000001";
 
     #[test]
+    fn host_artifact_copy_rejects_changed_bytes_without_replacing_cached_binary()
+    -> anyhow::Result<()> {
+        let temp = filesystem::PrivateTempDir::new("host-artifact-copy")?;
+        let source = temp.path().join("candidate");
+        let runtime_root = temp.path().join("runtime");
+        filesystem::atomic_write(&source, b"verified", 0o600)?;
+        let digest = sha256_hex(b"verified");
+        let cached = cache_systemd_artifact(&source, &runtime_root, &digest)?;
+        filesystem::atomic_write(&source, b"changed", 0o600)?;
+        assert!(cache_systemd_artifact(&source, &runtime_root, &digest).is_err());
+        assert_eq!(std::fs::read(cached)?, b"verified");
+        Ok(())
+    }
+
+    #[test]
     fn config_snapshot_reuses_current_bytes_and_preserves_resumed_generation() -> anyhow::Result<()>
     {
         let temp = filesystem::PrivateTempDir::new("update-config-snapshot")?;
@@ -1730,28 +1745,19 @@ pub(crate) fn verify_pinned_artifact_facts(
                         )
                     })?;
                 let source = Path::new(host_binary_path);
-                let observed_digest = filesystem::sha256(source).map_err(|error| {
-                    Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        sanitize(error.to_string()),
-                    )
-                })?;
-                if observed_digest != host_binary_sha256 {
-                    return Err(Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        "local pre-release host binary does not match its content digest",
-                    ));
-                }
                 let cached =
-                    cache_systemd_artifact(source, Path::new(runtime_root), &observed_digest)
+                    cache_systemd_artifact(source, Path::new(runtime_root), host_binary_sha256)
                         .map_err(|error| {
-                            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+                            Failure::new(
+                                super::install_exec::ARTIFACT_UNVERIFIED,
+                                sanitize(format!("{error:#}")),
+                            )
                         })?;
                 (
-                    observed_digest.clone(),
+                    host_binary_sha256.to_owned(),
                     runtime_backend::ArtifactReference::HostBinary {
                         path: cached,
-                        sha256: observed_digest,
+                        sha256: host_binary_sha256.to_owned(),
                     },
                 )
             }
@@ -1810,29 +1816,15 @@ pub(crate) fn verify_pinned_artifact_facts(
                     "systemd deployment state has no app-binary directory resource",
                 )
             })?;
-            let source = release
-                .artifact("binary", &artifact.repository)
-                .map_err(|error| {
-                    Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        sanitize(error.to_string()),
-                    )
-                })?;
-            let digest = filesystem::sha256(&source).map_err(|error| {
-                Failure::new(
-                    super::install_exec::ARTIFACT_UNVERIFIED,
-                    sanitize(error.to_string()),
-                )
-            })?;
-            let cached = cache_systemd_artifact(&source, Path::new(runtime_root), &digest)
-                .map_err(|error| {
-                    Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-                })?;
+            let (source, digest) = release.binary_artifact();
+            let cached = cache_systemd_artifact(&source, Path::new(runtime_root), digest).map_err(
+                |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
+            )?;
             (
-                digest.clone(),
+                digest.to_owned(),
                 runtime_backend::ArtifactReference::HostBinary {
                     path: cached,
-                    sha256: digest,
+                    sha256: digest.to_owned(),
                 },
             )
         }
