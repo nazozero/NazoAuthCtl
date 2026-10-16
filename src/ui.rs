@@ -1,5 +1,9 @@
 //! Shared presentation rules for the command-line boundary.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    borrow::Cow,
+    fmt::Write as _,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use unicode_width::UnicodeWidthStr;
 
 static JSON: AtomicBool = AtomicBool::new(false);
@@ -103,24 +107,35 @@ pub(crate) use fail;
 
 pub(crate) fn fields(title: &str, values: &[(&str, String)]) -> String {
     let width = values.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
-    let mut lines = vec![title.to_owned(), String::new()];
+    let mut output = String::from(title);
+    output.push('\n');
     for (key, value) in values {
-        lines.push(format!(
-            "{key}{} : {value}",
-            " ".repeat(width - key.width())
-        ));
+        write!(
+            output,
+            "\n{key}{:padding$} : {value}",
+            "",
+            padding = width - key.width()
+        )
+        .unwrap();
     }
-    lines.join("\n")
+    output
 }
 
 pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
-    let clean = |value: &str| value.replace(['\r', '\n', '\t'], " ");
-    let rows: Vec<Vec<String>> = std::iter::once(headers.iter().copied().map(clean).collect())
-        .chain(
-            rows.iter()
-                .map(|row| row.iter().map(|value| clean(value)).collect()),
-        )
-        .collect();
+    fn clean(value: &str) -> Cow<'_, str> {
+        if value.contains(['\r', '\n', '\t']) {
+            Cow::Owned(value.replace(['\r', '\n', '\t'], " "))
+        } else {
+            Cow::Borrowed(value)
+        }
+    }
+    let rows: Vec<Vec<Cow<'_, str>>> =
+        std::iter::once(headers.iter().copied().map(clean).collect())
+            .chain(
+                rows.iter()
+                    .map(|row| row.iter().map(|value| clean(value)).collect()),
+            )
+            .collect();
     let widths: Vec<usize> = (0..headers.len())
         .map(|column| {
             rows.iter()
@@ -129,35 +144,41 @@ pub(crate) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
                 .unwrap_or(0)
         })
         .collect();
-    let mut lines = Vec::new();
+    let mut output = String::new();
     for (index, row) in rows.iter().enumerate() {
-        lines.push(
-            widths
-                .iter()
-                .enumerate()
-                .map(|(column, width)| {
-                    let value = row.get(column).map_or("", String::as_str);
-                    format!("{value}{}", " ".repeat(width - value.width()))
-                })
-                .collect::<Vec<_>>()
-                .join(" | ")
-                .trim_end()
-                .to_owned(),
-        );
+        if index > 0 {
+            output.push('\n');
+        }
+        let start = output.len();
+        for (column, width) in widths.iter().enumerate() {
+            if column > 0 {
+                output.push_str(" | ");
+            }
+            let value = row.get(column).map_or("", |value| value.as_ref());
+            write!(
+                output,
+                "{value}{:padding$}",
+                "",
+                padding = width - value.width()
+            )
+            .unwrap();
+        }
+        output.truncate(start + output[start..].trim_end().len());
         if index == 0 {
-            lines.push(
-                widths
-                    .iter()
-                    .map(|w| "-".repeat(*w))
-                    .collect::<Vec<_>>()
-                    .join("-+-"),
-            );
+            output.push('\n');
+            for (column, width) in widths.iter().enumerate() {
+                if column > 0 {
+                    output.push_str("-+-");
+                }
+                output.extend(std::iter::repeat_n('-', *width));
+            }
         }
     }
     if rows.len() == 1 {
-        lines.push(text("No records.", "暂无记录。").to_owned());
+        output.push('\n');
+        output.push_str(text("No records.", "暂无记录。"));
     }
-    lines.join("\n")
+    output
 }
 
 pub(crate) fn print_report(report: &str) {
@@ -172,7 +193,7 @@ pub(crate) fn print_report(report: &str) {
     }
 }
 
-pub(crate) fn label(key: &str) -> String {
+pub(crate) fn label(key: &str) -> Cow<'_, str> {
     let chinese = match key {
         "schema" => "格式版本",
         "alias" | "name" => "名称",
@@ -388,14 +409,18 @@ pub(crate) fn label(key: &str) -> String {
         "host_id" => "主机编号",
         "directory" => "目录",
         "platform" => "平台",
-        _ => return key.replace('_', " "),
+        _ => return key.replace('_', " ").into(),
     };
-    text(&key.replace('_', " "), chinese).to_owned()
+    if crate::chinese_output() && !json_mode() {
+        Cow::Borrowed(chinese)
+    } else {
+        Cow::Owned(key.replace('_', " "))
+    }
 }
 
 pub(crate) fn render_value(value: &serde_json::Value) -> String {
-    fn append(value: &serde_json::Value, depth: usize, key_context: &str, lines: &mut Vec<String>) {
-        let indent = "  ".repeat(depth);
+    fn append(value: &serde_json::Value, depth: usize, key_context: &str, output: &mut String) {
+        let indent = depth * 2;
         match value {
             serde_json::Value::Object(map) => {
                 for (key, value) in map {
@@ -416,47 +441,50 @@ pub(crate) fn render_value(value: &serde_json::Value) -> String {
                         continue;
                     }
                     let name = if key_context == "observation" && key == "summary" {
-                        text("Original diagnostic", "诊断详情（原文）").to_owned()
+                        Cow::Borrowed(text("Original diagnostic", "诊断详情（原文）"))
                     } else {
                         label(key)
                     };
                     if key == "config_template" {
-                        lines.push(format!(
-                            "{indent}{name}: {}",
+                        writeln!(
+                            output,
+                            "{:indent$}{name}: {}",
+                            "",
                             text(
                                 "Use --json for the full template",
                                 "使用 --json 查看完整模板"
                             )
-                        ));
+                        )
+                        .unwrap();
                     } else if value.is_object() || value.is_array() {
-                        lines.push(format!("{indent}{name}:"));
-                        append(value, depth + 1, key, lines);
+                        writeln!(output, "{:indent$}{name}:", "").unwrap();
+                        append(value, depth + 1, key, output);
                     } else {
-                        lines.push(format!("{indent}{name}: {}", scalar(value, key)));
+                        writeln!(output, "{:indent$}{name}: {}", "", scalar(value, key)).unwrap();
                     }
                 }
             }
             serde_json::Value::Array(items) => {
                 if items.is_empty() {
-                    lines.push(format!("{indent}{}", text("None", "无")));
+                    writeln!(output, "{:indent$}{}", "", text("None", "无")).unwrap();
                 }
                 for item in items {
-                    append(item, depth, key_context, lines);
-                    lines.push(String::new());
+                    append(item, depth, key_context, output);
+                    output.push('\n');
                 }
             }
-            _ => lines.push(format!("{indent}{}", scalar(value, key_context))),
+            _ => writeln!(output, "{:indent$}{}", "", scalar(value, key_context)).unwrap(),
         }
     }
-    fn scalar(value: &serde_json::Value, key: &str) -> String {
+    fn scalar<'a>(value: &'a serde_json::Value, key: &str) -> Cow<'a, str> {
         match value {
-            serde_json::Value::Null => text("Not set", "未设置").to_owned(),
+            serde_json::Value::Null => text("Not set", "未设置").into(),
             serde_json::Value::Bool(v) => if *v {
                 text("Yes", "是")
             } else {
                 text("No", "否")
             }
-            .to_owned(),
+            .into(),
             serde_json::Value::String(s)
                 if matches!(
                     key,
@@ -471,93 +499,89 @@ pub(crate) fn render_value(value: &serde_json::Value) -> String {
                 ) =>
             {
                 match s.as_str() {
-                    "ok" | "passed" | "healthy" => text("Healthy", "正常").to_owned(),
-                    "failed" | "failure" | "down" => text("Failed", "失败").to_owned(),
-                    "pending" => text("Pending", "待完成").to_owned(),
-                    "completed" | "succeeded" => text("Completed", "已完成").to_owned(),
-                    "local" => text("Local", "本机").to_owned(),
-                    "unknown" => text("Unknown", "未知").to_owned(),
-                    "prepared" => text("prepared", "已准备").to_owned(),
-                    "staged" => text("staged", "已暂存").to_owned(),
-                    "activating" => text("activating", "正在启用").to_owned(),
-                    "activated" => text("activated", "已启用").to_owned(),
-                    "reloaded" => text("reloaded", "已重新加载").to_owned(),
-                    "verified" => text("verified", "已验证").to_owned(),
-                    "rollback_failed" => text("rollback failed", "回滚失败").to_owned(),
-                    "rolled_back" => text("rolled back", "已回滚").to_owned(),
-                    "committed" => text("committed", "已提交").to_owned(),
-                    "account_ready" => text("account ready", "账户已就绪").to_owned(),
-                    "order_created" => text("order created", "订单已创建").to_owned(),
-                    "challenge_published" => {
-                        text("challenge published", "域名验证已发布").to_owned()
-                    }
-                    "challenge_ready" => text("challenge ready", "域名验证已就绪").to_owned(),
-                    "csr_ready" => text("csr ready", "证书申请已就绪").to_owned(),
-                    "finalized" => text("finalized", "申请已提交").to_owned(),
-                    "issued" => text("issued", "已签发").to_owned(),
-                    "external_files" => text("external files", "外部证书文件").to_owned(),
-                    "acme_receipt" => text("acme receipt", "ACME 签发记录").to_owned(),
-                    "active" => text("active", "有效").to_owned(),
-                    "revoked" => text("revoked", "已撤销").to_owned(),
-                    "expired" => text("expired", "已过期").to_owned(),
+                    "ok" | "passed" | "healthy" => text("Healthy", "正常").into(),
+                    "failed" | "failure" | "down" => text("Failed", "失败").into(),
+                    "pending" => text("Pending", "待完成").into(),
+                    "completed" | "succeeded" => text("Completed", "已完成").into(),
+                    "local" => text("Local", "本机").into(),
+                    "unknown" => text("Unknown", "未知").into(),
+                    "prepared" => text("prepared", "已准备").into(),
+                    "staged" => text("staged", "已暂存").into(),
+                    "activating" => text("activating", "正在启用").into(),
+                    "activated" => text("activated", "已启用").into(),
+                    "reloaded" => text("reloaded", "已重新加载").into(),
+                    "verified" => text("verified", "已验证").into(),
+                    "rollback_failed" => text("rollback failed", "回滚失败").into(),
+                    "rolled_back" => text("rolled back", "已回滚").into(),
+                    "committed" => text("committed", "已提交").into(),
+                    "account_ready" => text("account ready", "账户已就绪").into(),
+                    "order_created" => text("order created", "订单已创建").into(),
+                    "challenge_published" => text("challenge published", "域名验证已发布").into(),
+                    "challenge_ready" => text("challenge ready", "域名验证已就绪").into(),
+                    "csr_ready" => text("csr ready", "证书申请已就绪").into(),
+                    "finalized" => text("finalized", "申请已提交").into(),
+                    "issued" => text("issued", "已签发").into(),
+                    "external_files" => text("external files", "外部证书文件").into(),
+                    "acme_receipt" => text("acme receipt", "ACME 签发记录").into(),
+                    "active" => text("active", "有效").into(),
+                    "revoked" => text("revoked", "已撤销").into(),
+                    "expired" => text("expired", "已过期").into(),
                     "offline-chain-san-key-expiry-usage-validation" => text(
                         "offline chain san key expiry usage validation",
                         "离线检查证书链、域名、密钥、有效期与用途",
                     )
-                    .to_owned(),
+                    .into(),
                     "unique-generation-write-fsync" => text(
                         "unique generation write fsync",
                         "保存候选证书并完成磁盘写入",
                     )
-                    .to_owned(),
+                    .into(),
                     "candidate-provider-validation" => {
-                        text("candidate provider validation", "检查候选证书配置").to_owned()
+                        text("candidate provider validation", "检查候选证书配置").into()
                     }
                     "atomic-current-pointer-replace" => {
-                        text("atomic current pointer replace", "原子切换当前证书").to_owned()
+                        text("atomic current pointer replace", "原子切换当前证书").into()
                     }
-                    "provider-reload" => text("provider reload", "重新加载证书").to_owned(),
+                    "provider-reload" => text("provider reload", "重新加载证书").into(),
                     "public-tls-identity-and-health-verification" => text(
                         "public tls identity and health verification",
                         "验证公网证书与健康状态",
                     )
-                    .to_owned(),
+                    .into(),
                     "receipt-commit-or-rollback" => {
-                        text("receipt commit or rollback", "成功后保存回执，失败则回滚").to_owned()
+                        text("receipt commit or rollback", "成功后保存回执，失败则回滚").into()
                     }
                     "persist-config-and-transaction" => {
-                        text("persist config and transaction", "保存配置与操作记录").to_owned()
+                        text("persist config and transaction", "保存配置与操作记录").into()
                     }
                     "create-or-restore-bound-account" => {
-                        text("create or restore bound account", "创建或恢复 ACME 账户").to_owned()
+                        text("create or restore bound account", "创建或恢复 ACME 账户").into()
                     }
                     "create-or-resume-exact-identifier-order" => text(
                         "create or resume exact identifier order",
                         "创建或继续此域名的证书订单",
                     )
-                    .to_owned(),
+                    .into(),
                     "publish-http-01-challenge" => {
-                        text("publish http 01 challenge", "发布 HTTP-01 域名验证文件").to_owned()
+                        text("publish http 01 challenge", "发布 HTTP-01 域名验证文件").into()
                     }
-                    "poll-authorization" => {
-                        text("poll authorization", "等待域名验证结果").to_owned()
-                    }
+                    "poll-authorization" => text("poll authorization", "等待域名验证结果").into(),
                     "persist-key-and-csr" => {
-                        text("persist key and csr", "保存密钥与证书申请").to_owned()
+                        text("persist key and csr", "保存密钥与证书申请").into()
                     }
-                    "finalize-order" => text("finalize order", "提交证书申请").to_owned(),
+                    "finalize-order" => text("finalize order", "提交证书申请").into(),
                     "validate-chain-san-key-expiry-usage" => {
-                        text("validate chain san key expiry usage", "验证签发证书").to_owned()
+                        text("validate chain san key expiry usage", "验证签发证书").into()
                     }
                     "commit-receipt-and-retire-challenge" => text(
                         "commit receipt and retire challenge",
                         "保存签发回执并清理验证文件",
                     )
-                    .to_owned(),
-                    _ => s.clone(),
+                    .into(),
+                    _ => Cow::Borrowed(s),
                 }
             }
-            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::String(s) => Cow::Borrowed(s),
             serde_json::Value::Number(n)
                 if key.ends_with("_at")
                     || matches!(key, "not_before" | "not_after" | "certificate_not_after") =>
@@ -566,13 +590,15 @@ pub(crate) fn render_value(value: &serde_json::Value) -> String {
                     .and_then(|n| chrono::DateTime::from_timestamp(n, 0))
                     .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                     .unwrap_or_else(|| n.to_string())
+                    .into()
             }
-            _ => value.to_string(),
+            _ => value.to_string().into(),
         }
     }
-    let mut lines = Vec::new();
-    append(value, 0, "", &mut lines);
-    lines.join("\n").trim_end().to_owned()
+    let mut output = String::new();
+    append(value, 0, "", &mut output);
+    output.truncate(output.trim_end().len());
+    output
 }
 
 pub fn print_value(value: &serde_json::Value) {
@@ -617,6 +643,6 @@ mod tests {
             lines[0].split('|').next().unwrap().width(),
             lines[2].split('|').next().unwrap().width()
         );
-        assert!(table.contains("生产 环境"));
+        assert_eq!(table, "实例      | Host\n----------+------\n生产 环境 | local");
     }
 }
