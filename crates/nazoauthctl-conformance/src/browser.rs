@@ -6,7 +6,6 @@ use std::io::Cursor;
 use thiserror::Error;
 #[cfg(any(unix, test))]
 use url::Url;
-use zeroize::Zeroizing;
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum BrowserError {
@@ -64,95 +63,15 @@ pub enum BrowserReviewScreenshotSource {
 const MAX_REVIEW_SCREENSHOT_BYTES: usize = 500 * 1024;
 pub(crate) const MAX_REVIEW_SCREENSHOTS_PER_MODULE: usize = 2;
 pub(crate) const MAX_REVIEW_SCREENSHOTS_PER_RUN: usize = 64;
-const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 pub(crate) fn validate_png_screenshot(bytes: &[u8]) -> Result<(), BrowserError> {
-    if bytes.len() > MAX_REVIEW_SCREENSHOT_BYTES || !bytes.starts_with(PNG_SIGNATURE) {
+    if bytes.len() > MAX_REVIEW_SCREENSHOT_BYTES {
         return Err(BrowserError::InvalidScreenshot);
     }
-    // PNG is deliberately parsed completely here instead of accepting a
-    // magic prefix. Retained evidence is untrusted at this boundary.
-    // Bound width/height and verify every chunk CRC before evidence reaches
-    // the root-owned directory. The browser is the only producer, so we do
-    // not accept ancillary trailing bytes or a truncated IEND.
-    let mut cursor = PNG_SIGNATURE.len();
-    let mut saw_ihdr = false;
-    let mut saw_idat = false;
-    let mut saw_iend = false;
-    while cursor < bytes.len() {
-        let header_end = cursor
-            .checked_add(8)
-            .ok_or(BrowserError::InvalidScreenshot)?;
-        if header_end > bytes.len() {
-            return Err(BrowserError::InvalidScreenshot);
-        }
-        let length = u32::from_be_bytes(
-            bytes[cursor..cursor + 4]
-                .try_into()
-                .map_err(|_| BrowserError::InvalidScreenshot)?,
-        ) as usize;
-        let kind = &bytes[cursor + 4..header_end];
-        let data_end = header_end
-            .checked_add(length)
-            .ok_or(BrowserError::InvalidScreenshot)?;
-        let crc_end = data_end
-            .checked_add(4)
-            .ok_or(BrowserError::InvalidScreenshot)?;
-        if crc_end > bytes.len() {
-            return Err(BrowserError::InvalidScreenshot);
-        }
-        let expected_crc = u32::from_be_bytes(
-            bytes[data_end..crc_end]
-                .try_into()
-                .map_err(|_| BrowserError::InvalidScreenshot)?,
-        );
-        if png_crc32(&bytes[cursor + 4..data_end]) != expected_crc {
-            return Err(BrowserError::InvalidScreenshot);
-        }
-        match kind {
-            b"IHDR" if !saw_ihdr && !saw_idat && !saw_iend && length == 13 => {
-                let width = u32::from_be_bytes(
-                    bytes[header_end..header_end + 4]
-                        .try_into()
-                        .map_err(|_| BrowserError::InvalidScreenshot)?,
-                );
-                let height = u32::from_be_bytes(
-                    bytes[header_end + 4..header_end + 8]
-                        .try_into()
-                        .map_err(|_| BrowserError::InvalidScreenshot)?,
-                );
-                let bit_depth = bytes[header_end + 8];
-                let color_type = bytes[header_end + 9];
-                if width == 0
-                    || height == 0
-                    || width > 8_192
-                    || height > 8_192
-                    || u64::from(width) * u64::from(height) > 16 * 1024 * 1024
-                    || !matches!(bit_depth, 1 | 2 | 4 | 8 | 16)
-                    || !matches!(color_type, 0 | 2 | 3 | 4 | 6)
-                    || bytes[header_end + 10] != 0
-                    || bytes[header_end + 11] != 0
-                    || bytes[header_end + 12] > 1
-                {
-                    return Err(BrowserError::InvalidScreenshot);
-                }
-                saw_ihdr = true;
-            }
-            b"IDAT" if saw_ihdr && !saw_iend && length > 0 => saw_idat = true,
-            b"IEND" if saw_ihdr && saw_idat && !saw_iend && length == 0 => {
-                saw_iend = true;
-                if crc_end != bytes.len() {
-                    return Err(BrowserError::InvalidScreenshot);
-                }
-            }
-            _ if saw_iend || !saw_ihdr => return Err(BrowserError::InvalidScreenshot),
-            _ => {}
-        }
-        cursor = crc_end;
-    }
-    if !saw_ihdr || !saw_idat || !saw_iend {
-        return Err(BrowserError::InvalidScreenshot);
-    }
-    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    let mut input = Cursor::new(bytes);
+    let mut options = png::DecodeOptions::default();
+    // Retained evidence rejects corrupt ancillary chunks as well as image chunks.
+    options.set_skip_ancillary_crc_failures(false);
+    let mut decoder = png::Decoder::new_with_options(&mut input, options);
     decoder.set_limits(png::Limits {
         bytes: 64 * 1024 * 1024,
     });
@@ -161,34 +80,29 @@ pub(crate) fn validate_png_screenshot(bytes: &[u8]) -> Result<(), BrowserError> 
         .map_err(|_| BrowserError::InvalidScreenshot)?;
     let info = reader.info();
     if info.is_animated()
-        || info.width == 0
-        || info.height == 0
         || info.width > 8_192
         || info.height > 8_192
         || u64::from(info.width) * u64::from(info.height) > 16 * 1024 * 1024
+        || reader
+            .output_buffer_size()
+            .is_none_or(|size| size > 64 * 1024 * 1024)
     {
         return Err(BrowserError::InvalidScreenshot);
     }
-    let output_size = reader
-        .output_buffer_size()
-        .filter(|size| *size <= 64 * 1024 * 1024)
-        .ok_or(BrowserError::InvalidScreenshot)?;
-    let mut decoded = Zeroizing::new(vec![0_u8; output_size]);
+    // Decode every row to validate compressed data without retaining a full image.
+    while reader
+        .next_row()
+        .map_err(|_| BrowserError::InvalidScreenshot)?
+        .is_some()
+    {}
     reader
-        .next_frame(decoded.as_mut_slice())
+        .finish()
         .map_err(|_| BrowserError::InvalidScreenshot)?;
-    Ok(())
-}
-
-fn png_crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
-        }
+    drop(reader);
+    if input.position() != bytes.len() as u64 {
+        return Err(BrowserError::InvalidScreenshot);
     }
-    !crc
+    Ok(())
 }
 
 #[cfg(any(unix, test))]
@@ -386,5 +300,32 @@ mod tests {
         let mut trailing = png;
         trailing.push(0);
         assert!(validate_png_screenshot(&trailing).is_err());
+    }
+    #[test]
+    fn historical_png_evidence_checks_all_chunks_and_decodes_all_rows() {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 16, 32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_chunk(png::chunk::ChunkType(*b"tEXt"), b"key\0value")
+            .unwrap();
+        writer.write_image_data(&vec![42; 16 * 32 * 4]).unwrap();
+        writer.finish().unwrap();
+        assert!(validate_png_screenshot(&bytes).is_ok());
+        for length in 0..bytes.len() {
+            assert!(
+                validate_png_screenshot(&bytes[..length]).is_err(),
+                "truncation at {length}"
+            );
+        }
+        let text = bytes.windows(4).position(|part| part == b"tEXt").unwrap();
+        let mut corrupt = bytes.clone();
+        corrupt[text + 4] ^= 1;
+        assert!(validate_png_screenshot(&corrupt).is_err());
+        let mut joined = bytes.clone();
+        joined.extend_from_slice(&bytes);
+        assert!(validate_png_screenshot(&joined).is_err());
     }
 }
