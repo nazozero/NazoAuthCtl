@@ -470,7 +470,7 @@ impl ConformanceSession {
         let tenant_id = uuid::Uuid::parse_str(tenant_id)
             .with_context(|| format!("{label} tenant ID is invalid"))?;
         let token =
-            nazo_operator_protocol::hkdf_sha256_v1(&root, tenant_id.as_bytes(), purpose, 32);
+            nazo_operator_protocol::hkdf_sha256_v1::<32>(&root, tenant_id.as_bytes(), purpose);
         Ok(zeroize::Zeroizing::new(
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token),
         ))
