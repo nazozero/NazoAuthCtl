@@ -156,20 +156,14 @@ def verify_generator_checkout(reviewed_commit: str) -> None:
     root = pathlib.Path(root_text).resolve(strict=True)
     if script_path.relative_to(root).as_posix() != GENERATOR_REPO_PATH:
         raise ValueError("generator is not running from its fixed repository path")
-    resolved_commit = run_git(root, ["rev-parse", "--verify", f"{reviewed_commit}^{{commit}}"]).decode().strip()
     head = run_git(root, ["rev-parse", "--verify", "HEAD^{commit}"]).decode().strip()
-    if resolved_commit != reviewed_commit or head != reviewed_commit:
+    if head != reviewed_commit:
         raise ValueError("generator checkout HEAD does not equal the reviewed commit")
     require_git_clean(root, ["diff", "--quiet", "--"], "generator checkout has tracked worktree changes")
     require_git_clean(root, ["diff", "--cached", "--quiet", "--"], "generator checkout has staged changes")
 
 
 def read_source_matrix(repo: pathlib.Path) -> dict[str, object]:
-    if not repo.is_dir():
-        raise ValueError("--source-repo must name an existing Git worktree")
-    commit = run_git(repo, ["rev-parse", "--verify", f"{SOURCE_COMMIT}^{{commit}}"]).decode().strip()
-    if commit != SOURCE_COMMIT:
-        raise ValueError("the source commit resolved to an unexpected object")
     source_bytes = run_git(repo, ["show", f"{SOURCE_COMMIT}:{SOURCE_PATH}"])
     try:
         source = json.loads(source_bytes.decode("utf-8"))
@@ -189,8 +183,11 @@ def fsync_directory(directory: pathlib.Path) -> None:
 
 
 def atomic_write(path: pathlib.Path, value: bytes, mode: int) -> None:
-    if path.exists() or path.is_symlink():
+    try:
         current = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
         if not stat.S_ISREG(current.st_mode) or current.st_uid != os.geteuid():
             raise ValueError(f"refusing to replace unsafe output path: {path}")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
@@ -207,17 +204,17 @@ def atomic_write(path: pathlib.Path, value: bytes, mode: int) -> None:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary.exists():
-            temporary.unlink()
+        temporary.unlink(missing_ok=True)
 
 
 def prepare_public_directory(path: pathlib.Path) -> None:
-    if path.exists() or path.is_symlink():
+    try:
         current = path.lstat()
-        if not stat.S_ISDIR(current.st_mode) or path.is_symlink():
-            raise ValueError("public output must be a non-symlink directory")
-    else:
+    except FileNotFoundError:
         path.mkdir(parents=True, mode=0o755)
+    else:
+        if not stat.S_ISDIR(current.st_mode):
+            raise ValueError("public output must be a non-symlink directory")
     os.chmod(path, 0o755)
     unexpected = {entry.name for entry in path.iterdir()} - PUBLIC_OUTPUT_NAMES
     if unexpected:
@@ -248,8 +245,6 @@ def verify_private_directory(path: pathlib.Path) -> None:
 
 
 def verify_signing_key(path: pathlib.Path) -> None:
-    if os.name != "posix":
-        raise ValueError("artifact signing is supported only on a Unix host")
     absolute = reject_symlink_components(path, "signing key")
     verify_private_directory(absolute.parent)
     current = absolute.lstat()
@@ -329,15 +324,17 @@ def apply_reviewed_amendments(groups: list[dict[str, object]]) -> None:
 
     def migrate_ciba_reference(value: object) -> object:
         if isinstance(value, dict):
-            return {key: migrate_ciba_reference(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [migrate_ciba_reference(item) for item in value]
-        if isinstance(value, str):
+            for key, item in value.items():
+                value[key] = migrate_ciba_reference(item)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                value[index] = migrate_ciba_reference(item)
+        elif isinstance(value, str):
             return value.replace(old_ciba_reference, new_ciba_reference)
         return value
 
-    for index, group in enumerate(groups):
-        groups[index] = migrate_ciba_reference(group)
+    for group in groups:
+        migrate_ciba_reference(group)
 
 
 def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict[str, object], dict[str, int]]:
@@ -413,7 +410,7 @@ def p1363_signature(der: bytes) -> bytes:
         raise ValueError("OpenSSL returned a non-canonical ECDSA signature")
     r, offset = parse_der_integer(der, 2)
     s, offset = parse_der_integer(der, offset)
-    if offset != len(der) or r == 0 or s == 0 or r.bit_length() > 256 or s.bit_length() > 256:
+    if offset != len(der) or r.bit_length() > 256 or s.bit_length() > 256:
         raise ValueError("OpenSSL returned an out-of-range ECDSA signature")
     return r.to_bytes(32, "big") + s.to_bytes(32, "big")
 
@@ -437,34 +434,16 @@ def compressed_public_key(key_path: pathlib.Path) -> bytes:
 
 
 def sign(key_path: pathlib.Path, signing_input: bytes) -> bytes:
-    with tempfile.TemporaryDirectory() as directory:
-        root = pathlib.Path(directory)
-        input_path = root / "input"
-        signature_path = root / "signature.der"
-        input_path.write_bytes(signing_input)
-        try:
-            subprocess.run(
-                ["openssl", "dgst", "-sha256", "-sign", str(key_path), "-out", str(signature_path), str(input_path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            signature_der = signature_path.read_bytes()
-            public_path = root / "public.pem"
-            subprocess.run(
-                ["openssl", "ec", "-in", str(key_path), "-pubout", "-out", str(public_path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["openssl", "dgst", "-sha256", "-verify", str(public_path), "-signature", str(signature_path), str(input_path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.CalledProcessError) as error:
-            raise ValueError("OpenSSL could not create and verify the artifact signature") from error
+    try:
+        signature_der = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", str(key_path)],
+            input=signing_input,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("OpenSSL could not create the artifact signature") from error
     return p1363_signature(signature_der)
 
 
@@ -514,7 +493,9 @@ def main() -> None:
     matrix, driver, bounds = transform_matrix(source_matrix)
     matrix_bytes = compact_json(matrix)
     driver_bytes = compact_json(driver)
-    artifact_revision = sha256(driver_bytes + matrix_bytes)[:40]
+    revision_digest = hashlib.sha256(driver_bytes)
+    revision_digest.update(matrix_bytes)
+    artifact_revision = revision_digest.hexdigest()[:40]
     computed = derived_metadata(driver_bytes, matrix_bytes, artifact_revision, bounds)
     if args.print_derived_metadata:
         print(
@@ -565,14 +546,12 @@ def main() -> None:
         "driver": {
             "schema": 1,
             "url": f"{source_url}driver.json",
-            "sha256": sha256(driver_bytes),
-            "size": len(driver_bytes),
+            **computed["driver"],
         },
         "matrix": {
             "schema": 3,
             "url": f"{source_url}matrix.json",
-            "sha256": sha256(matrix_bytes),
-            "size": len(matrix_bytes),
+            **computed["matrix"],
         },
         "resource_bounds": bounds,
     }
@@ -592,8 +571,8 @@ def main() -> None:
     metadata = {
         "artifact_manifest_sha256": sha256(compact_manifest),
         "artifact_revision": artifact_revision,
-        "driver_sha256": sha256(driver_bytes),
-        "matrix_sha256": sha256(matrix_bytes),
+        "driver_sha256": computed["driver"]["sha256"],
+        "matrix_sha256": computed["matrix"]["sha256"],
         "key_id": key_id,
         "suite_revision": SUITE_REVISION,
         "suite_image_digest": SUITE_IMAGE,
