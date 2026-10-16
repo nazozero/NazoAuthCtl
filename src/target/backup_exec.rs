@@ -43,7 +43,6 @@ use crate::runtime_backend::{
 pub const BACKUP_EXECUTION_FAILED: &str = "BACKUP_EXECUTION_FAILED";
 pub const RESTORE_TEST_FAILED: &str = "RESTORE_TEST_FAILED";
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-const MAX_KEY_BYTES: u64 = 16 * 1024;
 const MAX_VALKEY_CLEANUP_OUTPUT: usize = 1024 * 1024;
 const SIGNING_KEY_ENCRYPTION_KEY_SECRET: &str = "signing-key-encryption-key";
 const SIGNING_KEY_ENCRYPTION_KEY_SETTING: &str = "SIGNING_KEY_ENCRYPTION_KEY_FILE";
@@ -2221,36 +2220,11 @@ fn artifact_matches_state(
 }
 
 fn verify_runtime_identity(data: &Path, state: &DeploymentState) -> anyhow::Result<String> {
-    let identity_dir = data.join("instance");
-    let public_bytes = super::read_runtime_owned_file(
-        &identity_dir.join("identity.pub"),
-        "runtime instance public key",
-        false,
-        MAX_KEY_BYTES,
+    let (statement, _) = super::read_runtime_identity(
+        &data.join(super::DEFAULT_INSTANCE_IDENTITY_DIRECTORY),
         state,
     )?;
-    let encoded = std::str::from_utf8(public_bytes.trim_ascii())?;
-    let public_key = nazo_operator_protocol::decode_instance_public_key(encoded)?;
-    let key_id = nazo_operator_protocol::instance_key_id(&public_key);
-    let statement_bytes = super::read_runtime_owned_file(
-        &identity_dir.join("deployment-statement.jws"),
-        "runtime deployment statement",
-        false,
-        nazo_operator_protocol::MAX_COMPACT_JWS_BYTES as u64,
-        state,
-    )?;
-    let statement = nazo_operator_protocol::verify_deployment_statement(
-        std::str::from_utf8(statement_bytes.trim_ascii())?,
-        &key_id,
-        &public_key,
-    )?;
-    ensure!(
-        statement.deployment_id == state.deployment_id
-            && statement.issuer == state.issuer
-            && statement.product == nazo_operator_protocol::CONTROL_DISCOVERY_PRODUCT,
-        "runtime deployment statement does not match DeploymentState"
-    );
-    Ok(key_id)
+    Ok(statement.instance_key_id)
 }
 
 fn run_pg_dump(connection: &PostgresConnection, output: &Path) -> anyhow::Result<()> {

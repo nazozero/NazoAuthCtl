@@ -1712,65 +1712,16 @@ fn current_instance_identity(
         ));
     }
 
-    let encoded_public_key = read_runtime_owned_file(
-        &public_key_path,
-        "runtime instance public key",
-        false,
-        MAX_INSTANCE_PUBLIC_KEY_BYTES,
-        state,
-    )
-    .and_then(|bytes| {
-        std::str::from_utf8(bytes.trim_ascii())
-            .map(str::to_owned)
-            .map_err(anyhow::Error::from)
-    })
-    .map_err(|error| {
-        Failure::new(
-            CONTROL_TARGET_DRIFT,
-            wire::sanitize(format!("invalid runtime instance public key: {error}")),
-        )
-    })?;
-    let public_key = nazo_operator_protocol::decode_instance_public_key(&encoded_public_key)
-        .map_err(|error| {
+    let (statement, public_key) =
+        read_runtime_identity(&identity_directory, state).map_err(|error| {
             Failure::new(
                 CONTROL_TARGET_DRIFT,
-                wire::sanitize(format!("invalid runtime instance public key: {error}")),
+                wire::sanitize(format!("invalid runtime instance identity: {error:#}")),
             )
         })?;
-    let instance_key_id = nazo_operator_protocol::instance_key_id(&public_key);
-    let deployment_statement = read_runtime_owned_file(
-        &statement_path,
-        "runtime deployment statement",
-        false,
-        nazo_operator_protocol::MAX_COMPACT_JWS_BYTES as u64,
-        state,
-    )
-    .and_then(|bytes| {
-        std::str::from_utf8(bytes.trim_ascii())
-            .map(str::to_owned)
-            .map_err(anyhow::Error::from)
-    })
-    .and_then(|compact| {
-        nazo_operator_protocol::verify_deployment_statement(&compact, &instance_key_id, &public_key)
-            .map_err(anyhow::Error::from)
-    })
-    .map_err(|error| {
-        Failure::new(
-            CONTROL_TARGET_DRIFT,
-            wire::sanitize(format!("invalid runtime deployment statement: {error}")),
-        )
-    })?;
-    if deployment_statement.deployment_id != state.deployment_id
-        || deployment_statement.issuer != state.issuer
-    {
-        return Err(Failure::new(
-            CONTROL_TARGET_DRIFT,
-            "the runtime instance identity does not match DeploymentState",
-        ));
-    }
     Ok(Some(RuntimeInstanceIdentity {
-        runtime_instance_id: deployment_statement.runtime_instance_id,
-        instance_key_id,
+        runtime_instance_id: statement.runtime_instance_id,
+        instance_key_id: statement.instance_key_id,
         instance_public_key_base64: nazo_operator_protocol::encode_instance_public_key(&public_key),
     }))
 }
@@ -1786,40 +1737,63 @@ fn secure_path_exists(path: &std::path::Path) -> Result<bool, Failure> {
     }
 }
 
-pub(super) fn read_runtime_owned_file(
-    path: &std::path::Path,
-    label: &str,
-    private: bool,
-    max_bytes: u64,
+fn read_runtime_identity(
+    directory: &Path,
     state: &DeploymentState,
-) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+) -> anyhow::Result<(
+    nazo_operator_protocol::DeploymentStatement,
+    nazo_crypto::ed25519::VerifyingKey,
+)> {
     #[cfg(unix)]
-    {
-        let runtime_uid = match state.runtime.kind {
-            runtime_backend::RuntimeBackendKind::Host => {
-                runtime_backend::systemd_service_user_uid(&state.deployment_id)?
-            }
-            runtime_backend::RuntimeBackendKind::Podman
-            | runtime_backend::RuntimeBackendKind::Docker => {
-                runtime_backend::NON_ROOT_ONE_SHOT_USER
-                    .split_once(':')
-                    .and_then(|(uid, _)| uid.parse::<u32>().ok())
-                    .ok_or_else(|| anyhow::anyhow!("runtime UID policy is invalid"))?
-            }
-        };
-        crate::filesystem::read_secure_regular_file_for_uid(
-            path,
-            label,
-            private,
-            max_bytes,
-            runtime_uid,
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = state;
-        crate::filesystem::read_secure_regular_file(path, label, private, max_bytes)
-    }
+    let runtime_uid = match state.runtime.kind {
+        runtime_backend::RuntimeBackendKind::Host => {
+            runtime_backend::systemd_service_user_uid(&state.deployment_id)?
+        }
+        runtime_backend::RuntimeBackendKind::Podman
+        | runtime_backend::RuntimeBackendKind::Docker => runtime_backend::NON_ROOT_ONE_SHOT_USER
+            .split_once(':')
+            .and_then(|(uid, _)| uid.parse::<u32>().ok())
+            .ok_or_else(|| anyhow::anyhow!("runtime UID policy is invalid"))?,
+    };
+    let read = |name: &str, label: &str, max_bytes: u64| {
+        let path = directory.join(name);
+        #[cfg(unix)]
+        {
+            crate::filesystem::read_secure_regular_file_for_uid(
+                &path,
+                label,
+                false,
+                max_bytes,
+                runtime_uid,
+            )
+        }
+        #[cfg(not(unix))]
+        crate::filesystem::read_secure_regular_file(&path, label, false, max_bytes)
+    };
+    let public_bytes = read(
+        INSTANCE_IDENTITY_PUBLIC_FILE,
+        "runtime instance public key",
+        MAX_INSTANCE_PUBLIC_KEY_BYTES,
+    )?;
+    let public_key = nazo_operator_protocol::decode_instance_public_key(std::str::from_utf8(
+        public_bytes.trim_ascii(),
+    )?)?;
+    let key_id = nazo_operator_protocol::instance_key_id(&public_key);
+    let statement_bytes = read(
+        INSTANCE_DEPLOYMENT_STATEMENT_FILE,
+        "runtime deployment statement",
+        nazo_operator_protocol::MAX_COMPACT_JWS_BYTES as u64,
+    )?;
+    let statement = nazo_operator_protocol::verify_deployment_statement(
+        std::str::from_utf8(statement_bytes.trim_ascii())?,
+        &key_id,
+        &public_key,
+    )?;
+    anyhow::ensure!(
+        statement.deployment_id == state.deployment_id && statement.issuer == state.issuer,
+        "runtime deployment statement does not match DeploymentState"
+    );
+    Ok((statement, public_key))
 }
 
 fn inspection_from_state(
