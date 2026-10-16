@@ -1265,10 +1265,13 @@ pub struct BackupTransferChunk {
 /// secret carrier for this protocol: never Debug or Clone it. Construction
 /// and deserialization enforce the fixed 4 MiB ceiling.
 #[derive(Eq, PartialEq)]
-pub struct SecretMaterial(Vec<u8>);
+pub struct SecretMaterial(zeroize::Zeroizing<Vec<u8>>);
 
 impl SecretMaterial {
-    pub fn try_new(bytes: Vec<u8>) -> Result<Self, MessageRejection> {
+    pub fn try_new(
+        bytes: impl Into<zeroize::Zeroizing<Vec<u8>>>,
+    ) -> Result<Self, MessageRejection> {
+        let bytes = bytes.into();
         if bytes.is_empty() || bytes.len() > MAX_CONTROL_CHANGE_SET_BYTES {
             return Err(MessageRejection::new(
                 RejectionCode::OperationMalformed,
@@ -1290,12 +1293,6 @@ impl std::fmt::Debug for SecretMaterial {
             .field("redacted", &true)
             .field("byte_len", &self.0.len())
             .finish()
-    }
-}
-
-impl Drop for SecretMaterial {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
 

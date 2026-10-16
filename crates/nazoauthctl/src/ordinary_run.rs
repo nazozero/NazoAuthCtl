@@ -713,7 +713,9 @@ fn execute_with_progress<S: ProgressSink>(
                     tenant_id: invocation.tenant_id.clone(),
                     resources: manifest.resource_identities().to_vec(),
                 },
-                Some(manifest.bytes().as_bytes().to_vec()),
+                Some(nazoauthctl_core::target::SecretMaterial::try_new(
+                    manifest.bytes().as_bytes().to_vec(),
+                )?),
                 |completion| {
                     lock_recovery(&recovery)?.record_terminal_completion(
                         TenantResourceRecoveryPhase::Applied,
@@ -3155,7 +3157,7 @@ fn resume_pending_candidate<F>(
     session: &nazoauthctl_core::ConformanceSession,
     expected: &nazoauthctl_core::controller_identity::OperationJournalEntry,
     operation: ControlOperationPayload,
-    change_set: Option<Vec<u8>>,
+    change_set: Option<nazoauthctl_core::target::SecretMaterial>,
     persist: F,
 ) -> anyhow::Result<nazoauthctl_core::ConformanceControlOutcome>
 where
@@ -3229,7 +3231,12 @@ fn execute_pending_recovery_candidate(
             };
             let recovery = &mut recoveries[index];
             let change_set = matches!(step, PendingRecoveryStep::Apply(_))
-                .then(|| recovery.read_private_material().map(|value| value.to_vec()))
+                .then(|| {
+                    nazoauthctl_core::target::SecretMaterial::try_new(
+                        recovery.read_private_material()?,
+                    )
+                    .map_err(anyhow::Error::from)
+                })
                 .transpose()?;
             let _ =
                 resume_pending_candidate(session, expected, operation, change_set, |completion| {
@@ -3288,10 +3295,10 @@ fn recover_pending_runs(
     let mut pending = store.claim_pending()?;
     resume_pending_conformance_operation(session, &mut pending)?;
     for mut recovery in pending {
-        let binding = recovery.ordinary_binding().clone();
+        let run_id = recovery.ordinary_binding().run_id.clone();
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
             let (directory_revision, tenant_present) =
-                tenant_directory_presence(session, &binding.tenant_id)?;
+                tenant_directory_presence(session, &recovery.ordinary_binding().tenant_id)?;
             let terminal_failure = recovery.terminal_failure().cloned();
             if let Some(failure) = terminal_failure {
                 let tenant_cleanup = if tenant_present {
@@ -3331,7 +3338,7 @@ fn recover_pending_runs(
             // Each local cleanup remains executable even if the other boundary fails.
             let proxy_result = (|| -> anyhow::Result<()> {
                 if !recovery.proxy_cleanup_complete() {
-                    if let Some(proxy) = binding.proxy.as_ref() {
+                    if let Some(proxy) = recovery.ordinary_binding().proxy.as_ref() {
                         recover_proxy_trust(&proxy.bundle_path, &proxy.reload_executable)?;
                     }
                     recovery.mark_proxy_cleanup_complete()?;
@@ -3361,7 +3368,7 @@ fn recover_pending_runs(
         match result {
             Ok(Some(receipt)) => retained.push(receipt),
             Ok(None) => {}
-            Err(error) => failures.push(format!("{}: {error:#}", binding.run_id)),
+            Err(error) => failures.push(format!("{run_id}: {error:#}")),
         }
     }
     if failures.is_empty() {

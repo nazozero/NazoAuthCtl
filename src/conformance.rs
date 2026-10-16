@@ -231,13 +231,13 @@ impl ConformanceSession {
         &self,
         expected: &crate::controller_identity::OperationJournalEntry,
         operation: ControlOperationPayload,
-        change_set: Option<Vec<u8>>,
+        change_set: Option<SecretMaterial>,
         persist: F,
     ) -> anyhow::Result<Option<ConformanceControlOutcome>>
     where
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
-        validate_control_change_set(&operation, change_set.as_deref())?;
+        validate_control_change_set(&operation, change_set.as_ref())?;
         let journal =
             OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
         let Some(prepared) = prepare_pending_control_operation(
@@ -265,13 +265,13 @@ impl ConformanceSession {
     pub fn execute_control_operation<F>(
         &self,
         operation: ControlOperationPayload,
-        change_set: Option<Vec<u8>>,
+        change_set: Option<SecretMaterial>,
         persist: F,
     ) -> anyhow::Result<ConformanceControlOutcome>
     where
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
-        validate_control_change_set(&operation, change_set.as_deref())?;
+        validate_control_change_set(&operation, change_set.as_ref())?;
 
         let journal =
             OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
@@ -292,20 +292,16 @@ impl ConformanceSession {
         &self,
         journal: &OperationJournal,
         prepared: PreparedOperation,
-        change_set: Option<Vec<u8>>,
+        change_set: Option<SecretMaterial>,
         persist: F,
     ) -> anyhow::Result<ConformanceControlOutcome>
     where
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
         let expected_journal = prepared.journal_entry();
-        let secret_material = change_set
-            .map(SecretMaterial::try_new)
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("invalid Apply material: {}", error.detail))?;
         let receipt: ControlOperationReceipt = self
             .target
-            .execute_control_operation(prepared.request(secret_material)?)?;
+            .execute_control_operation(prepared.request(change_set)?)?;
         if receipt.operation_id != prepared.signed.operation.operation_id {
             bail!(
                 "target returned operation '{}' for controller operation '{}'",
@@ -696,7 +692,7 @@ mod tests {
             session
                 .execute_control_operation(
                     ControlOperationPayload::KeysValidate,
-                    Some(b"unused".to_vec()),
+                    Some(SecretMaterial::try_new(b"unused".to_vec())?),
                     |_| Ok(())
                 )
                 .is_err()

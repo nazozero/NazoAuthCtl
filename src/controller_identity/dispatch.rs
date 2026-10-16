@@ -61,10 +61,7 @@ impl PreparedOperation {
         &self,
         change_set: Option<SecretMaterial>,
     ) -> anyhow::Result<ControlOperationRequest> {
-        validate_control_change_set(
-            &self.signed.operation.operation,
-            change_set.as_ref().map(SecretMaterial::as_bytes),
-        )?;
+        validate_control_change_set(&self.signed.operation.operation, change_set.as_ref())?;
         Ok(ControlOperationRequest {
             operation_id: self.signed.operation.operation_id.clone(),
             deployment_id: self.signed.operation.deployment_id.clone(),
@@ -86,7 +83,7 @@ impl PreparedOperation {
 /// Enforce the single material-consumer rule before journaling or transport.
 pub fn validate_control_change_set(
     operation: &ControlOperationPayload,
-    change_set: Option<&[u8]>,
+    change_set: Option<&SecretMaterial>,
 ) -> anyhow::Result<()> {
     let apply = matches!(
         operation,
@@ -95,11 +92,6 @@ pub fn validate_control_change_set(
     match (apply, change_set) {
         (true, None) => bail!("tenant-resource Apply requires change-set material"),
         (false, Some(_)) => bail!("only tenant-resource Apply accepts change-set material"),
-        (true, Some([])) => bail!("change-set material must not be empty"),
-        (true, Some(bytes)) if bytes.len() > crate::target::MAX_CONTROL_CHANGE_SET_BYTES => bail!(
-            "change-set material exceeds the {}-byte limit",
-            crate::target::MAX_CONTROL_CHANGE_SET_BYTES
-        ),
         _ => Ok(()),
     }
 }
@@ -820,14 +812,8 @@ mod tests {
         )?;
         assert!(prepared.request(None).is_err());
         assert!(SecretMaterial::try_new(Vec::new()).is_err());
-        assert!(
-            validate_control_change_set(&prepared.signed.operation.operation, Some(&[])).is_err()
-        );
         let oversized = vec![0; crate::target::MAX_CONTROL_CHANGE_SET_BYTES + 1];
-        assert!(
-            validate_control_change_set(&prepared.signed.operation.operation, Some(&oversized))
-                .is_err()
-        );
+        assert!(SecretMaterial::try_new(oversized).is_err());
         assert_eq!(
             prepared
                 .request(Some(SecretMaterial::try_new(b"material".to_vec())?))?
