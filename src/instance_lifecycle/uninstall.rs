@@ -1,5 +1,4 @@
-//! G06 — uninstall that touches only ctl-owned deployment-scoped resources
-//! (goal plan 07 §7).
+//! Uninstall only ctl-owned, deployment-scoped resources.
 //!
 //! Plan first, then execute:
 //!
@@ -106,18 +105,14 @@ fn prepare_uninstall(
     let (record, host, target, inspection) = resolve_live_instance(context, selector, "uninstall")?;
     let mut managed_deletions = Vec::new();
     let mut kept_external = Vec::new();
-    for resource in &inspection.resources {
+    for resource in inspection.resources {
         // Container-kind resources are deleted through the dedicated runtime
         // surface object (ownership label + digest re-confirmation), never as
         // a second deletion entry — declaring them here would double-delete.
         if resource.kind == "container" {
             continue;
         }
-        let entry = (
-            resource.resource_id.clone(),
-            resource.kind.clone(),
-            resource.locator.clone(),
-        );
+        let entry = (resource.resource_id, resource.kind, resource.locator);
         match (resource.ownership, resource.scope) {
             (ResourceOwnership::Managed, ResourceScope::Deployment) => {
                 managed_deletions.push(entry)
@@ -127,12 +122,12 @@ fn prepare_uninstall(
     }
     Ok((
         UninstallPlan {
-            deployment_id: inspection.deployment_id.clone(),
+            deployment_id: inspection.deployment_id,
             alias: record.alias,
             host_alias: host.alias,
             revision: inspection.revision,
             managed_deletions,
-            runtime_object: inspection.runtime.object.clone(),
+            runtime_object: inspection.runtime.object,
             config_reference: inspection.config_reference,
             kept_external,
         },
@@ -192,7 +187,7 @@ pub(crate) fn run_uninstall(
     let _controller_recovery_lock = FileLock::acquire(&instance_dir.join("recovery.lock"))?;
     let _data_recovery_lock = FileLock::acquire(&instance_dir.join("recovery-plan.lock"))?;
     let _transfer_lock = FileLock::acquire(&instance_dir.join("backup-transfer.lock"))?;
-    ensure_no_pending_remote_cleanup(controller_keys, &plan.deployment_id)?;
+    ensure_no_pending_remote_cleanup(&instance_dir)?;
 
     let operation = HostOperation::state_mutate(
         uuid::Uuid::now_v7().to_string(),
@@ -241,11 +236,7 @@ pub(crate) fn run_uninstall(
     ))
 }
 
-fn ensure_no_pending_remote_cleanup(
-    controller_keys: &ControllerKeyStore,
-    deployment_id: &str,
-) -> anyhow::Result<()> {
-    let instance_dir = controller_keys.instance_dir(deployment_id)?;
+fn ensure_no_pending_remote_cleanup(instance_dir: &std::path::Path) -> anyhow::Result<()> {
     for (file, operation) in [
         ("recovery-plan.json", "disaster recovery"),
         ("backup-transfer.json", "off-host backup transfer"),

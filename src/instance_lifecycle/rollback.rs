@@ -1,5 +1,4 @@
-//! G04 — explicit rollback to the previous verified artifact (goal plan 07
-//! §5).
+//! Explicit rollback to the previous verified artifact.
 //!
 //! Rollback is a normal, explicit user action — never a bypass of the
 //! anti-downgrade floor and never a break-glass flow:
@@ -21,14 +20,14 @@ use crate::target::{
     HostCompletionBody, HostOperation, ROLLBACK_UNAVAILABLE, StateMutationPayload,
 };
 
-/// The G04 entry point. Delivery boundary: wired into the CLI by the I wave.
+/// Restores the saved artifact and matching configuration generation.
 pub(crate) fn run_rollback(
     context: &LifecycleContext,
     selector: Option<&str>,
 ) -> anyhow::Result<String> {
     let action = "rollback";
     let (record, _host, target, inspection) = resolve_live_instance(context, selector, action)?;
-    let deployment_id = inspection.deployment_id.clone();
+    let deployment_id = &inspection.deployment_id;
     let revision = inspection.revision;
     if inspection.artifact.previous.is_none() {
         bail!(
@@ -57,8 +56,8 @@ pub(crate) fn run_rollback(
         action,
     )?;
 
-    let fresh = target.inspect_instance(&deployment_id)?;
-    record_observation(context, &deployment_id, &fresh);
+    let fresh = target.inspect_instance(deployment_id)?;
+    record_observation(context, deployment_id, &fresh);
 
     let title = crate::ui::message!(
         "Restored previous verified version for '{}'",
@@ -72,8 +71,7 @@ pub(crate) fn run_rollback(
                 crate::ui::text("Version", "版本"),
                 fresh
                     .current_release
-                    .as_ref()
-                    .map(|release| release.version.clone())
+                    .map(|release| release.version)
                     .unwrap_or_else(|| "-".into()),
             ),
             (

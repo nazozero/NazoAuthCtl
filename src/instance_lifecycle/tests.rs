@@ -386,7 +386,7 @@ impl Fixture {
 #[test]
 fn update_dispatches_migration_once_and_commits_new_revision() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
-    let report = run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
+    let report = run_update(&fixture.context, &fixture.keys, fixture.update_request())?;
     assert!(report.contains("accepted once"), "{report}");
     assert_eq!(
         *fixture.lifecycle.update_calls.lock().unwrap(),
@@ -411,7 +411,7 @@ fn update_dispatches_migration_once_and_commits_new_revision() -> anyhow::Result
 fn target_noop_clears_prepared_migration_without_a_control_result() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
     *fixture.lifecycle.no_op_update.lock().unwrap() = true;
-    let report = run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
+    let report = run_update(&fixture.context, &fixture.keys, fixture.update_request())?;
 
     assert!(
         report.contains("target-verified artifact") && report.contains("no migration"),
@@ -434,7 +434,7 @@ fn target_noop_clears_prepared_migration_without_a_control_result() -> anyhow::R
 fn adopted_artifact_without_release_version_can_update() -> anyhow::Result<()> {
     let fixture = Fixture::with_current_release(None)?;
 
-    run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
+    run_update(&fixture.context, &fixture.keys, fixture.update_request())?;
 
     let state = fixture.store()?.load_existing(DEPLOYMENT)?;
     assert_eq!(state.artifact.current.as_deref(), Some(NEW_REF));
@@ -522,7 +522,7 @@ fn target_backup_gate_runs_before_lifecycle_and_update_replay_is_idempotent() ->
 fn update_activation_failure_commits_nothing_and_reports_stable_code() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
     fixture.lifecycle.set_fail_update(true);
-    let error = run_update(&fixture.context, &fixture.keys, &fixture.update_request())
+    let error = run_update(&fixture.context, &fixture.keys, fixture.update_request())
         .expect_err("activation failure must fail the update");
     assert!(error.to_string().contains(ACTIVATION_FAILED), "{error}");
     // Migration was accepted server-side (journaled), but the target state
@@ -538,7 +538,7 @@ fn update_activation_failure_commits_nothing_and_reports_stable_code() -> anyhow
 fn unknown_outcome_resumes_with_the_same_operation_id() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
     *fixture.control.answer.lock().unwrap() = None;
-    let error = run_update(&fixture.context, &fixture.keys, &fixture.update_request())
+    let error = run_update(&fixture.context, &fixture.keys, fixture.update_request())
         .expect_err("outcome unknown must fail closed");
     assert!(
         error.to_string().contains(CONTROL_OUTCOME_UNKNOWN),
@@ -549,7 +549,7 @@ fn unknown_outcome_resumes_with_the_same_operation_id() -> anyhow::Result<()> {
     // minting a new operation.
     *fixture.control.answer.lock().unwrap() = Some(());
     let second = fixture.control.presented.lock().unwrap().len();
-    let _ = run_update(&fixture.context, &fixture.keys, &fixture.update_request())?;
+    let _ = run_update(&fixture.context, &fixture.keys, fixture.update_request())?;
     let presented = fixture.control.presented.lock().unwrap();
     assert_eq!(presented.len(), second + 1);
     assert_eq!(
@@ -791,7 +791,7 @@ fn durable_failed_migration_terminates_update_before_activation() -> anyhow::Res
         config_content: None,
         config_schema: None,
     };
-    let error = super::update::run_update(&fixture.context, &fixture.keys, &request)
+    let error = super::update::run_update(&fixture.context, &fixture.keys, request)
         .expect_err("a durably failed migration must terminate the update");
 
     assert!(
@@ -820,14 +820,14 @@ fn durable_failed_migration_clears_controller_slot_after_persistence() -> anyhow
     // receives a new operation identity rather than pinning the controller.
     let fixture = Fixture::new()?;
     *fixture.control.fail_business.lock().unwrap() = true;
-    let request = UpdateRequest {
-        instance: Some(format!("inst-{DEPLOYMENT}")),
-        version: None,
-        config_content: None,
-        config_schema: None,
-    };
     for _ in 0..2 {
-        let error = super::update::run_update(&fixture.context, &fixture.keys, &request)
+        let request = UpdateRequest {
+            instance: Some(format!("inst-{DEPLOYMENT}")),
+            version: None,
+            config_content: None,
+            config_schema: None,
+        };
+        let error = super::update::run_update(&fixture.context, &fixture.keys, request)
             .expect_err("durable failure repeats");
         assert!(error.to_string().contains("migration failed durably"));
     }

@@ -1366,7 +1366,7 @@ fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
             "Verifying release and updating the instance…",
             "正在验证发行版并更新实例……",
         ),
-        || crate::instance_lifecycle::run_update(&context, &keys, &request),
+        || crate::instance_lifecycle::run_update(&context, &keys, request),
     )?;
     crate::ui::print_report(&report);
     Ok(())
