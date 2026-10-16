@@ -57,9 +57,9 @@ pub use descriptor::{
     DescriptorVariant, MAX_DESCRIPTOR_BYTES, MatrixDescriptor, RoleRequirement,
 };
 use descriptor::{
-    descriptor_requires_reference, extract_single_mdoc_trust_anchor_from_bundle, is_placeholder,
-    parse_placeholder, referenced_openid4vc_credential_dataset_ids, validate_binding_reference,
-    validate_descriptor, validate_digest, validate_single_mdoc_trust_anchor,
+    descriptor_requires_reference, extract_single_mdoc_trust_anchor_from_bundle, parse_placeholder,
+    referenced_openid4vc_credential_dataset_ids, validate_descriptor, validate_digest,
+    validate_single_mdoc_trust_anchor,
 };
 use template::{
     materialize_registration_template, materialize_value, materialize_vci_config,
@@ -1056,8 +1056,6 @@ pub enum MaterializerError {
     SecureIo,
     #[error("onboarding output is missing a required logical client")]
     MissingClientMapping,
-    #[error("onboarding output contains an unexpected logical client")]
-    ExtraClientMapping,
     #[error("onboarding output contains duplicate actual clients")]
     DuplicateClientMapping,
     #[error("onboarding request identity does not match preparation")]
@@ -1252,7 +1250,7 @@ impl DescriptorMaterializer {
             clients.insert(
                 logical_client_id.to_owned(),
                 PreparedClient::new(
-                    logical_client_id.to_owned(),
+                    logical_client_id,
                     &descriptor,
                     registration.policy,
                     registration.template,
@@ -1299,7 +1297,7 @@ impl DescriptorMaterializer {
 
     /// Finalize a Suite matrix from an ordinary tenant-resource Apply.
     pub fn finalize_tenant_resources(
-        prepared: PreparedMaterialization,
+        mut prepared: PreparedMaterialization,
         apply_output: TenantResourceApplyOutput,
         tenant_signing_certificate_chain_pem: impl Into<String>,
     ) -> Result<TenantResourceMaterializedMatrix, MaterializerError> {
@@ -1372,7 +1370,6 @@ impl DescriptorMaterializer {
                 .ok_or(MaterializerError::MissingClientMapping)?;
             clients.insert(logical_client_id.clone(), (*public_id).to_owned());
         }
-        validate_client_mapping_keys(&prepared, &clients)?;
 
         let bindings = MaterializationBindings {
             applicant_id,
@@ -1380,18 +1377,18 @@ impl DescriptorMaterializer {
             openid4vc_request_object_trust_anchor_pem: tenant_trust_anchor_pem,
             clients,
         };
-        let matrix = materialize_matrix_document(&prepared, &bindings)?;
+        let matrix = materialize_matrix_document(&mut prepared, &bindings)?;
         Ok(TenantResourceMaterializedMatrix {
             matrix: Some(SelectedMatrix::from_materialized(
                 matrix,
                 prepared.matrix_sha256.clone(),
             )),
             matrix_sha256: prepared.matrix_sha256.clone(),
-            operation_id: apply_output.operation_id().to_owned(),
-            request_hash: apply_output.request_hash().to_owned(),
-            controller_kid: apply_output.controller_kid().to_owned(),
-            applied_revision: apply_output.revision(),
-            resource_manifest_sha256: apply_output.resource_manifest_sha256().to_owned(),
+            operation_id: apply_output.operation_id,
+            request_hash: apply_output.request_hash,
+            controller_kid: apply_output.controller_kid,
+            applied_revision: apply_output.revision,
+            resource_manifest_sha256: apply_output.resource_manifest_sha256,
             applicant_id: applicant_uuid,
             clients: bindings.clients,
             trust_policy_identity,
@@ -1399,35 +1396,19 @@ impl DescriptorMaterializer {
     }
 }
 
-fn validate_client_mapping_keys(
-    prepared: &PreparedMaterialization,
-    clients: &BTreeMap<String, String>,
-) -> Result<(), MaterializerError> {
-    let expected = prepared.clients.keys().collect::<BTreeSet<_>>();
-    let actual = clients.keys().collect::<BTreeSet<_>>();
-    if !expected.is_subset(&actual) {
-        return Err(MaterializerError::MissingClientMapping);
-    }
-    if !actual.is_subset(&expected) {
-        return Err(MaterializerError::ExtraClientMapping);
-    }
-    Ok(())
-}
-
 fn materialize_matrix_document(
-    prepared: &PreparedMaterialization,
+    prepared: &mut PreparedMaterialization,
     bindings: &MaterializationBindings,
 ) -> Result<MatrixDocument, MaterializerError> {
     let mut groups = Vec::with_capacity(prepared.descriptor.groups.len());
-    for group in &prepared.descriptor.groups {
+    for group in std::mem::take(&mut prepared.descriptor.groups) {
         let mut plans = Vec::with_capacity(group.plans.len());
-        for plan in &group.plans {
+        for plan in group.plans {
             let config = materialize_value(
-                &plan.config_template,
+                plan.config_template,
                 &plan.secret_bindings,
                 prepared,
                 bindings,
-                &mut BTreeSet::new(),
             )?;
             let config = materialize_vci_config(
                 &plan.plan,
@@ -1448,19 +1429,19 @@ fn materialize_matrix_document(
                 prepared.attestation.as_ref(),
             )?;
             plans.push(MatrixPlan {
-                id: plan.id.clone(),
-                plan: plan.plan.clone(),
+                id: plan.id,
+                plan: plan.plan,
                 config,
-                variant: plan.variant.clone(),
-                expected_results: plan.expected_results.clone(),
+                variant: plan.variant,
+                expected_results: plan.expected_results,
             });
         }
         groups.push(MatrixGroup {
-            id: group.id.clone(),
-            profile: group.profile.clone(),
+            id: group.id,
+            profile: group.profile,
             variant: MatrixVariant {
-                id: group.variant.id.clone(),
-                values: group.variant.values.clone(),
+                id: group.variant.id,
+                values: group.variant.values,
             },
             plans,
         });
@@ -1559,7 +1540,7 @@ impl std::fmt::Debug for TenantResourceMaterializedMatrix {
 
 impl PreparedClient {
     fn new(
-        logical_client_id: String,
+        logical_client_id: &str,
         descriptor: &MatrixDescriptor,
         policy: &CryptoPolicy,
         registration_template: &Value,
@@ -1597,7 +1578,7 @@ impl PreparedClient {
         )?;
         let mut request = materialize_registration_template(
             registration_template,
-            &logical_client_id,
+            logical_client_id,
             target_issuer,
             suite_origin,
             &generated.rsa_public_jwks,
@@ -2412,8 +2393,18 @@ mod tests {
 
     #[test]
     fn ordinary_finalize_uses_typed_apply_mappings_without_lease_identity() {
+        let mut descriptor = descriptor();
+        let plan = &mut descriptor.groups[0].plans[0];
+        plan.secret_bindings = BTreeMap::from([
+            ("outer".into(), "{{secret.inner}}".into()),
+            ("inner".into(), "{{client.web.id}}".into()),
+        ]);
+        plan.config_template["client_id"] = serde_json::json!("{{outer}}");
+        plan.config_template["nested"] = serde_json::json!([
+            {"client": "{{secret.outer}}", "literal": "保留原值"}, 17, null
+        ]);
         let prepared = prepare_for_test(
-            descriptor(),
+            descriptor,
             "https://issuer.example",
             &suite(),
             request_jti(),
@@ -2445,9 +2436,52 @@ mod tests {
             "actual-client"
         );
         assert_eq!(
+            finalized.matrix().document.groups[0].plans[0].config["nested"],
+            serde_json::json!([{"client": "actual-client", "literal": "保留原值"}, 17, null])
+        );
+        assert_eq!(
             finalized.operation_id(),
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f50"
         );
+    }
+
+    #[test]
+    fn preparation_rejects_invalid_alias_graphs_before_materialization() {
+        for (bindings, expected) in [
+            (
+                BTreeMap::from([
+                    ("outer".into(), "{{secret.inner}}".into()),
+                    ("inner".into(), "{{outer}}".into()),
+                ]),
+                MaterializerError::SecretCycle,
+            ),
+            (
+                BTreeMap::from([("outer".into(), "{{secret.missing}}".into())]),
+                MaterializerError::UnknownSecretReference("secret.missing".into()),
+            ),
+            (
+                BTreeMap::from([("outer".into(), "{{plan.other}}".into())]),
+                MaterializerError::CrossPlanReference("plan.other".into()),
+            ),
+            (
+                BTreeMap::from([("outer".into(), "{{client.missing.id}}".into())]),
+                MaterializerError::UnknownClientReference("missing".into()),
+            ),
+        ] {
+            let mut descriptor = descriptor();
+            let plan = &mut descriptor.groups[0].plans[0];
+            plan.secret_bindings = bindings;
+            plan.config_template["client_id"] = serde_json::json!("{{outer}}");
+            let error = prepare_for_test(
+                descriptor,
+                "https://issuer.example",
+                &suite(),
+                request_jti(),
+            )
+            .err()
+            .expect("invalid descriptor must fail during preparation");
+            assert_eq!(error, expected);
+        }
     }
 
     #[test]

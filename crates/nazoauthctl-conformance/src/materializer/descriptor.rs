@@ -610,33 +610,24 @@ fn validate_bindings(plan: &DescriptorPlan) -> Result<(), MaterializerError> {
     Ok(())
 }
 
-pub(super) fn validate_binding_reference(
-    reference: &str,
-    bindings: &BTreeMap<String, String>,
-    stack: &mut BTreeSet<String>,
+pub(super) fn validate_binding_reference<'a>(
+    reference: &'a str,
+    bindings: &'a BTreeMap<String, String>,
+    stack: &mut BTreeSet<&'a str>,
 ) -> Result<(), MaterializerError> {
     let name = reference.trim();
     if name.starts_with("plan.") || name.starts_with("group.") || name.contains("::") {
         return Err(MaterializerError::CrossPlanReference(name.to_owned()));
     }
-    if let Some(binding_name) = name.strip_prefix("secret.") {
-        if !bindings.contains_key(binding_name) {
-            return Err(MaterializerError::UnknownSecretReference(name.to_owned()));
-        }
-        if !stack.insert(binding_name.to_owned()) {
+    let binding_name = name.strip_prefix("secret.").unwrap_or(name);
+    if let Some(binding) = bindings.get(binding_name) {
+        if !stack.insert(binding_name) {
             return Err(MaterializerError::SecretCycle);
         }
-        let nested = parse_placeholder(
-            bindings
-                .get(binding_name)
-                .ok_or(MaterializerError::InvalidPlaceholder)?,
-        )?;
+        let nested = parse_placeholder(binding)?;
         let result = validate_binding_reference(nested, bindings, stack);
         stack.remove(binding_name);
         return result;
-    }
-    if bindings.contains_key(name) {
-        return validate_binding_reference(&format!("secret.{name}"), bindings, stack);
     }
     if is_builtin_reference(name) {
         return Ok(());
@@ -722,8 +713,12 @@ fn validate_template_references(
         Value::Object(values) => values
             .values()
             .try_for_each(|value| validate_template_references(value, bindings)),
-        Value::String(text) if is_placeholder(text) => {
-            validate_binding_reference(parse_placeholder(text)?, bindings, &mut BTreeSet::new())
+        Value::String(text) => {
+            if let Ok(reference) = parse_placeholder(text) {
+                validate_binding_reference(reference, bindings, &mut BTreeSet::new())
+            } else {
+                Ok(())
+            }
         }
         _ => Ok(()),
     }
@@ -741,37 +736,32 @@ fn validate_template_clients(
         Value::Object(values) => values
             .values()
             .try_for_each(|value| validate_template_clients(value, bindings, clients)),
-        Value::String(text) if is_placeholder(text) => validate_reference_client(
-            parse_placeholder(text)?,
-            bindings,
-            clients,
-            &mut BTreeSet::new(),
-        ),
+        Value::String(text) => {
+            if let Ok(reference) = parse_placeholder(text) {
+                validate_reference_client(reference, bindings, clients, &mut BTreeSet::new())
+            } else {
+                Ok(())
+            }
+        }
         _ => Ok(()),
     }
 }
 
-fn validate_reference_client(
-    name: &str,
-    bindings: &BTreeMap<String, String>,
+fn validate_reference_client<'a>(
+    name: &'a str,
+    bindings: &'a BTreeMap<String, String>,
     clients: &BTreeMap<&str, ClientRegistration<'_>>,
-    stack: &mut BTreeSet<String>,
+    stack: &mut BTreeSet<&'a str>,
 ) -> Result<(), MaterializerError> {
-    if let Some(binding_name) = name.strip_prefix("secret.") {
-        if !stack.insert(binding_name.to_owned()) {
+    let binding_name = name.strip_prefix("secret.").unwrap_or(name);
+    if let Some(binding) = bindings.get(binding_name) {
+        if !stack.insert(binding_name) {
             return Err(MaterializerError::SecretCycle);
         }
-        let nested = parse_placeholder(
-            bindings
-                .get(binding_name)
-                .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()))?,
-        )?;
+        let nested = parse_placeholder(binding)?;
         let result = validate_reference_client(nested, bindings, clients, stack);
         stack.remove(binding_name);
         return result;
-    }
-    if bindings.contains_key(name) {
-        return validate_reference_client(&format!("secret.{name}"), bindings, clients, stack);
     }
     if let Some(rest) = name.strip_prefix("client.") {
         let logical = rest
@@ -832,20 +822,18 @@ pub(super) fn descriptor_requires_reference(
         group.required_roles.iter().any(|role| {
             role.secret_refs.iter().any(|secret_ref| {
                 secret_ref.trim() == reference
-                    || value_contains_reference(&Value::String(secret_ref.clone()), reference)
+                    || parse_placeholder(secret_ref).ok() == Some(reference)
             })
         }) || group.plans.iter().any(|plan| {
             value_contains_reference(&plan.config_template, reference)
-                || plan.secret_bindings.values().any(|binding| {
-                    value_contains_reference(&Value::String(binding.clone()), reference)
-                })
+                || plan
+                    .secret_bindings
+                    .values()
+                    .any(|binding| parse_placeholder(binding).ok() == Some(reference))
                 || plan.required_roles.iter().any(|role| {
                     role.secret_refs.iter().any(|secret_ref| {
                         secret_ref.trim() == reference
-                            || value_contains_reference(
-                                &Value::String(secret_ref.clone()),
-                                reference,
-                            )
+                            || parse_placeholder(secret_ref).ok() == Some(reference)
                     })
                 })
         })
@@ -860,9 +848,7 @@ pub(super) fn value_contains_reference(value: &Value, reference: &str) -> bool {
         Value::Object(values) => values
             .values()
             .any(|value| value_contains_reference(value, reference)),
-        Value::String(text) => {
-            is_placeholder(text) && parse_placeholder(text).ok() == Some(reference)
-        }
+        Value::String(text) => parse_placeholder(text).ok() == Some(reference),
         _ => false,
     }
 }
@@ -885,7 +871,7 @@ pub(super) fn parse_placeholder(value: &str) -> Result<&str, MaterializerError> 
 }
 
 pub(super) fn is_placeholder(value: &str) -> bool {
-    value.starts_with("{{") && value.ends_with("}}") && parse_placeholder(value).is_ok()
+    parse_placeholder(value).is_ok()
 }
 
 /// Validate a signed-artifact placeholder against the same reference grammar
@@ -926,8 +912,9 @@ fn validate_name(value: &str, field: &'static str) -> Result<(), MaterializerErr
 
 pub(super) fn validate_digest(value: &str, field: &'static str) -> Result<(), MaterializerError> {
     if value.len() != 64
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || value != value.to_ascii_lowercase()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(MaterializerError::InvalidField(field));
     }
