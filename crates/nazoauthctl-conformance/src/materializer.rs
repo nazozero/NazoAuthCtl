@@ -1486,14 +1486,6 @@ pub struct TenantResourceMaterializedMatrix {
     trust_policy_identity: Option<TenantResourceIdentity>,
 }
 
-impl Drop for TenantResourceMaterializedMatrix {
-    fn drop(&mut self) {
-        if let Some(matrix) = &mut self.matrix {
-            matrix.zeroize_config();
-        }
-    }
-}
-
 impl TenantResourceMaterializedMatrix {
     pub fn matrix(&self) -> &SelectedMatrix {
         self.matrix

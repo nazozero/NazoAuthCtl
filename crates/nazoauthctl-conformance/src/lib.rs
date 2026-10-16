@@ -83,8 +83,8 @@ pub use materializer::{
     TenantResourceManifestResource, TenantResourceMaterializedMatrix,
 };
 pub use matrix::{
-    MATRIX_SCHEMA_VERSION, MAX_MATRIX_BYTES, MatrixArtifact, MatrixDocument, MatrixError,
-    MatrixGroup, MatrixPlan, MatrixSelection, MatrixVariant, SelectedMatrix,
+    MATRIX_SCHEMA_VERSION, MatrixDocument, MatrixError, MatrixGroup, MatrixPlan, MatrixSelection,
+    MatrixVariant, SelectedMatrix,
 };
 pub use orchestrator::{
     BOUNDED_PLAN_RUNNER_PROTOCOL, ConformanceAutomation, ConformanceRunConfig, ConformanceRunner,
