@@ -75,7 +75,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
         ),
     });
     if !prepared.errors.is_empty() || prepared.planned.is_empty() {
-        return runner.run_prepared(sink, prepared);
+        return runner.run_prepared(sink, prepared, runner.config.automation.first());
     }
 
     let mut prepared = prepared;
@@ -110,43 +110,17 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                         let Some(next_index) = next else {
                             break;
                         };
-                        let child = ConformanceRunner {
-                            config: ConformanceRunConfig {
-                                client: runner.config.client.clone(),
-                                matrix: runner.config.matrix.clone(),
-                                target_origin: runner.config.target_origin.clone(),
-                                binding: runner.config.binding.clone(),
-                                poll_timeout: runner.config.poll_timeout,
-                                control: runner.config.control.clone(),
-                                plan_lanes: runner.config.plan_lanes.clone(),
-                                plan_resource_budgets: runner.config.plan_resource_budgets.clone(),
-                                selected_resource_budget: runner
-                                    .config
-                                    .selected_resource_budget
-                                    .clone(),
-                                jobs: 1,
-
-                                automation: runner
-                                    .config
-                                    .automation
-                                    .get(worker_index)
-                                    .cloned()
-                                    .into_iter()
-                                    .collect(),
-                                suite_resource_observer: runner
-                                    .config
-                                    .suite_resource_observer
-                                    .clone(),
-                            },
-                        };
                         let mut progress = ChannelSink {
                             index: next_index,
                             sender: sender.clone(),
                             stop_launching: Arc::clone(&stop_launching),
                             fail_fast: runner.config.control.is_fail_fast(),
                         };
-                        let summary = child
-                            .run_prepared(&mut progress, worker_prepared(&work_ref[next_index]));
+                        let summary = runner.run_prepared(
+                            &mut progress,
+                            worker_prepared(&work_ref[next_index]),
+                            runner.config.automation.get(worker_index),
+                        );
                         if has_unsettled_suite_resources(&summary.report)
                             || (runner.config.control.is_fail_fast()
                                 && completed_plan_stops_dispatch(&summary.report))

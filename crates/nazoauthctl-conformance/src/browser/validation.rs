@@ -51,7 +51,7 @@ impl BrowserTargetOrigin {
         &self.url
     }
 
-    pub(super) fn allows(&self, candidate: &Url) -> bool {
+    pub(crate) fn allows(&self, candidate: &Url) -> bool {
         same_origin(&self.url, candidate)
     }
 }

@@ -235,8 +235,11 @@ impl ConformanceRunner {
             return Err(OrchestrationError::InvalidInput);
         }
         if !plan_lanes_match_selected(&config.matrix, &config.plan_lanes)
-            || !resource_budgets_match_selected(
-                &config.matrix,
+            || !config
+                .plan_lanes
+                .keys()
+                .eq(config.plan_resource_budgets.keys())
+            || !resource_budget_totals_match(
                 &config.plan_resource_budgets,
                 &config.selected_resource_budget,
             )
@@ -259,9 +262,7 @@ impl ConformanceRunner {
         states: &[&str],
     ) -> Result<Value, String> {
         let started = Instant::now();
-        let deadline = Instant::now()
-            .checked_add(self.config.poll_timeout)
-            .ok_or_else(|| "Suite poll timeout is out of range".to_owned())?;
+        let deadline = started + self.config.poll_timeout;
         self.wait_for_state_until(sink, test, module_id, states, deadline, started)
     }
 
@@ -290,7 +291,7 @@ impl ConformanceRunner {
             match self.config.client.wait_for_state(module_id, states, slice) {
                 Ok(state) => return Ok(state),
                 Err(SuiteClientError::Timeout) => continue,
-                Err(error) => return Err(safe_error(&error)),
+                Err(error) => return Err(error.to_string()),
             }
         }
     }
@@ -318,9 +319,7 @@ impl ConformanceRunner {
         const USER_REJECTS_AUTHENTICATION: &str = "fapi-ciba-id1-user-rejects-authentication";
 
         let started = Instant::now();
-        let deadline = started
-            .checked_add(self.config.poll_timeout)
-            .ok_or_else(|| "CIBA poll timeout is out of range".to_owned())?;
+        let deadline = started + self.config.poll_timeout;
         let approve = module.test_name != USER_REJECTS_AUTHENTICATION;
         let mut decided = BTreeSet::new();
         let mut observed = initial;
@@ -333,7 +332,7 @@ impl ConformanceRunner {
             if deadline.saturating_duration_since(Instant::now()).is_zero() {
                 return Err("CIBA user decision timed out".to_owned());
             }
-            if is_terminal_state(&observed) {
+            if is_terminal(&observed) {
                 return Ok((observed, false));
             }
             if !is_waiting(&observed) {
@@ -358,7 +357,7 @@ impl ConformanceRunner {
                 .config
                 .client
                 .module_log(module_id)
-                .map_err(|error| safe_error(&error))?;
+                .map_err(|error| error.to_string())?;
             let mut made_decision = false;
             for auth_req_id in ciba_approval_requests(&log).map_err(|error| error.to_string())? {
                 if decided.contains(&auth_req_id) {
@@ -395,7 +394,7 @@ impl ConformanceRunner {
                 .config
                 .client
                 .module_info(module_id)
-                .map_err(|error| safe_error(&error))?;
+                .map_err(|error| error.to_string())?;
         }
     }
 
@@ -409,9 +408,7 @@ impl ConformanceRunner {
         initial: Value,
     ) -> Result<Value, String> {
         let started = Instant::now();
-        let deadline = started
-            .checked_add(self.config.poll_timeout)
-            .ok_or_else(|| "OpenID4VCI poll timeout is out of range".to_owned())?;
+        let deadline = started + self.config.poll_timeout;
         let mut observed = initial;
         let mut first_round = true;
         let mut last_wait_report = None;
@@ -427,8 +424,8 @@ impl ConformanceRunner {
                     .config
                     .client
                     .module_info(module_id)
-                    .map_err(|error| safe_error(&error))?;
-                if is_terminal_state(&observed) {
+                    .map_err(|error| error.to_string())?;
+                if is_terminal(&observed) {
                     return Ok(observed);
                 }
                 if !is_waiting(&observed) {
@@ -440,7 +437,7 @@ impl ConformanceRunner {
                         deadline,
                         started,
                     )?;
-                    if is_terminal_state(&observed) {
+                    if is_terminal(&observed) {
                         return Ok(observed);
                     }
                 }
@@ -457,7 +454,7 @@ impl ConformanceRunner {
                     self.wait_for_runner_refresh(deadline, "OpenID4VCI")?;
                     continue;
                 }
-                Err(error) => return Err(safe_error(&error)),
+                Err(error) => return Err(error.to_string()),
             };
             let module_context = OpenId4VciModule::new(
                 module_id.to_owned(),
@@ -519,8 +516,7 @@ impl ConformanceRunner {
                 Ok(info) => info,
                 Err(error) => {
                     errors.push(format!(
-                        "Suite module reconciliation info read failed for {module_id}: {}",
-                        safe_error(&error)
+                        "Suite module reconciliation info read failed for {module_id}: {error}"
                     ));
                     continue;
                 }
@@ -539,8 +535,7 @@ impl ConformanceRunner {
                 Ok(log) => log,
                 Err(error) => {
                     errors.push(format!(
-                        "Suite module reconciliation log read failed for {module_id}: {}",
-                        safe_error(&error)
+                        "Suite module reconciliation log read failed for {module_id}: {error}"
                     ));
                     continue;
                 }
@@ -595,14 +590,7 @@ impl ConformanceRunner {
         let mut errors = Vec::<String>::new();
         let mut unknown_declared_skip_modules = Vec::<String>::new();
         let mut matrix_expectations_satisfied = true;
-        let selected_plan_count = self
-            .config
-            .matrix
-            .document
-            .groups
-            .iter()
-            .map(|group| group.plans.len())
-            .sum::<usize>();
+        let selected_plan_count = self.config.matrix.document.plan_count();
         let mut enumerated_plan_count = 0usize;
         let mut auth_probe = None;
         let mut current_profile = None;
@@ -612,7 +600,7 @@ impl ConformanceRunner {
         sink.activity(&ProgressActivity::AuthenticatingSuite);
         match self.config.client.probe_auth() {
             Ok(probe) => auth_probe = Some(probe),
-            Err(error) => errors.push(safe_error(&error)),
+            Err(error) => errors.push(error.to_string()),
         }
 
         // Phase 1: create every selected plan and enumerate its modules. No
@@ -662,7 +650,7 @@ impl ConformanceRunner {
                         {
                             Ok(created) => created,
                             Err(error) => {
-                                errors.push(safe_error(&error));
+                                errors.push(error.to_string());
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'create;
                             }
@@ -706,9 +694,7 @@ impl ConformanceRunner {
                         *module_name_counts
                             .entry(module.test_name.as_str())
                             .or_default() += 1;
-                        if !definition_identities
-                            .insert((module.test_name.clone(), module.variant.clone()))
-                        {
+                        if !definition_identities.insert((&module.test_name, &module.variant)) {
                             duplicate_definition_identities
                                 .push(definition_identity(&plan.id, module));
                         }
@@ -796,10 +782,15 @@ impl ConformanceRunner {
 
     fn run_serial<S: ProgressSink>(&self, sink: &mut S) -> RunSummary {
         let prepared = self.prepare_run(sink);
-        self.run_prepared(sink, prepared)
+        self.run_prepared(sink, prepared, self.config.automation.first())
     }
 
-    fn run_prepared<S: ProgressSink>(&self, sink: &mut S, prepared: PreparedRun) -> RunSummary {
+    fn run_prepared<S: ProgressSink>(
+        &self,
+        sink: &mut S,
+        prepared: PreparedRun,
+        automation: Option<&ConformanceAutomation>,
+    ) -> RunSummary {
         let PreparedRun {
             mut groups,
             mut plans,
@@ -890,7 +881,7 @@ impl ConformanceRunner {
                     {
                         Ok(instance) => instance,
                         Err(error) => {
-                            errors.push_fatal(safe_error(&error));
+                            errors.push_fatal(error.to_string());
                             groups[group_index].status = GroupStatus::Failed;
                             break 'execute;
                         }
@@ -938,7 +929,7 @@ impl ConformanceRunner {
                             Ok(info) => Some(info),
                             Err(crate::client::SuiteClientError::HttpStatus(404)) => None,
                             Err(error) => {
-                                errors.push(safe_error(&error));
+                                errors.push(error.to_string());
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             }
@@ -964,7 +955,7 @@ impl ConformanceRunner {
                             current_test.clone(),
                         );
                         if let Err(error) = self.config.client.start_module(&instance.id) {
-                            errors.push(safe_error(&error));
+                            errors.push(error.to_string());
                             groups[group_index].status = GroupStatus::Failed;
                             break 'execute;
                         }
@@ -994,11 +985,8 @@ impl ConformanceRunner {
 
                     if observed.as_ref().is_some_and(is_waiting) {
                         if plan.lane == OidfDriverLane::Ciba {
-                            let Some(approver) = self
-                                .config
-                                .automation
-                                .first()
-                                .and_then(|automation| automation.ciba_approver.as_ref())
+                            let Some(approver) =
+                                automation.and_then(|automation| automation.ciba_approver.as_ref())
                             else {
                                 errors.push("CIBA user automation is unavailable".to_owned());
                                 groups[group_index].status = GroupStatus::Failed;
@@ -1009,7 +997,7 @@ impl ConformanceRunner {
                                 approver,
                                 module,
                                 &instance.id,
-                                observed.clone().expect("waiting runner state"),
+                                observed.take().expect("waiting runner state"),
                             ) {
                                 Ok((state, review_pending)) => {
                                     observed = Some(state);
@@ -1022,11 +1010,8 @@ impl ConformanceRunner {
                                 }
                             }
                         } else if plan.plan_name.starts_with("oid4vci-") {
-                            let Some(issuer) = self
-                                .config
-                                .automation
-                                .first()
-                                .and_then(|automation| automation.issuer.as_ref())
+                            let Some(issuer) =
+                                automation.and_then(|automation| automation.issuer.as_ref())
                             else {
                                 errors
                                     .push("OpenID4VCI issuer automation is unavailable".to_owned());
@@ -1039,7 +1024,7 @@ impl ConformanceRunner {
                                 plan,
                                 module,
                                 &instance.id,
-                                observed.clone().expect("waiting runner state"),
+                                observed.take().expect("waiting runner state"),
                             ) {
                                 Ok(state) => observed = Some(state),
                                 Err(error) => {
@@ -1049,11 +1034,8 @@ impl ConformanceRunner {
                                 }
                             }
                         } else if is_openid4vp_verifier_plan(plan) {
-                            let Some(verifier) = self
-                                .config
-                                .automation
-                                .first()
-                                .and_then(|automation| automation.verifier.as_ref())
+                            let Some(verifier) =
+                                automation.and_then(|automation| automation.verifier.as_ref())
                             else {
                                 errors.push(
                                     "OpenID4VP verifier automation is unavailable".to_owned(),
@@ -1120,7 +1102,7 @@ impl ConformanceRunner {
                                     .config
                                     .client
                                     .runner_info(&instance.id)
-                                    .map_err(|error| safe_error(&error))?;
+                                    .map_err(|error| error.to_string())?;
                                 let browser = runner.get("browser").ok_or_else(|| {
                                     "OpenID4VP runner has no URI-input request".to_owned()
                                 })?;
@@ -1151,7 +1133,7 @@ impl ConformanceRunner {
                         }
                     }
 
-                    if !observed.as_ref().is_some_and(is_terminal_state)
+                    if !observed.as_ref().is_some_and(is_terminal)
                         && let Err(error) = self.wait_for_state_interruptible(
                             sink,
                             &module.test_name,
@@ -1166,7 +1148,7 @@ impl ConformanceRunner {
                     let info = match self.config.client.module_info(&instance.id) {
                         Ok(info) => info,
                         Err(error) => {
-                            errors.push(safe_error(&error));
+                            errors.push(error.to_string());
                             groups[group_index].status = GroupStatus::Failed;
                             break 'execute;
                         }
@@ -1174,7 +1156,7 @@ impl ConformanceRunner {
                     let log = match self.config.client.module_log(&instance.id) {
                         Ok(log) => log,
                         Err(error) => {
-                            errors.push(safe_error(&error));
+                            errors.push(error.to_string());
                             groups[group_index].status = GroupStatus::Failed;
                             break 'execute;
                         }
@@ -1205,15 +1187,15 @@ impl ConformanceRunner {
                     if external_review_pending {
                         module_report.mark_external_review_pending();
                     }
-                    modules.push(module_report);
-                    let module_outcome = modules.last().map(|module| module.outcome);
+                    let module_outcome = module_report.outcome;
                     let module_settled = terminal || external_review_pending;
-                    if module_settled && let Some(module) = modules.last() {
-                        record_module_progress(&mut groups[group_index], module);
+                    if module_settled {
+                        record_module_progress(&mut groups[group_index], &module_report);
                     }
-                    if matches!(module_outcome, Some(ModuleOutcome::Failed)) {
+                    modules.push(module_report);
+                    if module_outcome == ModuleOutcome::Failed {
                         groups[group_index].status = GroupStatus::Failed;
-                    } else if matches!(module_outcome, Some(ModuleOutcome::Incomplete) | None)
+                    } else if module_outcome == ModuleOutcome::Incomplete
                         && groups[group_index].status != GroupStatus::Failed
                     {
                         groups[group_index].status = GroupStatus::Incomplete;
@@ -1230,8 +1212,7 @@ impl ConformanceRunner {
                         // Keep an unsettled allocation at the plan boundary.
                         break 'execute;
                     }
-                    if matches!(module_outcome, Some(ModuleOutcome::Failed))
-                        && self.config.control.is_fail_fast()
+                    if module_outcome == ModuleOutcome::Failed && self.config.control.is_fail_fast()
                     {
                         self.config.control.interrupt();
                         break 'execute;
@@ -1546,12 +1527,7 @@ fn plan_lanes_match_selected(
         .iter()
         .flat_map(|group| group.plans.iter().map(|plan| plan.id.as_str()))
         .collect::<BTreeSet<_>>();
-    let selected_plan_count = matrix
-        .document
-        .groups
-        .iter()
-        .map(|group| group.plans.len())
-        .sum::<usize>();
+    let selected_plan_count = matrix.document.plan_count();
     selected_plan_ids.len() == selected_plan_count
         && selected_plan_ids.len() == plan_lanes.len()
         && plan_lanes
@@ -1559,32 +1535,10 @@ fn plan_lanes_match_selected(
             .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
 }
 
-fn resource_budgets_match_selected(
-    matrix: &SelectedMatrix,
+fn resource_budget_totals_match(
     plan_resource_budgets: &BTreeMap<String, OidfPlanResourceBudget>,
     selected_resource_budget: &OidfPlanResourceBudget,
 ) -> bool {
-    let selected_plan_ids = matrix
-        .document
-        .groups
-        .iter()
-        .flat_map(|group| group.plans.iter().map(|plan| plan.id.as_str()))
-        .collect::<BTreeSet<_>>();
-    let selected_plan_count = matrix
-        .document
-        .groups
-        .iter()
-        .map(|group| group.plans.len())
-        .sum::<usize>();
-    if selected_plan_ids.len() != selected_plan_count
-        || selected_plan_ids.len() != plan_resource_budgets.len()
-        || !plan_resource_budgets
-            .keys()
-            .all(|plan_id| selected_plan_ids.contains(plan_id.as_str()))
-    {
-        return false;
-    }
-
     let summed = plan_resource_budgets.values().try_fold(
         OidfPlanResourceBudget {
             modules: 0,
@@ -1766,11 +1720,7 @@ fn cleanup_all(
                     Err(retry_error) => report.failures.push(CleanupFailure {
                         operation: "delete-plan".to_owned(),
                         target: plan_id.clone(),
-                        error: format!(
-                            "{}; retry: {}",
-                            safe_error(&first_error),
-                            safe_error(&retry_error)
-                        ),
+                        error: format!("{first_error}; retry: {retry_error}"),
                     }),
                 }
             }
@@ -1836,8 +1786,7 @@ pub fn recover_suite_resources(
             Err(SuiteClientError::HttpStatus(404)) => {}
             Err(error) => {
                 return Err(format!(
-                    "Suite recovery refused to cancel module {module_id}: cannot read current Suite state: {}",
-                    safe_error(&error)
+                    "Suite recovery refused to cancel module {module_id}: cannot read current Suite state: {error}"
                 ));
             }
         }
@@ -1867,7 +1816,7 @@ fn cancel_once(client: &SuiteClient, module_id: &str, report: &mut CleanupReport
         Err(error) => report.failures.push(CleanupFailure {
             operation: "cancel-module".to_owned(),
             target: module_id.to_owned(),
-            error: safe_error(&error),
+            error: error.to_string(),
         }),
     }
 }
@@ -1905,10 +1854,6 @@ fn definition_identity(matrix_plan_id: &str, module: &ModuleDefinition) -> Strin
     format!("{matrix_plan_id}/{}?variant={variant}", module.test_name)
 }
 
-fn safe_error(error: &impl std::fmt::Display) -> String {
-    error.to_string()
-}
-
 fn initial_runner_info(value: &Value) -> Option<Value> {
     (value.get("status").or_else(|| value.get("state"))).map(|_| value.clone())
 }
@@ -1931,19 +1876,12 @@ fn is_waiting(value: &Value) -> bool {
     )
 }
 
-/// OIDF deferred evidence has a narrower contract than generic interactive
-/// browser waiting: the Suite must still report its exact `WAITING` review
-/// boundary after NazoAuthWeb capture, not another user/browser state.
-fn is_terminal_state(value: &Value) -> bool {
+fn is_terminal(value: &Value) -> bool {
     matches!(status(value), Some("FINISHED" | "INTERRUPTED"))
 }
 
 fn needs_interactive_or_terminal_wait(value: Option<&Value>) -> bool {
-    value.is_none_or(|state| !is_waiting(state) && !is_terminal_state(state))
-}
-
-fn is_terminal(value: &Value) -> bool {
-    is_terminal_state(value)
+    value.is_none_or(|state| !is_waiting(state) && !is_terminal(state))
 }
 
 fn validate_matrix_origins(
@@ -1981,11 +1919,11 @@ fn validate_value_origins(
         Value::String(text) if text.contains("://") => {
             let parsed = Url::parse(text).map_err(|_| ())?;
             let _host = parsed.host_str().ok_or(())?;
-            let same_target = target.is_some_and(|origin| same_browser_origin(origin, &parsed));
+            let same_target = target.is_some_and(|origin| origin.allows(&parsed));
             if parsed.scheme() != "https" && !(parsed.scheme() == "http" && same_target) {
                 return Err(());
             }
-            let same_suite = same_url_origin(suite, &parsed);
+            let same_suite = suite.same_origin_url(&parsed);
             let explicit_external =
                 key.is_some_and(|key| matches!(key, "issuer" | "request_object_trust_anchor_uri"));
             if !(same_suite || same_target || explicit_external) {
@@ -1995,37 +1933,6 @@ fn validate_value_origins(
         }
         _ => Ok(()),
     }
-}
-
-fn same_browser_origin(origin: &BrowserTargetOrigin, url: &Url) -> bool {
-    let expected = origin.as_url();
-    expected.scheme() == url.scheme()
-        && expected.host_str().map(str::to_ascii_lowercase)
-            == url.host_str().map(str::to_ascii_lowercase)
-        && expected.port_or_known_default() == url.port_or_known_default()
-        && url.username().is_empty()
-        && url.password().is_none()
-}
-
-fn same_url_origin(origin: &Origin, url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return false;
-    }
-    let mut authority = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_ascii_lowercase()
-    };
-    if let Some(port) = url.port()
-        && port != 443
-    {
-        authority.push(':');
-        authority.push_str(&port.to_string());
-    }
-    origin.as_str() == format!("https://{authority}")
 }
 
 pub(crate) fn suite_resources_settled(
@@ -2821,6 +2728,13 @@ mod tests {
         };
 
         assert!(ConformanceRunner::new(make_config(BTreeMap::new(), budget(0, 0, 0))).is_err());
+        assert!(
+            ConformanceRunner::new(make_config(
+                BTreeMap::from([("other".to_owned(), budget(1, 1, 60))]),
+                budget(1, 1, 60)
+            ))
+            .is_err()
+        );
         assert!(ConformanceRunner::new(make_config(one_plan_budgets(), budget(2, 1, 60))).is_ok());
         for inexact_total in [budget(1, 2, 60), budget(1, 1, 61)] {
             assert!(
@@ -3278,11 +3192,44 @@ mod tests {
     }
 
     #[test]
+    fn origin_validation_reuses_suite_and_target_origin_rules() {
+        let suite = Origin::parse("https://[::1]:8443").unwrap();
+        let target = BrowserTargetOrigin::parse("http://[::1]:8080").unwrap();
+        for value in ["https://[::1]:8443/test/a", "http://[::1]:8080/callback"] {
+            assert!(
+                validate_value_origins(
+                    &serde_json::json!({"audience": value}),
+                    &suite,
+                    Some(&target),
+                    None
+                )
+                .is_ok()
+            );
+        }
+        for value in [
+            "https://[::1]:9443/test/a",
+            "https://user@[::1]:8443/test/a",
+            "http://[::1]:8081/callback",
+            "http://user@[::1]:8080/callback",
+        ] {
+            assert!(
+                validate_value_origins(
+                    &serde_json::json!({"audience": value}),
+                    &suite,
+                    Some(&target),
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn origin_validation_accepts_suite_verification_evidence_glob() {
         let suite = Origin::parse("https://suite.example").expect("origin");
         let parsed =
             Url::parse("https://suite.example/test/a/*/verification-evidence").expect("glob URL");
-        assert!(same_url_origin(&suite, &parsed));
+        assert!(suite.same_origin_url(&parsed));
         let config = serde_json::json!({
             "browser": [{
                 "match": "https://suite.example/test/a/*/verification-evidence",
@@ -3987,7 +3934,7 @@ mod tests {
             )
             .expect("both CIBA decisions");
 
-        assert!(is_terminal_state(&observed));
+        assert!(is_terminal(&observed));
         assert!(!needs_interactive_driver);
         assert_eq!(decisions.load(Ordering::SeqCst), 2);
         assert_eq!(

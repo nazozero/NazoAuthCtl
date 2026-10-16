@@ -582,8 +582,8 @@ fn merge_terminal_and_deferred_review_workers(
 
     let mut prepared = runner.prepare_run(&mut ());
     let work = plan_work(&mut prepared);
-    let terminal = runner.run_prepared(&mut (), worker_prepared(&work[0]));
-    let mut deferred = runner.run_prepared(&mut (), worker_prepared(&work[1]));
+    let terminal = runner.run_prepared(&mut (), worker_prepared(&work[0]), None);
+    let mut deferred = runner.run_prepared(&mut (), worker_prepared(&work[1]), None);
     let module = deferred
         .report
         .modules
