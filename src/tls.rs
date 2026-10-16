@@ -627,7 +627,9 @@ fn apply(
     let source = bind_certificate_source(&resolved_source, &material)?;
     let previous = load_receipt(store, &record, &tenant, &hostname)?;
     let proxy_template = proxy_config::load_template(input, &provider.config)?;
-    let proxy_configuration_sha256 = proxy_template.as_deref().map(sha256);
+    let proxy_configuration_sha256 = proxy_template
+        .as_ref()
+        .map(|template| template.sha256.clone());
     validate_active_receipt(&provider.config, previous.as_ref())?;
     if let Some(previous) = previous.as_ref() {
         validate_receipt_provider_authority(previous, &provider)?;
@@ -692,7 +694,7 @@ fn apply(
     let result = (|| -> anyhow::Result<CertificateReceipt> {
         ensure_transaction_fresh(&transaction)?;
         stage_generation(&transaction, &material)?;
-        proxy_config::stage(&transaction, proxy_template.as_deref())?;
+        proxy_config::stage(&transaction.generation, proxy_template.as_ref())?;
         transaction.phase = TransactionPhase::Staged;
         persist_pending(store, &transaction)?;
         ensure_transaction_fresh(&transaction)?;
@@ -968,7 +970,7 @@ fn build_plan(
         validate_receipt_provider_authority(current, provider)?;
     }
     let proxy_template = proxy_config::load_template(input, &provider.config)?;
-    let proxy_configuration_sha256 = proxy_template.as_deref().map(sha256);
+    let proxy_configuration_sha256 = proxy_template.map(|template| template.sha256);
     ensure_source_not_current(current, source, proxy_configuration_sha256.as_deref())?;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
     Ok(CertificatePlan {

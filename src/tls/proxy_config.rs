@@ -1,16 +1,22 @@
 //! Native proxy configuration shares the certificate generation and rollback.
 
 use super::*;
+use zeroize::Zeroizing;
 
 const MAX_CONFIGURATION_BYTES: u64 = 1024 * 1024;
 const CERTIFICATE: &str = "\"@NAZOAUTH_TLS_CERTIFICATE_FILE@\"";
 const PRIVATE_KEY: &str = "\"@NAZOAUTH_TLS_PRIVATE_KEY_FILE@\"";
 const CONFIGURATION: &str = "\"@NAZOAUTH_TLS_CONFIGURATION_SHA256@\"";
 
+pub(super) struct Template {
+    pub(super) bytes: Zeroizing<Vec<u8>>,
+    pub(super) sha256: String,
+}
+
 pub(super) fn load_template(
     input: &TlsCertificateInput,
     provider: &ProviderConfig,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<Option<Template>> {
     match (&input.proxy_config, &provider.native_proxy_program) {
         (None, None) => Ok(None),
         (Some(path), Some(_)) => {
@@ -20,9 +26,14 @@ pub(super) fn load_template(
                 true,
                 MAX_CONFIGURATION_BYTES,
             )?;
+            let sha256 = sha256(&bytes);
             // Validate placeholder syntax during plan, before any journal write.
-            render(&bytes, &provider.material_root.join("generations/plan"))?;
-            Ok(Some(bytes.to_vec()))
+            render(
+                &bytes,
+                &provider.material_root.join("generations/plan"),
+                &sha256,
+            )?;
+            Ok(Some(Template { bytes, sha256 }))
         }
         _ => bail!("--proxy-config and provider native_proxy_program must be supplied together"),
     }
@@ -46,7 +57,7 @@ fn quoted_path(path: &Path) -> anyhow::Result<String> {
     Ok(escaped)
 }
 
-fn render(template: &[u8], generation: &Path) -> anyhow::Result<Vec<u8>> {
+fn render(template: &[u8], generation: &Path, digest: &str) -> anyhow::Result<Vec<u8>> {
     let template =
         std::str::from_utf8(template).context("native proxy configuration must be UTF-8")?;
     if template.contains('\0')
@@ -67,33 +78,24 @@ fn render(template: &[u8], generation: &Path) -> anyhow::Result<Vec<u8>> {
             PRIVATE_KEY,
             &quoted_path(&generation.join("private-key.pem"))?,
         )
-        .replace(
-            CONFIGURATION,
-            &format!("\"{}\"", sha256(template.as_bytes())),
-        );
+        .replace(CONFIGURATION, &format!("\"{digest}\""));
     if rendered.contains("@NAZOAUTH_TLS_") {
         bail!("native proxy configuration contains an unresolved TLS placeholder");
     }
     Ok(rendered.into_bytes())
 }
 
-pub(super) fn stage(
-    transaction: &CertificateTransaction,
-    template: Option<&[u8]>,
-) -> anyhow::Result<()> {
-    match (template, transaction.proxy_configuration_sha256.as_deref()) {
-        (None, None) => Ok(()),
-        (Some(template), Some(digest)) if sha256(template) == digest => {
-            let rendered = render(template, &transaction.generation)?;
-            atomic_write(
-                &transaction.generation.join("proxy.conf.template"),
-                template,
-                0o600,
-            )?;
-            atomic_write(&transaction.generation.join("proxy.conf"), &rendered, 0o600)
-        }
-        _ => bail!("native proxy configuration differs from the prepared transaction"),
-    }
+pub(super) fn stage(generation: &Path, template: Option<&Template>) -> anyhow::Result<()> {
+    let Some(template) = template else {
+        return Ok(());
+    };
+    let rendered = render(&template.bytes, generation, &template.sha256)?;
+    atomic_write(
+        &generation.join("proxy.conf.template"),
+        &template.bytes,
+        0o600,
+    )?;
+    atomic_write(&generation.join("proxy.conf"), &rendered, 0o600)
 }
 
 pub(super) fn validate_generation(generation: &Path, expected: Option<&str>) -> anyhow::Result<()> {
@@ -115,7 +117,7 @@ pub(super) fn validate_generation(generation: &Path, expected: Option<&str>) -> 
         true,
         MAX_CONFIGURATION_BYTES * 2,
     )?;
-    if rendered.as_slice() != render(&template, generation)? {
+    if rendered.as_slice() != render(&template, generation, expected)? {
         bail!("installed native proxy configuration drifted from its template");
     }
     Ok(())
@@ -158,18 +160,32 @@ mod tests {
     #[test]
     fn native_configuration_binds_both_tls_files_to_one_generation() -> anyhow::Result<()> {
         let template = b"ssl_certificate \"@NAZOAUTH_TLS_CERTIFICATE_FILE@\";\nssl_certificate_key \"@NAZOAUTH_TLS_PRIVATE_KEY_FILE@\"; add_header X-NazoAuth-TLS-Configuration \"@NAZOAUTH_TLS_CONFIGURATION_SHA256@\" always;";
-        let rendered = String::from_utf8(render(template, Path::new("/etc/tls/generations/1"))?)?
-            .replace("\\\\", "/");
+        let digest = sha256(template);
+        let rendered = String::from_utf8(render(
+            template,
+            Path::new("/etc/tls/generations/1"),
+            &digest,
+        )?)?
+        .replace("\\\\", "/");
         assert!(rendered.contains("ssl_certificate \"/etc/tls/generations/1/fullchain.pem\";"));
         assert!(
             rendered.contains("ssl_certificate_key \"/etc/tls/generations/1/private-key.pem\";")
         );
         assert!(!rendered.contains('@'));
-        assert!(render(b"ssl_certificate /old/cert;", Path::new("/etc/tls/1")).is_err());
+        assert!(rendered.contains(&format!("\"{digest}\" always;")));
+        assert!(
+            render(
+                b"ssl_certificate /old/cert;",
+                Path::new("/etc/tls/1"),
+                &digest
+            )
+            .is_err()
+        );
         assert!(
             render(
                 b"@NAZOAUTH_TLS_CERTIFICATE_FILE@ @NAZOAUTH_TLS_PRIVATE_KEY_FILE@",
-                Path::new("/etc/tls/1")
+                Path::new("/etc/tls/1"),
+                &digest
             )
             .is_err()
         );

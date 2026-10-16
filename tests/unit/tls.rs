@@ -1056,8 +1056,12 @@ fn proxy_configuration_is_digest_bound_and_removed_with_its_generation() -> anyh
     let mut transaction = test_transaction(work.path().join("material"));
     let template = b"ssl_certificate \"@NAZOAUTH_TLS_CERTIFICATE_FILE@\"; ssl_certificate_key \"@NAZOAUTH_TLS_PRIVATE_KEY_FILE@\"; add_header X-NazoAuth-TLS-Configuration \"@NAZOAUTH_TLS_CONFIGURATION_SHA256@\" always;";
     transaction.proxy_configuration_sha256 = Some(sha256(template));
+    let template = proxy_config::Template {
+        bytes: template.to_vec().into(),
+        sha256: sha256(template),
+    };
     ensure_private_directory(&transaction.generation, "test generation")?;
-    proxy_config::stage(&transaction, Some(template))?;
+    proxy_config::stage(&transaction.generation, Some(&template))?;
     proxy_config::validate_generation(
         &transaction.generation,
         transaction.proxy_configuration_sha256.as_deref(),
@@ -1074,7 +1078,7 @@ fn proxy_configuration_is_digest_bound_and_removed_with_its_generation() -> anyh
         )
         .is_err()
     );
-    proxy_config::stage(&transaction, Some(template))?;
+    proxy_config::stage(&transaction.generation, Some(&template))?;
     atomic_write(
         &transaction.generation.join("proxy.conf.template"),
         b"changed",
