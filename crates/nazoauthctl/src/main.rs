@@ -711,12 +711,9 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
         let option = values[index].as_str();
         match option {
             "--poll-timeout" | "--jobs" => {
-                let value = values
-                    .get(index + 1)
-                    .with_context(|| {
-                        localized_message!("{option} requires a value", "{option} 需要一个值")
-                    })?
-                    .clone();
+                let value = values.get(index + 1).with_context(|| {
+                    localized_message!("{option} requires a value", "{option} 需要一个值")
+                })?;
                 match option {
                     "--poll-timeout" => {
                         poll_timeout = Duration::from_secs(value.parse::<u64>().context(
@@ -777,12 +774,9 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                 index += 1;
             }
             "--exclude-plan" => {
-                let value = values
-                    .get(index + 1)
-                    .with_context(|| {
-                        localized_message!("{option} requires a value", "{option} 需要一个值")
-                    })?
-                    .clone();
+                let value = values.get(index + 1).with_context(|| {
+                    localized_message!("{option} requires a value", "{option} 需要一个值")
+                })?;
                 push_unique_vec(&mut excluded_plans, value, option)?;
                 index += 2;
             }
@@ -791,12 +785,12 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                 "OIDF 测试不支持选项 {value}"
             ),
             value => {
-                set_once(&mut selector, value.to_owned(), "OIDF selector")?;
+                set_once(&mut selector, value, "OIDF selector")?;
                 index += 1;
             }
         }
     }
-    let mut selection = resolve_bundled_oidf_selection(selector.as_deref()).map_err(|error| {
+    let mut selection = resolve_bundled_oidf_selection(selector).map_err(|error| {
         if error == nazoauthctl_conformance::OidfPlanError::UnknownSelection {
             let choices = bundled_oidf_selection_choices()
                 .map(|choices| choices.join(", "))
@@ -808,7 +802,7 @@ fn parse_run_options(values: &[String], instance: Option<String>) -> anyhow::Res
                 localized_message!(
                     "unknown OIDF selector `{}`; valid choices: {choices}",
                     "未知的 OIDF 选择项“{}”；可选项：{choices}",
-                    selector.as_deref().unwrap_or_default()
+                    selector.unwrap_or_default()
                 )
             )
         } else {
@@ -881,7 +875,11 @@ fn push_unique(
     Ok(())
 }
 
-fn push_unique_vec(values: &mut Vec<String>, value: String, option: &str) -> anyhow::Result<()> {
+fn push_unique_vec<T: PartialEq>(
+    values: &mut Vec<T>,
+    value: T,
+    option: &str,
+) -> anyhow::Result<()> {
     if values.contains(&value) {
         localized_bail!("{option} values must be unique", "{option} 的值不能重复");
     }

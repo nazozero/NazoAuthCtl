@@ -17,7 +17,7 @@ use crate::browser::{
 };
 use crate::ciba_approval::{CibaUserApprovalClient, ciba_approval_requests};
 use crate::client::{DeleteOutcome, ModuleDefinition, SuiteClient, SuiteClientError};
-use crate::matrix::{MatrixError, SelectedMatrix, zeroize_json_value};
+use crate::matrix::{SelectedMatrix, zeroize_json_value};
 use crate::origin::Origin;
 use crate::progress::{
     GroupProgress, GroupStatus, ProgressActivity, ProgressEvent, ProgressSink, ProgressSnapshot,
@@ -1568,8 +1568,6 @@ pub struct RunSummary {
 pub enum OrchestrationError {
     #[error("invalid conformance run input")]
     InvalidInput,
-    #[error("matrix validation failed")]
-    Matrix(#[from] MatrixError),
 }
 
 fn emit_waiting_activity<S: ProgressSink>(

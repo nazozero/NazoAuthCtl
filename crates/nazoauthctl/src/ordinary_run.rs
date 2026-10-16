@@ -14,7 +14,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use cliclack::{
@@ -27,12 +27,12 @@ use nazoauthctl_conformance::{
     ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
     EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceRuntimeIdentity,
-    EvidenceSourceIdentity, GroupProgress, GroupStatus, HttpRequest, HttpTransport,
-    MatrixSelection, ModuleOutcome, OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane,
-    OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage,
-    ProgressActivity, ProgressEvent, ProgressSink, RunControl, StableRenderer, SuiteClient,
-    SuiteClientError, SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    EvidenceSourceIdentity, GroupProgress, GroupStatus, HttpRequest, HttpTransport, ModuleOutcome,
+    OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
+    OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
+    ProgressEvent, ProgressSink, RunControl, StableRenderer, SuiteClient, SuiteClientError,
+    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
     SuiteRetentionManifestReceipt, SuiteRetentionPlan, TenantResourceApplyOutput,
     TenantResourceControlOperation, TenantResourceRecoveryBinding, TenantResourceRecoveryPhase,
     Transport, activity_label, bundled_oidf_matrix, current_matrix_label,
@@ -43,7 +43,7 @@ use serde::Serialize;
 use url::Url;
 use zeroize::Zeroizing;
 
-use super::RunInvocation;
+use super::{RunInvocation, current_unix_time};
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
@@ -558,9 +558,9 @@ fn execute_with_progress<S: ProgressSink>(
     let selected_plan_ids = driver_plan
         .plans
         .iter()
-        .map(|plan| (plan.group_id.clone(), plan.plan_id.clone()))
+        .map(|plan| (plan.group_id.as_str(), plan.plan_id.as_str()))
         .collect::<BTreeSet<_>>();
-    let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids)?;
+    let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids);
     let plan_lanes = driver_plan
         .plans
         .iter()
@@ -1081,6 +1081,50 @@ mod acceptance_tests {
         completed_lifecycle_candidate, next_pending_for_run, persist_pending_recovery_completion,
         persisted_candidate_for_pending, pre_suite_requires_resource_cleanup,
     };
+
+    #[test]
+    fn run_materializes_exact_driver_selection_including_exclusions() {
+        use nazoauthctl_conformance::{
+            OidfPlanSelection, Origin, bundled_oidf_matrix, open_bundled_oidf_driver_plan,
+        };
+
+        let matrix = bundled_oidf_matrix().unwrap();
+        let group = matrix
+            .groups
+            .iter()
+            .find(|group| group.plans.len() > 1)
+            .unwrap();
+        let excluded = group.plans[0].id.clone();
+        let driver = open_bundled_oidf_driver_plan(
+            OidfPlanSelection {
+                groups: vec![group.id.clone()],
+                plans: Vec::new(),
+                excluded_plans: vec![excluded.clone()],
+            },
+            &Origin::parse_public_suite("https://www.certification.openid.net").unwrap(),
+            1_800_000_000,
+        )
+        .unwrap();
+        let expected = driver
+            .plans
+            .iter()
+            .map(|plan| (plan.group_id.as_str(), plan.plan_id.as_str()))
+            .collect();
+        let selected = super::select_artifact_matrix_for_run(matrix, &expected);
+        let actual = selected
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .plans
+                    .iter()
+                    .map(|plan| (group.id.as_str(), plan.id.as_str()))
+            })
+            .collect();
+        assert_eq!(expected, actual);
+        assert!(!expected.iter().any(|(_, id)| *id == excluded));
+        assert_eq!(expected.len(), driver.selected_plan_count as usize);
+    }
 
     #[test]
     fn temporary_tenant_uses_the_instance_owned_domain() {
@@ -2263,14 +2307,7 @@ fn run_signed_suite<S: ProgressSink>(
         .then(|| session.openid4vp_management_token(&invocation.tenant_id))
         .transpose()
         .context("failed to derive the run tenant OpenID4VP management token")?;
-    let selected = materialized
-        .take_matrix()
-        .select(&MatrixSelection {
-            groups: invocation.groups.clone(),
-            profiles: Vec::new(),
-            plans: invocation.plans.clone(),
-        })
-        .context("requested selection is outside the signed artifact Matrix")?;
+    let selected = materialized.take_matrix();
     let interrupt = control.clone();
     ctrlc::set_handler(move || {
         if !user_interrupted.swap(true, Ordering::SeqCst) {
@@ -3529,31 +3566,15 @@ fn create_evidence_directory(recovery_directory: &Path, run_id: &str) -> anyhow:
     }
 }
 
-fn current_unix_time() -> anyhow::Result<i64> {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_secs();
-    i64::try_from(seconds).context("system clock exceeds the supported range")
-}
-
 fn select_artifact_matrix_for_run(
     mut matrix: OidfArtifactMatrix,
-    selected_plan_ids: &BTreeSet<(String, String)>,
-) -> anyhow::Result<OidfArtifactMatrix> {
-    let mut retained = BTreeSet::new();
+    selected_plan_ids: &BTreeSet<(&str, &str)>,
+) -> OidfArtifactMatrix {
     matrix.groups.retain_mut(|group| {
-        group.plans.retain(|plan| {
-            let selected = selected_plan_ids.contains(&(group.id.clone(), plan.id.clone()));
-            if selected {
-                retained.insert((group.id.clone(), plan.id.clone()));
-            }
-            selected
-        });
+        group
+            .plans
+            .retain(|plan| selected_plan_ids.contains(&(group.id.as_str(), plan.id.as_str())));
         !group.plans.is_empty()
     });
-    if retained != *selected_plan_ids {
-        bail!("selected signed Matrix plans changed before materialization");
-    }
-    Ok(matrix)
+    matrix
 }
