@@ -52,15 +52,13 @@ pub use artifact_plan::{
     open_bundled_oidf_driver_plan, resolve_bundled_oidf_plan_id, resolve_bundled_oidf_selection,
 };
 pub use browser::{
-    BrowserCommand, BrowserEntry, BrowserError, BrowserLimits, BrowserPolicy,
-    BrowserReviewScreenshotSource, BrowserRunnerState, BrowserSelector, BrowserTargetOrigin,
-    BrowserTask, ConformanceBinding, OpenId4VciError, OpenId4VciIssuerClient,
+    BrowserError, BrowserPolicy, BrowserReviewScreenshotSource, BrowserRunnerState,
+    BrowserTargetOrigin, ConformanceBinding, OpenId4VciError, OpenId4VciIssuerClient,
     OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpCompletionOutcome,
     OpenId4VpError, OpenId4VpEvidenceBindingDiagnostic, OpenId4VpEvidenceContext,
     OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier, OpenId4VpPresentation,
     OpenId4VpStartRequest, OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, ReviewScreenshotMarker, parse_browser_entries,
-    parse_browser_entries_owned,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, ReviewScreenshotMarker,
 };
 pub use ciba_approval::{
     CibaApprovalFailureStage, CibaUserApprovalClient, CibaUserApprovalError, ciba_approval_requests,

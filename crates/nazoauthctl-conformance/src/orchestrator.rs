@@ -1120,8 +1120,7 @@ impl ConformanceRunner {
                                 let policy = BrowserPolicy::new(
                                     target_origin,
                                     self.config.client.origin().clone(),
-                                )
-                                .map_err(|error| error.to_string())?;
+                                );
                                 let runner = self
                                     .config
                                     .client

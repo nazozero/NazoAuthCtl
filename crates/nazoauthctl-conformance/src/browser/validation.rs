@@ -1,30 +1,15 @@
 use std::fmt;
-use std::net::IpAddr;
 use std::time::Duration;
 
-use regex::Regex;
-use url::Url;
+use url::{Host, Url};
 
 use crate::origin::Origin;
 
 use super::BrowserError;
 
 pub(super) const MAX_STEP_TIMEOUT: Duration = Duration::from_secs(300);
-pub(super) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub(super) const MAX_STEPS: usize = 256;
 pub(super) const MAX_MATCH_BYTES: usize = 4096;
-pub(super) const MAX_SELECTOR_BYTES: usize = 4096;
-pub(super) const MAX_TEXT_BYTES: usize = 64 * 1024;
-pub(super) const MAX_REDIRECTS: usize = 3;
-
-pub(super) fn is_loopback_host(host: &str) -> bool {
-    let normalized = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    normalized == "localhost"
-        || normalized == "localhost.localdomain"
-        || normalized
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-}
 
 /// A target origin accepted by the browser policy. Production targets must
 /// be HTTPS; plaintext HTTP is only accepted for an explicitly loopback
@@ -48,7 +33,12 @@ impl BrowserTargetOrigin {
             return Err(BrowserError::InvalidOrigin);
         }
         if url.scheme() == "http"
-            && !is_loopback_host(url.host_str().ok_or(BrowserError::InvalidOrigin)?)
+            && !match url.host() {
+                Some(Host::Domain(host)) => matches!(host, "localhost" | "localhost.localdomain"),
+                Some(Host::Ipv4(address)) => address.is_loopback(),
+                Some(Host::Ipv6(address)) => address.is_loopback(),
+                None => false,
+            }
         {
             return Err(BrowserError::InsecureTarget);
         }
@@ -81,31 +71,18 @@ impl fmt::Debug for BrowserTargetOrigin {
 pub struct BrowserPolicy {
     pub target_origin: BrowserTargetOrigin,
     pub suite_origin: Origin,
-    pub limits: BrowserLimits,
 }
 
 impl BrowserPolicy {
-    pub fn new(
-        target_origin: BrowserTargetOrigin,
-        suite_origin: Origin,
-    ) -> Result<Self, BrowserError> {
-        let policy = Self {
+    pub fn new(target_origin: BrowserTargetOrigin, suite_origin: Origin) -> Self {
+        Self {
             target_origin,
             suite_origin,
-            limits: BrowserLimits::default(),
-        };
-        Ok(policy)
-    }
-
-    pub fn with_limits(mut self, limits: BrowserLimits) -> Result<Self, BrowserError> {
-        limits.validate()?;
-        self.limits = limits;
-        Ok(self)
+        }
     }
 
     pub fn allows_url(&self, url: &Url) -> bool {
-        (self.target_origin.allows(url) || self.suite_origin.same_origin_url(url))
-            && matches!(url.scheme(), "https" | "http")
+        self.target_origin.allows(url) || self.suite_origin.same_origin_url(url)
     }
 
     pub(super) fn validate_url(&self, url: &Url) -> Result<(), BrowserError> {
@@ -115,66 +92,6 @@ impl BrowserPolicy {
             Err(BrowserError::CrossOriginNavigation)
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct BrowserLimits {
-    pub max_steps: usize,
-    pub max_redirects: usize,
-    pub max_step_timeout: Duration,
-    pub poll_interval: Duration,
-}
-
-impl Default for BrowserLimits {
-    fn default() -> Self {
-        Self {
-            max_steps: MAX_STEPS,
-            max_redirects: MAX_REDIRECTS,
-            max_step_timeout: MAX_STEP_TIMEOUT,
-            poll_interval: DEFAULT_POLL_INTERVAL,
-        }
-    }
-}
-
-impl BrowserLimits {
-    fn validate(self) -> Result<(), BrowserError> {
-        if self.max_steps == 0
-            || self.max_steps > MAX_STEPS
-            || self.max_redirects > MAX_REDIRECTS
-            || self.max_step_timeout.is_zero()
-            || self.max_step_timeout > MAX_STEP_TIMEOUT
-            || self.poll_interval.is_zero()
-        {
-            return Err(BrowserError::InvalidLimits);
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn validate_contains(value: &str) -> Result<(), BrowserError> {
-    if value.is_empty()
-        || value.len() > MAX_MATCH_BYTES
-        || value.chars().any(char::is_control)
-        || value.contains("://")
-        || value.contains("..")
-    {
-        return Err(BrowserError::InvalidSchema);
-    }
-    Ok(())
-}
-
-pub(super) fn compile_pattern(value: &str) -> Result<Regex, BrowserError> {
-    if value.len() > MAX_MATCH_BYTES || value.chars().any(char::is_control) {
-        return Err(BrowserError::InvalidSchema);
-    }
-    Regex::new(value).map_err(|_| BrowserError::InvalidPattern)
-}
-
-pub(super) fn validate_match_pattern(value: &str, max: usize) -> Result<(), BrowserError> {
-    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
-        return Err(BrowserError::InvalidSchema);
-    }
-    Ok(())
 }
 
 pub(super) fn redacted_origin(url: &Url) -> String {

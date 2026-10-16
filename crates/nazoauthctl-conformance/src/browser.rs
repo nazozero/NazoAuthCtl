@@ -14,8 +14,6 @@ pub enum BrowserError {
     InvalidOrigin,
     #[error("plaintext browser target must be loopback")]
     InsecureTarget,
-    #[error("browser limits are invalid")]
-    InvalidLimits,
     #[error("browser schema is invalid")]
     InvalidSchema,
     #[error("browser command is unsupported")]
@@ -26,17 +24,11 @@ pub enum BrowserError {
     StepLimit,
     #[error("browser URL crossed the allowlist")]
     CrossOriginNavigation,
-    #[error("browser command pattern is invalid")]
-    InvalidPattern,
-    #[error("browser command timeout is invalid")]
-    InvalidTimeout,
 }
 
 mod openid4vci;
 mod openid4vp;
-mod parser;
 mod plan;
-mod schema;
 mod validation;
 pub use openid4vci::{
     OpenId4VciError, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
@@ -49,12 +41,15 @@ pub use openid4vp::{
     OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
     OpenId4VpVerifierClient,
 };
-pub use parser::{parse_browser_entries, parse_browser_entries_owned};
 pub use plan::BrowserRunnerState;
-pub use schema::{
-    BrowserCommand, BrowserEntry, BrowserSelector, BrowserTask, ReviewScreenshotMarker,
-};
-pub use validation::{BrowserLimits, BrowserPolicy, BrowserTargetOrigin};
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewScreenshotMarker {
+    Required,
+    Optional,
+}
+
+pub use validation::{BrowserPolicy, BrowserTargetOrigin};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BrowserReviewScreenshotSource {
@@ -223,107 +218,39 @@ pub(crate) fn review_screenshot_path_binds_module(url: &Url, module_id: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::validation::MAX_TEXT_BYTES;
     use super::*;
     use crate::origin::Origin;
     use serde_json::json;
     #[test]
     fn target_http_is_only_loopback_and_suite_is_https() {
-        assert!(BrowserTargetOrigin::parse("http://127.0.0.1:8080").is_ok());
+        for origin in [
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "http://localhost",
+        ] {
+            assert!(BrowserTargetOrigin::parse(origin).is_ok());
+        }
         assert!(BrowserTargetOrigin::parse("http://issuer.example").is_err());
         assert!(Origin::parse("https://suite.example").is_ok());
-    }
-    #[test]
-    fn command_parser_redacts_secret_debug_and_rejects_unknown_ops() {
-        let command = BrowserCommand::try_from(&json!(["text", "id", "password", "super-secret"]))
-            .expect("text");
-        assert_eq!(format!("{command:?}"), "text");
-        assert!(BrowserCommand::try_from(&json!(["execute-script", "alert(1)"])).is_err());
-
-        assert!(matches!(
-            BrowserCommand::try_from(&json!(["click", "id", "logout", "optional"])),
-            Ok(BrowserCommand::Click { optional: true, .. })
-        ));
-        assert!(matches!(
-            BrowserCommand::try_from(&json!(["click", "id", "logout", "ignored"])),
-            Err(BrowserError::UnsupportedCommand)
-        ));
-
-        assert!(matches!(
-            BrowserCommand::try_from(&json!([
-                "wait",
-                "xpath",
-                "//*",
-                1,
-                ".*",
-                "update-image-placeholder"
-            ])),
-            Ok(BrowserCommand::WaitForElement {
-                selector: BrowserSelector::XPath(_),
-                review_screenshot: Some(ReviewScreenshotMarker::Required),
-                ..
-            })
-        ));
-        assert!(matches!(
-            BrowserCommand::try_from(&json!([
-                "wait",
-                "css",
-                ".review",
-                1,
-                ".*",
-                "update-image-placeholder-optional"
-            ])),
-            Ok(BrowserCommand::WaitForElement {
-                review_screenshot: Some(ReviewScreenshotMarker::Optional),
-                ..
-            })
-        ));
-    }
-    #[test]
-    fn contains_is_not_a_selector_and_rejects_urls() {
-        let command = BrowserCommand::try_from(&json!(["wait", "contains", "/ui/consent", 30]))
-            .expect("contains");
-        assert!(matches!(command, BrowserCommand::WaitContains { .. }));
-        assert!(
-            BrowserCommand::try_from(&json!(["wait", "contains", "https://evil.example", 30]))
-                .is_err()
+        let policy = BrowserPolicy::new(
+            BrowserTargetOrigin::parse("https://target.example").unwrap(),
+            Origin::parse("https://suite.example").unwrap(),
         );
-    }
-    #[test]
-    fn browser_entry_parses_official_nazo_schema() {
-        let value = json!({
-            "comment": "NazoAuth conformance browser automation.",
-            "match": "https://issuer.example/authorize*",
-            "match-limit": 1,
-            "tasks": [{
-                "task": "Complete login page",
-                "match": "https://issuer.example/ui/auth*",
-                "commands": [
-                    ["wait-element-visible", "id", "nazo-login-email", 30],
-                    ["text", "id", "nazo-login-email", "user@example.test"],
-                    ["wait", "contains", "/ui/consent", 30]
-                ]
-            }]
-        });
-        assert!(BrowserEntry::parse(&value).is_ok());
-
-        let invalid_comment = json!({
-            "comment": "x".repeat(MAX_TEXT_BYTES + 1),
-            "match": "https://issuer.example/authorize*",
-            "tasks": []
-        });
-        assert!(matches!(
-            BrowserEntry::parse(&invalid_comment),
-            Err(BrowserError::InvalidSchema)
-        ));
+        for rejected in [
+            "https://user@target.example",
+            "https://user@suite.example",
+            "http://target.example",
+            "https://attacker.example",
+        ] {
+            assert!(!policy.allows_url(&Url::parse(rejected).unwrap()));
+        }
     }
     #[test]
     fn suite_browser_state_projects_urls_from_the_full_runner_shape() {
         let policy = BrowserPolicy::new(
             BrowserTargetOrigin::parse("https://target.example").expect("target"),
             Origin::parse("https://suite.example").expect("suite"),
-        )
-        .expect("policy");
+        );
         let state = BrowserRunnerState::parse(
             &json!({
                 "show_qr_code": false,
@@ -373,8 +300,7 @@ mod tests {
         let policy = BrowserPolicy::new(
             BrowserTargetOrigin::parse("https://target.example").expect("target"),
             Origin::parse("https://suite.example").expect("suite"),
-        )
-        .expect("policy");
+        );
         let state = BrowserRunnerState::parse(
             &json!({
                 "urls": [],
