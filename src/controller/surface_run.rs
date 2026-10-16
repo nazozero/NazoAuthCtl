@@ -48,10 +48,11 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Instance(mut command) => {
             // P1-2: fold the global --instance into the command-level selector,
             // strictly rejecting collisions where both channels are present.
-            let apply_merge = |sel: &mut InstanceSelector, label: &str| -> anyhow::Result<()> {
-                if let Some(merged) = sel.merge_global(instance_flag, label)? {
-                    sel.positional = Some(merged);
-                    sel.named = None;
+            let mut global_instance = global_instance;
+            let mut apply_merge = |sel: &mut InstanceSelector, label: &str| -> anyhow::Result<()> {
+                sel.merge_global(global_instance.as_deref(), label)?;
+                if let Some(global) = global_instance.take() {
+                    sel.named = Some(global);
                 }
                 Ok(())
             };
@@ -78,74 +79,51 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Version { selector, all } => {
-            let merged = merge(&selector, instance_flag, "version")?;
-            crate::fleet::fleet_read::run_version(merged.as_deref(), all, json_mode)
+            let merged = selector.merge_global(instance_flag, "version")?;
+            crate::fleet::fleet_read::run_version(merged, all, json_mode)
         }
         Command::Status { selector, all } => {
-            selector_scoped(&selector, instance_flag, "status", |merged| {
-                let store = RegistryStore::open_default()?;
-                crate::fleet::fleet_read::run_status_like(
-                    &store,
-                    merged.as_deref(),
-                    all,
-                    json_mode,
-                    "status",
-                    false,
-                )
-            })
+            let merged = selector.merge_global(instance_flag, "status")?;
+            let store = RegistryStore::open_default()?;
+            crate::fleet::fleet_read::run_status_like(
+                &store, merged, all, json_mode, "status", false,
+            )
         }
         Command::Doctor { selector, all } => {
-            selector_scoped(&selector, instance_flag, "doctor", |merged| {
-                let store = RegistryStore::open_default()?;
-                crate::fleet::fleet_read::run_status_like(
-                    &store,
-                    merged.as_deref(),
-                    all,
-                    json_mode,
-                    "doctor",
-                    true,
-                )
-            })
+            let merged = selector.merge_global(instance_flag, "doctor")?;
+            let store = RegistryStore::open_default()?;
+            crate::fleet::fleet_read::run_status_like(
+                &store, merged, all, json_mode, "doctor", true,
+            )
         }
         Command::Logs { selector, limit } => {
-            selector_scoped(&selector, instance_flag, "logs", |merged| {
-                let store = RegistryStore::open_default()?;
-                crate::fleet::fleet_read::run_logs_view(&store, merged.as_deref(), limit, json_mode)
-            })
+            let merged = selector.merge_global(instance_flag, "logs")?;
+            let store = RegistryStore::open_default()?;
+            crate::fleet::fleet_read::run_logs_view(&store, merged, limit, json_mode)
         }
-        Command::Verify { selector } => {
-            selector_scoped(&selector, instance_flag, "verify", run_verify)
-        }
+        Command::Verify { selector } => run_verify(selector.merge_global(instance_flag, "verify")?),
         Command::Update(args) => run_update(args, instance_flag),
         Command::Rollback { selector } => {
-            let merged = merge(&selector, instance_flag, "rollback")?;
+            let merged = selector.merge_global(instance_flag, "rollback")?;
             let context = LifecycleContext::production()?;
-            let report = crate::instance_lifecycle::run_rollback(&context, merged.as_deref())?;
+            let report = crate::instance_lifecycle::run_rollback(&context, merged)?;
             crate::ui::print_report(&report);
             Ok(())
         }
         Command::Operation { selector, limit } => {
-            selector_scoped(&selector, instance_flag, "operation", |merged| {
-                let store = RegistryStore::open_default()?;
-                let keys = ControllerKeyStore::open_default()?;
-                crate::fleet::fleet_read::run_operation_view(
-                    &store,
-                    &keys,
-                    merged.as_deref(),
-                    limit,
-                    json_mode,
-                )
-            })
+            let merged = selector.merge_global(instance_flag, "operation")?;
+            let store = RegistryStore::open_default()?;
+            let keys = ControllerKeyStore::open_default()?;
+            crate::fleet::fleet_read::run_operation_view(&store, &keys, merged, limit, json_mode)
         }
         Command::Backup(args) => run_backup(args, instance_flag, json_mode),
         Command::Policy(args) => run_policy(args, instance_flag),
         Command::Recover(args) => run_recover(args, instance_flag),
         Command::Uninstall { selector, yes } => {
-            let merged = merge(&selector, instance_flag, "uninstall")?;
+            let merged = selector.merge_global(instance_flag, "uninstall")?;
             let context = LifecycleContext::production()?;
             let keys = ControllerKeyStore::open_default()?;
-            let report =
-                crate::instance_lifecycle::run_uninstall(&context, &keys, merged.as_deref(), yes)?;
+            let report = crate::instance_lifecycle::run_uninstall(&context, &keys, merged, yes)?;
             crate::ui::print_report(&report);
             Ok(())
         }
@@ -169,34 +147,15 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
 
 // ------------------------------------------------------------------ helpers
 
-/// Apply the I02 exactly-one rule between the global `--instance` and any
-/// command-level channel.
-fn merge(
-    selector: &InstanceSelector,
-    global: Option<&str>,
-    action: &str,
-) -> anyhow::Result<Option<String>> {
-    selector.merge_global(global, action)
-}
-
-fn selector_scoped<T>(
-    selector: &InstanceSelector,
-    global: Option<&str>,
-    action: &str,
-    body: impl FnOnce(Option<String>) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    body(merge(selector, global, action)?)
-}
-
 fn run_backup(args: BackupArgs, global: Option<&str>, json_mode: bool) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "backup")?;
+    let merged = args.selector.merge_global(global, "backup")?;
     if args.command == BackupCommand::Show {
         let store = RegistryStore::open_default()?;
-        return crate::fleet::fleet_read::run_backup_view(&store, merged.as_deref(), json_mode);
+        return crate::fleet::fleet_read::run_backup_view(&store, merged, json_mode);
     }
     let context = LifecycleContext::production()?;
     let (record, source_host, target, inspection) =
-        crate::instance_lifecycle::resolve_live_instance(&context, merged.as_deref(), "backup")?;
+        crate::instance_lifecycle::resolve_live_instance(&context, merged, "backup")?;
     if let BackupCommand::Copy { to_host } = args.command {
         return run_backup_copy(
             &context.registry,
@@ -656,9 +615,9 @@ fn expect_transfer_written(result: crate::target::HostResult) -> anyhow::Result<
 }
 
 fn run_policy(args: PolicyArgs, global: Option<&str>) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "policy")?;
+    let merged = args.selector.merge_global(global, "policy")?;
     let store = RegistryStore::open_default()?;
-    let record = crate::fleet::resolve_instance(&store, merged.as_deref(), "policy")?;
+    let record = crate::fleet::resolve_instance(&store, merged, "policy")?;
     let updated = store.set_backup_before_update(&record.deployment_id, args.mode)?;
     let policy = match updated.backup_before_update {
         crate::registry::BackupBeforeUpdatePolicy::Off => crate::ui::text("Off", "关闭").to_owned(),
@@ -685,10 +644,10 @@ fn run_policy(args: PolicyArgs, global: Option<&str>) -> anyhow::Result<()> {
 fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
     use nazo_operator_protocol::{ControlOutcome, ControlResultData};
 
-    let merged = merge(&args.selector, global, "recover")?;
+    let merged = args.selector.merge_global(global, "recover")?;
     let context = LifecycleContext::production()?;
     let (record, host, target, inspection) =
-        crate::instance_lifecycle::resolve_live_instance(&context, merged.as_deref(), "recover")?;
+        crate::instance_lifecycle::resolve_live_instance(&context, merged, "recover")?;
     let keys = ControllerKeyStore::open_default()?;
     let journal = RecoveryJournal::open(&keys.instance_dir(&record.deployment_id)?)?;
     let mut plan = match journal.load()? {
@@ -991,7 +950,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     &context.registry,
                     &keys,
                     &api,
-                    Some(&record.deployment_id),
+                    &record.deployment_id,
                     &secret,
                     "recovered-controller",
                     &delivery,
@@ -1315,9 +1274,9 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_verify(merged: Option<String>) -> anyhow::Result<()> {
+fn run_verify(merged: Option<&str>) -> anyhow::Result<()> {
     let store = RegistryStore::open_default()?;
-    let record = crate::fleet::resolve_instance(&store, merged.as_deref(), "verify")?;
+    let record = crate::fleet::resolve_instance(&store, merged, "verify")?;
     let prober = CurlPublicProber;
     let report = verify_public(&prober, &record.issuer);
     crate::ui::print_report(&report.render());
@@ -1334,13 +1293,10 @@ fn run_admin(command: AdminCommand, global: Option<&str>) -> anyhow::Result<()> 
 /// The target resolves runtime/config paths from its live DeploymentState and
 /// invokes only the fixed `nazoauth admin-provision` entry point.
 fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "admin create")?;
+    let merged = args.selector.merge_global(global, "admin create")?;
     let context = LifecycleContext::production()?;
-    let (record, _host, target, inspection) = crate::instance_lifecycle::resolve_live_instance(
-        &context,
-        merged.as_deref(),
-        "admin create",
-    )?;
+    let (record, _host, target, inspection) =
+        crate::instance_lifecycle::resolve_live_instance(&context, merged, "admin create")?;
     let mut credentials = read_admin_credentials(
         if args.credentials_stdin {
             AdminCredentialsInput::Stdin
@@ -1391,13 +1347,13 @@ fn admin_operation_id() -> uuid::Uuid {
 }
 
 fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "update")?;
+    let merged = args.selector.merge_global(global, "update")?;
     let config_content = match &args.config_file {
         Some(path) => Some(read_config_file(path)?),
         None => None,
     };
     let request = UpdateRequest {
-        instance: merged,
+        instance: merged.map(str::to_owned),
         version: args.version,
         config_content,
         config_schema: args.config_schema,

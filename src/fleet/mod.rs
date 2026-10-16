@@ -631,7 +631,10 @@ pub(crate) fn resolve_instance(
     }
 }
 
-fn merged_selector(selector: &InstanceSelector, action: &str) -> anyhow::Result<Option<String>> {
+fn merged_selector<'a>(
+    selector: &'a InstanceSelector,
+    action: &str,
+) -> anyhow::Result<Option<&'a str>> {
     selector
         .explicit()
         .with_context(|| format!("{action}: conflicting selectors"))
@@ -744,7 +747,7 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
 
 fn instance_show(context: &FleetContext, selector: &InstanceSelector) -> anyhow::Result<String> {
     let explicit = merged_selector(selector, "instance show")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance show")?;
+    let record = resolve_instance(&context.store, explicit, "instance show")?;
     let host = context.store.host_by_id(record.host_id)?.with_context(|| {
         format!(
             "instance '{}' references missing host {}",
@@ -780,7 +783,7 @@ fn instance_rename(
     new_alias: &str,
 ) -> anyhow::Result<String> {
     let explicit = merged_selector(source, "instance rename")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance rename")?;
+    let record = resolve_instance(&context.store, explicit, "instance rename")?;
     let renamed = context.store.rename_instance(&record.alias, new_alias)?;
     Ok(crate::ui::message!(
         "renamed instance '{}' -> '{}' (deployment {}; key/issuer/host bindings unchanged)\n",
@@ -793,7 +796,7 @@ fn instance_rename(
 
 fn instance_forget(context: &FleetContext, selector: &InstanceSelector) -> anyhow::Result<String> {
     let explicit = merged_selector(selector, "instance forget")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance forget")?;
+    let record = resolve_instance(&context.store, explicit, "instance forget")?;
     let mut report = String::new();
     if record.controller_id.is_some() || record.controller_key_ref.is_some() {
         report.push_str(&crate::ui::message!(
@@ -819,7 +822,7 @@ fn instance_relocate(
     to_host: &str,
 ) -> anyhow::Result<String> {
     let explicit = merged_selector(selector, "instance relocate")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance relocate")?;
+    let record = resolve_instance(&context.store, explicit, "instance relocate")?;
     let current = context.store.host_by_id(record.host_id)?.with_context(|| {
         format!(
             "instance '{}' references missing host {}",

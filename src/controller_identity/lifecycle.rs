@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize as _;
 
 use crate::admin_credentials::{AdminCredentialsInput, read_admin_credentials};
-use crate::cli::{BindOptions, ControllerCommand, InstanceSelector};
+use crate::cli::{BindOptions, ControllerCommand};
 use crate::file_lock::FileLock;
 use crate::filesystem;
 use crate::registry::{InstanceRecord, RegistryStore, validate_issuer};
@@ -90,19 +90,22 @@ fn load_pending_bind_recovery(
     deployment_id: &str,
 ) -> anyhow::Result<Option<PendingBindRecovery>> {
     let path = pending_bind_recovery_path(keys, deployment_id)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    }
-    let bytes = filesystem::read_secure_regular_file(
+    let bytes = match filesystem::read_secure_regular_file(
         &path,
         "pending first-bind recovery material",
         true,
         MAX_PENDING_BIND_RECOVERY_BYTES,
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let pending: PendingBindRecovery = serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "pending first-bind recovery material is invalid: {}",
@@ -140,12 +143,8 @@ fn clear_pending_bind_recovery(
     deployment_id: &str,
 ) -> anyhow::Result<()> {
     let path = pending_bind_recovery_path(keys, deployment_id)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => filesystem::remove_file_durable(&path)
-            .with_context(|| format!("failed to erase {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
+    filesystem::remove_file_durable(&path)
+        .with_context(|| format!("failed to erase {}", path.display()))
 }
 
 /// Exact public proposal facts used for display and approval issuance.
@@ -213,49 +212,6 @@ impl ProposalPresentation {
 // ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
-
-fn resolve_record(
-    registry: &RegistryStore,
-    selector: Option<&str>,
-) -> anyhow::Result<InstanceRecord> {
-    let instances = registry.list_instances()?;
-    if let Some(selector) = selector {
-        return instances
-            .iter()
-            .find(|record| record.alias == selector || record.deployment_id == selector)
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "{}: no registered instance matches '{selector}' exactly",
-                    crate::error_codes::INSTANCE_NOT_REGISTERED
-                )
-            });
-    }
-    match instances.as_slice() {
-        [] => bail!("no instances are registered yet"),
-        [single] => Ok(single.clone()),
-        many => {
-            let candidates = many
-                .iter()
-                .map(|record| record.alias.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "{}: multiple instances are registered ({candidates}); \
-                 pass --instance SELECTOR",
-                crate::error_codes::INSTANCE_AMBIGUOUS
-            )
-        }
-    }
-}
-
-fn load_public_key(
-    keys: &ControllerKeyStore,
-    deployment_id: &str,
-    kid: &str,
-) -> anyhow::Result<String> {
-    keys.public_key(deployment_id, kid)
-}
 
 /// Pick a pending local candidate for a NEW proposal: newest non-active key
 /// that the server does not list at all. Material already known to the server
@@ -474,12 +430,11 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     api: &A,
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
-    selector: Option<&str>,
+    record: InstanceRecord,
     label: &str,
     approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
     delivery: &dyn recovery::ReplacementSecretDelivery,
 ) -> anyhow::Result<String> {
-    let record = resolve_record(registry, selector)?;
     validate_label(label)?;
     let deployment = record.deployment_id.clone();
     let instance_dir = keys.instance_dir(&deployment)?;
@@ -532,7 +487,7 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
             None => keys.generate_candidate(&deployment)?.kid,
         },
     };
-    let public_key = load_public_key(keys, &deployment, &kid)?;
+    let public_key = keys.public_key(&deployment, &kid)?;
 
     let recovery_material = match pending_recovery {
         Some(pending) => material_from_display(&deployment, &pending.recovery_secret)?,
@@ -601,11 +556,10 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
     api: &A,
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
-    selector: Option<&str>,
+    record: InstanceRecord,
     label: Option<&str>,
     approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    let record = resolve_record(registry, selector)?;
     let deployment = record.deployment_id.clone();
     let controller_id = require_bound(&record)?;
     let snapshot = api.list_slots(&deployment)?;
@@ -645,7 +599,7 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
         Some(pending) => pending,
         None => keys.generate_candidate(&deployment)?.kid,
     };
-    let public_key = load_public_key(keys, &deployment, &kid)?;
+    let public_key = keys.public_key(&deployment, &kid)?;
 
     let presentation = ProposalPresentation {
         action: "rotate",
@@ -705,11 +659,10 @@ pub fn add_flow<A: ControllerRegistryApi>(
     api: &A,
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
-    selector: Option<&str>,
+    record: InstanceRecord,
     label: &str,
     approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    let record = resolve_record(registry, selector)?;
     validate_label(label)?;
     require_bound(&record)?;
     let deployment = record.deployment_id.clone();
@@ -751,7 +704,7 @@ pub fn add_flow<A: ControllerRegistryApi>(
         Some(pending) => pending,
         None => keys.generate_candidate(&deployment)?.kid,
     };
-    let public_key = load_public_key(keys, &deployment, &kid)?;
+    let public_key = keys.public_key(&deployment, &kid)?;
 
     let presentation = ProposalPresentation {
         action: "add",
@@ -793,11 +746,10 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
     api: &A,
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
-    selector: Option<&str>,
+    record: InstanceRecord,
     controller_id: &str,
     approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    let record = resolve_record(registry, selector)?;
     let deployment = record.deployment_id.clone();
     let snapshot = api.list_slots(&deployment)?;
 
@@ -896,9 +848,8 @@ pub fn slots_flow<A: ControllerRegistryApi>(
     api: &A,
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
-    selector: Option<&str>,
+    record: InstanceRecord,
 ) -> anyhow::Result<String> {
-    let record = resolve_record(registry, selector)?;
     let deployment = record.deployment_id.clone();
     let snapshot = api.list_slots(&deployment)?;
 
@@ -1183,10 +1134,10 @@ pub(crate) fn run_controller_command(
     let keys = ControllerKeyStore::open_default()?;
     match command {
         ControllerCommand::List { selector } => {
-            let explicit = merge_global(selector, global, "controller list")?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
+            let explicit = selector.merge_global(global, "controller list")?;
+            let record = crate::fleet::resolve_instance(&registry, explicit, "controller list")?;
             let api = make_public_api(&record.issuer)?;
-            let report = slots_flow(&api, &registry, &keys, explicit.as_deref())?;
+            let report = slots_flow(&api, &registry, &keys, record)?;
             crate::ui::print_report(&report);
         }
         ControllerCommand::Add {
@@ -1195,8 +1146,8 @@ pub(crate) fn run_controller_command(
             approval_token,
             credentials_file,
         } => {
-            let explicit = merge_global(selector, global, "controller add")?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
+            let explicit = selector.merge_global(global, "controller add")?;
+            let record = crate::fleet::resolve_instance(&registry, explicit, "controller add")?;
             let issue_approval = approval_token.is_none();
             let api = if issue_approval {
                 make_authenticated_api(&record.issuer, credentials_file.as_deref())?
@@ -1207,7 +1158,7 @@ pub(crate) fn run_controller_command(
                 &api,
                 &registry,
                 &keys,
-                explicit.as_deref(),
+                record,
                 &label,
                 approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
@@ -1219,8 +1170,8 @@ pub(crate) fn run_controller_command(
             approval_token,
             credentials_file,
         } => {
-            let explicit = merge_global(selector, global, "controller rotate")?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
+            let explicit = selector.merge_global(global, "controller rotate")?;
+            let record = crate::fleet::resolve_instance(&registry, explicit, "controller rotate")?;
             let issue_approval = approval_token.is_none();
             let api = if issue_approval {
                 make_authenticated_api(&record.issuer, credentials_file.as_deref())?
@@ -1231,7 +1182,7 @@ pub(crate) fn run_controller_command(
                 &api,
                 &registry,
                 &keys,
-                explicit.as_deref(),
+                record,
                 label.as_deref(),
                 approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
@@ -1243,8 +1194,8 @@ pub(crate) fn run_controller_command(
             approval_token,
             credentials_file,
         } => {
-            let explicit = merge_global(selector, global, "controller revoke")?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
+            let explicit = selector.merge_global(global, "controller revoke")?;
+            let record = crate::fleet::resolve_instance(&registry, explicit, "controller revoke")?;
             let issue_approval = approval_token.is_none();
             let api = if issue_approval {
                 make_authenticated_api(&record.issuer, credentials_file.as_deref())?
@@ -1255,7 +1206,7 @@ pub(crate) fn run_controller_command(
                 &api,
                 &registry,
                 &keys,
-                explicit.as_deref(),
+                record,
                 &controller_id,
                 approval_callback(&api, approval_token.as_deref(), issue_approval),
             )?;
@@ -1269,8 +1220,8 @@ pub(crate) fn run_controller_command(
             credentials_file,
             output_secret_file,
         } => {
-            let explicit = merge_global(selector, global, "controller recover")?;
-            let record = resolve_record(&registry, explicit.as_deref())?;
+            let explicit = selector.merge_global(global, "controller recover")?;
+            let record = crate::fleet::resolve_instance(&registry, explicit, "controller recover")?;
             let api = if rotate_secret {
                 make_authenticated_api(&record.issuer, credentials_file.as_deref())?
             } else {
@@ -1301,7 +1252,7 @@ pub(crate) fn run_controller_command(
                     &registry,
                     &keys,
                     &api,
-                    explicit.as_deref(),
+                    &record.deployment_id,
                     &secret_text,
                     &label,
                     delivery.as_ref(),
@@ -1325,8 +1276,8 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
     } = options;
     let registry = RegistryStore::open_default()?;
     let keys = ControllerKeyStore::open_default()?;
-    let explicit = merge_global(selector, global, "bind")?;
-    let record = resolve_record(&registry, explicit.as_deref())?;
+    let explicit = selector.merge_global(global, "bind")?;
+    let record = crate::fleet::resolve_instance(&registry, explicit, "bind")?;
     let issue_approval = approval_token.is_none();
     let api = if issue_approval {
         make_authenticated_api(&record.issuer, credentials_file.as_deref())?
@@ -1346,21 +1297,13 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
         &api,
         &registry,
         &keys,
-        explicit.as_deref(),
+        record,
         &label,
         approval_callback(&api, approval_token.as_deref(), issue_approval),
         delivery.as_ref(),
     )?;
     crate::ui::print_report(&report);
     Ok(())
-}
-
-fn merge_global(
-    selector: InstanceSelector,
-    global: Option<&str>,
-    action: &str,
-) -> anyhow::Result<Option<String>> {
-    selector.merge_global(global, action)
 }
 
 /// Recovery Secret input: a private file when given, otherwise one hidden
@@ -1457,6 +1400,13 @@ mod tests {
     }
 
     impl Fixture {
+        fn record(&self) -> InstanceRecord {
+            self.registry
+                .instance_by_deployment("deploy-alpha")
+                .unwrap()
+                .unwrap()
+        }
+
         fn mark_bound(&self, controller_id: &str) -> anyhow::Result<()> {
             let key_ref = controller_key_ref_for("deploy-alpha")?;
             self.registry.update_controller_binding(
@@ -1706,7 +1656,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "ops",
             approval_callback(&api, None, true),
             &SilentDelivery,
@@ -1772,7 +1722,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "ops",
             fixed_approval("approval-token-2"),
             &SilentDelivery,
@@ -1796,7 +1746,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "ops",
             approval_callback(&api, Some("explicit-approval-token"), true),
             &SilentDelivery,
@@ -1823,7 +1773,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "ops",
             approval_callback(&api, None, true),
             &SilentDelivery,
@@ -1855,7 +1805,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "ops",
             fixed_approval("expired-token-0001"),
             &delivery,
@@ -1885,7 +1835,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "ops",
             fixed_approval("good-token-000002"),
             &delivery,
@@ -1978,7 +1928,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             None,
             fixed_approval("rotate-token-001"),
         )?;
@@ -2021,7 +1971,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             None,
             fixed_approval("unused-token-01"),
         )?;
@@ -2063,7 +2013,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "backup",
             fixed_approval("add-token-000001"),
         )?;
@@ -2112,7 +2062,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "more",
             fixed_approval("never-consumed-tok"),
         )
@@ -2162,7 +2112,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             "unknown-controller",
             fixed_approval("never-consumed-tok"),
         )
@@ -2183,7 +2133,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             CONTROLLER_A,
             fixed_approval("revoke-token-00001"),
         )?;
@@ -2206,7 +2156,7 @@ mod tests {
             &api,
             &f.registry,
             &f.keys,
-            None,
+            f.record(),
             CONTROLLER_A,
             fixed_approval("never-consumed-tok"),
         )
@@ -2221,7 +2171,7 @@ mod tests {
         let f = fixture()?;
         let api = FakeApi::default();
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 20)]);
-        let report = slots_flow(&api, &f.registry, &f.keys, None)?;
+        let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
         assert!(
             report.contains("Active") && report.contains("Expires (UTC)"),
             "{report}"
@@ -2229,18 +2179,18 @@ mod tests {
         assert!(report.contains(CONTROLLER_A), "{report}");
 
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 3)]);
-        let report = slots_flow(&api, &f.registry, &f.keys, None)?;
+        let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
         assert!(report.contains("WARNING"), "{report}");
 
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 0)]);
-        let report = slots_flow(&api, &f.registry, &f.keys, None)?;
+        let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
         assert!(report.contains("EXPIRED"), "{report}");
 
         let mut server_warned = slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 20);
         server_warned.warning =
             Some(crate::controller_identity::admin_api::ExpiryWarningKind::Urgent24h);
         api.push_snapshot(vec![server_warned]);
-        let report = slots_flow(&api, &f.registry, &f.keys, None)?;
+        let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
         assert!(
             report.contains("server-warning=urgent_24h"),
             "server warning must survive local clock disagreement: {report}"
