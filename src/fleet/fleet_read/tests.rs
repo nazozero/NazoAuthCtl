@@ -287,6 +287,40 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
 }
 
 #[test]
+fn panicked_worker_keeps_one_outcome_per_input() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let runner = FleetReadRunner::new(
+        Arc::new(|host| {
+            Ok(Box::new(ScriptedTarget {
+                scenario: Scenario::Online,
+                target_id: host.host_id,
+            }))
+        }),
+        MAX_CONCURRENCY,
+    );
+    let outcomes = runner.run(
+        fixture.items()?,
+        Arc::new(|instance, _, _| {
+            assert_ne!(instance.alias, "prod-b", "simulated worker failure");
+            Ok(json!({"alias": instance.alias}))
+        }),
+    );
+    assert_eq!(outcomes.len(), 3);
+    for (outcome, alias) in outcomes.iter().zip(["prod-a", "prod-b", "prod-c"]) {
+        assert_eq!(outcome.instance.alias, alias);
+        if alias == "prod-b" {
+            assert_eq!(
+                outcome.result.as_ref().unwrap_err().0,
+                error_codes::INTERNAL_ERROR
+            );
+        } else {
+            assert!(outcome.result.is_ok());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
     const PROBE_CONCURRENCY: usize = 8;
     let in_flight = Arc::new(AtomicUsize::new(0));

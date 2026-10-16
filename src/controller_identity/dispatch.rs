@@ -137,7 +137,7 @@ pub fn prepare_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<PreparedOperation> {
-    let record = registry.resolve_control_instance(instance_selector)?;
+    let record = registry.resolve_instance(instance_selector)?;
 
     let journaled = journal.load()?;
     if let Some(entry) = &journaled {
@@ -181,7 +181,7 @@ pub fn prepare_pending_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
-    let record = registry.resolve_control_instance(instance_selector)?;
+    let record = registry.resolve_instance(instance_selector)?;
     let Some(entry) = journal.load()? else {
         return Ok(None);
     };

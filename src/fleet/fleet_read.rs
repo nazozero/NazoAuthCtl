@@ -88,9 +88,8 @@ impl FleetReadRunner {
         }
         let cursor = Arc::new(AtomicUsize::new(0));
         let items = Arc::new(items);
-        let (sender, receiver) = mpsc::channel::<(usize, FleetItemOutcome)>();
-        let sender = Arc::new(sender);
-        let budget = self.concurrency.clamp(1, MAX_CONCURRENCY).min(total);
+        let (sender, receiver) = mpsc::channel();
+        let budget = self.concurrency.min(total);
         let mut workers = Vec::new();
         for worker_index in 0..budget {
             let cursor = cursor.clone();
@@ -108,40 +107,35 @@ impl FleetReadRunner {
                                 break;
                             }
                             let (instance, host) = (&items[index].0, &items[index].1);
-                            let result = execute_one(instance, host, factory.as_ref(), job.clone());
-                            let _ = sender.send((
-                                index,
-                                FleetItemOutcome {
-                                    instance: instance.clone(),
-                                    host_alias: host.alias.clone(),
-                                    result,
-                                },
-                            ));
+                            let result =
+                                execute_one(instance, host, factory.as_ref(), job.as_ref());
+                            let _ = sender.send((index, result));
                         }
                     })
                     .expect("fleet worker thread spawns"),
             );
         }
         drop(sender);
-        let mut indexed: Vec<Option<FleetItemOutcome>> = (0..total).map(|_| None).collect();
+        let mut indexed: Vec<_> = (0..total).map(|_| None).collect();
         for (index, outcome) in receiver {
             indexed[index] = Some(outcome);
         }
         for worker in workers {
             let _ = worker.join();
         }
+        let items = Arc::into_inner(items).expect("all fleet workers have joined");
         indexed
             .into_iter()
-            .zip(items.iter())
-            .map(|(slot, (instance, host))| {
-                slot.unwrap_or_else(|| FleetItemOutcome {
-                    instance: instance.clone(),
-                    host_alias: host.alias.clone(),
-                    result: Err((
+            .zip(items)
+            .map(|(slot, (instance, host))| FleetItemOutcome {
+                instance,
+                host_alias: host.alias,
+                result: slot.unwrap_or_else(|| {
+                    Err((
                         error_codes::INTERNAL_ERROR.to_owned(),
                         "the runner produced no outcome for this target".to_owned(),
-                    )),
-                })
+                    ))
+                }),
             })
             .collect()
     }
@@ -153,7 +147,7 @@ fn execute_one(
     factory: &(
          dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync
      ),
-    job: Arc<ReadJob>,
+    job: &ReadJob,
 ) -> Result<Value, (String, String)> {
     // Transport construction happens INSIDE the worker thread; the produced
     // target never crosses a thread boundary afterwards.
@@ -164,8 +158,10 @@ fn execute_one(
             return Err((stable_code(&detail), detail));
         }
     };
-    job(instance, host, target.as_ref())
-        .map_err(|error| (stable_code(&format!("{error:#}")), format!("{error:#}")))
+    job(instance, host, target.as_ref()).map_err(|error| {
+        let detail = format!("{error:#}");
+        (stable_code(&detail), detail)
+    })
 }
 
 // ------------------------------------------------------------------ jobs
@@ -454,7 +450,7 @@ pub(crate) fn run_status_like(
     })?;
     let runner = FleetReadRunner::production();
     let job: Arc<ReadJob> = Arc::new(if doctor { doctor_job } else { status_job });
-    let outcomes = runner.run(vec![(record.clone(), host.clone())], job);
+    let outcomes = runner.run(vec![(record, host)], job);
     let outcome = outcomes.into_iter().next().expect("one input, one outcome");
     match &outcome.result {
         Ok(payload) => {
@@ -464,7 +460,7 @@ pub(crate) fn run_status_like(
                     serde_json::to_string_pretty(&payload).expect("status doc is valid JSON")
                 );
             } else if doctor {
-                print_single_status(&record, &host.alias, payload, doctor);
+                print_single_status(&outcome.instance, &outcome.host_alias, payload, doctor);
             } else {
                 println!(
                     "{}",
@@ -703,7 +699,7 @@ pub(crate) fn run_backup_view(
     })?;
     let runner = FleetReadRunner::production();
     let job: Arc<ReadJob> = Arc::new(status_job);
-    let outcomes = runner.run(vec![(record.clone(), host)], job);
+    let outcomes = runner.run(vec![(record, host)], job);
     let outcome = outcomes.into_iter().next().expect("one input, one outcome");
     let payload = outcome
         .result
@@ -712,7 +708,7 @@ pub(crate) fn run_backup_view(
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
-    let title = crate::ui::message!("Backup for '{}'", "实例“{}”的备份", record.alias);
+    let title = crate::ui::message!("Backup for '{}'", "实例“{}”的备份", outcome.instance.alias);
     println!(
         "{}",
         crate::ui::fields(

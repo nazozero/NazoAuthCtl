@@ -161,7 +161,7 @@ mod tests {
         instance_selector: &str,
         input: ControlOperationInput,
     ) -> anyhow::Result<SignedControlOperation> {
-        let record = registry.resolve_control_instance(instance_selector)?;
+        let record = registry.resolve_instance(instance_selector)?;
         build_signed_control_operation_for_record(keys, &record, input)
     }
 

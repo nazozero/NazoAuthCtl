@@ -710,18 +710,21 @@ impl RegistryStore {
         self.find_instance_by_alias_locked(alias)
     }
 
-    /// Resolve a control-operation selector under one registry lock: an exact
+    /// Resolve an explicit instance selector under one registry lock: an exact
     /// deployment id takes precedence over an alias with the same spelling.
-    pub(crate) fn resolve_control_instance(
-        &self,
-        selector: &str,
-    ) -> anyhow::Result<InstanceRecord> {
+    pub(crate) fn resolve_instance(&self, selector: &str) -> anyhow::Result<InstanceRecord> {
+        validate_identifier(selector, 128, "instance selector").with_context(|| {
+            format!(
+                "{}: invalid instance selector '{selector}'",
+                crate::error_codes::INSTANCE_NOT_REGISTERED
+            )
+        })?;
         let _lock = self.lock()?;
-        if let Some(record) = self.find_instance_by_deployment_locked(selector)? {
+        if let Some(record) = read_optional_record(&self.instance_path(selector), selector)? {
             return Ok(record);
         }
         self.find_instance_by_alias_locked(selector)?.with_context(|| {
-            format!("unknown instance selector '{selector}' (no registered deployment id or alias matches)")
+            format!("{}: unknown instance selector '{selector}' (no registered deployment id or alias matches)", crate::error_codes::INSTANCE_NOT_REGISTERED)
         })
     }
 
@@ -1227,7 +1230,11 @@ mod tests {
             store.instance_by_deployment("deploy-healthy")?,
             Some(instance.clone())
         );
-        assert_eq!(store.resolve_control_instance("deploy-healthy")?, instance);
+        assert_eq!(store.resolve_instance("deploy-healthy")?, instance);
+        assert_eq!(
+            crate::fleet::resolve_instance(&store, Some("deploy-healthy"), "test")?,
+            instance
+        );
         assert!(store.instance_by_deployment("deploy-broken").is_err());
         assert!(store.instance_by_deployment("../outside").is_err());
         assert!(store.list_hosts().is_err());
@@ -1240,11 +1247,15 @@ mod tests {
         let host = store.ensure_local_host()?;
         let first = register_fixture(&store, &host, "deploy-first", "first")?;
         let second = register_fixture(&store, &host, "deploy-second", "deploy-first")?;
-        assert_eq!(store.resolve_control_instance("deploy-first")?, first);
-        assert_eq!(store.resolve_control_instance("first")?, first);
-        assert_eq!(store.resolve_control_instance("deploy-second")?, second);
-        assert!(store.resolve_control_instance("missing").is_err());
-        assert!(store.resolve_control_instance("../outside").is_err());
+        assert_eq!(store.resolve_instance("deploy-first")?, first);
+        assert_eq!(
+            crate::fleet::resolve_instance(&store, Some("deploy-first"), "test")?,
+            first
+        );
+        assert_eq!(store.resolve_instance("first")?, first);
+        assert_eq!(store.resolve_instance("deploy-second")?, second);
+        assert!(store.resolve_instance("missing").is_err());
+        assert!(store.resolve_instance("../outside").is_err());
         Ok(())
     }
 

@@ -199,8 +199,8 @@ pub(crate) fn summarize_inspection(inspection: &InstanceInspection) -> String {
     let artifacts = match (&inspection.artifact.current, &inspection.artifact.previous) {
         (None, None) => "-".to_owned(),
         (current, previous) => {
-            let current = current.clone().unwrap_or_else(|| "-".to_owned());
-            let previous = previous.clone().unwrap_or_else(|| "-".to_owned());
+            let current = current.as_deref().unwrap_or("-");
+            let previous = previous.as_deref().unwrap_or("-");
             format!("{current}<-{previous}")
         }
     };
@@ -597,19 +597,10 @@ pub(crate) fn resolve_instance(
     explicit: Option<&str>,
     action: &str,
 ) -> anyhow::Result<InstanceRecord> {
-    let mut instances = store.list_instances()?;
     if let Some(selector) = explicit {
-        return instances
-            .into_iter()
-            .find(|record| record.alias == selector || record.deployment_id == selector)
-            .with_context(|| {
-                format!(
-                    "{INSTANCE_NOT_REGISTERED}: no registered instance matches '{selector}' \
-                     exactly. Selectors accept an exact alias or an exact deployment id only — \
-                     substring, fuzzy, and discovery-order selection are never attempted"
-                )
-            });
+        return store.resolve_instance(selector);
     }
+    let mut instances = store.list_instances()?;
     match instances.as_slice() {
         [] => crate::ui::fail!(
             "{INSTANCE_NOT_REGISTERED}: no instances are registered yet",
@@ -658,10 +649,9 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
             match live_probe(target.as_ref(), &host) {
                 Ok(hello) => {
                     let summary = summarize_hello(&hello);
-                    context.store.set_host_observation(
-                        host.host_id,
-                        ObservationCache::now(true, summary.clone()),
-                    )?;
+                    context
+                        .store
+                        .set_host_observation(host.host_id, ObservationCache::now(true, summary))?;
                     for bound in instances
                         .iter()
                         .filter(|other| other.host_id == host.host_id)

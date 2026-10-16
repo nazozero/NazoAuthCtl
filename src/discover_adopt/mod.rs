@@ -30,7 +30,7 @@
 //!
 //! The use cases are transport-agnostic by construction: they speak only to
 //! an [`ExecutionTarget`], so local and SSH hosts share this exact code and
-//! this exact test suite. CLI wiring lands with the I wave.
+//! this exact test suite.
 
 #[cfg(test)]
 mod tests;
@@ -45,7 +45,7 @@ use crate::registry::{
     DiscoveryEvidence, HostRecord, InstanceRecord, ObservationCache, RegistryStore,
 };
 use crate::target::{
-    ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome, InstanceInspection, Resource,
+    ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome, InstanceInspection,
     ResourceOwnership, ResourceScope,
 };
 
@@ -122,48 +122,6 @@ pub(crate) fn execute_state_list(
     }
 }
 
-/// Conservative goal-plan-07-§6 classification of one declared resource fact.
-/// Nothing is ever upgraded to managed here: only the authoritative target
-/// state's own managed+deployment declaration makes a resource ctl-deletable;
-/// every other combination — including anything undeclared — stays external
-/// or shared with zero-delete protection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdoptionClass {
-    /// Declared managed + deployment-scoped in the authoritative state; the
-    /// only classification any destructive path may ever touch.
-    ManagedDeletion,
-    /// Not provably ctl-owned, or shared beyond this deployment.
-    ExternalZeroDelete,
-}
-
-/// One resource fact paired with its conservative adoption classification.
-#[derive(Clone, Debug)]
-pub(crate) struct ClassifiedResource {
-    pub(crate) resource: Resource,
-    pub(crate) class: AdoptionClass,
-}
-
-/// Classify declared resources for display. Pure projection over the target's
-/// own facts — the schema already forbids managed+shared, and the match below
-/// still fails that combination closed as external rather than trusting it.
-pub(crate) fn classify_resources(resources: &[Resource]) -> Vec<ClassifiedResource> {
-    resources
-        .iter()
-        .map(|resource| {
-            let class = match (resource.ownership, resource.scope) {
-                (ResourceOwnership::Managed, ResourceScope::Deployment) => {
-                    AdoptionClass::ManagedDeletion
-                }
-                _ => AdoptionClass::ExternalZeroDelete,
-            };
-            ClassifiedResource {
-                resource: resource.clone(),
-                class,
-            }
-        })
-        .collect()
-}
-
 /// Registry cross-reference status of one discovered deployment (display only;
 /// discover writes nothing in every branch).
 enum CandidateStatus {
@@ -200,9 +158,6 @@ fn candidate_status(
 /// per-deployment fact report and Registry cross-reference. Multi-target
 /// output lists every deployment and demands an exact id for any follow-up;
 /// bare discover writes zero registry records.
-///
-/// Delivery boundary: the I wave wires this into the CLI parser; until then
-/// the use case and its shared test suite are the contract.
 pub(crate) fn run_discover(
     context: &DiscoveryContext,
     request: DiscoverRequest,
@@ -306,9 +261,6 @@ fn render_discovery_block(
 /// target's own DeploymentState, one controlled InstanceRecord write, and the
 /// bind next-step guidance. Signs nothing, needs no controller key, changes
 /// no target state.
-///
-/// Delivery boundary: the I wave wires this into the CLI parser; until then
-/// the use case and its shared test suite are the contract.
 pub(crate) fn run_adopt(
     context: &DiscoveryContext,
     request: AdoptRequest,
@@ -416,17 +368,18 @@ fn render_resources(inspection: &InstanceInspection) -> String {
     if inspection.resources.is_empty() {
         return crate::ui::text("resources: none declared — everything is treated as external; uninstall could delete nothing", "未声明资源；所有资源按外部资源保留，卸载时不删除。 ").to_owned();
     }
-    let rows = classify_resources(&inspection.resources)
+    let rows = inspection
+        .resources
         .iter()
-        .map(|item| {
+        .map(|resource| {
             vec![
-                item.resource.kind.to_string(),
-                item.resource.locator.clone(),
-                match item.class {
-                    AdoptionClass::ManagedDeletion => {
+                resource.kind.to_string(),
+                resource.locator.clone(),
+                match (resource.ownership, resource.scope) {
+                    (ResourceOwnership::Managed, ResourceScope::Deployment) => {
                         crate::ui::text("managed+deployment", "由 ctl 管理，卸载时删除")
                     }
-                    AdoptionClass::ExternalZeroDelete => crate::ui::text(
+                    _ => crate::ui::text(
                         "external/shared: zero-delete protection",
                         "外部或共享资源，保留",
                     ),
