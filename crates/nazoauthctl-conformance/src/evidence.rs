@@ -196,7 +196,7 @@ fn write_private_evidence_bundle(
     identity: &EvidenceBundleIdentity,
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
     validate_identity(report, identity)?;
-    validate_review_screenshot_run_limit(report)?;
+    validate_review_screenshot_run_limit(&report.modules)?;
     #[cfg(not(unix))]
     {
         let _ = root;
@@ -227,15 +227,11 @@ fn write_private_evidence_bundle(
         let mut modules = Vec::with_capacity(report.modules.len());
         let mut screenshots = Vec::new();
         let mut screenshot_paths = BTreeSet::new();
-        let mut total_screenshot_bytes = 0usize;
         for (index, module) in report.modules.iter().enumerate() {
             validate_review_screenshot_obligations(module)?;
             let mut obligations = BTreeSet::new();
-            let total_attempts = module
-                .review_screenshots
-                .len()
-                .checked_add(module.review_screenshots_missing)
-                .ok_or(EvidenceError::Identity)?;
+            let total_attempts =
+                module.review_screenshots.len() + module.review_screenshots_missing;
             let mut required_captured = 0usize;
             let index = u32::try_from(index).map_err(|_| EvidenceError::Encoding)?;
             let file = format!("module-{index:04}.json");
@@ -266,18 +262,13 @@ fn write_private_evidence_bundle(
             });
             for screenshot in &module.review_screenshots {
                 let module_id = module.module_id.as_deref().ok_or(EvidenceError::Identity)?;
-                if !screenshot_paths.insert(screenshot.path.clone()) {
+                if !screenshot_paths.insert(&screenshot.path) {
                     return Err(EvidenceError::Identity);
                 }
                 validate_review_screenshot_path(&screenshot.path)?;
                 let source = root.join(&screenshot.path);
                 let screenshot_bytes = crate::secure_file::read_bounded(&source, 500 * 1024, true)
                     .map_err(map_secure_file_error)?;
-                if screenshots.len() >= crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN
-                    || screenshot_bytes.len() > 32 * 1024 * 1024 - total_screenshot_bytes
-                {
-                    return Err(EvidenceError::Identity);
-                }
                 crate::browser::validate_png_screenshot(&screenshot_bytes)
                     .map_err(|_| EvidenceError::Identity)?;
                 if screenshot_bytes.len() != screenshot.size
@@ -313,9 +304,7 @@ fn write_private_evidence_bundle(
                     return Err(EvidenceError::Identity);
                 }
                 if matches!(audit.marker, crate::ReviewScreenshotMarker::Required) {
-                    required_captured = required_captured
-                        .checked_add(1)
-                        .ok_or(EvidenceError::Identity)?;
+                    required_captured += 1;
                 }
                 let destination = directory.join(&screenshot.path);
                 write_private_screenshot_pair(&destination, &screenshot_bytes, &receipt)?;
@@ -323,8 +312,8 @@ fn write_private_evidence_bundle(
                     matrix_plan_id: module.matrix_plan_id.clone(),
                     suite_plan_id: module.suite_plan_id.clone(),
                     module_id: module_id.to_owned(),
-                    test_name: audit.test_name.clone(),
-                    variant: audit.variant.clone(),
+                    test_name: audit.test_name,
+                    variant: audit.variant,
                     marker: audit.marker,
                     obligation_index: audit.obligation_index,
                     path: screenshot.path.clone(),
@@ -337,7 +326,6 @@ fn write_private_evidence_bundle(
                     source: audit.source,
                     verification_receipt: audit.verification_receipt,
                 });
-                total_screenshot_bytes = total_screenshot_bytes.saturating_add(screenshot.size);
             }
             if required_captured != module.review_screenshots_required {
                 return Err(EvidenceError::Identity);
@@ -612,7 +600,7 @@ pub fn write_review_screenshot_manifest(
         if suite_origin.as_str() != report.suite_origin {
             return Err(EvidenceError::Identity);
         }
-        validate_review_screenshot_run_limit(report)?;
+        validate_review_screenshot_run_limit(&report.modules)?;
         if crate::artifact::validate_identifier(run_jti, 128).is_err() {
             return Err(EvidenceError::Identity);
         }
@@ -636,15 +624,11 @@ pub fn write_review_screenshot_manifest(
         let mut modules = Vec::with_capacity(report.modules.len());
         let mut screenshots = Vec::new();
         let mut paths = BTreeSet::new();
-        let mut total_screenshot_bytes = 0usize;
         for module in &report.modules {
             validate_review_screenshot_obligations(module)?;
             let mut obligations = BTreeSet::new();
-            let total_attempts = module
-                .review_screenshots
-                .len()
-                .checked_add(module.review_screenshots_missing)
-                .ok_or(EvidenceError::Identity)?;
+            let total_attempts =
+                module.review_screenshots.len() + module.review_screenshots_missing;
             let mut required_captured = 0usize;
             modules.push(ReviewScreenshotModuleManifest {
                 matrix_plan_id: module.matrix_plan_id.clone(),
@@ -658,18 +642,13 @@ pub fn write_review_screenshot_manifest(
             });
             for screenshot in &module.review_screenshots {
                 let module_id = module.module_id.as_deref().ok_or(EvidenceError::Identity)?;
-                if !paths.insert(screenshot.path.clone()) {
+                if !paths.insert(&screenshot.path) {
                     return Err(EvidenceError::Identity);
                 }
                 validate_review_screenshot_path(&screenshot.path)?;
                 let source = root.join(&screenshot.path);
                 let image = crate::secure_file::read_bounded(&source, 500 * 1024, true)
                     .map_err(map_secure_file_error)?;
-                if screenshots.len() >= crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN
-                    || image.len() > 32 * 1024 * 1024 - total_screenshot_bytes
-                {
-                    return Err(EvidenceError::Identity);
-                }
                 crate::browser::validate_png_screenshot(&image)
                     .map_err(|_| EvidenceError::Identity)?;
                 if image.len() != screenshot.size || sha256(&image) != screenshot.sha256 {
@@ -706,16 +685,14 @@ pub fn write_review_screenshot_manifest(
                     return Err(EvidenceError::Identity);
                 }
                 if matches!(audit.marker, crate::ReviewScreenshotMarker::Required) {
-                    required_captured = required_captured
-                        .checked_add(1)
-                        .ok_or(EvidenceError::Identity)?;
+                    required_captured += 1;
                 }
                 screenshots.push(EvidenceScreenshotManifest {
                     matrix_plan_id: module.matrix_plan_id.clone(),
                     suite_plan_id: module.suite_plan_id.clone(),
                     module_id: module_id.to_owned(),
-                    test_name: audit.test_name.clone(),
-                    variant: audit.variant.clone(),
+                    test_name: audit.test_name,
+                    variant: audit.variant,
                     marker: audit.marker,
                     obligation_index: audit.obligation_index,
                     path: screenshot.path.clone(),
@@ -728,7 +705,6 @@ pub fn write_review_screenshot_manifest(
                     source: audit.source,
                     verification_receipt: audit.verification_receipt,
                 });
-                total_screenshot_bytes = total_screenshot_bytes.saturating_add(image.len());
             }
             if required_captured != module.review_screenshots_required {
                 return Err(EvidenceError::Identity);
@@ -802,10 +778,7 @@ fn validate_review_screenshot_obligations(
 ) -> Result<(), EvidenceError> {
     if module.review_screenshots_required != module.review_screenshots_required_captured
         || module.review_screenshots_required_captured > module.review_screenshots.len()
-        || module
-            .review_screenshots
-            .len()
-            .saturating_add(module.review_screenshots_missing)
+        || module.review_screenshots.len() + module.review_screenshots_missing
             > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
     {
         return Err(EvidenceError::Identity);
@@ -891,8 +864,12 @@ fn valid_vp_verification_receipt_provenance(
         && !receipt.expires_at.is_empty()
 }
 
-fn validate_review_screenshot_run_limit(report: &ConformanceReport) -> Result<(), EvidenceError> {
-    let attempts = report.modules.iter().try_fold(0usize, |total, module| {
+fn validate_review_screenshot_run_limit(
+    modules: &[crate::report::ModuleReport],
+) -> Result<(), EvidenceError> {
+    // At most 64 captures, each read with a 500 KiB ceiling, also bound image
+    // payloads below 32 MiB before either writer starts processing evidence.
+    let attempts = modules.iter().try_fold(0usize, |total, module| {
         total
             .checked_add(module.review_screenshots.len())
             .and_then(|total| total.checked_add(module.review_screenshots_missing))
@@ -1187,6 +1164,33 @@ impl std::error::Error for EvidenceError {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_limits_reject_excess_and_overflow_before_writing() {
+        let mut module = crate::report::ModuleReport::from_info(
+            crate::report::ModuleReportContext {
+                matrix_plan_id: "matrix-plan".to_owned(),
+                suite_plan_id: "suite-plan".to_owned(),
+                module_id: Some("module".to_owned()),
+                test_name: "test".to_owned(),
+                variant: Default::default(),
+                terminal: true,
+                expected_result: None,
+            },
+            serde_json::json!({"status": "FINISHED", "result": "PASSED"}),
+            serde_json::json!([]),
+        );
+        module.review_screenshots_missing = 2;
+        assert!(validate_review_screenshot_obligations(&module).is_ok());
+        let mut modules = vec![module.clone(); 32];
+        assert!(validate_review_screenshot_run_limit(&modules).is_ok());
+        modules.push(module.clone());
+        assert!(validate_review_screenshot_run_limit(&modules).is_err());
+        module.review_screenshots_missing = 3;
+        assert!(validate_review_screenshot_obligations(&module).is_err());
+        modules[1].review_screenshots_missing = usize::MAX;
+        assert!(validate_review_screenshot_run_limit(&modules).is_err());
+    }
 
     #[test]
     fn completion_evidence_is_bound_to_the_dynamic_tenant_issuer() {
