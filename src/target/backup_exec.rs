@@ -2868,7 +2868,6 @@ fn prepare_stage_ownership_if_present(
     if config.exists() {
         runtime_ownership(super::install_exec::set_runtime_identity(
             config,
-            false,
             preserve_owner,
         ))?;
     }
@@ -2889,7 +2888,6 @@ fn prepare_runtime_ownership(
     prepare_secrets_ownership(secrets, preserve_owner)?;
     runtime_ownership(super::install_exec::set_runtime_identity(
         config,
-        false,
         preserve_owner,
     ))
 }
@@ -2903,7 +2901,6 @@ fn prepare_secrets_ownership(secrets: &Path, preserve_owner: bool) -> anyhow::Re
         let path = entry?.path();
         runtime_ownership(super::install_exec::set_runtime_identity(
             &path,
-            false,
             preserve_owner,
         ))?;
     }

@@ -2275,7 +2275,7 @@ fn grant_runtime_config_read(
             )),
         )
     })?;
-    super::install_exec::set_runtime_identity(path, false, preserve_owner)
+    super::install_exec::set_runtime_identity(path, preserve_owner)
 }
 
 fn rollback_result(errors: Vec<String>) -> Result<(), Failure> {

@@ -590,18 +590,9 @@ impl HostInstallExecutor {
             ));
         }
 
-        let secret_root = job
-            .order
-            .secrets
-            .first()
-            .and_then(|secret| Path::new(&secret.path).parent())
-            .ok_or_else(|| {
-                Failure::new(
-                    SECRET_PROVISION_FAILED,
-                    "clean install requires one explicit secrets directory",
-                )
-            })?
-            .to_path_buf();
+        let secret_root = Path::new(&job.order.secrets[0].path)
+            .parent()
+            .expect("admission validated the shared secret parent");
         let config_dir = config_path.parent().ok_or_else(|| {
             Failure::new(
                 CONFIG_INVALID,
@@ -611,7 +602,7 @@ impl HostInstallExecutor {
         let mut managed_directories = vec![
             config_dir.to_path_buf(),
             PathBuf::from(&job.order.data_root),
-            secret_root,
+            secret_root.to_path_buf(),
         ];
         if let Some(runtime_root) = &job.order.runtime_root {
             managed_directories.push(PathBuf::from(runtime_root));
@@ -650,11 +641,19 @@ impl HostInstallExecutor {
 
         // 1. Official artifact: verify first, use afterwards (H01 single entry).
         let kind = job.runtime.kind;
-        if let Some(tls_mount) = install_tls_mount(
-            job.order.config_content.as_bytes(),
-            job.order.tls_material_root.as_deref(),
-            kind,
-        )? {
+        let config: std::collections::BTreeMap<String, yaml_serde::Value> =
+            yaml_serde::from_str(&job.order.config_content).map_err(|_| {
+                Failure::new(
+                    CONFIG_INVALID,
+                    "installation configuration must be a YAML mapping",
+                )
+            })?;
+        let tls_mount = install_tls_mount(&config, job.order.tls_material_root.as_deref(), kind)?;
+        let mut public_ports = Vec::new();
+        let initial_runtime = runtime_backend::backend(kind)
+            .inspect(&job.runtime.object)
+            .ok();
+        if let Some(tls_mount) = &tls_mount {
             filesystem::validate_secure_directory(&tls_mount.source, "TLS material root", false)
                 .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
             let metadata = fs::symlink_metadata(&tls_mount.source).map_err(|_| {
@@ -674,10 +673,6 @@ impl HostInstallExecutor {
                     "TLS material root must be a real directory disjoint from managed installation paths",
                 ));
             }
-            let config: std::collections::BTreeMap<String, yaml_serde::Value> =
-                yaml_serde::from_str(&job.order.config_content).map_err(|_| {
-                    Failure::new(CONFIG_INVALID, "invalid Direct TLS configuration")
-                })?;
             for key in [
                 "TLS_CERTIFICATE_FILE",
                 "TLS_PRIVATE_KEY_FILE",
@@ -713,8 +708,7 @@ impl HostInstallExecutor {
                 )
                 .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
             }
-            let public_ports =
-                direct_tls_public_ports(job.issuer, job.order.config_content.as_bytes())?;
+            public_ports = direct_tls_public_ports_from_config(job.issuer, &config)?;
             if public_ports
                 .iter()
                 .any(|(port, _)| *port == job.runtime.loopback_port)
@@ -724,11 +718,8 @@ impl HostInstallExecutor {
                     "public TLS port conflicts with local readiness port",
                 ));
             }
-            if runtime_backend::backend(kind)
-                .inspect(&job.runtime.object)
-                .is_err()
-            {
-                for (port, _) in public_ports {
+            if initial_runtime.is_none() {
+                for &(port, _) in &public_ports {
                     std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
                         .map(drop)
                         .map_err(|_| {
@@ -740,7 +731,22 @@ impl HostInstallExecutor {
                 }
             }
         }
-        require_loopback_port_available(kind, &job.runtime.object, job.runtime.loopback_port)?;
+        if !initial_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.running)
+        {
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, job.runtime.loopback_port))
+                .map(drop)
+                .map_err(|_| {
+                    Failure::new(
+                        RUNTIME_START_FAILED,
+                        format!(
+                            "loopback port {} is already in use on the target",
+                            job.runtime.loopback_port
+                        ),
+                    )
+                })?;
+        }
         for (label, endpoint) in [
             ("database runtime", &job.order.database_runtime_endpoint),
             ("database lifecycle", &job.order.database_lifecycle_endpoint),
@@ -760,14 +766,11 @@ impl HostInstallExecutor {
 
         // 2. Atomic config write with integrity check.
         let content_bytes = job.order.config_content.as_bytes();
-        if valid_lower_hex_sha256(&job.order.config_sha256) {
-            let digest = sha256_hex(content_bytes);
-            if digest != job.order.config_sha256 {
-                return Err(Failure::new(
-                    CONFIG_INVALID,
-                    "config content does not match its declared digest",
-                ));
-            }
+        if sha256_hex(content_bytes) != job.order.config_sha256 {
+            return Err(Failure::new(
+                CONFIG_INVALID,
+                "config content does not match its declared digest",
+            ));
         }
         atomic_write(&config_path, content_bytes, 0o600)
             .map_err(|error| Failure::new(CONFIG_INVALID, sanitize(error.to_string())))?;
@@ -779,7 +782,7 @@ impl HostInstallExecutor {
         // The container reads this file as the image's fixed runtime UID;
         // bind mounts keep host ownership, so hand it over group-readable.
         if kind.is_container() {
-            set_runtime_identity(&config_path, false, rootless_podman)?;
+            set_runtime_identity(&config_path, rootless_podman)?;
         }
         // P1-1: the deletion credential for the uninstall executor — proves
         // ctl created this exact file during install.
@@ -879,39 +882,14 @@ impl HostInstallExecutor {
                 }
             }
             if kind.is_container() {
-                set_runtime_identity(&path, false, rootless_podman)?;
+                set_runtime_identity(&path, rootless_podman)?;
             }
             performed.generated_secrets.push(secret.path.clone());
         }
 
         if kind.is_container() {
-            let parents = job
-                .order
-                .secrets
-                .iter()
-                .filter_map(|secret| Path::new(&secret.path).parent())
-                .collect::<std::collections::BTreeSet<_>>();
-            for parent in parents {
-                set_runtime_identity_directory(parent, rootless_podman)?;
-            }
-        }
-
-        // The writable data directory is mounted straight into the container:
-        // it must already exist AND be owned by the runtime UID, or the
-        // engine silently creates a root-owned directory the application
-        // cannot write to.
-        let data_root = PathBuf::from(&job.order.data_root);
-        if filesystem::ensure_directory_chain(&data_root).is_err() {
-            return Err(Failure::new(
-                HOST_ERR_OPERATION_INVALID,
-                sanitize(format!(
-                    "failed to prepare data directory {}",
-                    data_root.display()
-                )),
-            ));
-        }
-        if kind.is_container() {
-            set_runtime_identity_directory_data(&data_root, rootless_podman)?;
+            set_runtime_identity_directory(secret_root, rootless_podman)?;
+            set_runtime_identity_directory_data(Path::new(&job.order.data_root), rootless_podman)?;
         }
 
         // 4. Write the operator's config-revision marker BEFORE the runtime
@@ -930,7 +908,7 @@ impl HostInstallExecutor {
         if kind.is_container() {
             // The marker is bind-mounted into the container, whose tasks read
             // it as the fixed non-root identity (see set_runtime_identity).
-            set_runtime_identity(&revision_marker, false, rootless_podman)?;
+            set_runtime_identity(&revision_marker, rootless_podman)?;
         }
 
         // 6. Start the runtime and confirm it serves the verified artifact.
@@ -939,7 +917,7 @@ impl HostInstallExecutor {
                 start_systemd_runtime(job, &verified, performed)?;
             }
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
-                start_container_runtime(job, &verified, kind, performed)?;
+                start_container_runtime(job, &verified, kind, performed, tls_mount, public_ports)?;
             }
         }
 
@@ -952,28 +930,6 @@ impl HostInstallExecutor {
             release: Some(verified.release),
         })
     }
-}
-
-fn require_loopback_port_available(
-    kind: RuntimeBackendKind,
-    runtime_object: &str,
-    port: u16,
-) -> Result<(), Failure> {
-    let backend = runtime_backend::backend(kind);
-    if backend
-        .inspect(runtime_object)
-        .is_ok_and(|observation| observation.running)
-    {
-        return Ok(());
-    }
-    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .map(drop)
-        .map_err(|_| {
-            Failure::new(
-                RUNTIME_START_FAILED,
-                format!("loopback port {port} is already in use on the target"),
-            )
-        })
 }
 
 fn validate_endpoint_reachability(
@@ -1045,9 +1001,9 @@ fn install_observation_matches(
     observed: &runtime_backend::RuntimeObservation,
     expected: &runtime_backend::RuntimeReplacement,
 ) -> bool {
-    let mut ports = observed.ports.clone();
+    let mut ports: Vec<_> = observed.ports.iter().collect();
     ports.sort();
-    let mut expected_ports = expected.ports.clone();
+    let mut expected_ports: Vec<_> = expected.ports.iter().collect();
     expected_ports.sort();
     observed.server_command_verified
         && match (&observed.artifact, &expected.artifact) {
@@ -1080,6 +1036,8 @@ fn start_container_runtime(
     verified: &super::update_exec::VerifiedArtifactFacts,
     kind: RuntimeBackendKind,
     performed: &mut PerformedSteps,
+    tls_mount: Option<runtime_backend::NeutralMount>,
+    public_ports: Vec<(u16, u16)>,
 ) -> Result<(), Failure> {
     let runtime_artifact = match &verified.runtime_artifact {
         runtime_backend::ArtifactReference::Oci { .. } => verified.runtime_artifact.clone(),
@@ -1104,18 +1062,14 @@ fn start_container_runtime(
         ),
     ];
     let mut ports = vec![format!("127.0.0.1:{}:8000/tcp", job.runtime.loopback_port)];
-    if let Some(tls_mount) = install_tls_mount(
-        job.order.config_content.as_bytes(),
-        job.order.tls_material_root.as_deref(),
-        kind,
-    )? {
+    if let Some(tls_mount) = tls_mount {
         mounts.push(tls_mount);
-        ports.extend(
-            direct_tls_public_ports(job.issuer, job.order.config_content.as_bytes())?
-                .into_iter()
-                .map(|(public, internal)| format!("0.0.0.0:{public}:{internal}/tcp")),
-        );
     }
+    ports.extend(
+        public_ports
+            .into_iter()
+            .map(|(public, internal)| format!("0.0.0.0:{public}:{internal}/tcp")),
+    );
     // Database and Valkey URLs are direct values in the mounted configuration;
     // lifecycle credentials remain ctl-owned. Runtime key roots are mounted as
     // individual read-only files.
@@ -1262,7 +1216,12 @@ pub fn percent_encode_credential(credential: impl AsRef<[u8]>) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 encoded.push(byte as char)
             }
-            other => encoded.push_str(&format!("%{other:02X}")),
+            other => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(other >> 4) as usize] as char);
+                encoded.push(HEX[(other & 0x0f) as usize] as char);
+            }
         }
     }
     encoded
@@ -1538,11 +1497,7 @@ pub(super) fn path_is_owned_by_non_root(_path: &Path) -> std::io::Result<bool> {
 /// 0440. Rootless Podman maps the calling host user to container UID 10001,
 /// so the same files remain caller-owned and mode 0400.
 #[cfg(unix)]
-pub(super) fn set_runtime_identity(
-    path: &Path,
-    _directory: bool,
-    preserve_owner: bool,
-) -> Result<(), Failure> {
+pub(super) fn set_runtime_identity(path: &Path, preserve_owner: bool) -> Result<(), Failure> {
     use std::os::unix::fs::{PermissionsExt as _, chown};
     let apply = || -> std::io::Result<()> {
         if preserve_owner {
@@ -1607,11 +1562,7 @@ pub(super) fn set_runtime_identity_directory(
 }
 
 #[cfg(not(unix))]
-pub(super) fn set_runtime_identity(
-    _path: &Path,
-    _directory: bool,
-    _preserve_owner: bool,
-) -> Result<(), Failure> {
+pub(super) fn set_runtime_identity(_path: &Path, _preserve_owner: bool) -> Result<(), Failure> {
     Ok(())
 }
 
@@ -1637,14 +1588,21 @@ pub(crate) fn direct_tls_public_ports(
     issuer: &str,
     content: &[u8],
 ) -> Result<Vec<(u16, u16)>, Failure> {
+    let config = yaml_serde::from_slice(content)
+        .map_err(|_| Failure::new(CONFIG_INVALID, "invalid Direct TLS configuration"))?;
+    direct_tls_public_ports_from_config(issuer, &config)
+}
+
+fn direct_tls_public_ports_from_config(
+    issuer: &str,
+    config: &std::collections::BTreeMap<String, yaml_serde::Value>,
+) -> Result<Vec<(u16, u16)>, Failure> {
     let invalid = || {
         Failure::new(
             CONFIG_INVALID,
             "Direct TLS requires distinct HTTPS issuer/mTLS ports on one hostname and an unspecified IPv4 TLS_BIND",
         )
     };
-    let config: std::collections::BTreeMap<String, yaml_serde::Value> =
-        yaml_serde::from_slice(content).map_err(|_| invalid())?;
     let required = |key: &str| {
         config
             .get(key)
@@ -1686,11 +1644,11 @@ pub(crate) fn direct_tls_public_ports(
 }
 
 fn install_tls_mount(
-    content: &[u8],
+    config: &std::collections::BTreeMap<String, yaml_serde::Value>,
     root: Option<&str>,
     kind: RuntimeBackendKind,
 ) -> Result<Option<runtime_backend::NeutralMount>, Failure> {
-    let direct_tls = local_runtime_uses_https(content)?;
+    let direct_tls = config_uses_https(config)?;
     let Some(root) = root else {
         if direct_tls {
             return Err(Failure::new(
@@ -1706,9 +1664,6 @@ fn install_tls_mount(
             "TLS material installation requires Direct TLS on Podman or Docker",
         ));
     }
-    let config: std::collections::BTreeMap<String, yaml_serde::Value> =
-        yaml_serde::from_slice(content)
-            .map_err(|_| Failure::new(CONFIG_INVALID, "invalid Direct TLS configuration"))?;
     for key in [
         "TLS_CERTIFICATE_FILE",
         "TLS_PRIVATE_KEY_FILE",
@@ -1806,6 +1761,12 @@ pub(super) fn local_runtime_uses_https(config: &[u8]) -> Result<bool, Failure> {
                 "readiness configuration must be a YAML mapping",
             )
         })?;
+    config_uses_https(&config)
+}
+
+fn config_uses_https(
+    config: &std::collections::BTreeMap<String, yaml_serde::Value>,
+) -> Result<bool, Failure> {
     let direct_tls = match config.get("TRANSPORT_MODE") {
         None => false,
         Some(yaml_serde::Value::String(mode))
@@ -1999,9 +1960,11 @@ mod endpoint_tests {
     #[test]
     fn direct_install_keeps_the_declared_parent_mount_and_exact_public_ports() {
         let config = b"TRANSPORT_MODE: direct-tls\nTLS_BIND: 0.0.0.0:8443\nMTLS_ENDPOINT_BASE_URL: https://auth.example:38444\nTLS_CERTIFICATE_FILE: /etc/nazo-tls/current/fullchain.pem\nTLS_PRIVATE_KEY_FILE: /etc/nazo-tls/current/private-key.pem\nTLS_CLIENT_CA_FILE: /etc/nazo-tls/client-ca.pem\n";
-        let material = install_tls_mount(config, Some("/etc/nazo-tls"), RuntimeBackendKind::Podman)
-            .unwrap()
-            .unwrap();
+        let parsed = yaml_serde::from_slice(config).unwrap();
+        let material =
+            install_tls_mount(&parsed, Some("/etc/nazo-tls"), RuntimeBackendKind::Podman)
+                .unwrap()
+                .unwrap();
         assert_eq!(material.source, std::path::Path::new("/etc/nazo-tls"));
         assert_eq!(material.destination, material.source);
         assert!(material.read_only);
@@ -2013,10 +1976,10 @@ mod endpoint_tests {
             direct_tls_public_ports("https://auth.example:38443", config).unwrap(),
             vec![(38443, 8000), (38444, 8443)]
         );
-        assert!(install_tls_mount(config, None, RuntimeBackendKind::Podman).is_err());
-        assert!(install_tls_mount(config, Some("/etc/nazo"), RuntimeBackendKind::Podman).is_err());
+        assert!(install_tls_mount(&parsed, None, RuntimeBackendKind::Podman).is_err());
+        assert!(install_tls_mount(&parsed, Some("/etc/nazo"), RuntimeBackendKind::Podman).is_err());
         assert!(
-            install_tls_mount(config, Some("/etc/nazo-tls"), RuntimeBackendKind::Host).is_err()
+            install_tls_mount(&parsed, Some("/etc/nazo-tls"), RuntimeBackendKind::Host).is_err()
         );
         assert!(direct_tls_public_ports("https://other.example:38443", config).is_err());
         assert!(direct_tls_public_ports("https://auth.example:38444", config).is_err());
@@ -2035,7 +1998,7 @@ mod endpoint_tests {
             .replace("current/private-key.pem", "../private-key.pem");
         assert!(
             install_tls_mount(
-                escaped.as_bytes(),
+                &yaml_serde::from_str(&escaped).unwrap(),
                 Some("/etc/nazo-tls"),
                 RuntimeBackendKind::Podman
             )
@@ -2229,8 +2192,7 @@ mod install_exec_tests {
         fs::write(&file, b"secret")?;
         let original_uid = fs::metadata(&file)?.uid();
 
-        set_runtime_identity(&file, false, true)
-            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        set_runtime_identity(&file, true).map_err(|failure| anyhow::anyhow!(failure.detail))?;
         set_runtime_identity_directory(&directory, true)
             .map_err(|failure| anyhow::anyhow!(failure.detail))?;
 
