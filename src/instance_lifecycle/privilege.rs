@@ -57,12 +57,7 @@ pub(crate) fn ensure_systemd_access() -> Result<(), PrivilegeError> {
             detail: "the 'systemctl' binary is not installed on this host".to_owned(),
         });
     }
-    let is_root = crate::process::Process::new("id")
-        .arg("-u")
-        .stdout()
-        .map(|uid| uid.trim() == "0")
-        .unwrap_or(false);
-    if is_root {
+    if crate::process::is_effective_root() {
         Ok(())
     } else {
         Err(PrivilegeError {

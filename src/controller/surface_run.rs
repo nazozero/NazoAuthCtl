@@ -39,8 +39,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     ) {
         super::self_update::repair_interrupted_update()?;
     }
-    // Copied out before the command is moved; selector helpers close over these.
-    let global_instance = cli.instance.clone();
+    // Move the independent global selector before consuming the command.
+    let global_instance = cli.instance;
     let json_mode = cli.json;
     let instance_flag = global_instance.as_deref();
     match cli.command {
@@ -264,13 +264,6 @@ fn run_backup_copy(
     let keys = ControllerKeyStore::open_default()?;
     let journal = TransferJournal::open(&keys.instance_dir(deployment_id)?)?;
     let existing = journal.load()?;
-    if let Some(existing) = &existing
-        && (existing.deployment_id != deployment_id
-            || existing.source_host_id != source_host.host_id.to_string()
-            || existing.destination_alias != destination_alias)
-    {
-        return transfer_binding_error(existing, &record.alias);
-    }
     let destination_host = registry.host_by_alias(destination_alias)?.with_context(|| {
         if let Some(existing) = &existing {
             format!(
@@ -376,7 +369,6 @@ fn resume_backup_transfer(
                     )?,
                     "source export preparation",
                 )?;
-                validate_source_plan(transfer, &plan)?;
                 transfer.source_plan = Some(plan);
                 transfer.phase = TransferPhase::DestinationPrepare;
                 journal.store(transfer)?;
@@ -463,33 +455,13 @@ fn resume_backup_transfer(
                 )?;
                 let receipt = transfer
                     .receipt
-                    .clone()
+                    .take()
                     .context("backup copy: durable destination receipt is missing")?;
                 journal.clear()?;
                 return Ok(receipt);
             }
         }
     }
-}
-
-fn validate_source_plan(
-    transfer: &TransferRecord,
-    plan: &crate::target::backup_exec::BackupTransferPlan,
-) -> anyhow::Result<()> {
-    if plan.operation_id != transfer.transfer_operation_id
-        || plan.deployment_id != transfer.deployment_id
-        || plan.manifest_sha256.len() != 64
-        || !plan
-            .manifest_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || plan.files.is_empty()
-    {
-        bail!(
-            "backup copy: source returned a transfer plan with mismatched immutable bindings; the durable transfer was retained for exact retry"
-        );
-    }
-    Ok(())
 }
 
 fn validate_receipt(
@@ -718,12 +690,6 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
     let context = LifecycleContext::production()?;
     let (record, host, target, inspection) =
         crate::instance_lifecycle::resolve_live_instance(&context, merged.as_deref(), "recover")?;
-    let snapshot = inspection
-        .backup
-        .snapshot
-        .as_ref()
-        .context("recover requires an existing immutable snapshot")?;
-    validate_recovery_snapshot(snapshot)?;
     let keys = ControllerKeyStore::open_default()?;
     let journal = RecoveryJournal::open(&keys.instance_dir(&record.deployment_id)?)?;
     let mut plan = match journal.load()? {
@@ -734,6 +700,12 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             plan
         }
         None => {
+            let snapshot = inspection
+                .backup
+                .snapshot
+                .as_ref()
+                .context("recover requires an existing immutable snapshot")?;
+            validate_recovery_snapshot(snapshot)?;
             let plan = recovery_journal::new_plan(
                 record.deployment_id.clone(),
                 inspection.revision,
@@ -889,7 +861,6 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         }
         let config_revision = restored
             .config_revision_marker
-            .clone()
             .context("recover: restored target has no config-revision marker")?;
         let control_journal = crate::controller_identity::journal::OperationJournal::open(
             keys.instance_dir(&record.deployment_id)?,
@@ -933,7 +904,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         }
         let candidate = plan
             .candidate
-            .clone()
+            .as_ref()
             .context("recover: recovery journal has no candidate pointer")?;
         let wrapper_operation_id = plan
             .candidate_control_operation_id
@@ -1262,24 +1233,28 @@ fn read_password_file_inner(
 /// is unusable.  It never enters argv, a target operation, or either journal.
 fn read_recovery_secret_file(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
     const MAX_SECRET_FILE_BYTES: u64 = 4096;
-    let bytes = crate::filesystem::read_secure_regular_file(
+    let mut bytes = crate::filesystem::read_secure_regular_file(
         path,
         "recovery secret",
         true,
         MAX_SECRET_FILE_BYTES,
     )
     .with_context(|| format!("--recovery-secret-file: failed to read {}", path.display()))?;
-    let value = std::str::from_utf8(&bytes).with_context(|| {
-        format!(
-            "--recovery-secret-file: {} is not valid UTF-8",
+    let value = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|error| {
+        let cause = error.utf8_error();
+        let _invalid = zeroize::Zeroizing::new(error.into_bytes());
+        anyhow::anyhow!(
+            "--recovery-secret-file: {} is not valid UTF-8: {cause}",
             path.display()
         )
     })?;
-    let value = value.trim_end_matches(['\r', '\n']);
-    if value.is_empty() {
+    let mut value = zeroize::Zeroizing::new(value);
+    let length = value.trim_end_matches(['\r', '\n']).len();
+    if length == 0 {
         bail!("--recovery-secret-file: {} is empty", path.display());
     }
-    Ok(zeroize::Zeroizing::new(value.to_owned()))
+    value.truncate(length);
+    Ok(value)
 }
 
 fn run_install(args: InstallArgs) -> anyhow::Result<()> {
@@ -1303,14 +1278,13 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         direct_tls_config: args
             .direct_tls_config
             .map(|path| {
-                let bytes = crate::filesystem::read_secure_regular_file(
+                let mut bytes = crate::filesystem::read_secure_regular_file(
                     &path,
                     "Direct TLS configuration",
                     false,
                     crate::target::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
                 )?;
-                std::str::from_utf8(&bytes)
-                    .map(str::to_owned)
+                String::from_utf8(std::mem::take(&mut *bytes))
                     .context("Direct TLS configuration is not UTF-8")
             })
             .transpose()?,
@@ -1442,14 +1416,14 @@ fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
 
 fn read_config_file(path: &std::path::Path) -> anyhow::Result<String> {
     const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-    let bytes = crate::filesystem::read_secure_regular_file(
+    let mut bytes = crate::filesystem::read_secure_regular_file(
         path,
         "staged configuration",
         false,
         MAX_CONFIG_BYTES,
     )
     .with_context(|| format!("failed to read {}", path.display()))?;
-    String::from_utf8(bytes.to_vec())
+    String::from_utf8(std::mem::take(&mut *bytes))
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 

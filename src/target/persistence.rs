@@ -47,18 +47,26 @@ impl LegacyRollbackPolicy {
 }
 
 pub(crate) fn read_deployment_state(bytes: &[u8]) -> anyhow::Result<DeploymentState> {
+    let current_error = match serde_json::from_slice::<DeploymentState>(bytes) {
+        Ok(state) => {
+            state.validate()?;
+            return Ok(state);
+        }
+        Err(error) => error,
+    };
+    // Only historical/invalid documents need a schema probe. It also preserves
+    // duplicate-schema rejection before a JSON tree could discard a member.
     #[derive(Deserialize)]
     struct Schema {
         schema: u32,
     }
-    if serde_json::from_slice::<Schema>(bytes)?.schema == DEPLOYMENT_STATE_SCHEMA {
-        let state: DeploymentState = serde_json::from_slice(bytes)?;
-        state.validate()?;
-        return Ok(state);
+    let schema = serde_json::from_slice::<Schema>(bytes)?.schema;
+    if schema == DEPLOYMENT_STATE_SCHEMA {
+        return Err(current_error.into());
     }
     let mut value: Value = serde_json::from_slice(bytes)?;
-    match value.get("schema").and_then(Value::as_u64) {
-        Some(7) => {
+    match schema {
+        7 => {
             let object = value
                 .as_object_mut()
                 .context("deployment state must be an object")?;
@@ -117,6 +125,37 @@ mod tests {
             "../../tests/fixtures/persistence/v0.2.28/snapshot-manifest.json"
         ))?;
         manifest.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn current_state_parser_preserves_duplicate_and_unknown_field_rejection() -> anyhow::Result<()>
+    {
+        let canonical = serde_json::to_string(&read_deployment_state(include_bytes!(
+            "../../tests/fixtures/persistence/v0.2.28/state.json"
+        ))?)?;
+        let duplicate = format!("{{\"schema\":{DEPLOYMENT_STATE_SCHEMA},{}", &canonical[1..]);
+        assert!(
+            read_deployment_state(duplicate.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate field")
+        );
+        let legacy = std::str::from_utf8(V027)?;
+        let duplicate_legacy = format!("{{\"schema\":7,{}", &legacy[1..]);
+        assert!(
+            read_deployment_state(duplicate_legacy.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate field")
+        );
+        let unknown = format!("{{\"unexpected\":true,{}", &canonical[1..]);
+        assert!(
+            read_deployment_state(unknown.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
         Ok(())
     }
 

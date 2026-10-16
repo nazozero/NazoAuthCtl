@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Cursor, Read as _, Seek as _, SeekFrom, Write as _},
+    io::{Read as _, Seek as _, SeekFrom, Write as _},
     net::TcpListener,
     path::{Component, Path, PathBuf},
     process::Output,
@@ -17,6 +17,7 @@ use std::{
 use anyhow::{Context as _, bail, ensure};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tar::{Builder as TarBuilder, EntryType, Header as TarHeader};
 use url::Url;
 use uuid::Uuid;
@@ -31,10 +32,7 @@ use super::{
         CONTAINER_CONFIG_FILE, CONTAINER_DATA_DIR, CONTAINER_SECRETS_DIR, LOCAL_READINESS_PATH,
         MIGRATION_RUNTIME_ROLE_ENV, SERVER_CONFIG_FILE_ENV,
     },
-    wire::{
-        BackupTransferBytes, BackupTransferChunk, HOST_ERR_OPERATION_INVALID,
-        MAX_BACKUP_TRANSFER_CHUNK_BYTES, MAX_BACKUP_TRANSFER_FILE_BYTES, sanitize,
-    },
+    wire::{BackupTransferBytes, BackupTransferChunk, HOST_ERR_OPERATION_INVALID, sanitize},
 };
 use crate::runtime_backend::{
     self, ArtifactReference, ContainerRuntimePolicy, NeutralMount, RecoveryCandidateEndpoint,
@@ -75,8 +73,8 @@ pub(super) struct SigningKeyEncryptionConfig {
 pub(super) fn parse_signing_key_encryption_config(
     config: &str,
 ) -> anyhow::Result<Option<SigningKeyEncryptionConfig>> {
-    let value: YamlValue = yaml_serde::from_reader(Cursor::new(config.as_bytes()))
-        .context("deployment configuration is not valid YAML")?;
+    let value: YamlValue =
+        yaml_serde::from_str(config).context("deployment configuration is not valid YAML")?;
     let YamlValue::Mapping(entries) = value else {
         bail!("deployment configuration must be a top-level key/value mapping");
     };
@@ -137,16 +135,16 @@ fn yaml_mapping_scalar(
     entries: &yaml_serde::Mapping,
     name: &str,
 ) -> anyhow::Result<Option<String>> {
-    let Some((_, value)) = entries.iter().find(|(key, _)| key.as_str() == Some(name)) else {
+    let Some(value) = entries.get(name) else {
         return Ok(None);
     };
     let value = match value {
-        YamlValue::String(value) => value.clone(),
+        YamlValue::String(value) => return Ok(Some(value.trim().to_owned())),
         YamlValue::Bool(value) => value.to_string(),
         YamlValue::Number(value) => value.to_string(),
         _ => bail!("server configuration key {name} must be a scalar"),
     };
-    Ok(Some(value.trim().to_owned()))
+    Ok(Some(value))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -251,19 +249,22 @@ fn create_snapshot(
         &secrets.join("database-lifecycle-url"),
         "lifecycle database URL",
     )?;
-    let mfa_key = secure_regular_path(&secrets.join("mfa-totp-key"), "MFA key")?;
     let release = state
         .current_release
         .clone()
         .context("deployment has no current release version")?;
-    let runtime_artifact = observe_exact_runtime_artifact(state)?;
-    let oidc_signing_key_ids = source_oidc_signing_key_ids(state)?;
+    let backend = runtime_backend::backend(state.runtime.kind);
+    let observation = backend.inspect(&state.runtime.object)?;
+    ensure!(observation.running, "deployment runtime is not running");
+    artifact_matches_state(&observation.artifact, state)?;
+    let oidc_signing_key_ids = source_oidc_signing_key_ids(state, &observation)?;
+    let runtime_artifact = observation.artifact;
     let runtime_instance_key_id = verify_runtime_identity(&data, state)?;
-    let mfa_key_sha256 = crate::filesystem::sha256(&mfa_key)?;
-    let database_sentinel_sha256 = database_sentinel(&database_url)?;
+    let connection = postgres_connection(&database_url)?;
+    let database_sentinel_sha256 = database_sentinel_with_connection(&connection)?;
     let dump_path = staging.join("postgresql.dump");
     let archive_path = staging.join("deployment.tar");
-    run_pg_dump(&database_url, &dump_path)?;
+    run_pg_dump(&connection, &dump_path)?;
     let archive_files = create_deployment_archive(
         &archive_path,
         &data,
@@ -271,6 +272,12 @@ fn create_snapshot(
         &config,
         snapshot_id.to_string().as_bytes(),
     )?;
+    let mfa_key_sha256 = archive_files
+        .iter()
+        .find(|file| file.path == "app-secrets/mfa-totp-key")
+        .expect("create_deployment_archive includes every required secret")
+        .sha256
+        .clone();
     let files = [dump_path, archive_path]
         .iter()
         .map(|path| snapshot_file(path, staging))
@@ -429,8 +436,6 @@ pub(crate) fn prepare_import(
     deployment_id: &str,
     operation_id: &str,
 ) -> Result<BackupTransferPlan, Failure> {
-    crate::registry::validate_identifier(deployment_id, 128, "backup deployment id")
-        .map_err(backup_failure)?;
     let operation = Uuid::parse_str(operation_id).map_err(|_| {
         Failure::new(
             HOST_ERR_OPERATION_INVALID,
@@ -470,62 +475,75 @@ pub(crate) fn read_transfer_chunk(
             "backup copy operation id must be a UUID",
         )
     })?;
-    if !matches!(
-        file_name,
-        "postgresql.dump" | "deployment.tar" | IMMUTABLE_MANIFEST_FILE
-    ) || maximum_bytes == 0
-        || maximum_bytes as usize > MAX_BACKUP_TRANSFER_CHUNK_BYTES
-    {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "backup transfer requested an invalid bounded file chunk",
-        ));
-    }
+    // LocalTarget and remote exec admit these fixed file names and bounds
+    // through HostOperation::validate before dispatch.
     let directory = scope_dir
         .join("backup")
         .join("transfers")
         .join(format!("export-{operation}"));
-    let manifest = backup::load_manifest_at(&directory.join(IMMUTABLE_MANIFEST_FILE))
-        .map_err(backup_failure)?
-        .ok_or_else(|| Failure::new(BACKUP_EXECUTION_FAILED, "backup export has no manifest"))?;
-    let expected = if file_name == IMMUTABLE_MANIFEST_FILE {
-        snapshot_file(&directory.join(file_name), &directory).map_err(backup_failure)?
+    let mut manifest_bytes = crate::filesystem::read_secure_regular_file(
+        &directory.join(IMMUTABLE_MANIFEST_FILE),
+        "backup export manifest",
+        false,
+        backup::MAX_BACKUP_EVIDENCE_BYTES,
+    )
+    .map_err(backup_failure)?;
+    // Prepare verified this export. The controller binds each answer to its
+    // saved plan, and finalization verifies the complete received snapshot.
+    // A chunk read needs only file facts, not every archived entry or another
+    // canonical manifest hash. No manifest-provided path is opened here.
+    let (size, file_sha256, bytes) = if file_name == IMMUTABLE_MANIFEST_FILE {
+        let size = manifest_bytes.len() as u64;
+        if offset >= size {
+            return Err(Failure::new(
+                BACKUP_EXECUTION_FAILED,
+                "backup transfer offset exceeds its manifest",
+            ));
+        }
+        let digest = backup::hex_digest(&manifest_bytes);
+        let count = (size - offset).min(u64::from(maximum_bytes)) as usize;
+        manifest_bytes.copy_within(offset as usize..offset as usize + count, 0);
+        manifest_bytes.truncate(count);
+        (size, digest, std::mem::take(&mut *manifest_bytes))
     } else {
-        manifest
+        #[derive(Deserialize)]
+        struct ExportFiles {
+            files: Vec<SnapshotFile>,
+        }
+        let manifest: ExportFiles = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| backup_failure(error.into()))?;
+        let expected = manifest
             .files
-            .iter()
+            .into_iter()
             .find(|file| file.path == file_name)
-            .cloned()
             .ok_or_else(|| {
                 Failure::new(
                     BACKUP_EXECUTION_FAILED,
                     "backup export lacks requested file",
                 )
-            })?
+            })?;
+        let path = directory.join(file_name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| backup_failure(error.into()))?;
+        if !metadata.is_file() || metadata.len() != expected.size || offset >= metadata.len() {
+            return Err(Failure::new(
+                BACKUP_EXECUTION_FAILED,
+                "backup transfer source no longer matches its immutable export",
+            ));
+        }
+        let count = (expected.size - offset).min(u64::from(maximum_bytes)) as usize;
+        let mut bytes = vec![0_u8; count];
+        let mut file = fs::File::open(&path).map_err(|error| backup_failure(error.into()))?;
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|error| backup_failure(error.into()))?;
+        (expected.size, expected.sha256, bytes)
     };
-    let path = secure_regular_path(&directory.join(file_name), "backup transfer source")
-        .map_err(backup_failure)?;
-    let size = fs::metadata(&path)
-        .map_err(|error| backup_failure(error.into()))?
-        .len();
-    if size != expected.size || offset >= size {
-        return Err(Failure::new(
-            BACKUP_EXECUTION_FAILED,
-            "backup transfer source no longer matches its immutable export",
-        ));
-    }
-    let count = (size - offset).min(maximum_bytes as u64) as usize;
-    let mut bytes = vec![0_u8; count];
-    let mut file = fs::File::open(&path).map_err(|error| backup_failure(error.into()))?;
-    file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_exact(&mut bytes))
-        .map_err(|error| backup_failure(error.into()))?;
     Ok(BackupTransferChunk {
         transfer_operation_id: operation.to_string(),
         file_name: file_name.to_owned(),
         offset,
         total_bytes: size,
-        file_sha256: expected.sha256,
+        file_sha256,
         bytes: BackupTransferBytes::try_new(bytes)
             .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, error.detail))?,
     })
@@ -540,8 +558,6 @@ pub(crate) fn write_transfer_chunk(
     transfer_operation_id: &str,
     file_name: &str,
     offset: u64,
-    total_bytes: u64,
-    file_sha256: &str,
     bytes: &BackupTransferBytes,
 ) -> Result<(), Failure> {
     let operation = Uuid::parse_str(transfer_operation_id).map_err(|_| {
@@ -550,86 +566,60 @@ pub(crate) fn write_transfer_chunk(
             "backup copy operation id must be a UUID",
         )
     })?;
-    if !matches!(
-        file_name,
-        "postgresql.dump" | "deployment.tar" | IMMUTABLE_MANIFEST_FILE
-    ) || total_bytes == 0
-        || total_bytes > MAX_BACKUP_TRANSFER_FILE_BYTES
-        || !valid_sha256(file_sha256)
-        || offset
-            .checked_add(bytes.as_bytes().len() as u64)
-            .is_none_or(|end| end > total_bytes)
-    {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "backup transfer write has an invalid chunk binding",
-        ));
-    }
     let directory = scope_dir
         .join("backup")
         .join("transfers")
         .join(format!("import-{operation}.partial"));
     let path = directory.join(file_name);
     let end = offset + bytes.as_bytes().len() as u64;
-    if path.exists() {
-        let metadata = fs::symlink_metadata(&path).map_err(|error| backup_failure(error.into()))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.len() < offset
-            || metadata.len() > end
-        {
-            return Err(Failure::new(
-                BACKUP_EXECUTION_FAILED,
-                "backup transfer destination offset does not match its partial file",
-            ));
+    let length = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() < offset
+                || metadata.len() > end
+            {
+                return Err(Failure::new(
+                    BACKUP_EXECUTION_FAILED,
+                    "backup transfer destination offset does not match its partial file",
+                ));
+            }
+            metadata.len()
         }
-        // Pending journal replay may observe a complete or partially written
-        // chunk. Only bytes belonging to this exact request may be overwritten.
-        let mut file = fs::File::open(&path).map_err(|error| backup_failure(error.into()))?;
-        let mut existing = vec![0; (metadata.len() - offset) as usize];
-        file.seek(SeekFrom::Start(offset))
-            .and_then(|_| file.read_exact(&mut existing))
-            .map_err(|error| backup_failure(error.into()))?;
-        if existing != bytes.as_bytes()[..existing.len()] {
-            return Err(Failure::new(
-                BACKUP_EXECUTION_FAILED,
-                "backup transfer replay conflicts with persisted chunk bytes",
-            ));
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if offset != 0 {
+                return Err(Failure::new(
+                    BACKUP_EXECUTION_FAILED,
+                    "backup transfer destination is missing preceding chunks",
+                ));
+            }
+            crate::filesystem::atomic_write(&path, b"", 0o600).map_err(backup_failure)?;
+            0
         }
-    } else if offset != 0 {
-        return Err(Failure::new(
-            BACKUP_EXECUTION_FAILED,
-            "backup transfer destination is missing preceding chunks",
-        ));
-    } else {
-        crate::filesystem::atomic_write(&path, b"", 0o600).map_err(backup_failure)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    let mut file = options
+        Err(error) => return Err(backup_failure(error.into())),
+    };
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .open(&path)
         .map_err(|error| backup_failure(error.into()))?;
+    // The deployment journal holds its exclusive lock. A pending replay may
+    // find a complete or partial chunk; compare that prefix and append only
+    // missing bytes through the same handle.
+    let mut existing = vec![0; (length - offset) as usize];
     file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.write_all(bytes.as_bytes()))
-        .and_then(|_| file.sync_all())
+        .and_then(|_| file.read_exact(&mut existing))
         .map_err(|error| backup_failure(error.into()))?;
-    let written = fs::metadata(&path)
-        .map_err(|error| backup_failure(error.into()))?
-        .len();
-    if written != offset + bytes.as_bytes().len() as u64 {
+    if existing != bytes.as_bytes()[..existing.len()] {
         return Err(Failure::new(
             BACKUP_EXECUTION_FAILED,
-            "backup transfer destination did not persist the exact chunk length",
+            "backup transfer replay conflicts with persisted chunk bytes",
         ));
     }
+    file.write_all(&bytes.as_bytes()[existing.len()..])
+        .and_then(|_| file.sync_all())
+        .map_err(|error| backup_failure(error.into()))?;
     Ok(())
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 /// Verify every received byte against the transferred immutable manifest,
@@ -643,12 +633,6 @@ pub(crate) fn finalize_import(
     source_host_id: &str,
     destination_host_id: &str,
 ) -> Result<backup::OffHostCopyReceipt, Failure> {
-    if source_host_id == destination_host_id {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "backup import source and destination target identities must differ",
-        ));
-    }
     let operation = Uuid::parse_str(transfer_operation_id).map_err(|_| {
         Failure::new(
             HOST_ERR_OPERATION_INVALID,
@@ -723,15 +707,12 @@ pub(crate) fn finalize_import(
     let receipt = backup::OffHostCopyReceipt {
         schema: backup::OFF_HOST_COPY_RECEIPT_SCHEMA,
         deployment_id: deployment_id.to_owned(),
-        snapshot_id: manifest.snapshot_id.clone(),
-        manifest_sha256: manifest.manifest_sha256.clone(),
+        snapshot_id: manifest.snapshot_id,
+        manifest_sha256: manifest.manifest_sha256,
         source_host_id: source_host_id.to_owned(),
         destination_host_id: destination_host_id.to_owned(),
         verified_at: Utc::now(),
     };
-    receipt
-        .validate_against(&manifest)
-        .map_err(backup_failure)?;
     Ok(receipt)
 }
 
@@ -797,18 +778,6 @@ pub(crate) fn recover(
             "recovery operation id must be a UUID",
         )
     })?;
-    let epoch = Uuid::parse_str(state_epoch).map_err(|_| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "recovery state epoch must be a UUID",
-        )
-    })?;
-    if epoch.get_version_num() != 7 {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "recovery state epoch must be UUIDv7",
-        ));
-    }
     let manifest = backup::load_manifest(scope_dir)
         .map_err(restore_failure)?
         .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?;
@@ -834,7 +803,6 @@ pub(crate) fn recover(
         .join("backup")
         .join("snapshots")
         .join(&manifest.snapshot_id);
-    verify_snapshot_files(&snapshot_dir, &manifest).map_err(restore_failure)?;
     let recovery_root = scope_dir
         .join("backup")
         .join("recoveries")
@@ -880,6 +848,7 @@ pub(crate) fn recover(
         }
         return Ok(facts);
     }
+    verify_snapshot_files(&snapshot_dir, &manifest).map_err(restore_failure)?;
     let extracted = recovery_root.join("extracted");
     prepare_recovery_archive(
         &snapshot_dir.join("deployment.tar"),
@@ -1102,18 +1071,6 @@ pub(crate) fn stage_recovery_candidate(
             "recovery candidate operation id must be a UUID",
         )
     })?;
-    let epoch = Uuid::parse_str(state_epoch).map_err(|_| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "recovery state epoch must be a UUID",
-        )
-    })?;
-    if epoch.get_version_num() != 7 {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "recovery state epoch must be UUIDv7",
-        ));
-    }
     let manifest = backup::load_manifest(scope_dir)
         .map_err(restore_failure)?
         .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?;
@@ -1235,14 +1192,6 @@ pub(crate) fn stage_recovery_candidate(
     } else {
         materialize_target()?
     };
-    if let Some(requested) = target.version.as_deref()
-        && candidate_facts.release.version != requested
-    {
-        return Err(Failure::new(
-            RESTORE_TEST_FAILED,
-            "recorded recovery candidate Release differs from the requested version",
-        ));
-    }
     let config_bytes = crate::filesystem::read_secure_regular_file(
         &config,
         "restored deployment configuration",
@@ -1401,21 +1350,14 @@ pub(crate) fn activate_recovered_runtime(
             "recovery activation operation id must be a UUID",
         )
     })?;
-    let epoch = Uuid::parse_str(state_epoch).map_err(|_| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "recovery activation state epoch must be a UUID",
-        )
-    })?;
-    if epoch.get_version_num() != 7
-        || state
-            .active_host_operation
-            .as_ref()
-            .is_none_or(|active| active.operation_id != recovery_operation_id)
+    if state
+        .active_host_operation
+        .as_ref()
+        .is_none_or(|active| active.operation_id != recovery_operation_id)
     {
         return Err(Failure::new(
             HOST_ERR_OPERATION_INVALID,
-            "recovery activation is not bound to the restored deployment and UUIDv7 epoch",
+            "recovery activation is not bound to the restored deployment",
         ));
     }
     let completed_path = scope_dir
@@ -1475,15 +1417,15 @@ pub(crate) fn activate_recovered_runtime(
         backend
             .start(&state.runtime.object)
             .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    }
-    let activated = backend
-        .inspect(&state.runtime.object)
-        .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
-    if !same_recovery_runtime(&activated, &candidate_facts.artifact, state_epoch) {
-        return Err(Failure::new(
-            RESTORE_TEST_FAILED,
-            "recovery activation did not start the verified target Release",
-        ));
+        let activated = backend
+            .inspect(&state.runtime.object)
+            .map_err(|error| Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string())))?;
+        if !same_recovery_runtime(&activated, &candidate_facts.artifact, state_epoch) {
+            return Err(Failure::new(
+                RESTORE_TEST_FAILED,
+                "recovery activation did not start the verified target Release",
+            ));
+        }
     }
     let config_bytes = crate::filesystem::read_secure_regular_file(
         Path::new(&state.config.reference),
@@ -1619,17 +1561,13 @@ fn run_restore_rehearsal(
         // database carries no runtime grants. `nazoauth migrate` is the sole
         // grant authority: run the same one-shot the install uses, pointed at
         // the isolated database, before the candidate starts.
-        let runtime_role = {
-            let connection = postgres_connection(&runtime_url_path)?;
-            connection.url_without_password.username().to_owned()
-        };
         run_restore_migration(
             backend.as_ref(),
             &manifest.runtime_artifact,
             &data,
             &config,
             &secrets,
-            &runtime_role,
+            runtime_connection.url_without_password.username(),
         )?;
         start_candidate(
             backend.as_ref(),
@@ -1919,14 +1857,11 @@ fn snapshot_file(path: &Path, root: &Path) -> anyhow::Result<SnapshotFile> {
 fn verify_snapshot_files(root: &Path, manifest: &SnapshotManifest) -> anyhow::Result<()> {
     // Every caller holds a manifest validated by load_manifest[_at]. The files
     // remain mutable filesystem state and must be checked at this boundary.
-    let expected: BTreeSet<&str> = ["postgresql.dump", "deployment.tar"].into_iter().collect();
-    let actual = manifest
-        .files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<BTreeSet<_>>();
     ensure!(
-        actual == expected,
+        manifest
+            .files
+            .iter()
+            .all(|file| matches!(file.path.as_str(), "postgresql.dump" | "deployment.tar")),
         "snapshot manifest does not contain the required artifact set"
     );
     for file in &manifest.files {
@@ -2019,7 +1954,12 @@ fn create_deployment_archive(
             &mut files,
         )?;
     }
-    append_regular(&mut archive, config, Path::new("config.yaml"), &mut files)?;
+    append_bytes(
+        &mut archive,
+        Path::new("config.yaml"),
+        &config_bytes,
+        &mut files,
+    )?;
     append_bytes(
         &mut archive,
         Path::new(SNAPSHOT_SENTINEL_FILE),
@@ -2088,11 +2028,32 @@ fn append_regular(
         bail!("snapshot source is not an allowed regular file");
     }
     let mut file = fs::File::open(source)?;
-    archive.append_file(archive_path, &mut file)?;
+    let mut header = TarHeader::new_gnu();
+    header.set_metadata(&metadata);
+    // EntryWriter records the size actually copied. The manifest hashes those
+    // same bytes, even if the source changes during archiving.
+    let mut entry = archive.append_writer(&mut header, archive_path)?;
+    let mut digest = Sha256::new();
+    let mut size = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        ensure!(
+            size <= MAX_SNAPSHOT_FILE_BYTES,
+            "snapshot source exceeds the file size limit"
+        );
+        entry.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+    }
+    entry.finish()?;
     files.push(SnapshotFile {
         path: relative_archive_path(archive_path)?,
-        size: metadata.len(),
-        sha256: crate::filesystem::sha256(source)?,
+        size,
+        sha256: hex::encode(digest.finalize()),
     });
     Ok(())
 }
@@ -2143,9 +2104,9 @@ fn prepare_recovery_archive(
             let mut found = Vec::new();
             collect_regular_files(destination, destination, &mut found)?;
             found.sort_by(|a, b| a.path.cmp(&b.path));
-            let mut sorted_expected = expected.to_vec();
+            let mut sorted_expected = expected.iter().collect::<Vec<_>>();
             sorted_expected.sort_by(|a, b| a.path.cmp(&b.path));
-            if found == sorted_expected {
+            if found.iter().eq(sorted_expected) {
                 return Ok(());
             }
             // This operation-owned directory is derived entirely from the
@@ -2193,8 +2154,7 @@ fn extract_deployment_archive(
         if !matches!(entry_type, EntryType::Regular | EntryType::Directory) {
             bail!("deployment archive contains a non-file entry");
         }
-        let path = entry.path()?.into_owned();
-        relative_archive_path(&path)?;
+        relative_archive_path(&entry.path()?)?;
         if !entry.unpack_in(destination)? {
             bail!("deployment archive entry escapes the restore-test directory");
         }
@@ -2202,10 +2162,10 @@ fn extract_deployment_archive(
     let mut found = Vec::new();
     collect_regular_files(destination, destination, &mut found)?;
     found.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut expected = expected.to_vec();
+    let mut expected = expected.iter().collect::<Vec<_>>();
     expected.sort_by(|left, right| left.path.cmp(&right.path));
     ensure!(
-        found == expected,
+        found.iter().eq(expected),
         "extracted deployment files do not match the manifest"
     );
     Ok(())
@@ -2216,10 +2176,8 @@ fn collect_regular_files(
     directory: &Path,
     files: &mut Vec<SnapshotFile>,
 ) -> anyhow::Result<()> {
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             bail!("extracted deployment tree contains a symbolic link");
@@ -2233,15 +2191,6 @@ fn collect_regular_files(
         }
     }
     Ok(())
-}
-
-fn observe_exact_runtime_artifact(state: &DeploymentState) -> anyhow::Result<ArtifactReference> {
-    let kind = state.runtime.kind;
-    let backend = runtime_backend::backend(kind);
-    let observation = backend.inspect(&state.runtime.object)?;
-    ensure!(observation.running, "deployment runtime is not running");
-    artifact_matches_state(&observation.artifact, state)?;
-    Ok(observation.artifact)
 }
 
 fn artifact_matches_state(
@@ -2262,7 +2211,7 @@ fn artifact_matches_state(
         }
         ArtifactReference::HostBinary { sha256, .. } => {
             ensure!(
-                current == format!("sha256:{sha256}"),
+                current.strip_prefix("sha256:") == Some(sha256.as_str()),
                 "host runtime artifact differs from DeploymentState"
             );
         }
@@ -2304,11 +2253,10 @@ fn verify_runtime_identity(data: &Path, state: &DeploymentState) -> anyhow::Resu
     Ok(key_id)
 }
 
-fn run_pg_dump(database_url_file: &Path, output: &Path) -> anyhow::Result<()> {
-    let connection = postgres_connection(database_url_file)?;
+fn run_pg_dump(connection: &PostgresConnection, output: &Path) -> anyhow::Result<()> {
     run_postgres_command(
         "pg_dump",
-        &connection,
+        connection,
         [
             "--format=custom",
             "--no-owner",
@@ -2431,10 +2379,6 @@ fn ensure_postgres_output(program: &str, output: std::process::Output) -> anyhow
     }
     Ok(output)
 }
-fn database_sentinel(database_url_file: &Path) -> anyhow::Result<String> {
-    database_sentinel_with_connection(&postgres_connection(database_url_file)?)
-}
-
 fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow::Result<String> {
     let output = crate::process::Process::new("psql")
         .arg("--dbname")
@@ -2632,7 +2576,7 @@ fn start_candidate(
     let previous_signing_key_configured = signing_key_config
         .as_ref()
         .is_some_and(|config| config.previous_file.is_some());
-    let mut mounts = live.mounts.clone();
+    let mut mounts = live.mounts;
     replace_mount(&mut mounts, CONTAINER_DATA_DIR, data, false)?;
     // The runtime mounts each allowlisted secret file individually, never the
     // directory; repoint every one into the restored secrets directory.
@@ -2677,7 +2621,7 @@ fn start_candidate(
     );
     replace_mount(&mut mounts, CONTAINER_CONFIG_FILE, config, true)?;
     let port = reserve_loopback_port()?;
-    let mut environment = live.safe_environment.clone();
+    let mut environment = live.safe_environment;
     environment.insert(
         SERVER_CONFIG_FILE_ENV.to_owned(),
         CONTAINER_CONFIG_FILE.to_owned(),
@@ -2727,15 +2671,16 @@ fn replace_mount(
     source: &Path,
     read_only: bool,
 ) -> anyhow::Result<()> {
-    let matching = mounts
+    let mut matching = mounts
         .iter_mut()
-        .filter(|mount| mount.destination == Path::new(destination))
-        .collect::<Vec<_>>();
+        .filter(|mount| mount.destination == Path::new(destination));
+    let mount = matching
+        .next()
+        .with_context(|| format!("runtime has no {destination} mount"))?;
     ensure!(
-        matching.len() == 1,
-        "runtime does not have exactly one {destination} mount"
+        matching.next().is_none(),
+        "runtime has duplicate {destination} mounts"
     );
-    let mount = matching.into_iter().next().expect("length checked");
     mount.source = source.to_path_buf();
     mount.read_only = read_only;
     Ok(())
@@ -2769,9 +2714,10 @@ fn fetch_runtime(port: u16, path: &str, issuer: &str, config: &[u8]) -> anyhow::
     bail!("candidate probe {path} failed: {last}")
 }
 
-fn source_oidc_signing_key_ids(state: &DeploymentState) -> anyhow::Result<Vec<String>> {
-    let backend = runtime_backend::backend(state.runtime.kind);
-    let observation = backend.inspect(&state.runtime.object)?;
+fn source_oidc_signing_key_ids(
+    state: &DeploymentState,
+    observation: &RuntimeObservation,
+) -> anyhow::Result<Vec<String>> {
     let port = observation
         .ports
         .iter()
@@ -3119,8 +3065,206 @@ fn restore_failure(error: anyhow::Error) -> Failure {
 
 #[cfg(test)]
 mod tests {
+    use super::super::wire::{MAX_BACKUP_TRANSFER_CHUNK_BYTES, MAX_BACKUP_TRANSFER_FILE_BYTES};
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_recovery_reuses_restored_facts_without_reading_backup() -> anyhow::Result<()> {
+        let Some(root) = std::env::var_os("BACKUP_REPLAY_TEST_ROOT") else {
+            use std::os::unix::fs::PermissionsExt as _;
+            let temp = crate::filesystem::PrivateTempDir::new("backup-replay-process")?;
+            for (program, body) in [
+                (
+                    "docker",
+                    r#"printf '%s\n' "$1" >> "$BACKUP_REPLAY_TEST_ROOT/calls"
+case "$1" in
+ container) cat "$BACKUP_REPLAY_TEST_ROOT/runtime.json";;
+ image) cat "$BACKUP_REPLAY_TEST_ROOT/image.json";;
+ *) exit 91;;
+esac"#,
+                ),
+                (
+                    "psql",
+                    r#"cat >/dev/null
+cat "$BACKUP_REPLAY_TEST_ROOT/sentinel""#,
+                ),
+            ] {
+                let path = temp.path().join(program);
+                fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))?;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+            let result = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "target::backup_exec::tests::completed_recovery_reuses_restored_facts_without_reading_backup", "--nocapture"])
+                .env("NAZOAUTHCTL_TESTING", "1")
+                .env("BACKUP_REPLAY_TEST_ROOT", temp.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+                .output()?;
+            ensure!(
+                result.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return Ok(());
+        };
+        let root = PathBuf::from(root);
+        let mut state: DeploymentState = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/persistence/v0.2.28/state.json"
+        ))?;
+        state.runtime.kind = RuntimeBackendKind::Docker;
+        let mut manifest: SnapshotManifest = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/persistence/v0.2.28/snapshot-manifest.json"
+        ))?;
+        manifest.files[0].path = "postgresql.dump".to_owned();
+        manifest.database_sentinel_sha256 = backup::hex_digest(b"restored-fact");
+        manifest.manifest_sha256 = manifest.computed_sha256()?;
+        let operation = state
+            .active_host_operation
+            .as_ref()
+            .unwrap()
+            .operation_id
+            .clone();
+        let epoch = Uuid::now_v7().to_string();
+        let secrets = root.join("secrets");
+        fs::create_dir(&secrets)?;
+        write_fixture(
+            secrets.join("database-lifecycle-url"),
+            b"postgresql://operator:unused@localhost/restored",
+        )?;
+        state
+            .resources
+            .push(super::super::deployment_state::Resource::new(
+                "app-secrets",
+                "directory",
+                secrets.to_str().unwrap(),
+                ResourceOwnership::Managed,
+                ResourceScope::Deployment,
+            )?);
+        let store = super::super::deployment_state::TargetStateStore::open(root.join("state"))?;
+        let scope = store.scope_dir(&state.deployment_id)?;
+        backup::write_manifest(&scope, &manifest)?;
+        let completed = scope
+            .join("backup/recoveries")
+            .join(&operation)
+            .join("completed.json");
+        crate::filesystem::ensure_private_directory(completed.parent().unwrap(), "recovery test")?;
+        let mut facts = RecoveryFacts {
+            operation_id: operation.clone(),
+            snapshot_id: manifest.snapshot_id.clone(),
+            manifest_sha256: manifest.manifest_sha256.clone(),
+            restored_database: "restored".to_owned(),
+            artifact: manifest.runtime_artifact.clone(),
+            release: manifest.release.clone(),
+            config_schema: manifest.config_schema.clone(),
+        };
+        write_fixture(&completed, serde_json::to_vec(&facts)?)?;
+        let image = format!("example/nazo@sha256:{}", "a".repeat(64));
+        let mut runtime = serde_json::json!({
+            "Id":"source-id", "Name":"live", "Path":"nazoauth", "Args":["server"],
+            "Config":{"Image":image,"Env":[format!("VALKEY_STATE_EPOCH={epoch}")]},
+            "State":{"Running":false}, "Mounts":[]
+        });
+        fs::write(root.join("runtime.json"), serde_json::to_vec(&runtime)?)?;
+        fs::write(root.join("image.json"), serde_json::to_vec(&vec![image])?)?;
+        fs::write(root.join("sentinel"), b"restored-fact\n")?;
+        // No dump/archive exists: a completed recovery consumes the live restored facts.
+        assert!(!scope.join("backup/snapshots").exists());
+        assert_eq!(
+            recover(
+                &scope,
+                &state,
+                &manifest.manifest_sha256,
+                &epoch,
+                &operation
+            )?,
+            facts
+        );
+        fs::write(root.join("sentinel"), b"changed-fact\n")?;
+        assert!(
+            recover(
+                &scope,
+                &state,
+                &manifest.manifest_sha256,
+                &epoch,
+                &operation
+            )
+            .is_err()
+        );
+        fs::write(root.join("sentinel"), b"restored-fact\n")?;
+        facts.operation_id = Uuid::now_v7().to_string();
+        write_fixture(&completed, serde_json::to_vec(&facts)?)?;
+        assert!(
+            recover(
+                &scope,
+                &state,
+                &manifest.manifest_sha256,
+                &epoch,
+                &operation
+            )
+            .is_err()
+        );
+        facts.operation_id = operation.clone();
+        write_fixture(&completed, serde_json::to_vec(&facts)?)?;
+        write_fixture(
+            completed.with_file_name("candidate-release.json"),
+            serde_json::to_vec(&RecoveryCandidateFacts {
+                schema: 2,
+                operation_id: operation.clone(),
+                artifact: facts.artifact,
+                release: facts.release,
+            })?,
+        )?;
+        runtime["State"]["Running"] = serde_json::json!(true);
+        fs::write(root.join("runtime.json"), serde_json::to_vec(&runtime)?)?;
+        fs::write(root.join("calls"), b"")?;
+        state.config.reference = root.join("absent-config").to_string_lossy().into_owned();
+        let error =
+            activate_recovered_runtime(&scope, &state, &store, "activate", &operation, &epoch, 0)
+                .unwrap_err();
+        assert!(error.detail.contains("configuration"), "{}", error.detail);
+        assert_eq!(
+            fs::read_to_string(root.join("calls"))?,
+            "container\nimage\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn archived_file_digest_binds_the_written_stream() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("archive-stream")?;
+        let source = temp.path().join("source");
+        let archive_path = temp.path().join("deployment.tar");
+        let mut archive = TarBuilder::new(fs::File::create(&archive_path)?);
+        let mut expected = Vec::new();
+        let bytes: Vec<u8> = (0..(128 * 1024 + 17)).map(|index| index as u8).collect();
+        write_fixture(&source, &bytes)?;
+        let long_path = format!("app-data/{}/data", "long".repeat(35));
+        append_regular(&mut archive, &source, Path::new(&long_path), &mut expected)?;
+        assert_eq!(expected[0].size, bytes.len() as u64);
+        assert_eq!(expected[0].sha256, backup::hex_digest(&bytes));
+        // A sparse input must still produce a regular entry the restore path accepts.
+        let mut sparse = fs::File::create(&source)?;
+        sparse.seek(SeekFrom::Start(256 * 1024))?;
+        sparse.write_all(b"tail")?;
+        drop(sparse);
+        append_regular(&mut archive, &source, Path::new("sparse"), &mut expected)?;
+        fs::write(&source, b"")?;
+        append_regular(&mut archive, &source, Path::new("empty"), &mut expected)?;
+        archive.finish()?;
+        drop(archive);
+        fs::remove_file(&source)?;
+        let destination = temp.path().join("restore");
+        fs::create_dir(&destination)?;
+        extract_deployment_archive(&archive_path, &destination, &expected)?;
+        assert_eq!(fs::read(destination.join(&long_path))?, bytes);
+        let sparse = fs::read(destination.join("sparse"))?;
+        assert!(sparse[..256 * 1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&sparse[256 * 1024..], b"tail");
+        assert_eq!(fs::metadata(destination.join("empty"))?.len(), 0);
+        Ok(())
+    }
 
     #[test]
     fn recovery_extraction_rebuilds_interrupted_staging_and_reuses_complete_content()
@@ -3312,7 +3456,7 @@ mod tests {
                 } else {
                     "legacy.dump"
                 });
-                run_pg_dump(&source_url_file, &dump)?;
+                run_pg_dump(&source, &dump)?;
                 create_database(&admin, &restored_name)?;
                 restore_database(&admin, &dump, &restored_name)?;
                 let actual =
@@ -3363,7 +3507,7 @@ mod tests {
                 "ALTER TABLE missing_issuances RENAME TO oauth_token_issuances",
             )?;
             let dump = temp.path().join("released.dump");
-            run_pg_dump(&source_url_file, &dump)?;
+            run_pg_dump(&source, &dump)?;
             create_database(&admin, &restored_name)?;
             restore_database(&admin, &dump, &restored_name)?;
             ensure!(
@@ -3551,6 +3695,13 @@ mod tests {
             oidc_signing_key_ids: vec!["signing-key".to_owned()],
             manifest_sha256: String::new(),
         };
+        manifest
+            .archive_files
+            .extend((1..4096).map(|index| SnapshotFile {
+                path: format!("app-data/{index:04}-{}.bin", "x".repeat(100)),
+                size: 1,
+                sha256: backup::hex_digest(b"x"),
+            }));
         manifest.manifest_sha256 = manifest.computed_sha256()?;
         backup::write_manifest_at(&final_dir.join(IMMUTABLE_MANIFEST_FILE), &manifest)?;
         write_fixture(backup::receipt_path(&scope_dir), b"stale")?;
@@ -3567,23 +3718,35 @@ mod tests {
         let plan = prepare_export(&scope_dir, &state, &transfer)?;
         let destination = crate::filesystem::PrivateTempDir::new("backup-import-replay")?;
         prepare_import(destination.path(), deployment_id, &transfer)?;
+        assert!(
+            plan.files
+                .iter()
+                .find(|file| file.path == IMMUTABLE_MANIFEST_FILE)
+                .unwrap()
+                .size
+                > MAX_BACKUP_TRANSFER_CHUNK_BYTES as u64
+        );
         for file in plan.files {
-            let chunk = read_transfer_chunk(
-                &scope_dir,
-                &transfer,
-                &file.path,
-                0,
-                MAX_BACKUP_TRANSFER_CHUNK_BYTES as u32,
-            )?;
-            write_transfer_chunk(
-                destination.path(),
-                &transfer,
-                &file.path,
-                0,
-                chunk.total_bytes,
-                &chunk.file_sha256,
-                &chunk.bytes,
-            )?;
+            let mut offset = 0;
+            while offset < file.size {
+                let chunk = read_transfer_chunk(
+                    &scope_dir,
+                    &transfer,
+                    &file.path,
+                    offset,
+                    MAX_BACKUP_TRANSFER_CHUNK_BYTES as u32,
+                )?;
+                assert_eq!(chunk.file_sha256, file.sha256);
+                assert_eq!(chunk.total_bytes, file.size);
+                write_transfer_chunk(
+                    destination.path(),
+                    &transfer,
+                    &file.path,
+                    offset,
+                    &chunk.bytes,
+                )?;
+                offset += chunk.bytes.as_bytes().len() as u64;
+            }
         }
         // Imported backup bytes must already satisfy the private-file contract
         // before publication, independently of the process token's default ACL.
@@ -3601,6 +3764,23 @@ mod tests {
         }
         let source_host = Uuid::now_v7().to_string();
         let destination_host = Uuid::now_v7().to_string();
+        let imported_dump = destination
+            .path()
+            .join("backup/transfers")
+            .join(format!("import-{transfer}.partial/postgresql.dump"));
+        write_fixture(&imported_dump, b"tampered")?;
+        assert!(
+            finalize_import(
+                destination.path(),
+                deployment_id,
+                &transfer,
+                &manifest.manifest_sha256,
+                &source_host,
+                &destination_host
+            )
+            .is_err()
+        );
+        write_fixture(&imported_dump, b"database")?;
         let first = finalize_import(
             destination.path(),
             deployment_id,
@@ -3653,79 +3833,29 @@ mod tests {
         let temp = crate::filesystem::PrivateTempDir::new("backup-transfer-write")?;
         let operation = Uuid::now_v7().to_string();
         prepare_import(temp.path(), "deploy-alpha", &operation)?;
-        let digest = "a".repeat(64);
         let first = BackupTransferBytes::try_new(b"abc".to_vec())?;
-        write_transfer_chunk(
-            temp.path(),
-            &operation,
-            "deployment.tar",
-            0,
-            6,
-            &digest,
-            &first,
-        )?;
+        write_transfer_chunk(temp.path(), &operation, "deployment.tar", 0, &first)?;
         let second = BackupTransferBytes::try_new(b"def".to_vec())?;
-        write_transfer_chunk(
-            temp.path(),
-            &operation,
-            "deployment.tar",
-            3,
-            6,
-            &digest,
-            &second,
-        )?;
+        write_transfer_chunk(temp.path(), &operation, "deployment.tar", 3, &second)?;
         let path = temp
             .path()
             .join("backup/transfers")
             .join(format!("import-{operation}.partial"))
             .join("deployment.tar");
         // A crash after the write but before its terminal journal replays this chunk.
-        write_transfer_chunk(
-            temp.path(),
-            &operation,
-            "deployment.tar",
-            3,
-            6,
-            &digest,
-            &second,
-        )?;
+        write_transfer_chunk(temp.path(), &operation, "deployment.tar", 3, &second)?;
         assert_eq!(fs::read(&path)?, b"abcdef");
         // The same pending request can also encounter a partial write.
         fs::OpenOptions::new().write(true).open(&path)?.set_len(4)?;
-        write_transfer_chunk(
-            temp.path(),
-            &operation,
-            "deployment.tar",
-            3,
-            6,
-            &digest,
-            &second,
-        )?;
+        write_transfer_chunk(temp.path(), &operation, "deployment.tar", 3, &second)?;
         assert_eq!(fs::read(&path)?, b"abcdef");
         let conflicting = BackupTransferBytes::try_new(b"xyz".to_vec())?;
         assert!(
-            write_transfer_chunk(
-                temp.path(),
-                &operation,
-                "deployment.tar",
-                3,
-                6,
-                &digest,
-                &conflicting
-            )
-            .is_err()
+            write_transfer_chunk(temp.path(), &operation, "deployment.tar", 3, &conflicting)
+                .is_err()
         );
         assert!(
-            write_transfer_chunk(
-                temp.path(),
-                &operation,
-                "deployment.tar",
-                1,
-                6,
-                &digest,
-                &second,
-            )
-            .is_err()
+            write_transfer_chunk(temp.path(), &operation, "deployment.tar", 1, &second,).is_err()
         );
         Ok(())
     }

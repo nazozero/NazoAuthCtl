@@ -30,14 +30,13 @@ use std::{
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 use uuid::Uuid;
 
-use crate::filesystem;
 use crate::target::wire::{RemoteHello, verify_remote_hello};
 use crate::target::{ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome, LocalTarget};
+use crate::{file_lock::FileLock, filesystem};
 
 /// Schema discriminator carried by every persisted registry record.
 pub const REGISTRY_RECORD_SCHEMA: u32 = 3;
@@ -540,26 +539,6 @@ pub(crate) fn validate_issuer(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Exclusive registry lock held across a store operation.
-struct StoreLock {
-    file: fs::File,
-}
-
-impl StoreLock {
-    fn acquire(path: &Path) -> anyhow::Result<Self> {
-        let file = filesystem::open_lock_file(path, false, "registry lock")?;
-        file.try_lock_exclusive()
-            .with_context(|| format!("another operation holds {}", path.display()))?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
 /// Handle to the user-scoped registry store.
 #[derive(Clone, Debug)]
 pub struct RegistryStore {
@@ -610,8 +589,8 @@ impl RegistryStore {
         self.root.join("registry.lock")
     }
 
-    fn lock(&self) -> anyhow::Result<StoreLock> {
-        StoreLock::acquire(&self.lock_path())
+    fn lock(&self) -> anyhow::Result<FileLock> {
+        FileLock::acquire(&self.lock_path())
     }
 
     /// Create the reserved built-in `local` host exactly once.
@@ -629,10 +608,11 @@ impl RegistryStore {
     pub fn add_host(&self, record: HostRecord) -> anyhow::Result<HostRecord> {
         record.validate()?;
         let _lock = self.lock()?;
-        if self.find_host_by_alias_locked(&record.alias)?.is_some() {
+        let hosts = self.load_all_locked::<HostRecord>(Directory::Hosts)?;
+        if hosts.iter().any(|host| host.alias == record.alias) {
             bail!("duplicate host alias '{}'", record.alias);
         }
-        if self.find_host_by_id_locked(record.host_id)?.is_some() {
+        if hosts.iter().any(|host| host.host_id == record.host_id) {
             bail!("duplicate host id {}", record.host_id);
         }
         self.write_host_locked(&record)?;
@@ -690,13 +670,16 @@ impl RegistryStore {
         new_alias: impl Into<String>,
     ) -> anyhow::Result<InstanceRecord> {
         let _lock = self.lock()?;
-        let record = self
-            .find_instance_by_alias_locked(old_alias)?
+        let mut instances = self.load_all_locked::<InstanceRecord>(Directory::Instances)?;
+        let index = instances
+            .iter()
+            .position(|record| record.alias == old_alias)
             .with_context(|| format!("unknown instance alias '{old_alias}'"))?;
         let new_alias = new_alias.into();
-        if new_alias != record.alias && self.find_instance_by_alias_locked(&new_alias)?.is_some() {
+        if new_alias != old_alias && instances.iter().any(|record| record.alias == new_alias) {
             bail!("duplicate instance alias '{new_alias}'");
         }
+        let record = instances.swap_remove(index);
         let renamed = record.renamed(new_alias)?;
         let path = self.instance_path(&renamed.deployment_id);
         write_record(&path, "instance record", &renamed)?;
@@ -1114,10 +1097,16 @@ impl ConformingRecord for InstanceRecord {
 }
 
 fn read_optional_record<T: ConformingRecord>(path: &Path, stem: &str) -> anyhow::Result<Option<T>> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => read_record(path, stem).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    match read_record(path, stem) {
+        Ok(record) => Ok(Some(record)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 

@@ -36,7 +36,8 @@ fn durable_file_helpers_round_trip_bytes_digest_and_absent_removal() {
     );
 
     let copy = work.path().join("copied");
-    copy_atomic(&source, &copy, 0o600).unwrap();
+    let mut source_file = open_secure_regular_file(&source, "copy source", false).unwrap();
+    copy_atomic_from_file(&mut source_file, &copy, 0o600, None).unwrap();
     assert_eq!(fs::read(&copy).unwrap(), b"abc");
     remove_file_durable(&copy).unwrap();
     remove_file_durable(&copy).unwrap();
@@ -91,10 +92,12 @@ fn filesystem_helpers_fail_closed_without_clobbering_staging_or_non_files() {
     fs::create_dir(&directory).unwrap();
     assert!(atomic_write(&directory, b"replacement", 0o600).is_err());
     assert!(remove_file_durable(&directory).is_err());
-    assert!(copy_atomic(&work.path().join("missing"), &target, 0o600).is_err());
     let source = work.path().join("verified-source");
     atomic_write(&source, b"candidate", 0o600).unwrap();
-    assert!(copy_atomic_verified(&source, &target, 0o600, &"00".repeat(32)).is_err());
+    let mut source_file = open_secure_regular_file(&source, "verified source", false).unwrap();
+    assert!(
+        copy_atomic_from_file(&mut source_file, &target, 0o600, Some(&"00".repeat(32))).is_err()
+    );
     assert_eq!(fs::read(&target).unwrap(), b"replacement");
     assert!(sha256(&work.path().join("missing")).is_err());
     assert!(
@@ -348,4 +351,31 @@ fn security_cloud_data_ownership_rejects_links_without_touching_targets() -> any
     let after = std::fs::metadata(outside)?;
     assert_eq!((before.uid(), before.mode()), (after.uid(), after.mode()));
     Ok(())
+}
+
+#[test]
+fn verified_atomic_copy_checks_all_bytes_before_publishing() {
+    use std::io::{Seek as _, SeekFrom};
+    let work = PrivateTempDir::new("nazoauthctl-verified-copy").unwrap();
+    let source = work.path().join("source");
+    let target = work.path().join("target");
+    let mut content = vec![b'a'; 2 * 64 * 1024 + 17];
+    atomic_write(&source, &content, 0o600).unwrap();
+    atomic_write(&target, b"previous", 0o600).unwrap();
+    let expected = sha256(&source).unwrap();
+    let mut opened = open_secure_regular_file(&source, "source", false).unwrap();
+    // The copy owns rewinding and must hash the whole file, including its final chunk.
+    opened.seek(SeekFrom::End(0)).unwrap();
+    copy_atomic_from_file(&mut opened, &target, 0o600, Some(&expected)).unwrap();
+    assert_eq!(fs::read(&target).unwrap(), content);
+    *content.last_mut().unwrap() = b'b';
+    fs::write(&source, &content).unwrap();
+    atomic_write(&target, b"previous", 0o600).unwrap();
+    assert!(copy_atomic_from_file(&mut opened, &target, 0o600, Some(&expected)).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"previous");
+    assert_eq!(
+        fs::read_dir(work.path()).unwrap().count(),
+        2,
+        "failed copy must remove its staging file"
+    );
 }

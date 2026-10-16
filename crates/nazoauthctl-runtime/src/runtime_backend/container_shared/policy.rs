@@ -110,12 +110,9 @@ pub(crate) fn assert_container_image(
     bail!("refusing to manage a {backend_name} container whose immutable image does not match")
 }
 
-pub(crate) fn inspect_image_environment(
-    command: &OsStr,
-    image: &str,
-    backend_name: &str,
-) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-    let document = inspect_document(command, &["image", "inspect", image], backend_name)?;
+pub(crate) fn image_environment(
+    document: &serde_json::Value,
+) -> anyhow::Result<std::collections::BTreeMap<&str, &str>> {
     let values = document
         .pointer("/Config/Env")
         .and_then(serde_json::Value::as_array)
@@ -125,11 +122,7 @@ pub(crate) fn inspect_image_environment(
         let (name, value) = value
             .split_once('=')
             .context("managed image contains an invalid environment entry")?;
-        if name.is_empty()
-            || environment
-                .insert(name.to_owned(), value.to_owned())
-                .is_some()
-        {
+        if name.is_empty() || environment.insert(name, value).is_some() {
             bail!("managed image environment is ambiguous");
         }
     }
@@ -236,7 +229,7 @@ pub(crate) fn assert_managed_container_policy(
     expected_network: &str,
     expected_mounts: &[(&str, bool, Option<&str>)],
     expected_environment: &[(&str, &str)],
-    image_environment: &std::collections::BTreeMap<String, String>,
+    image_environment: &std::collections::BTreeMap<&str, &str>,
 ) -> anyhow::Result<()> {
     let host_config = document
         .get("HostConfig")
@@ -311,7 +304,9 @@ pub(crate) fn assert_managed_container_policy(
             .filter_map(serde_json::Value::as_str)
             .any(|value| {
                 value.eq_ignore_ascii_case("no-new-privileges")
-                    || value.to_ascii_lowercase().starts_with("no-new-privileges=")
+                    || value
+                        .split_once('=')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("no-new-privileges"))
             })
     {
         bail!("{backend_name} managed container no-new-privileges policy drifted");
@@ -372,22 +367,18 @@ pub(crate) fn assert_managed_container_policy(
     let expected_tmpfs = policy
         .tmpfs
         .iter()
-        .map(|tmpfs| tmpfs.destination.to_string_lossy().into_owned())
+        .map(|tmpfs| tmpfs.destination.to_string_lossy())
         .collect::<std::collections::BTreeSet<_>>();
-    if observed_tmpfs
-        .keys()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>()
-        != expected_tmpfs
+    if observed_tmpfs.len() != expected_tmpfs.len()
+        || !expected_tmpfs
+            .iter()
+            .all(|destination| observed_tmpfs.contains_key(destination.as_ref()))
     {
         bail!("{backend_name} managed container tmpfs surface drifted");
     }
     for tmpfs in &policy.tmpfs {
         let destination = tmpfs.destination.to_string_lossy();
-        let observed = host_config
-            .get("Tmpfs")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|tmpfses| tmpfses.get(destination.as_ref()));
+        let observed = observed_tmpfs.get(destination.as_ref());
         let Some(observed) = observed else {
             bail!("{backend_name} managed container tmpfs policy drifted");
         };
@@ -412,22 +403,19 @@ pub(crate) fn assert_managed_container_policy(
         .context("container inspect omitted managed mounts")?;
     let mut expected_destinations = expected_mounts
         .iter()
-        .map(|(destination, _, _)| (*destination).to_owned())
-        .collect::<std::collections::BTreeSet<String>>();
+        .map(|(destination, _, _)| *destination)
+        .collect::<std::collections::BTreeSet<_>>();
     expected_destinations.extend(
-        policy
-            .tmpfs
+        expected_tmpfs
             .iter()
-            .map(|tmpfs| tmpfs.destination.to_string_lossy().into_owned()),
+            .map(|destination| destination.as_ref()),
     );
     for mount in mounts {
         let destination = mount
             .get("Destination")
             .and_then(serde_json::Value::as_str)
             .context("container inspect returned a mount without a destination")?;
-        if !expected_destinations
-            .iter()
-            .any(|expected| expected.as_str() == destination)
+        if !expected_destinations.contains(destination)
             && !ENGINE_FIXED_MOUNT_DESTINATIONS.contains(&destination)
         {
             bail!("{backend_name} managed container contains an undeclared mount");
@@ -483,7 +471,7 @@ pub(crate) fn assert_managed_container_policy(
         }
         if !expected_names.contains(name)
             && !ENGINE_FIXED_ENV_NAMES.contains(&name)
-            && image_environment.get(name).map(String::as_str) != Some(value)
+            && image_environment.get(name).copied() != Some(value)
         {
             bail!("{backend_name} managed container contains an undeclared environment variable");
         }
@@ -497,11 +485,10 @@ pub(crate) fn assert_managed_container_policy(
         }
     }
     for (name, expected) in image_environment {
-        if expected_names.contains(name.as_str()) || ENGINE_FIXED_ENV_NAMES.contains(&name.as_str())
-        {
+        if expected_names.contains(name) || ENGINE_FIXED_ENV_NAMES.contains(name) {
             continue;
         }
-        if observed_environment.get(name.as_str()).copied() != Some(expected.as_str()) {
+        if observed_environment.get(name).copied() != Some(*expected) {
             bail!("{backend_name} managed container image environment drifted");
         }
     }
@@ -519,8 +506,11 @@ pub(crate) fn observed_cap_drop_all(values: &[serde_json::Value]) -> bool {
         .iter()
         .filter_map(serde_json::Value::as_str)
         .map(|value| {
-            let upper = value.to_ascii_uppercase();
-            upper.strip_prefix("CAP_").unwrap_or(&upper).to_owned()
+            let mut upper = value.to_ascii_uppercase();
+            if upper.starts_with("CAP_") {
+                upper.drain(..4);
+            }
+            upper
         })
         .collect::<std::collections::BTreeSet<_>>();
     if normalized.contains("ALL") {
@@ -553,8 +543,14 @@ fn mount_source_matches(observed: &str, expected: &str) -> bool {
     observed == expected
         || (!expected.contains('/')
             && !expected.contains('\\')
-            && (observed.ends_with(&format!("/{expected}/_data"))
-                || observed.ends_with(&format!("\\{expected}\\_data"))))
+            && [('/', "/_data"), ('\\', "\\_data")]
+                .into_iter()
+                .any(|(separator, suffix)| {
+                    observed
+                        .strip_suffix(suffix)
+                        .and_then(|parent| parent.rsplit_once(separator))
+                        .is_some_and(|(_, name)| name == expected)
+                }))
 }
 
 fn inspect_u64_field(
@@ -703,10 +699,7 @@ mod tests {
     #[test]
     fn environment_index_preserves_declared_image_and_duplicate_rules() {
         let policy = ContainerRuntimePolicy::managed_default();
-        let image = std::collections::BTreeMap::from([
-            ("PATH".to_owned(), "/bin".to_owned()),
-            ("MODE".to_owned(), "image-default".to_owned()),
-        ]);
+        let image = std::collections::BTreeMap::from([("PATH", "/bin"), ("MODE", "image-default")]);
         for (env, error) in [
             (
                 vec!["PATH=/bin", "MODE=managed", "API_SECRET=approved"],

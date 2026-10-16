@@ -76,7 +76,7 @@ pub(super) fn inspect(
     observation_from_document(command, &value)
 }
 
-pub(super) fn observation_from_document(
+fn observation_from_document(
     command: &OsStr,
     value: &serde_json::Value,
 ) -> anyhow::Result<RuntimeObservation> {
@@ -218,7 +218,9 @@ fn parse_ports(value: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     Ok(observed)
 }
 
-fn parse_mounts(value: &serde_json::Value) -> anyhow::Result<Vec<super::super::NeutralMount>> {
+pub(super) fn parse_mounts(
+    value: &serde_json::Value,
+) -> anyhow::Result<Vec<super::super::NeutralMount>> {
     let Some(raw_mounts) = value.get("Mounts") else {
         return Ok(Vec::new());
     };

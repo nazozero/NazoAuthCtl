@@ -50,29 +50,6 @@ pub(super) fn stop(command: &OsStr, object_reference: &str) -> anyhow::Result<()
         .run_quiet()
 }
 
-pub(super) fn quiesce_for_recovery(command: &OsStr, object_reference: &str) -> anyhow::Result<()> {
-    let output = Process::new(command)
-        .args(["inspect", "--type", "container", object_reference])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("no such object")
-            || stderr.contains("no such container")
-            || stderr.contains("no container with name or id")
-        {
-            return Ok(());
-        }
-        bail!("Podman could not prove the recovery runtime is stopped or absent");
-    }
-    if super::discovery::inspect(command, object_reference)?.running {
-        stop(command, object_reference)?;
-    }
-    if super::discovery::inspect(command, object_reference)?.running {
-        bail!("Podman recovery runtime remained active after stop");
-    }
-    Ok(())
-}
-
 pub(super) fn restart(command: &OsStr, object_reference: &str) -> anyhow::Result<()> {
     Process::new(command)
         .args(["restart", object_reference])

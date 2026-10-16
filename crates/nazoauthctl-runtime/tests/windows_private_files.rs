@@ -9,7 +9,7 @@
 use std::{fs, path::Path};
 
 use nazoauthctl_runtime::filesystem::{
-    PrivateTempDir, atomic_write, copy_atomic, open_lock_file, open_secure_regular_file,
+    PrivateTempDir, atomic_write, copy_atomic_from_file, open_lock_file, open_secure_regular_file,
     read_secure_regular_file, set_mode, validate_secure_directory,
 };
 
@@ -167,7 +167,9 @@ fn windows_lock_and_copy_share_private_creation_contract() {
     let target = path.with_file_name("copy");
     atomic_write(&path, b"copy-me", 0o600).expect("source should be written");
     for mode in [0o400, 0o440, 0o444, 0o600] {
-        copy_atomic(&path, &target, mode).expect("copy should use the same secure staging path");
+        let mut source = open_secure_regular_file(&path, "copy source", false).unwrap();
+        copy_atomic_from_file(&mut source, &target, mode, None)
+            .expect("copy should use the same secure staging path");
         assert_eq!(
             read_secure_regular_file(&target, "private copy", true, 128)
                 .expect("copied file must retain the final protected trusted-only ACL")
@@ -176,4 +178,26 @@ fn windows_lock_and_copy_share_private_creation_contract() {
         );
     }
     assert!(Path::new(&lock_path).is_file());
+}
+
+#[test]
+fn windows_native_open_preserves_missing_and_existing_error_kinds() {
+    use nazoauthctl_runtime::secure_file::{self, SecureFileError};
+    let dir = PrivateTempDir::new("nazoauth-win-open-errors").unwrap();
+    let missing = dir.path().join("missing");
+    assert_eq!(
+        secure_file::read_bounded(&missing, 64, true),
+        Err(SecureFileError::NotFound)
+    );
+    assert_eq!(
+        secure_file::remove_file(&missing, true),
+        Err(SecureFileError::NotFound)
+    );
+    let lock_path = dir.path().join("lock");
+    let first = open_lock_file(&lock_path, false, "lock").unwrap();
+    let reopened = open_lock_file(&lock_path, false, "existing lock").unwrap();
+    assert_eq!(
+        first.metadata().unwrap().len(),
+        reopened.metadata().unwrap().len()
+    );
 }

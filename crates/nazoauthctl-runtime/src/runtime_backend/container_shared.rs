@@ -20,7 +20,7 @@ mod recovery;
 use policy::observed_cap_drop_all;
 pub(crate) use policy::{
     append_container_policy, assert_container_image, assert_managed_container_policy,
-    command_stdout, inspect_document, inspect_document_optional, inspect_image_environment,
+    command_stdout, image_environment, inspect_document, inspect_document_optional,
     is_engine_unavailable_error, remove_replacement_source,
 };
 pub(crate) use recovery::{cleanup_recovery_candidate, stage_recovery_candidate};
@@ -269,10 +269,7 @@ mod tests {
                 "managed-network",
                 &[("/data", false, Some("managed-data"))],
                 &[("POSTGRES_DB", "oauth")],
-                &std::collections::BTreeMap::from([(
-                    "PATH".to_owned(),
-                    "/usr/local/bin".to_owned(),
-                )]),
+                &std::collections::BTreeMap::from([("PATH", "/usr/local/bin")]),
             )
             .unwrap_err();
             assert!(error.to_string().contains(expected_error));
@@ -316,10 +313,7 @@ mod tests {
                 "managed-network",
                 &[("/data", false, Some("managed-data"))],
                 &[("POSTGRES_DB", "oauth")],
-                &std::collections::BTreeMap::from([(
-                    "PATH".to_owned(),
-                    "/usr/local/bin".to_owned(),
-                )]),
+                &std::collections::BTreeMap::from([("PATH", "/usr/local/bin")]),
             )
         }
 
@@ -361,6 +355,39 @@ pub(crate) fn append_mounts(mut command: Process, mounts: &[NeutralMount]) -> Pr
         ));
     }
     command
+}
+
+/// Stop the runtime, returning whether it was running before this operation.
+/// Recovery needs the running state, not image, mount, or discovery metadata.
+pub(crate) fn quiesce_for_recovery(
+    command: &OsStr,
+    object_reference: &str,
+    backend_name: &str,
+) -> anyhow::Result<bool> {
+    let running = || -> anyhow::Result<bool> {
+        let Some(document) = inspect_document_optional(
+            command,
+            &["container", "inspect", object_reference],
+            backend_name,
+        )?
+        else {
+            return Ok(false);
+        };
+        document
+            .pointer("/State/Running")
+            .and_then(serde_json::Value::as_bool)
+            .with_context(|| format!("{backend_name} inspect omitted the runtime running state"))
+    };
+    if !running()? {
+        return Ok(false);
+    }
+    Process::new(command)
+        .args(["stop", object_reference])
+        .run_quiet()?;
+    if running()? {
+        bail!("{backend_name} recovery runtime remained active after stop");
+    }
+    Ok(true)
 }
 
 pub(crate) fn one_shot_process(

@@ -3,8 +3,8 @@
 //! private; the path and descriptor checks are shared so a new persistence
 //! call cannot accidentally reintroduce a weaker implementation.
 
-use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::{borrow::Cow, fs};
 
 #[cfg(unix)]
 use rand::{TryRng as _, rngs::SysRng};
@@ -34,11 +34,13 @@ pub enum SecureFileError {
 /// than normalized through an attacker-controlled symlink.
 pub fn normalize_absolute(path: &Path) -> Result<PathBuf, SecureFileError> {
     let source = if path.is_absolute() {
-        path.to_owned()
+        Cow::Borrowed(path)
     } else {
-        std::env::current_dir()
-            .map_err(|_| SecureFileError::Io)?
-            .join(path)
+        Cow::Owned(
+            std::env::current_dir()
+                .map_err(|_| SecureFileError::Io)?
+                .join(path),
+        )
     };
     let mut result = PathBuf::new();
     for component in source.components() {
@@ -49,9 +51,6 @@ pub fn normalize_absolute(path: &Path) -> Result<PathBuf, SecureFileError> {
             Component::Normal(value) => result.push(value),
             Component::ParentDir => return Err(SecureFileError::UnsafePath),
         }
-    }
-    if result.as_os_str().is_empty() {
-        return Err(SecureFileError::UnsafePath);
     }
     Ok(result)
 }
@@ -468,7 +467,6 @@ pub fn read_bounded(
     #[cfg(windows)]
     {
         use std::io::Read as _;
-        fs::symlink_metadata(&absolute).map_err(map_io_error)?;
         validate_directory(parent, private)?;
         let file = crate::filesystem::open_secure_regular_file(&absolute, "bounded file", private)
             .map_err(map_runtime_error)?;
@@ -667,7 +665,6 @@ fn owner_is_current_or_root(uid: u32) -> bool {
 #[cfg(windows)]
 pub fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
     let absolute = normalize_absolute(path)?;
-    fs::symlink_metadata(&absolute).map_err(map_io_error)?;
     validate_directory(
         absolute.parent().ok_or(SecureFileError::UnsafePath)?,
         private,

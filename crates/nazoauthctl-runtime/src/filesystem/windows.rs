@@ -59,10 +59,7 @@ fn wide(path: &Path) -> anyhow::Result<Vec<u16>> {
 
 fn win_error(context: &str) -> anyhow::Error {
     let code = unsafe { GetLastError() } as i32;
-    anyhow::anyhow!(
-        "{context}: {} (Win32 error {code})",
-        io::Error::from_raw_os_error(code)
-    )
+    anyhow::Error::new(io::Error::from_raw_os_error(code)).context(context.to_owned())
 }
 
 fn check_bool(ok: i32, context: &str) -> anyhow::Result<()> {
@@ -77,7 +74,10 @@ fn check_code(code: u32, context: &str) -> anyhow::Result<()> {
     if code == 0 {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("{context}: Win32 error {code}"))
+        Err(
+            anyhow::Error::new(io::Error::from_raw_os_error(code as i32))
+                .context(context.to_owned()),
+        )
     }
 }
 
@@ -184,11 +184,11 @@ fn mode_access_mask(bits: u32, is_directory: bool, owner_extra: u32) -> u32 {
     mask | owner_extra
 }
 
-fn with_security_attributes<T>(
+fn with_acl<T>(
     mode: u32,
     is_directory: bool,
     owner_extra: u32,
-    operation: impl FnOnce(*mut SECURITY_ATTRIBUTES, *mut ACL) -> anyhow::Result<T>,
+    operation: impl FnOnce(*mut ACL, PSID) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     if mode & 0o022 != 0 {
         bail!("Windows secure ACL cannot grant non-owner write access");
@@ -225,85 +225,87 @@ fn with_security_attributes<T>(
             "AddAccessAllowedAceEx",
         )?;
     }
-    let mut descriptor = SECURITY_DESCRIPTOR::default();
-    check_bool(
-        unsafe {
-            InitializeSecurityDescriptor((&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(), 1)
-        },
-        "InitializeSecurityDescriptor",
-    )?;
-    check_bool(
-        unsafe {
-            SetSecurityDescriptorDacl(
-                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                1,
-                acl,
-                0,
-            )
-        },
-        "SetSecurityDescriptorDacl",
-    )?;
-    // A token running with an elevated Administrators owner can cause
-    // CreateFileW/CreateDirectoryW to choose the token's default owner rather
-    // than TokenUser.  Set the owner explicitly so the descriptor we pass at
-    // creation time has the same identity that validation requires.
-    check_bool(
-        unsafe {
-            SetSecurityDescriptorOwner(
-                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                sids[0].as_ptr() as PSID,
-                0,
-            )
-        },
-        "SetSecurityDescriptorOwner",
-    )?;
-    check_bool(
-        unsafe {
-            SetSecurityDescriptorControl(
-                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                SE_DACL_PROTECTED,
-                SE_DACL_PROTECTED,
-            )
-        },
-        "SetSecurityDescriptorControl",
-    )?;
-    let mut descriptor_control = 0u16;
-    let mut descriptor_revision = 0u32;
-    check_bool(
-        unsafe {
-            GetSecurityDescriptorControl(
-                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                &mut descriptor_control,
-                &mut descriptor_revision,
-            )
-        },
-        "GetSecurityDescriptorControl(create)",
-    )?;
-    if descriptor_control & SE_DACL_PROTECTED == 0 {
-        bail!("failed to mark create-time DACL protected");
-    }
-    // CreateFileW/CreateDirectoryW consume a self-relative descriptor.  Passing
-    // the stack-local absolute descriptor can preserve the ACEs while silently
-    // dropping the protected-DACL control bit on the created object.
-    let absolute = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
-    let mut relative_len = 0u32;
-    let first = unsafe { MakeSelfRelativeSD(absolute, null_mut(), &mut relative_len) };
-    if first != 0
-        || unsafe { GetLastError() } != windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER
-    {
-        return Err(win_error("MakeSelfRelativeSD size"));
-    }
-    let mut relative = vec![0u8; relative_len as usize];
-    check_bool(
-        unsafe { MakeSelfRelativeSD(absolute, relative.as_mut_ptr().cast(), &mut relative_len) },
-        "MakeSelfRelativeSD",
-    )?;
-    let mut attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: relative.as_mut_ptr().cast(),
-        bInheritHandle: 0,
-    };
-    operation(&mut attributes, acl)
+    operation(acl, sids[0].as_ptr() as PSID)
+}
+
+fn with_security_attributes<T>(
+    mode: u32,
+    is_directory: bool,
+    owner_extra: u32,
+    operation: impl FnOnce(*mut SECURITY_ATTRIBUTES) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_acl(mode, is_directory, owner_extra, |acl, owner| {
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        check_bool(
+            unsafe {
+                InitializeSecurityDescriptor(
+                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                    1,
+                )
+            },
+            "InitializeSecurityDescriptor",
+        )?;
+        check_bool(
+            unsafe {
+                SetSecurityDescriptorDacl(
+                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                    1,
+                    acl,
+                    0,
+                )
+            },
+            "SetSecurityDescriptorDacl",
+        )?;
+        // A token running with an elevated Administrators owner can cause
+        // CreateFileW/CreateDirectoryW to choose the token's default owner rather
+        // than TokenUser.  Set the owner explicitly so the descriptor we pass at
+        // creation time has the same identity that validation requires.
+        check_bool(
+            unsafe {
+                SetSecurityDescriptorOwner(
+                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                    owner,
+                    0,
+                )
+            },
+            "SetSecurityDescriptorOwner",
+        )?;
+        check_bool(
+            unsafe {
+                SetSecurityDescriptorControl(
+                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
+                    SE_DACL_PROTECTED,
+                    SE_DACL_PROTECTED,
+                )
+            },
+            "SetSecurityDescriptorControl",
+        )?;
+        // CreateFileW/CreateDirectoryW consume a self-relative descriptor.  Passing
+        // the stack-local absolute descriptor can preserve the ACEs while silently
+        // dropping the protected-DACL control bit on the created object.
+        let absolute = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+        let mut relative_len = 0u32;
+        let first = unsafe { MakeSelfRelativeSD(absolute, null_mut(), &mut relative_len) };
+        if first != 0
+            || unsafe { GetLastError() }
+                != windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER
+        {
+            return Err(win_error("MakeSelfRelativeSD size"));
+        }
+        let mut relative = vec![0u8; relative_len as usize];
+        check_bool(
+            unsafe {
+                MakeSelfRelativeSD(absolute, relative.as_mut_ptr().cast(), &mut relative_len)
+            },
+            "MakeSelfRelativeSD",
+        )?;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: relative.as_mut_ptr().cast(),
+            bInheritHandle: 0,
+        };
+        operation(&mut attributes)
+    })
 }
 
 fn set_acl(handle: HANDLE, mode: u32) -> anyhow::Result<()> {
@@ -316,7 +318,7 @@ fn set_acl(handle: HANDLE, mode: u32) -> anyhow::Result<()> {
         info.dwFileAttributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
             != 0
     };
-    with_security_attributes(mode, is_directory, 0, |_attributes, acl| {
+    with_acl(mode, is_directory, 0, |acl, _owner| {
         // Changing the owner is a separate privilege boundary.  This helper
         // only replaces the DACL; including OWNER_SECURITY_INFORMATION here
         // makes a normal owner-only handle fail with ERROR_ACCESS_DENIED.
@@ -542,7 +544,7 @@ fn open_handle_with_mode(
     let flags: FILE_FLAGS_AND_ATTRIBUTES =
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH;
     let mut created = false;
-    let mut open = |attributes: *mut SECURITY_ATTRIBUTES, _acl: *mut ACL| {
+    let mut open = |attributes: *mut SECURITY_ATTRIBUTES| {
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
@@ -567,7 +569,7 @@ fn open_handle_with_mode(
     };
     let handle = match mode {
         Some(mode) => with_security_attributes(mode, false, DELETE | WRITE_DAC, open)?,
-        None => open(null_mut(), null_mut())?,
+        None => open(null_mut())?,
     };
     let file = unsafe { File::from_raw_handle(handle.cast()) };
     if let Some(mode) = mode
@@ -622,7 +624,7 @@ pub fn validate_directory_path_acl(path: &Path, _label: &str, private: bool) -> 
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
     let name =
         wide(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    let result = with_security_attributes(0o700, true, WRITE_DAC, |attributes, _acl| {
+    let result = with_security_attributes(0o700, true, WRITE_DAC, |attributes| {
         let ok = unsafe { CreateDirectoryW(name.as_ptr(), attributes) };
         if ok != 0 {
             Ok(())
@@ -768,12 +770,11 @@ fn rename_file(
     // providers reject the verbatim prefix in FILE_RENAME_INFO.  A long path
     // must retain that prefix, however, or the provider reports
     // ERROR_FILENAME_EXCED_RANGE.
-    let names = if normalized_name == target_name {
-        vec![target_name.as_ref()]
-    } else {
-        vec![normalized_name, target_name.as_ref()]
-    };
-    for (attempt, name_text) in names.into_iter().enumerate() {
+    let names = [
+        Some(normalized_name),
+        (normalized_name != target_name).then_some(target_name.as_ref()),
+    ];
+    for (attempt, name_text) in names.into_iter().flatten().enumerate() {
         let name: Vec<u16> = std::ffi::OsStr::new(name_text).encode_wide().collect();
         if name.len() > (u32::MAX as usize / 2) {
             bail!("atomic target path is too long");
@@ -783,7 +784,6 @@ fn rename_file(
         let mut bytes = vec![0u8; bytes_len];
         let info = bytes.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         unsafe {
-            ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len());
             (*info).Anonymous = FILE_RENAME_INFO_0 {
                 ReplaceIfExists: replace_existing,
             };
@@ -901,7 +901,12 @@ pub fn atomic_write(target: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()
     commit_staged(staged, &stage, &parent_handle, target, mode)
 }
 
-pub fn copy_atomic_from_file(source: &mut File, target: &Path, mode: u32) -> anyhow::Result<()> {
+pub fn copy_atomic_from_file(
+    source: &mut File,
+    target: &Path,
+    mode: u32,
+    expected_sha256: Option<&str>,
+) -> anyhow::Result<()> {
     source
         .seek(SeekFrom::Start(0))
         .context("failed to rewind validated source")?;
@@ -929,7 +934,7 @@ pub fn copy_atomic_from_file(source: &mut File, target: &Path, mode: u32) -> any
         CREATE_NEW,
         Some(staging_mode(mode)),
     )?;
-    if let Err(error) = std::io::copy(source, &mut staged)
+    if let Err(error) = super::copy_contents(source, &mut staged, expected_sha256)
         .with_context(|| format!("failed to copy staged {}", target.display()))
     {
         drop(staged);
@@ -953,8 +958,9 @@ pub fn open_lock_file(path: &Path, label: &str) -> anyhow::Result<File> {
             Ok(file)
         }
         Err(error)
-            if error.to_string().contains("Win32 error 80")
-                || error.to_string().contains("Win32 error 183") =>
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::AlreadyExists) =>
         {
             open_secure_regular_file(path, label, true)
         }
@@ -984,7 +990,7 @@ mod tests {
 
     #[test]
     fn private_acl_accepts_current_user_only_and_rejects_foreign_readers() {
-        with_security_attributes(0o600, false, 0, |attributes, _acl| {
+        with_security_attributes(0o600, false, 0, |attributes| {
             let descriptor = unsafe { (*attributes).lpSecurityDescriptor };
             let mut present = 0;
             let mut defaulted = 0;

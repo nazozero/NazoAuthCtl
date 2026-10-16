@@ -399,15 +399,6 @@ pub fn validate_secure_directory(path: &Path, label: &str, private: bool) -> any
     )?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink()
-                || is_reparse_point(&metadata)
-                || !metadata.is_dir()
-            {
-                bail!(
-                    "{label} must be a regular non-symlink, non-reparse directory: {}",
-                    path.display()
-                );
-            }
             validate_secure_directory_metadata(&metadata, path, label, private, None)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -434,17 +425,7 @@ pub fn ensure_private_directory(path: &Path, label: &str) -> anyhow::Result<()> 
 /// metadata checks used by key and driver readers.
 #[cfg(windows)]
 pub fn open_lock_file(path: &Path, read_only: bool, label: &str) -> anyhow::Result<File> {
-    if !path.is_absolute()
-        || path.parent().is_none()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-    {
-        bail!("{label} must be a normalized absolute path");
-    }
+    validate_normalized_absolute_path(path, label)?;
     let parent = path.parent().context("lock path has no parent directory")?;
     if read_only {
         return open_secure_regular_file(path, label, true);
@@ -472,17 +453,7 @@ pub fn open_append_file(path: &Path, label: &str) -> anyhow::Result<File> {
 
 #[cfg(not(windows))]
 pub fn open_lock_file(path: &Path, read_only: bool, label: &str) -> anyhow::Result<File> {
-    if !path.is_absolute()
-        || path.parent().is_none()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        })
-    {
-        bail!("{label} must be a normalized absolute path");
-    }
+    validate_normalized_absolute_path(path, label)?;
     let parent = path.parent().context("lock path has no parent directory")?;
     if read_only {
         return open_secure_regular_file(path, label, true);
@@ -561,18 +532,6 @@ fn validate_secure_ancestors_for_owner(
     while let Some(candidate) = current {
         match fs::symlink_metadata(candidate) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-                    bail!(
-                        "{label} path contains a symlink/reparse-point ancestor: {}",
-                        candidate.display()
-                    );
-                }
-                if !metadata.is_dir() {
-                    bail!(
-                        "{label} path ancestor is not a directory: {}",
-                        candidate.display()
-                    );
-                }
                 validate_secure_directory_metadata(
                     &metadata,
                     candidate,
@@ -607,38 +566,28 @@ fn validate_secure_file_metadata(
             path.display()
         );
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mode = metadata.mode() & 0o7777;
-        if !owner_is_allowed(metadata.uid(), expected_owner_uid) {
-            bail!("{label} has an unexpected owner: {}", path.display());
-        }
-        if metadata.nlink() != 1 {
-            bail!(
-                "{label} must have exactly one hard link: {}",
-                path.display()
-            );
-        }
-        if mode & 0o022 != 0 {
-            bail!(
-                "{label} must not be group/world writable: {}",
-                path.display()
-            );
-        }
-        if private && (mode & 0o077 != 0 || mode & 0o400 == 0 || mode & 0o111 != 0) {
-            bail!(
-                "{label} must be owner-readable and private: {}",
-                path.display()
-            );
-        }
+    use std::os::unix::fs::MetadataExt;
+    let mode = metadata.mode() & 0o7777;
+    if !owner_is_allowed(metadata.uid(), expected_owner_uid) {
+        bail!("{label} has an unexpected owner: {}", path.display());
     }
-    #[cfg(not(unix))]
-    {
-        #[cfg(windows)]
-        windows::validate_file_path_acl(path, label, private)?;
-        #[cfg(not(windows))]
-        let _ = (path, private);
+    if metadata.nlink() != 1 {
+        bail!(
+            "{label} must have exactly one hard link: {}",
+            path.display()
+        );
+    }
+    if mode & 0o022 != 0 {
+        bail!(
+            "{label} must not be group/world writable: {}",
+            path.display()
+        );
+    }
+    if private && (mode & 0o077 != 0 || mode & 0o400 == 0 || mode & 0o111 != 0) {
+        bail!(
+            "{label} must be owner-readable and private: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -715,18 +664,8 @@ fn validate_normalized_absolute_path(path: &Path, label: &str) -> anyhow::Result
 }
 
 #[cfg(unix)]
-fn owner_is_controller_or_root(uid: u32) -> bool {
-    uid == 0 || current_uid() == Some(uid)
-}
-
-#[cfg(unix)]
 fn owner_is_allowed(uid: u32, expected_owner_uid: Option<u32>) -> bool {
-    owner_is_controller_or_root(uid) || expected_owner_uid == Some(uid)
-}
-
-#[cfg(unix)]
-fn current_uid() -> Option<u32> {
-    Some(rustix::process::geteuid().as_raw())
+    uid == 0 || rustix::process::geteuid().as_raw() == uid || expected_owner_uid == Some(uid)
 }
 
 #[cfg(unix)]
@@ -877,34 +816,23 @@ pub fn sync_parent(_path: &Path) -> anyhow::Result<()> {
 
 pub fn copy_atomic(source: &Path, target: &Path, mode: u32) -> anyhow::Result<()> {
     let mut source = open_secure_regular_file(source, "atomic-copy source", false)?;
-    copy_atomic_from_file(&mut source, target, mode)
-}
-
-/// Verify and activate exactly the same opened source object. This is the
-/// required boundary for signed artifacts: a path digest followed by a second
-/// path open would allow a replacement between verification and persistence.
-pub fn copy_atomic_verified(
-    source: &Path,
-    target: &Path,
-    mode: u32,
-    expected_sha256: &str,
-) -> anyhow::Result<()> {
-    let mut source = open_secure_regular_file(source, "verified atomic-copy source", false)?;
-    let actual = sha256_file(&mut source, "verified atomic-copy source")?;
-    if actual != expected_sha256 {
-        bail!("atomic-copy source does not match the expected SHA-256 digest");
-    }
-    copy_atomic_from_file(&mut source, target, mode)
+    copy_atomic_from_file(&mut source, target, mode, None)
 }
 
 /// Copy an already-validated source descriptor into an atomic target.  The
 /// descriptor is rewound rather than reopening the source path, so callers
 /// that validated a digest cannot be redirected to a replacement path between
-/// validation and activation.
-pub fn copy_atomic_from_file(source: &mut File, target: &Path, mode: u32) -> anyhow::Result<()> {
+/// validation and activation. If a digest is supplied, hash the copied bytes
+/// and compare before publishing, without reopening or rereading the target.
+pub fn copy_atomic_from_file(
+    source: &mut File,
+    target: &Path,
+    mode: u32,
+    expected_sha256: Option<&str>,
+) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        windows::copy_atomic_from_file(source, target, mode)
+        windows::copy_atomic_from_file(source, target, mode, expected_sha256)
     }
     #[cfg(not(windows))]
     {
@@ -926,7 +854,7 @@ pub fn copy_atomic_from_file(source: &mut File, target: &Path, mode: u32) -> any
         let mut staged = atomic_write_file::AtomicWriteFile::open(target)
             .with_context(|| format!("failed to stage atomic copy for {}", target.display()))?;
         set_file_mode(staged.as_file(), mode)?;
-        std::io::copy(source, &mut staged)
+        copy_contents(source, &mut staged, expected_sha256)
             .with_context(|| format!("failed to copy validated source to {}", target.display()))?;
         staged
             .sync_all()
@@ -936,6 +864,31 @@ pub fn copy_atomic_from_file(source: &mut File, target: &Path, mode: u32) -> any
             .with_context(|| format!("failed to activate atomic copy for {}", target.display()))?;
         sync_parent(target)
     }
+}
+
+fn copy_contents(
+    source: &mut File,
+    target: &mut impl std::io::Write,
+    expected_sha256: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(expected) = expected_sha256 else {
+        std::io::copy(source, target)?;
+        return Ok(());
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+    }
+    if hex::encode(digest.finalize()) != expected {
+        bail!("atomic-copy content does not match the expected SHA-256 digest");
+    }
+    Ok(())
 }
 
 pub fn generate_secret(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {

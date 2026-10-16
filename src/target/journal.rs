@@ -74,12 +74,11 @@ use std::fs::OpenOptions;
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error_codes::OPERATION_ID_CONFLICT;
-use crate::filesystem;
+use crate::{file_lock::FileLock, filesystem};
 
 use super::wire::{HOST_OPERATION_KINDS, HostOperation, HostResult, canonical_operation_hash};
 
@@ -245,8 +244,9 @@ impl TargetJournal {
         execute: impl FnOnce(&HostOperation) -> HostResult,
     ) -> anyhow::Result<HostResult> {
         let scope = scope_slug(operation.deployment_id.as_deref())?;
-        let path = self.path_for(&scope);
-        let _lock = JournalLock::acquire(&path)?;
+        let path = self.path_for(scope);
+        filesystem::ensure_directory_chain(path.parent().expect("journal has a scope directory"))?;
+        let _lock = FileLock::acquire(&path.with_extension("lock"))?;
         // Bounding first: an oversized leftover from a crash between append
         // and compaction must shrink before strict parsing, never wedge.
         let compacted = self.compact_if_needed(&path)?;
@@ -343,23 +343,21 @@ impl TargetJournal {
         {
             return Ok(result);
         }
-        self.append(
-            &path,
-            &JournalLine {
-                schema: JOURNAL_SCHEMA,
-                operation_id: operation.operation_id.clone(),
-                operation_hash,
-                action,
-                recorded_at: Utc::now(),
-                status: match result.outcome {
-                    super::wire::HostOutcome::Completed { .. } => JournalStatus::Completed,
-                    super::wire::HostOutcome::Failed { .. } => JournalStatus::Failed,
-                },
-                result: Some(result.clone()),
+        let terminal = JournalLine {
+            schema: JOURNAL_SCHEMA,
+            operation_id: operation.operation_id.clone(),
+            operation_hash,
+            action,
+            recorded_at: Utc::now(),
+            status: match result.outcome {
+                super::wire::HostOutcome::Completed { .. } => JournalStatus::Completed,
+                super::wire::HostOutcome::Failed { .. } => JournalStatus::Failed,
             },
-        )?;
+            result: Some(result),
+        };
+        self.append(&path, &terminal)?;
         self.compact_if_needed(&path)?;
-        Ok(result)
+        Ok(terminal.result.expect("terminal line owns the result"))
     }
 
     fn remove_operation(&self, path: &Path, operation_id: &str) -> anyhow::Result<()> {
@@ -445,7 +443,7 @@ impl TargetJournal {
     /// Purely observational — never consulted for authorization.
     pub fn operation_log(&self, deployment_id: &str) -> anyhow::Result<Vec<OperationLogEntry>> {
         let scope = deployment_scope(deployment_id)?;
-        self.project_log(&self.path_for(&scope))
+        self.project_log(&self.path_for(scope))
     }
 
     /// Read-only operation-log view for the host-level scope (operations
@@ -456,18 +454,18 @@ impl TargetJournal {
 
     fn project_log(&self, path: &Path) -> anyhow::Result<Vec<OperationLogEntry>> {
         let lines = read_lines_with(path, self.bounds.read_cap)?;
-        Ok(lines.iter().map(project_entry).collect())
+        Ok(lines.into_iter().map(project_entry).collect())
     }
 }
 
 /// Project one journal line into the read-only view type.
-fn project_entry(line: &JournalLine) -> OperationLogEntry {
+fn project_entry(line: JournalLine) -> OperationLogEntry {
     OperationLogEntry {
-        operation_id: line.operation_id.clone(),
-        action: line.action.clone(),
+        operation_id: line.operation_id,
+        action: line.action,
         status: line.status,
         recorded_at: line.recorded_at,
-        outcome: match (&line.status, &line.result) {
+        outcome: match (line.status, line.result) {
             (
                 JournalStatus::Completed | JournalStatus::Failed,
                 Some(super::wire::HostResult {
@@ -481,10 +479,7 @@ fn project_entry(line: &JournalLine) -> OperationLogEntry {
                     outcome: super::wire::HostOutcome::Failed { code, detail },
                     ..
                 }),
-            ) => Some(OperationOutcomeSummary::Failed {
-                code: code.clone(),
-                detail: detail.clone(),
-            }),
+            ) => Some(OperationOutcomeSummary::Failed { code, detail }),
             _ => None,
         },
     }
@@ -504,18 +499,13 @@ pub(crate) fn keep_mask(lines: &[JournalLine], bounds: &JournalBounds) -> Vec<bo
     let mut mask = vec![false; lines.len()];
     let mut budget = bounds.target_bytes;
     let mut retained_terminals = 0usize;
-    let mut terminal_seen = HashSet::new();
-    let mut pending_seen = HashSet::new();
+    let mut seen = HashSet::new();
     for index in (0..lines.len()).rev() {
+        let newest = seen.insert(lines[index].operation_id.as_str());
         if matches!(lines[index].status, JournalStatus::Pending) {
-            if !terminal_seen.contains(lines[index].operation_id.as_str())
-                && pending_seen.insert(lines[index].operation_id.as_str())
-            {
-                mask[index] = true;
-            }
+            mask[index] = newest;
             continue;
         }
-        terminal_seen.insert(lines[index].operation_id.as_str());
         let size = serde_json::to_vec(&lines[index]).map_or(0, |bytes| bytes.len() as u64);
         if retained_terminals < bounds.min_terminal_retained || budget >= size {
             mask[index] = true;
@@ -526,32 +516,6 @@ pub(crate) fn keep_mask(lines: &[JournalLine], bounds: &JournalBounds) -> Vec<bo
     mask
 }
 
-/// Exclusive lock serializing journal readers and writers per scope, so two
-/// concurrent remote-exec processes cannot interleave acceptance decisions.
-struct JournalLock {
-    file: fs::File,
-}
-
-impl JournalLock {
-    fn acquire(journal_path: &Path) -> anyhow::Result<Self> {
-        let parent = journal_path
-            .parent()
-            .context("journal path has no parent directory")?;
-        filesystem::ensure_directory_chain(parent)?;
-        let lock_path = journal_path.with_extension("lock");
-        let file = filesystem::open_lock_file(&lock_path, false, "target operation journal lock")?;
-        file.try_lock_exclusive()
-            .with_context(|| format!("another controller holds {}", lock_path.display()))?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for JournalLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
 /// Deployment ids become path components here, so they are re-validated at
 /// the boundary that consumes them: registry-legal identifiers pass, anything
 /// with separators or traversal segments fails closed.
@@ -559,7 +523,7 @@ impl Drop for JournalLock {
 /// This is the single rule source for deployment-scope directory names; the
 /// DeploymentState store (F01) reuses it so a state document and its journal
 /// always share one scope directory.
-pub(crate) fn deployment_scope(deployment_id: &str) -> anyhow::Result<String> {
+pub(crate) fn deployment_scope(deployment_id: &str) -> anyhow::Result<&str> {
     let legal = !deployment_id.is_empty()
         && deployment_id.len() <= 128
         && deployment_id != "."
@@ -568,15 +532,15 @@ pub(crate) fn deployment_scope(deployment_id: &str) -> anyhow::Result<String> {
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || ".:_+-".contains(character));
     if legal {
-        Ok(deployment_id.to_owned())
+        Ok(deployment_id)
     } else {
         bail!("{TARGET_JOURNAL_INVALID}: deployment_id is not usable as a journal scope")
     }
 }
 
-fn scope_slug(deployment_id: Option<&str>) -> anyhow::Result<String> {
+fn scope_slug(deployment_id: Option<&str>) -> anyhow::Result<&str> {
     match deployment_id {
-        None => Ok(HOST_SCOPE.to_owned()),
+        None => Ok(HOST_SCOPE),
         Some(id) => deployment_scope(id),
     }
 }
@@ -585,11 +549,22 @@ fn scope_slug(deployment_id: Option<&str>) -> anyhow::Result<String> {
 const HOST_SCOPE: &str = "host";
 
 fn read_lines_with(path: &Path, read_cap: u64) -> anyhow::Result<Vec<JournalLine>> {
-    if fs::symlink_metadata(path).is_err() {
-        return Ok(Vec::new());
-    }
-    let bytes =
-        filesystem::read_secure_regular_file(path, "target operation journal", false, read_cap)?;
+    let bytes = match filesystem::read_secure_regular_file(
+        path,
+        "target operation journal",
+        false,
+        read_cap,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         anyhow::anyhow!(
             "{TARGET_JOURNAL_INVALID}: journal is not UTF-8 ({})",

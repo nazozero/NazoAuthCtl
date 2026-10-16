@@ -16,6 +16,7 @@ pub(crate) mod backup;
 pub(crate) mod backup_exec;
 pub(crate) mod control_exec;
 pub mod deployment_state;
+mod digest;
 pub(crate) mod install_exec;
 pub mod journal;
 pub mod persistence;
@@ -384,10 +385,15 @@ impl LocalTarget {
                     mutation: StateMutationPayload::Uninstall { .. }
                 }
             ) {
-                let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+                let deployment_id = operation
+                    .deployment_id
+                    .as_deref()
+                    .expect("validated deployment binding");
                 let completed = match store.converge_uninstall_completion(
                     deployment_id,
-                    operation.expected_revision.unwrap_or_default(),
+                    operation
+                        .expected_revision
+                        .expect("validated revision binding"),
                     &operation.operation_id,
                 ) {
                     Ok(completed) => completed,
@@ -397,7 +403,9 @@ impl LocalTarget {
                     return HostResult::completed(
                         &operation.operation_id,
                         HostCompletionBody::StateMutateApplied {
-                            revision: operation.expected_revision.unwrap_or_default(),
+                            revision: operation
+                                .expected_revision
+                                .expect("validated revision binding"),
                             control_result: None,
                         },
                     );
@@ -466,7 +474,10 @@ fn dispatch_validated_host_operation(
         HostOperationBody::JournalRead { limit } => answer_journal_read(operation, store, *limit)
             .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::BackupSnapshot {} => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             let answered = (|| -> Result<HostResult, Failure> {
                 let state = store.load_existing(deployment_id)?;
                 let scope_dir = store.scope_dir(deployment_id)?;
@@ -479,7 +490,10 @@ fn dispatch_validated_host_operation(
             answered.unwrap_or_else(|failure| state_failure(operation, &failure))
         }
         HostOperationBody::BackupRestoreTest {} => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             let answered = (|| -> Result<HostResult, Failure> {
                 let state = store.load_existing(deployment_id)?;
                 let scope_dir = store.scope_dir(deployment_id)?;
@@ -495,23 +509,17 @@ fn dispatch_validated_host_operation(
             expected_manifest_sha256,
             state_epoch,
         } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
-                let expected_revision = operation.expected_revision.ok_or_else(|| {
-                    Failure::new(
-                        HOST_ERR_OPERATION_INVALID,
-                        "backup recover requires expected_revision",
-                    )
-                })?;
+                let expected_revision = operation
+                    .expected_revision
+                    .expect("validated revision binding");
                 let state = store.load_existing(deployment_id)?;
                 let backend = runtime_backend::backend(state.runtime.kind);
                 let runtime_was_running = backend
-                    .inspect_optional(&state.runtime.object)
-                    .map_err(|error| {
-                        Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string()))
-                    })?
-                    .is_some_and(|runtime| runtime.running);
-                backend
                     .quiesce_for_recovery(&state.runtime.object)
                     .map_err(|error| {
                         Failure::new(RESTORE_TEST_FAILED, sanitize(error.to_string()))
@@ -568,14 +576,12 @@ fn dispatch_validated_host_operation(
             state_epoch,
             artifact,
         } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
-                let expected_revision = operation.expected_revision.ok_or_else(|| {
-                    Failure::new(
-                        HOST_ERR_OPERATION_INVALID,
-                        "recovery candidate stage requires expected_revision",
-                    )
-                })?;
+                let expected_revision = operation.expected_revision.expect("validated revision binding");
                 let state = store.load_existing(deployment_id)?;
                 if state.config.revision != expected_revision {
                     return Err(Failure::new(
@@ -614,7 +620,10 @@ fn dispatch_validated_host_operation(
         )
         .unwrap_or_else(|failure| state_failure(operation, &failure)),
         HostOperationBody::BackupRecoveryCandidateCleanup { endpoint } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let state = store.load_existing(deployment_id)?;
                 backup_exec::cleanup_recovery_candidate(&state, endpoint)?;
@@ -630,14 +639,14 @@ fn dispatch_validated_host_operation(
             state_epoch,
             not_before,
         } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
-                let expected_revision = operation.expected_revision.ok_or_else(|| {
-                    Failure::new(
-                        HOST_ERR_OPERATION_INVALID,
-                        "recovery activation requires expected_revision",
-                    )
-                })?;
+                let expected_revision = operation
+                    .expected_revision
+                    .expect("validated revision binding");
                 let state = store.load_existing(deployment_id)?;
                 if state.config.revision != expected_revision {
                     return Err(Failure::new(
@@ -663,7 +672,10 @@ fn dispatch_validated_host_operation(
             .unwrap_or_else(|failure| state_failure(operation, &failure))
         }
         HostOperationBody::BackupExportPrepare {} => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let state = store.load_existing(deployment_id)?;
                 let scope_dir = store.scope_dir(deployment_id)?;
@@ -677,7 +689,10 @@ fn dispatch_validated_host_operation(
             .unwrap_or_else(|failure| state_failure(operation, &failure))
         }
         HostOperationBody::BackupImportPrepare {} => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let scope_dir = store.scope_dir(deployment_id)?;
                 let plan = backup_exec::prepare_import(
@@ -698,7 +713,10 @@ fn dispatch_validated_host_operation(
             offset,
             maximum_bytes,
         } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let scope_dir = store.scope_dir(deployment_id)?;
                 let chunk = backup_exec::read_transfer_chunk(
@@ -719,11 +737,13 @@ fn dispatch_validated_host_operation(
             transfer_operation_id,
             file_name,
             offset,
-            total_bytes,
-            file_sha256,
             bytes,
+            ..
         } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let scope_dir = store.scope_dir(deployment_id)?;
                 backup_exec::write_transfer_chunk(
@@ -731,8 +751,6 @@ fn dispatch_validated_host_operation(
                     transfer_operation_id,
                     file_name,
                     *offset,
-                    *total_bytes,
-                    file_sha256,
                     bytes,
                 )?;
                 Ok(HostResult::completed(
@@ -748,10 +766,13 @@ fn dispatch_validated_host_operation(
             source_host_id,
             destination_host_id,
         } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let local_target_id = target_identity(store.root())?.to_string();
-                if destination_host_id != &local_target_id || source_host_id == destination_host_id {
+                if destination_host_id != &local_target_id {
                     return Err(Failure::new(
                         HOST_ERR_OPERATION_INVALID,
                         "backup import receipt identities do not bind distinct source and destination targets",
@@ -774,7 +795,10 @@ fn dispatch_validated_host_operation(
             .unwrap_or_else(|failure| state_failure(operation, &failure))
         }
         HostOperationBody::BackupOffHostRecord { receipt } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let local_target_id = target_identity(store.root())?.to_string();
                 if receipt.source_host_id != local_target_id
@@ -797,7 +821,10 @@ fn dispatch_validated_host_operation(
         HostOperationBody::BackupTransferCleanup {
             transfer_operation_id,
         } => {
-            let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+            let deployment_id = operation
+                .deployment_id
+                .as_deref()
+                .expect("validated deployment binding");
             (|| -> Result<HostResult, Failure> {
                 let scope_dir = store.scope_dir(deployment_id)?;
                 backup_exec::cleanup_transfer(&scope_dir, transfer_operation_id)?;
@@ -830,14 +857,17 @@ fn dispatch_validated_host_operation(
                 resources,
                 install,
             } => {
-                let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+                let deployment_id = operation
+                    .deployment_id
+                    .as_deref()
+                    .expect("validated deployment binding");
                 match install {
                     // G01 clean install: execute the full order first; only a
                     // fully healthy target commits `local_healthy` state. The
                     // artifact refs recorded in state come from the verified
                     // facts the executor returns — never from the request.
                     Some(order) => {
-                        let scope_dir = match store.scope_dir(&deployment_id) {
+                        let scope_dir = match store.scope_dir(deployment_id) {
                             Ok(dir) => dir,
                             Err(failure) => return state_failure(operation, &failure),
                         };
@@ -845,7 +875,7 @@ fn dispatch_validated_host_operation(
                             return state_failure(operation, &failure);
                         }
                         let job = install_exec::InstallJob {
-                            deployment_id: &deployment_id,
+                            deployment_id,
                             issuer,
                             runtime,
                             config_reference,
@@ -868,7 +898,7 @@ fn dispatch_validated_host_operation(
                                 resources: resources.clone(),
                                 current_release: facts.release.clone(),
                             };
-                            commit_clean_install(store, &deployment_id, params, operation)
+                            commit_clean_install(store, deployment_id, params, operation)
                         }) {
                             Ok(inspection) => HostResult::completed(
                                 &operation.operation_id,
@@ -887,20 +917,15 @@ fn dispatch_validated_host_operation(
                 }
             }
             StateMutationPayload::ApplyConfig { reference, schema } => {
-                // CAS is mandatory at the wire level; validate() already
-                // rejected absent expectations, so treat None defensively.
-                let Some(expected_revision) = operation.expected_revision else {
-                    return state_failure(
-                        operation,
-                        &Failure::new(
-                            HOST_ERR_OPERATION_INVALID,
-                            "apply-config requires expected_revision",
-                        ),
-                    );
-                };
-                let deployment_id = operation.deployment_id.clone().unwrap_or_default();
+                let expected_revision = operation
+                    .expected_revision
+                    .expect("validated revision binding");
+                let deployment_id = operation
+                    .deployment_id
+                    .as_deref()
+                    .expect("validated deployment binding");
                 match store.apply_config(
-                    &deployment_id,
+                    deployment_id,
                     expected_revision,
                     reference.clone(),
                     schema.clone(),
@@ -940,12 +965,6 @@ const MAX_TARGET_IDENTITY_BYTES: u64 = 64;
 /// holding a private file lock.  This belongs beside TargetJournal because it
 /// names the target itself, not an inventory alias or one deployment.
 fn target_identity(root: &Path) -> Result<Uuid, Failure> {
-    crate::filesystem::ensure_private_directory(root, "target state root").map_err(|error| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            format!("target identity root: {error}"),
-        )
-    })?;
     let _lock =
         crate::file_lock::FileLock::acquire(&root.join(TARGET_IDENTITY_LOCK)).map_err(|error| {
             Failure::new(
@@ -954,20 +973,13 @@ fn target_identity(root: &Path) -> Result<Uuid, Failure> {
             )
         })?;
     let path = root.join(TARGET_IDENTITY_FILE);
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {
-            let bytes = crate::filesystem::read_secure_regular_file(
-                &path,
-                "target identity",
-                true,
-                MAX_TARGET_IDENTITY_BYTES,
-            )
-            .map_err(|error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    format!("target identity: {error}"),
-                )
-            })?;
+    match crate::filesystem::read_secure_regular_file(
+        &path,
+        "target identity",
+        true,
+        MAX_TARGET_IDENTITY_BYTES,
+    ) {
+        Ok(bytes) => {
             let value = std::str::from_utf8(&bytes)
                 .map_err(|_| {
                     Failure::new(HOST_ERR_OPERATION_INVALID, "target identity is not UTF-8")
@@ -984,7 +996,11 @@ fn target_identity(root: &Path) -> Result<Uuid, Failure> {
             }
             Ok(id)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
             let id = Uuid::now_v7();
             crate::filesystem::atomic_write(&path, id.to_string().as_bytes(), 0o600).map_err(
                 |error| {
@@ -998,7 +1014,7 @@ fn target_identity(root: &Path) -> Result<Uuid, Failure> {
         }
         Err(error) => Err(Failure::new(
             HOST_ERR_OPERATION_INVALID,
-            format!("failed to inspect target identity: {error}"),
+            format!("failed to read target identity: {error}"),
         )),
     }
 }
@@ -1021,7 +1037,10 @@ fn answer_runtime_logs(
     store: &TargetStateStore,
     limit: usize,
 ) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
     let state = store.load_existing(deployment_id)?;
     let kind = state.runtime.kind;
     let backend = runtime_backend::backend(kind);
@@ -1047,7 +1066,10 @@ fn answer_journal_read(
     store: &TargetStateStore,
     limit: usize,
 ) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.as_deref().unwrap_or_default();
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
     store.load_existing(deployment_id)?;
     let mut entries = TargetJournal::open(store.root())
         .map_err(|error| {
@@ -1074,18 +1096,26 @@ fn answer_journal_read(
 
 fn redact_log_line(line: &str) -> String {
     fn sensitive(name: &str) -> bool {
-        let name = name.to_ascii_lowercase();
-        matches!(
-            name.as_str(),
-            "authorization"
-                | "proxy-authorization"
-                | "cookie"
-                | "set-cookie"
-                | "database_url"
-                | "valkey_url"
-        ) || ["password", "secret", "token", "private_key"]
-            .iter()
-            .any(|suffix| name == *suffix || name.ends_with(&format!("_{suffix}")))
+        [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "database_url",
+            "valkey_url",
+            "password",
+            "secret",
+            "token",
+            "private_key",
+        ]
+        .iter()
+        .any(|key| name.eq_ignore_ascii_case(key))
+            || ["_password", "_secret", "_token", "_private_key"]
+                .iter()
+                .any(|suffix| {
+                    name.get(name.len().saturating_sub(suffix.len())..)
+                        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+                })
     }
     fn redact_text(line: &str) -> String {
         let bytes = line.as_bytes();
@@ -1137,10 +1167,15 @@ fn redact_log_line(line: &str) -> String {
                         cursor += 1;
                     }
                 }
-            } else if matches!(
-                name.to_ascii_lowercase().as_str(),
-                "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
-            ) {
+            } else if [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+            ]
+            .iter()
+            .any(|key| name.eq_ignore_ascii_case(key))
+            {
                 cursor = bytes.len();
             } else {
                 while cursor < bytes.len()
@@ -1203,22 +1238,22 @@ fn answer_update(
     else {
         unreachable!("answer_update is called only for update mutations")
     };
-    let Some(expected_revision) = operation.expected_revision else {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "update requires expected_revision",
-        ));
-    };
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let state = store.load_existing(&deployment_id)?;
-    let scope_dir = store.scope_dir(&deployment_id)?;
+    let expected_revision = operation
+        .expected_revision
+        .expect("validated revision binding");
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
+    let state = store.load_existing(deployment_id)?;
+    let scope_dir = store.scope_dir(deployment_id)?;
     // TargetJournal holds this deployment's exclusive operation lock across
     // dispatch. Validate the exact current backup projection before entering
     // the lifecycle executor, which is the first artifact/migration/config
     // side-effect boundary.
     update_exec::validate_backup_precondition(&scope_dir, &state, backup_precondition, Utc::now())?;
     ensure_scope_dir(&scope_dir)?;
-    let Some(current_artifact) = state.artifact.current.clone() else {
+    let Some(current_artifact) = state.artifact.current.as_deref() else {
         return Err(Failure::new(
             HOST_ERR_OPERATION_INVALID,
             "the deployment records no current artifact reference; adopt or install it first",
@@ -1229,12 +1264,12 @@ fn answer_update(
     let current_version = state
         .current_release
         .as_ref()
-        .map(|identity| identity.version.clone());
+        .map(|identity| identity.version.as_str());
     let data_root = state
         .resources
         .iter()
         .find(|resource| resource.resource_id == "app-data" && resource.kind == "directory")
-        .map(|resource| resource.locator.clone())
+        .map(|resource| resource.locator.as_str())
         .ok_or_else(|| {
             Failure::new(
                 HOST_ERR_OPERATION_INVALID,
@@ -1245,12 +1280,12 @@ fn answer_update(
         .resources
         .iter()
         .find(|resource| resource.resource_id == "app-binary" && resource.kind == "directory")
-        .map(|resource| resource.locator.clone());
+        .map(|resource| resource.locator.as_str());
     let secrets_root = state
         .resources
         .iter()
         .find(|resource| resource.resource_id == "app-secrets" && resource.kind == "directory")
-        .map(|resource| resource.locator.clone())
+        .map(|resource| resource.locator.as_str())
         .ok_or_else(|| {
             Failure::new(
                 HOST_ERR_OPERATION_INVALID,
@@ -1259,18 +1294,18 @@ fn answer_update(
         })?;
     let job = update_exec::UpdateJob {
         operation_id: &operation.operation_id,
-        deployment_id: &deployment_id,
+        deployment_id,
         issuer: &state.issuer,
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
-        config_reference: &state.config.reference.clone(),
+        config_reference: &state.config.reference,
         port: state.runtime.loopback_port,
-        data_root: &data_root,
-        secrets_root: &secrets_root,
-        runtime_root: runtime_root.as_deref(),
-        config_schema: &state.config.schema.clone(),
-        current_artifact: &current_artifact,
-        current_version: current_version.as_deref(),
+        data_root,
+        secrets_root,
+        runtime_root,
+        config_schema: &state.config.schema,
+        current_artifact,
+        current_version,
         expected_revision,
         artifact,
         config: config.as_ref(),
@@ -1313,23 +1348,23 @@ fn answer_rollback(
     store: &TargetStateStore,
     lifecycle: &Arc<dyn update_exec::LifecycleExecutor>,
 ) -> Result<HostResult, Failure> {
-    let Some(expected_revision) = operation.expected_revision else {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "rollback requires expected_revision",
-        ));
-    };
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let state = store.load_existing(&deployment_id)?;
+    let expected_revision = operation
+        .expected_revision
+        .expect("validated revision binding");
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
+    let state = store.load_existing(deployment_id)?;
     if state.applied_migration.is_some() {
         return Err(Failure::new(
             deployment_state::ROLLBACK_RECOVERY_REQUIRED,
             "an applied migration forbids artifact/config rollback; keep the writer stopped and recover a verified backup",
         ));
     }
-    let scope_dir = store.scope_dir(&deployment_id)?;
+    let scope_dir = store.scope_dir(deployment_id)?;
     ensure_scope_dir(&scope_dir)?;
-    let Some(current_artifact) = state.artifact.current.clone() else {
+    let Some(current_artifact) = state.artifact.current.as_deref() else {
         return Err(Failure::new(
             ROLLBACK_UNAVAILABLE,
             "the deployment records no current artifact reference",
@@ -1339,18 +1374,18 @@ fn answer_rollback(
         .resources
         .iter()
         .find(|resource| resource.resource_id == "app-binary" && resource.kind == "directory")
-        .map(|resource| resource.locator.clone());
+        .map(|resource| resource.locator.as_str());
     let job = update_exec::RollbackJob {
         operation_id: &operation.operation_id,
-        deployment_id: &deployment_id,
+        deployment_id,
         issuer: &state.issuer,
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
-        config_reference: &state.config.reference.clone(),
+        config_reference: &state.config.reference,
         port: state.runtime.loopback_port,
-        runtime_root: runtime_root.as_deref(),
-        config_schema: &state.config.schema.clone(),
-        current_artifact: &current_artifact,
+        runtime_root,
+        config_schema: &state.config.schema,
+        current_artifact,
         previous_artifact: state.artifact.previous.as_deref(),
         expected_revision,
         scope_dir: &scope_dir,
@@ -1374,20 +1409,20 @@ fn answer_uninstall(
     store: &TargetStateStore,
     deletion: &Arc<dyn uninstall_exec::DeletionExecutor>,
 ) -> Result<HostResult, Failure> {
-    let Some(expected_revision) = operation.expected_revision else {
-        return Err(Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "uninstall requires expected_revision",
-        ));
-    };
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let state = store.load_existing(&deployment_id)?;
+    let expected_revision = operation
+        .expected_revision
+        .expect("validated revision binding");
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
+    let state = store.load_existing(deployment_id)?;
     let job = uninstall_exec::DeletionJob {
         operation_id: &operation.operation_id,
-        deployment_id: &deployment_id,
+        deployment_id,
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
-        config_reference: &state.config.reference.clone(),
+        config_reference: &state.config.reference,
         declared: &state.resources,
         expected_revision,
         store,
@@ -1413,8 +1448,11 @@ fn answer_control_operation(
     change_set: Option<&[u8]>,
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
 ) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let state = store.load_existing(&deployment_id)?;
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
+    let state = store.load_existing(deployment_id)?;
     let result = execute_bound_control_operation(
         &operation.operation_id,
         &state,
@@ -1443,14 +1481,14 @@ fn answer_recovery_candidate_control(
     compact_jws: &str,
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
 ) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let expected_revision = operation.expected_revision.ok_or_else(|| {
-        Failure::new(
-            HOST_ERR_OPERATION_INVALID,
-            "recovery candidate control requires expected_revision",
-        )
-    })?;
-    let state = store.load_existing(&deployment_id)?;
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
+    let expected_revision = operation
+        .expected_revision
+        .expect("validated revision binding");
+    let state = store.load_existing(deployment_id)?;
     if state.config.revision != expected_revision
         || endpoint.deployment_id != deployment_id
         || state
@@ -1464,7 +1502,7 @@ fn answer_recovery_candidate_control(
             "recovery candidate no longer matches the restored deployment state",
         ));
     }
-    let scope_dir = store.scope_dir(&deployment_id)?;
+    let scope_dir = store.scope_dir(deployment_id)?;
     let candidate_artifact =
         backup_exec::recovery_candidate_artifact_reference(&scope_dir, &endpoint.operation_id)?;
     let result = execute_bound_control_operation(
@@ -1497,9 +1535,12 @@ fn answer_admin_create(
     password: &[u8],
     admin: &Arc<dyn admin_exec::AdminProvisionExecutor>,
 ) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let state = store.load_existing(&deployment_id)?;
-    let current_artifact = state.artifact.current.clone().ok_or_else(|| {
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
+    let state = store.load_existing(deployment_id)?;
+    let current_artifact = state.artifact.current.as_deref().ok_or_else(|| {
         Failure::new(
             CONTROL_TARGET_DRIFT,
             "the deployment records no current artifact reference",
@@ -1509,32 +1550,28 @@ fn answer_admin_create(
         .resources
         .iter()
         .find(|resource| resource.resource_id == "app-data" && resource.kind == "directory")
-        .map(|resource| resource.locator.clone())
+        .map(|resource| resource.locator.as_str())
         .ok_or_else(|| {
             Failure::new(
                 HOST_ERR_OPERATION_INVALID,
                 "deployment state has no app-data directory resource",
             )
         })?;
-    let scope_dir = store.scope_dir(&deployment_id)?;
+    let scope_dir = store.scope_dir(deployment_id)?;
     let job = admin_exec::AdminProvisionJob {
         operation_id: &operation.operation_id,
-        deployment_id: &deployment_id,
-        artifact_reference: &current_artifact,
+        deployment_id,
+        artifact_reference: current_artifact,
         runtime_kind: state.runtime.kind,
         runtime_object: &state.runtime.object,
         config_reference: &state.config.reference,
-        data_root: &data_root,
+        data_root,
         scope_dir: &scope_dir,
         email,
         password,
     };
     let receipt = admin.execute(&job)?;
-    admin_exec::validate_admin_provision_receipt(
-        &receipt,
-        &operation.operation_id,
-        &deployment_id,
-    )?;
+    admin_exec::validate_admin_provision_receipt(&receipt, &operation.operation_id, deployment_id)?;
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::AdminCreated { receipt },
@@ -1559,10 +1596,7 @@ fn execute_bound_control_operation(
     runtime: ControlRuntimeBinding<'_>,
     control: &Arc<dyn control_exec::ControlOperationExecutor>,
 ) -> Result<ControlResult, Failure> {
-    let current_artifact = runtime
-        .artifact
-        .map(str::to_owned)
-        .or_else(|| state.artifact.current.clone());
+    let current_artifact = runtime.artifact.or(state.artifact.current.as_deref());
     let Some(current_artifact) = current_artifact else {
         return Err(Failure::new(
             CONTROL_TARGET_DRIFT,
@@ -1573,7 +1607,7 @@ fn execute_bound_control_operation(
         .resources
         .iter()
         .find(|resource| resource.resource_id == "app-data" && resource.kind == "directory")
-        .map(|resource| resource.locator.clone())
+        .map(|resource| resource.locator.as_str())
         .ok_or_else(|| {
             Failure::new(
                 HOST_ERR_OPERATION_INVALID,
@@ -1584,7 +1618,7 @@ fn execute_bound_control_operation(
         .resources
         .iter()
         .find(|resource| resource.resource_id == "app-secrets" && resource.kind == "directory")
-        .map(|resource| resource.locator.clone())
+        .map(|resource| resource.locator.as_str())
         .ok_or_else(|| {
             Failure::new(
                 HOST_ERR_OPERATION_INVALID,
@@ -1595,12 +1629,12 @@ fn execute_bound_control_operation(
     let job = control_exec::ControlJob {
         operation_id,
         deployment_id: &state.deployment_id,
-        artifact_reference: &current_artifact,
+        artifact_reference: current_artifact,
         runtime_kind: state.runtime.kind,
         runtime_object: runtime.object,
         config_reference: &state.config.reference,
-        data_root: &data_root,
-        secrets_root: &secrets_root,
+        data_root,
+        secrets_root,
         scope_dir: &scope_dir,
         transient_state_epoch: runtime.transient_state_epoch,
         compact_jws,
@@ -1841,9 +1875,12 @@ fn answer_inspect(
     operation: &HostOperation,
     store: &TargetStateStore,
 ) -> Result<HostResult, Failure> {
-    let deployment_id = operation.deployment_id.clone().unwrap_or_default();
-    let state = store.load_existing(&deployment_id)?;
-    let scope_dir = store.scope_dir(&deployment_id)?;
+    let deployment_id = operation
+        .deployment_id
+        .as_deref()
+        .expect("validated deployment binding");
+    let state = store.load_existing(deployment_id)?;
+    let scope_dir = store.scope_dir(deployment_id)?;
     let identity = current_instance_identity(&state);
     let mut inspection = inspection_from_state(store, state)?;
     match identity {
@@ -1971,7 +2008,6 @@ impl ExecutionTarget for LocalTarget {
         // every other kind (decision 1): validated, journaled, dispatched to
         // the local one-shot NazoAuth operator.  The JWS is public; the
         // optional Apply material remains an opaque, zeroizing carrier.
-        let request_operation_id = request.operation_id.clone();
         let operation = HostOperation::control_operation(
             request.operation_id,
             request.deployment_id,
@@ -1979,7 +2015,7 @@ impl ExecutionTarget for LocalTarget {
             request.change_set,
         );
         let result = self.execute_host_operation(&operation)?;
-        control_operation_receipt(request_operation_id, result.outcome)
+        control_operation_receipt(operation.operation_id, result.outcome)
     }
 
     fn read_health(&self, deployment_id: &str) -> anyhow::Result<HealthSnapshot> {
@@ -2014,6 +2050,11 @@ mod tests {
         );
         assert!(!value.contains("hidden"));
         assert!(value.contains("token rejected"));
+        let value = super::redact_log_line(
+            r#"{"Ä_ACCESS_TOKEN":"hidden","X_PRIVATE_KEY":"hidden","é":"visible"}"#,
+        );
+        assert!(!value.contains("hidden"));
+        assert!(value.contains("visible"));
     }
     use super::*;
     use crate::filesystem::PrivateTempDir;

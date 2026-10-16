@@ -24,7 +24,7 @@ use super::deployment_state::{DeploymentState, ReleaseVersion};
 pub const BACKUP_MANIFEST_SCHEMA: u32 = 5;
 pub const RESTORE_TEST_RECEIPT_SCHEMA: u32 = 2;
 pub const OFF_HOST_COPY_RECEIPT_SCHEMA: u32 = 1;
-const MAX_BACKUP_EVIDENCE_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAX_BACKUP_EVIDENCE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 4_096;
 
 /// One immutable file comprising a snapshot.  `path` is relative to the
@@ -190,7 +190,6 @@ impl SnapshotManifest {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_contents()?;
-        validate_sha256(&self.manifest_sha256, "backup manifest sha256")?;
         if self.manifest_sha256 != self.computed_sha256()? {
             bail!("backup manifest hash does not bind its contents");
         }
@@ -198,9 +197,9 @@ impl SnapshotManifest {
     }
 
     pub fn computed_sha256(&self) -> anyhow::Result<String> {
-        let mut bytes = Vec::new();
-        self.serialize_with_hash(&mut serde_json::Serializer::new(&mut bytes), "")?;
-        Ok(hex_digest(&bytes))
+        let mut writer = super::digest::Sha256Writer::default();
+        self.serialize_with_hash(&mut serde_json::Serializer::new(&mut writer), "")?;
+        Ok(writer.finish())
     }
 }
 
@@ -469,15 +468,18 @@ fn load_evidence<T>(
     label: &str,
     parse: impl FnOnce(&[u8]) -> anyhow::Result<T>,
 ) -> anyhow::Result<Option<T>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            filesystem::read_secure_regular_file(path, label, false, MAX_BACKUP_EVIDENCE_BYTES)
-                .and_then(|bytes| parse(&bytes))
-                .map(Some)
-                .with_context(|| format!("failed to read {label}"))
+    match filesystem::read_secure_regular_file(path, label, false, MAX_BACKUP_EVIDENCE_BYTES) {
+        Ok(bytes) => parse(&bytes)
+            .map(Some)
+            .with_context(|| format!("failed to read {label}")),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {label}")),
+        Err(error) => Err(error).with_context(|| format!("failed to read {label}")),
     }
 }
 

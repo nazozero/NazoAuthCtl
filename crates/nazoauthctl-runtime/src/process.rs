@@ -20,6 +20,18 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Whether this process has the effective Unix root identity.
+pub fn is_effective_root() -> bool {
+    #[cfg(unix)]
+    {
+        rustix::process::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct Process {
     program: OsString,
@@ -244,7 +256,7 @@ impl Process {
             }
         });
         Ok(LineSession {
-            child,
+            child: Some(child),
             requests,
             responses,
             diagnostics,
@@ -362,12 +374,11 @@ impl Process {
         result
     }
 
-    fn display_name(&self) -> String {
+    fn display_name(&self) -> std::borrow::Cow<'_, str> {
         Path::new(&self.program)
             .file_name()
             .unwrap_or_else(|| OsStr::new("command"))
             .to_string_lossy()
-            .into_owned()
     }
 }
 
@@ -382,7 +393,7 @@ fn read_bounded(reader: impl std::io::Read) -> anyhow::Result<Vec<u8>> {
 
 #[derive(Debug)]
 pub struct LineSession {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     requests: SyncSender<Vec<u8>>,
     responses: Receiver<anyhow::Result<Vec<u8>>>,
     diagnostics: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -390,6 +401,12 @@ pub struct LineSession {
 }
 
 impl LineSession {
+    fn terminate(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            terminate_and_reap(&mut child);
+        }
+    }
+
     /// An empty request reads the peer's initial greeting without writing.
     pub fn exchange(&mut self, request: Vec<u8>) -> anyhow::Result<Vec<u8>> {
         self.requests
@@ -398,12 +415,12 @@ impl LineSession {
         let result = match self.responses.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(error) => {
-                terminate_and_reap(&mut self.child);
+                self.terminate();
                 return Err(error).context("session timed out or closed waiting for a reply");
             }
         };
         if result.is_err() {
-            terminate_and_reap(&mut self.child);
+            self.terminate();
         }
         result.map_err(|error| {
             let diagnostics = self
@@ -418,7 +435,7 @@ impl LineSession {
 
 impl Drop for LineSession {
     fn drop(&mut self) {
-        terminate_and_reap(&mut self.child);
+        self.terminate();
     }
 }
 
@@ -617,7 +634,10 @@ mod process_tests {
                 .to_string()
                 .contains("timed out")
         );
-        assert!(session.child.try_wait().unwrap().is_some());
+        assert!(
+            session.child.is_none(),
+            "timed-out session must release its child"
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 

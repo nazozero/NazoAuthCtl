@@ -1397,9 +1397,6 @@ pub(super) fn cache_systemd_artifact(
     runtime_root: &Path,
     digest: &str,
 ) -> anyhow::Result<PathBuf> {
-    if filesystem::sha256(source)? != digest {
-        anyhow::bail!("verified systemd binary changed before caching");
-    }
     let artifacts_root = runtime_root.join("artifacts");
     let cache_dir = artifacts_root.join(digest);
     filesystem::ensure_directory_chain(&cache_dir)?;
@@ -1409,10 +1406,7 @@ pub(super) fn cache_systemd_artifact(
     let cached = cache_dir.join("nazoauth");
     let mut source_file =
         filesystem::open_secure_regular_file(source, "verified systemd release binary", false)?;
-    filesystem::copy_atomic_from_file(&mut source_file, &cached, 0o555)?;
-    if filesystem::sha256(&cached)? != digest {
-        anyhow::bail!("cached systemd binary does not match its verified digest");
-    }
+    filesystem::copy_atomic_from_file(&mut source_file, &cached, 0o555, Some(digest))?;
     Ok(cached)
 }
 

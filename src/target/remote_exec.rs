@@ -19,7 +19,7 @@ use anyhow::{Context, bail};
 
 use super::{
     LocalTarget, TargetJournal, target_state_root,
-    wire::{RejectionCode, encode_host_result, parse_host_operation},
+    wire::{encode_host_result, parse_host_operation},
 };
 
 /// CLI entry point: wire real stdin/stdout into [`serve`]. The state root is
@@ -47,8 +47,9 @@ fn serve_stream(
     let target = LocalTarget::with_state_root(state_root);
     output.write_all(STREAM_GREETING)?;
     output.flush()?;
+    let mut frame = Vec::new();
     loop {
-        let mut frame = Vec::new();
+        frame.clear();
         input
             .take(super::wire::MAX_HOST_OPERATION_BYTES as u64 + 1)
             .read_until(b'\n', &mut frame)?;
@@ -81,13 +82,6 @@ pub(crate) fn serve(
     output: &mut impl std::io::Write,
     state_root: &std::path::Path,
 ) -> anyhow::Result<()> {
-    if input.len() > super::wire::MAX_HOST_OPERATION_BYTES {
-        bail!(
-            "{}: stdin exceeds the {}-byte HostOperation limit",
-            RejectionCode::OperationOversize.as_str(),
-            super::wire::MAX_HOST_OPERATION_BYTES
-        );
-    }
     // Typed parse: closed kinds, deny_unknown_fields at both nesting levels,
     // schema discriminator, UUIDv7 id, per-kind payload validation.
     let operation =

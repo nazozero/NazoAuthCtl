@@ -12,7 +12,6 @@ pub(super) fn run() -> anyhow::Result<()> {
         let keys = crate::controller_identity::store::ControllerKeyStore::open_default()?;
         for instance in registry.list_instances()? {
             let directory = keys.instance_dir(&instance.deployment_id)?;
-            keys.load_active(&instance.deployment_id)?;
             keys.list_keys(&instance.deployment_id)?;
             crate::controller_identity::journal::OperationJournal::open(directory.clone())?
                 .load()?;

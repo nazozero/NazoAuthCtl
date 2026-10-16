@@ -382,7 +382,8 @@ pub trait RuntimeBackend {
     fn read_logs(&self, object_reference: &str, limit: usize) -> anyhow::Result<Vec<String>>;
     fn start(&self, object_reference: &str) -> anyhow::Result<()>;
     fn stop(&self, object_reference: &str) -> anyhow::Result<()>;
-    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()>;
+    /// Stop or prove absence, returning whether the runtime was initially running.
+    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<bool>;
     fn restart(&self, object_reference: &str) -> anyhow::Result<()>;
     fn remove(&self, object_reference: &str) -> anyhow::Result<()>;
     /// Replace the runtime object without starting it. The caller restores the desired running state.

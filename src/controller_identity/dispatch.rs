@@ -871,7 +871,7 @@ mod tests {
                 input("rev-1"),
             )?;
             if expected_state == JournalState::Accepted {
-                journal.mark_accepted(&first.signed.operation_id)?;
+                journal.mark_accepted_if_matches(&journal.load()?.context("write-ahead entry")?)?;
             }
             let journaled = journal.load()?.context("write-ahead entry")?;
             assert_eq!(journaled.state, expected_state);
