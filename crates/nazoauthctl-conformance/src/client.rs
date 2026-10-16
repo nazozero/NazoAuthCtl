@@ -6,7 +6,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use url::Url;
 use zeroize::Zeroize;
 
 use crate::credentials::BearerToken;
@@ -218,6 +217,7 @@ impl SuiteClient {
         }
         let deadline = Instant::now() + timeout;
         let state_string = states.join(",");
+        let path = format!("/api/runner/{module_id}/wait-state");
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -226,7 +226,7 @@ impl SuiteClient {
             let call_ms = wait_state_call_timeout_ms(remaining, self.config.timeout).to_string();
             let response = self.request_json(
                 HttpMethod::Get,
-                &format!("/api/runner/{module_id}/wait-state"),
+                &path,
                 &[
                     ("states", state_string.as_str()),
                     ("timeoutMs", call_ms.as_str()),
@@ -235,9 +235,6 @@ impl SuiteClient {
                 true,
                 self.config.max_response_bytes,
             )?;
-            if response.status == 404 {
-                return Err(SuiteClientError::HttpStatus(404));
-            }
             if response.status != 200 {
                 return Err(SuiteClientError::HttpStatus(response.status));
             }
@@ -274,15 +271,7 @@ impl SuiteClient {
     /// document is distinct from `/api/info/{id}` and carries the authoritative
     /// `exposed` and `browser` fields consumed by the native OpenID4VC drivers.
     pub fn runner_info(&self, module_id: &str) -> Result<Value, SuiteClientError> {
-        if module_id.is_empty()
-            || module_id.len() > 256
-            || module_id == "."
-            || module_id == ".."
-            || module_id.chars().any(|character| {
-                character.is_control()
-                    || !matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.')
-            })
-        {
+        if !valid_path_component(module_id) {
             return Err(SuiteClientError::InvalidInput);
         }
         let response = self.request_json(
@@ -360,14 +349,14 @@ impl SuiteClient {
                 placeholder
                     .as_str()
                     .filter(|id| valid_path_component(id))
-                    .map(ToOwned::to_owned)
                     .ok_or(SuiteClientError::MalformedResponse)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let [placeholder_id] = pending.as_slice() else {
             return Err(SuiteClientError::ReviewPlaceholderBoundary);
         };
-        let encoded = format!("data:image/png;base64,{}", STANDARD.encode(png));
+        let mut encoded = String::from("data:image/png;base64,");
+        STANDARD.encode_string(png, &mut encoded);
         let response = self.request_bytes(
             HttpMethod::Post,
             &format!("/api/log/{module_id}/images/{placeholder_id}"),
@@ -388,7 +377,7 @@ impl SuiteClient {
         {
             return Err(SuiteClientError::MalformedResponse);
         }
-        Ok(placeholder_id.clone())
+        Ok((*placeholder_id).to_owned())
     }
 
     pub fn cancel_module(&self, module_id: &str) -> Result<CancelOutcome, SuiteClientError> {
@@ -466,7 +455,7 @@ impl SuiteClient {
                 pairs.append_pair(key, value);
             }
         }
-        if !same_origin(&self.origin, &url) {
+        if !self.origin.same_origin_url(&url) {
             return Err(SuiteClientError::CrossOriginRedirect);
         }
         let mut headers = vec![("Accept".to_owned(), "application/json".to_owned())];
@@ -500,7 +489,7 @@ impl SuiteClient {
                     return Err(SuiteClientError::Redirect);
                 }
                 let redirected = url.join(location).map_err(|_| SuiteClientError::Redirect)?;
-                if !same_origin(&self.origin, &redirected) {
+                if !self.origin.same_origin_url(&redirected) {
                     return Err(SuiteClientError::CrossOriginRedirect);
                 }
                 url = redirected;
@@ -544,8 +533,6 @@ pub struct ModuleDefinition {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub variant: BTreeMap<String, String>,
-    #[serde(skip)]
-    pub raw: Value,
 }
 
 impl Drop for ModuleDefinition {
@@ -554,7 +541,6 @@ impl Drop for ModuleDefinition {
             key.zeroize();
             value.zeroize();
         }
-        zeroize_json_value(&mut self.raw);
     }
 }
 
@@ -570,8 +556,6 @@ pub struct PlanCreated {
     pub id: String,
     pub name: String,
     pub modules: Vec<ModuleDefinition>,
-    #[serde(skip)]
-    pub raw: Value,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -649,96 +633,32 @@ fn valid_path_component(value: &str) -> bool {
         && value.len() <= 256
         && value != "."
         && value != ".."
-        && value.chars().all(|character| {
-            !character.is_control()
-                && matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn parse_plan_created(body: Value) -> Result<PlanCreated, SuiteClientError> {
-    let object = body
-        .as_object()
-        .ok_or(SuiteClientError::MalformedResponse)?;
-    let id = object
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or(SuiteClientError::MalformedResponse)?;
-    let name = object
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or(SuiteClientError::MalformedResponse)?;
-    let modules = object
-        .get("modules")
-        .and_then(Value::as_array)
-        .ok_or(SuiteClientError::MalformedResponse)?;
-    if id.len() > 256
-        || name.len() > 512
-        || id.chars().any(char::is_control)
-        || name.chars().any(char::is_control)
+    let created: PlanCreated =
+        serde_json::from_value(body).map_err(|_| SuiteClientError::MalformedResponse)?;
+    if created.id.len() > 256
+        || created.name.len() > 512
+        || created.id.chars().any(char::is_control)
+        || created.name.chars().any(char::is_control)
+        || created.modules.iter().any(|module| {
+            module.test_name.is_empty()
+                || module.test_name.len() > 256
+                || module.test_name.chars().any(char::is_control)
+        })
     {
         return Err(SuiteClientError::MalformedResponse);
     }
-    let mut parsed = Vec::with_capacity(modules.len());
-    for raw in modules {
-        let module = raw.as_object().ok_or(SuiteClientError::MalformedResponse)?;
-        let test_name = module
-            .get("testModule")
-            .and_then(Value::as_str)
-            .ok_or(SuiteClientError::MalformedResponse)?;
-        if test_name.is_empty() || test_name.len() > 256 || test_name.chars().any(char::is_control)
-        {
-            return Err(SuiteClientError::MalformedResponse);
-        }
-        let variant = match module.get("variant") {
-            None | Some(Value::Null) => BTreeMap::new(),
-            Some(Value::Object(entries)) => entries
-                .iter()
-                .map(|(key, value)| {
-                    value
-                        .as_str()
-                        .map(|value| (key.clone(), value.to_owned()))
-                        .ok_or(SuiteClientError::MalformedResponse)
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?,
-            Some(_) => return Err(SuiteClientError::MalformedResponse),
-        };
-        parsed.push(ModuleDefinition {
-            test_name: test_name.to_owned(),
-            variant,
-            raw: raw.clone(),
-        });
-    }
-    Ok(PlanCreated {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        modules: parsed,
-        raw: body,
-    })
+    Ok(created)
 }
 
 fn is_finalisation_race(value: &Value) -> bool {
     let text = serde_json::to_string(value).unwrap_or_default();
     text.contains("runInBackground called after runFinalisationTaskInBackground()")
-}
-
-fn same_origin(expected: &Origin, actual: &Url) -> bool {
-    let Some(host) = actual.host_str() else {
-        return false;
-    };
-    if actual.scheme() != "https" || !actual.username().is_empty() || actual.password().is_some() {
-        return false;
-    }
-    let mut authority = host.to_owned();
-    if host.contains(':') {
-        authority = format!("[{host}]");
-    }
-    if let Some(port) = actual.port()
-        && port != 443
-    {
-        authority.push(':');
-        authority.push_str(&port.to_string());
-    }
-    expected.as_str() == format!("https://{authority}")
 }
 
 fn wait_state_call_timeout_ms(remaining: Duration, transport_timeout: Duration) -> u128 {
@@ -893,26 +813,87 @@ mod tests {
 
     #[test]
     fn bearer_never_enters_url_or_error() {
-        let capture = Arc::new(AuthCapture {
-            requests: Mutex::new(Vec::new()),
-            authenticated_status: 200,
-            authenticated_body: b"{}".to_vec(),
-        });
-        let client = SuiteClient::with_transport(
-            Origin::parse("https://suite.example").expect("origin"),
-            Some(BearerToken::new("secret-token").expect("token")),
-            capture.clone(),
-            ClientConfig::default(),
-        )
-        .expect("client");
-        client.probe_auth().expect("auth probe");
-        let requests = capture.requests.lock().expect("lock");
-        let authenticated = requests.get(1).expect("authenticated request");
-        assert_eq!(
-            authenticated.header("authorization"),
-            Some("Bearer secret-token")
-        );
-        assert!(!authenticated.url().as_str().contains("secret-token"));
+        for origin in [
+            "https://suite.example",
+            "https://[::1]",
+            "https://[2001:db8::1]:8443",
+        ] {
+            let capture = Arc::new(AuthCapture {
+                requests: Mutex::new(Vec::new()),
+                authenticated_status: 200,
+                authenticated_body: b"{}".to_vec(),
+            });
+            let client = SuiteClient::with_transport(
+                Origin::parse(origin).expect("origin"),
+                Some(BearerToken::new("secret-token").expect("token")),
+                capture.clone(),
+                ClientConfig::default(),
+            )
+            .expect("client");
+            client.probe_auth().expect("auth probe");
+            let requests = capture.requests.lock().expect("lock");
+            let authenticated = requests.get(1).expect("authenticated request");
+            assert_eq!(
+                authenticated.header("authorization"),
+                Some("Bearer secret-token")
+            );
+            assert!(!authenticated.url().as_str().contains("secret-token"));
+        }
+    }
+
+    #[test]
+    fn redirects_keep_bearer_within_the_ipv6_suite_origin() {
+        struct Redirect {
+            location: &'static str,
+            requests: Mutex<Vec<HttpRequest>>,
+        }
+        impl Transport for Redirect {
+            fn send(
+                &self,
+                request: HttpRequest,
+                _max: usize,
+            ) -> Result<HttpResponse, TransportError> {
+                let mut requests = self.requests.lock().unwrap();
+                let first = requests.is_empty();
+                requests.push(request);
+                Ok(HttpResponse {
+                    status: if first { 302 } else { 200 },
+                    headers: vec![("Location".into(), self.location.into())],
+                    body: b"{}".to_vec(),
+                })
+            }
+        }
+        for (location, allowed) in [
+            ("/api/info/next", true),
+            ("https://[::1]:443/api/info/next", true),
+            ("https://[::1]:8443/api/info/next", false),
+            ("https://other.example/api/info/next", false),
+            ("https://user@[::1]/api/info/next", false),
+            ("http://[::1]/api/info/next", false),
+        ] {
+            let transport = Arc::new(Redirect {
+                location,
+                requests: Mutex::new(Vec::new()),
+            });
+            let client = SuiteClient::with_transport(
+                Origin::parse("https://[::1]").unwrap(),
+                Some(BearerToken::new("secret-token").unwrap()),
+                transport.clone(),
+                ClientConfig::default(),
+            )
+            .unwrap();
+            let result = client.module_info("module");
+            if allowed {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(SuiteClientError::CrossOriginRedirect)));
+            }
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests.len(), if allowed { 2 } else { 1 });
+            for request in requests.iter() {
+                assert_eq!(request.header("authorization"), Some("Bearer secret-token"));
+            }
+        }
     }
 
     #[test]

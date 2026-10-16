@@ -167,7 +167,7 @@ impl Drop for PlannedPlan {
         // Suite responses and materialized Matrix configs may contain private
         // client material. Every worker-owned clone must clear its own config;
         // clearing only the parent Matrix cannot cover these independent
-        // allocations. ModuleDefinition owns and clears its response Values.
+        // allocations. ModuleDefinition clears its own variant values.
         zeroize_json_value(&mut self.config);
     }
 }
@@ -655,7 +655,7 @@ impl ConformanceRunner {
                         } else {
                             None
                         };
-                    let mut created =
+                    let created =
                         match self
                             .config
                             .client
@@ -668,10 +668,6 @@ impl ConformanceRunner {
                                 break 'create;
                             }
                         };
-                    // `PlanCreated::raw` is a response-owned Value separate
-                    // from each module's raw copy. Clear it before the
-                    // response wrapper is partially moved below.
-                    zeroize_json_value(&mut created.raw);
                     suite_plan_ids.push(created.id.clone());
                     // Persist the opaque ID before evaluating any returned
                     // definition or budget. A local rejection must never
@@ -4001,7 +3997,6 @@ mod tests {
         let module = ModuleDefinition {
             test_name: "fapi-ciba-id1".into(),
             variant: BTreeMap::new(),
-            raw: serde_json::json!({}),
         };
 
         let (observed, needs_interactive_driver) = runner
@@ -4125,7 +4120,6 @@ mod tests {
         let module = ModuleDefinition {
             test_name: "test".into(),
             variant: BTreeMap::new(),
-            raw: serde_json::json!({}),
         };
         let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
         let error = runner
