@@ -574,7 +574,7 @@ fn execute_with_progress<S: ProgressSink>(
         .iter()
         .map(|plan| (plan.plan_id.clone(), plan.resource_budget.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut selected_resource_budget = driver_plan.selected_resource_budget.clone();
+    let mut selected_resource_budget = driver_plan.selected_resource_budget;
     // The official Suite owns each plan's live module list and may add tests
     // without changing the plan identity. Bound the run by the artifact-wide
     // module ceiling instead of treating an old per-plan count as immutable.
@@ -774,15 +774,6 @@ fn execute_with_progress<S: ProgressSink>(
         cleanup_complete: false,
     };
 
-    // The OpenID4VP client and runner are being generalized in the adjacent
-    // slice. Keep this typed boundary ordinary-only: a lease-shaped adapter is
-    // deliberately impossible here.
-    let ciba_approver = build_ciba_user_approver(
-        requires_ciba,
-        &ephemeral_tenant.issuer,
-        &run_secrets,
-        ordinary.clients().values().cloned().collect(),
-    )?;
     let run_result = run_signed_suite(
         ordinary,
         suite_client.clone(),
@@ -796,7 +787,7 @@ fn execute_with_progress<S: ProgressSink>(
         plan_resource_budgets,
         selected_resource_budget,
         recovery.clone(),
-        ciba_approver,
+        requires_ciba,
         requires_vci,
         requires_vp,
         control,
@@ -866,16 +857,11 @@ fn execute_with_progress<S: ProgressSink>(
             None
         }
     };
-    let cleanup_complete = cleanup_evidence.is_some()
-        && !errors
-            .iter()
-            .any(|error| error.starts_with("resource-cleanup="));
-    let retention_commit_possible = retention_eligible && cleanup_evidence.is_some();
-    // Screenshot evidence, not the optional control evidence, is the durable
-    // certification-retention boundary.  The screenshot manifest was bound
-    // to the Prepared journal above and is revalidated by stage, commit,
-    // publish, recovery claim, and finish. Control-operation evidence is written only
-    // after ownership has transferred and the final report is fixed.
+    let cleanup_complete = cleanup_evidence.is_some();
+    let retention_commit_possible = retention_eligible && cleanup_complete;
+    // Transfer Suite plan ownership only after ordinary resource cleanup.
+    // Control-operation evidence is written after retention has committed and
+    // the final report is fixed.
     let mut retention_committed = if retention_commit_possible {
         match (|| -> anyhow::Result<()> {
             recovery.stage_suite_retention_manifest()?;
@@ -954,17 +940,12 @@ fn execute_with_progress<S: ProgressSink>(
         report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
             && !retention_committed
             && report.orchestration_integrity.suite_resources_settled;
-        if errors
-            .iter()
-            .any(|error| error.starts_with("suite-retention"))
-        {
-            report.errors.extend(
-                errors
-                    .iter()
-                    .filter(|error| error.starts_with("suite-retention"))
-                    .cloned(),
-            );
-        }
+        report.errors.extend(
+            errors
+                .iter()
+                .filter(|error| error.starts_with("suite-retention"))
+                .cloned(),
+        );
         report.local_success = report.errors.is_empty()
             && report.orchestration_integrity.all_modules_instantiated
             && report.orchestration_integrity.all_modules_settled
@@ -976,7 +957,7 @@ fn execute_with_progress<S: ProgressSink>(
     // a successful writer and to FinalOutput; a failed writer is represented
     // only by outer diagnostics and an absent receipt.
     let mut evidence = None;
-    if let (Some(report), Some(cleanup_operations)) = (report.as_ref(), cleanup_evidence.as_ref()) {
+    if let (Some(report), Some(cleanup_operations)) = (report.as_ref(), cleanup_evidence) {
         progress.activity(&ProgressActivity::WritingEvidence);
         let runtime = evidence_runtime(&deployment.runtime);
         let identity = EvidenceBundleIdentity {
@@ -994,7 +975,7 @@ fn execute_with_progress<S: ProgressSink>(
             control: EvidenceControlIdentity {
                 deployment_id: deployment.deployment_id,
                 tenant_id: invocation.tenant_id.clone(),
-                operations: cleanup_operations.clone(),
+                operations: cleanup_operations,
                 cleanup_complete,
             },
             outer_cleanup_complete: cleanup_complete,
@@ -1016,7 +997,7 @@ fn execute_with_progress<S: ProgressSink>(
     } else {
         None
     };
-    if cleanup_evidence.is_some()
+    if cleanup_complete
         && recovery.suite_cleanup_complete()
         && let Err(error) = recovery.finish()
     {
@@ -1552,13 +1533,10 @@ struct EphemeralTenant {
 
 impl EphemeralTenant {
     fn new(tenant_id: &str, tenant_domain: &str, target_issuer: &str) -> anyhow::Result<Self> {
-        let tenant_id = uuid::Uuid::parse_str(tenant_id)
-            .context("generated OIDF tenant ID is invalid")?
-            .to_string();
         let realm_id = uuid::Uuid::now_v7().to_string();
         let organization_id = uuid::Uuid::now_v7().to_string();
         Self::from_ids(
-            &tenant_id,
+            tenant_id,
             &realm_id,
             &organization_id,
             tenant_domain,
@@ -2252,7 +2230,7 @@ fn run_signed_suite<S: ProgressSink>(
     plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
-    ciba_approver: Option<Arc<CibaUserApprovalClient>>,
+    requires_ciba: bool,
     requires_vci: bool,
     requires_vp: bool,
     control: RunControl,
@@ -2260,6 +2238,15 @@ fn run_signed_suite<S: ProgressSink>(
     interrupt_notice: &'static str,
     progress: &mut S,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
+    let ciba_approver = requires_ciba
+        .then(|| {
+            build_ciba_user_approver(
+                target_issuer,
+                &secrets,
+                materialized.clients().values().cloned().collect(),
+            )
+        })
+        .transpose()?;
     let binding = materialized
         .trust_policy_identity()
         .map(|identity| {
@@ -2369,21 +2356,17 @@ fn run_signed_suite<S: ProgressSink>(
 }
 
 fn build_ciba_user_approver(
-    requires_ciba: bool,
     target_issuer: &str,
     secrets: &RunSecrets,
     allowed_clients: std::collections::HashSet<String>,
-) -> anyhow::Result<Option<Arc<CibaUserApprovalClient>>> {
-    if !requires_ciba {
-        return Ok(None);
-    }
+) -> anyhow::Result<Arc<CibaUserApprovalClient>> {
     let issuer = Url::parse(target_issuer)
         .context("deployment target issuer is not a valid CIBA approval URL")?;
     let transport = Arc::new(
         HttpTransport::new(Duration::from_secs(30))
             .context("failed to initialize normal CIBA user-approval transport")?,
     );
-    Ok(Some(Arc::new(
+    Ok(Arc::new(
         CibaUserApprovalClient::new(
             issuer,
             secrets.applicant_email.clone(),
@@ -2392,7 +2375,7 @@ fn build_ciba_user_approver(
             allowed_clients,
         )
         .context("failed to initialize normal CIBA user approval")?,
-    )))
+    ))
 }
 
 struct DurableSuiteObserver {
@@ -2979,9 +2962,7 @@ fn next_pending_for_run(
         )
         .map(Some);
     }
-    if recovery.terminal_failure().is_some()
-        || retained_recovery_stops_before_live_apply(recovery.suite_retention_committed())
-    {
+    if recovery.terminal_failure().is_some() || recovery.suite_retention_committed() {
         return Ok(None);
     }
     if recovery.baseline_enumerate_operation().is_none() {
@@ -3299,7 +3280,7 @@ fn recover_pending_runs(
             if !tenant_present {
                 recovery.mark_tenant_absent(directory_revision)?;
             }
-            if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
+            if recovery.suite_retention_committed() {
                 cleanup_ephemeral_tenant(session, &mut recovery)?;
                 if suite_client.is_none() {
                     return Ok(None);
@@ -3393,10 +3374,6 @@ where
             None
         }
     }
-}
-
-fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool {
-    retention_committed
 }
 
 fn resolve_token<S: ProgressSink>(
