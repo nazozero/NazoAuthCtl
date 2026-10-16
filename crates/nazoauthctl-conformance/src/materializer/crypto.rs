@@ -158,7 +158,7 @@ pub(super) fn generate_attestation_material(
     if let Some(issuing_country) = issuing_country {
         configure_mdoc_identity(
             &mut ca_params,
-            &ca_key,
+            mdoc_subject_key_identifier(&ca_key),
             issuing_country,
             "NazoAuth conformance IACA",
         )?;
@@ -265,17 +265,21 @@ fn generate_credential_signing_leaf<'a>(
         .custom_extensions
         .push(subject_alternative_name(suite_origin)?);
     if let Some(issuing_country) = issuing_country {
+        let subject_key_id = mdoc_subject_key_identifier(&signing_key);
+        params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[2, 5, 29, 14],
+                der_tlv(0x04, &subject_key_id),
+            ));
         configure_mdoc_identity(
             &mut params,
-            &signing_key,
+            subject_key_id,
             issuing_country,
             "NazoAuth conformance document signer",
         )?;
         params.use_authority_key_identifier_extension = true;
         params.crl_distribution_points = vec![mdoc_crl_distribution_point(suite_origin)];
-        params
-            .custom_extensions
-            .push(subject_key_identifier(&signing_key));
         params
             .custom_extensions
             .push(issuer_alternative_name(suite_origin));
@@ -316,7 +320,7 @@ fn generate_credential_signing_leaf<'a>(
 
 fn configure_mdoc_identity(
     params: &mut CertificateParams,
-    signing_key: &SigningKey,
+    subject_key_id: Vec<u8>,
     issuing_country: &str,
     common_name: &str,
 ) -> Result<(), MaterializerError> {
@@ -328,8 +332,7 @@ fn configure_mdoc_identity(
     params
         .distinguished_name
         .push(DnType::CommonName, common_name.to_owned());
-    params.key_identifier_method =
-        KeyIdMethod::PreSpecified(mdoc_subject_key_identifier(signing_key));
+    params.key_identifier_method = KeyIdMethod::PreSpecified(subject_key_id);
     Ok(())
 }
 
@@ -338,13 +341,6 @@ fn mdoc_subject_key_identifier(signing_key: &SigningKey) -> Vec<u8> {
     digest(&SHA1_FOR_LEGACY_USE_ONLY, point.as_bytes())
         .as_ref()
         .to_vec()
-}
-
-fn subject_key_identifier(signing_key: &SigningKey) -> CustomExtension {
-    CustomExtension::from_oid_content(
-        &[2, 5, 29, 14],
-        der_tlv(0x04, &mdoc_subject_key_identifier(signing_key)),
-    )
 }
 
 fn issuer_alternative_name(suite_origin: &str) -> CustomExtension {
@@ -398,22 +394,30 @@ fn ec_pkcs8_der(signing_key: &p256::ecdsa::SigningKey) -> Vec<u8> {
 }
 
 fn der_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
-    let payload = parts.concat();
-    der_tlv(0x30, &payload)
+    let mut output = der_header(0x30, parts.iter().map(Vec::len).sum());
+    for part in parts {
+        output.extend_from_slice(part);
+    }
+    output
 }
 
 fn der_tlv(tag: u8, payload: &[u8]) -> Vec<u8> {
-    let mut output = vec![tag];
-    let length = payload.len();
+    let mut output = der_header(tag, payload.len());
+    output.extend_from_slice(payload);
+    output
+}
+
+fn der_header(tag: u8, length: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(2 + size_of::<usize>() + length);
+    output.push(tag);
     if length < 128 {
         output.push(length as u8);
     } else {
-        let bytes = (length as u32).to_be_bytes();
-        let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(3);
-        output.push(0x80 | u8::try_from(4 - first).unwrap_or(4));
+        let bytes = length.to_be_bytes();
+        let first = (length.leading_zeros() / 8) as usize;
+        output.push(0x80 | (bytes.len() - first) as u8);
         output.extend_from_slice(&bytes[first..]);
     }
-    output.extend_from_slice(payload);
     output
 }
 
@@ -462,8 +466,10 @@ pub(super) fn rsa_jwks(pkcs8_der: &[u8]) -> Result<(Zeroizing<String>, String), 
     let e = b64(key.public_exponent.as_bytes());
     let kid = jwk_thumbprint(&format!(r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#));
     let public = serde_json::json!({
-        "kty": "RSA", "n": n, "e": e, "kid": kid,
-        "alg": "PS256", "use": "sig", "key_ops": ["verify"]
+        "keys": [{
+            "kty": "RSA", "n": n, "e": e, "kid": kid,
+            "alg": "PS256", "use": "sig", "key_ops": ["verify"]
+        }]
     });
     let d = Zeroizing::new(b64(key.private_exponent.as_bytes()));
     let p = Zeroizing::new(b64(key.prime1.as_bytes()));
@@ -483,8 +489,7 @@ pub(super) fn rsa_jwks(pkcs8_der: &[u8]) -> Result<(Zeroizing<String>, String), 
         qi.as_str(),
     )
     .map_err(|_| MaterializerError::Encoding)?;
-    let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
-        .map_err(|_| MaterializerError::Encoding)?;
+    let public_jwks = serde_json::to_string(&public).map_err(|_| MaterializerError::Encoding)?;
     Ok((private_jwks, public_jwks))
 }
 
@@ -498,17 +503,20 @@ pub(super) fn ec_jwks(key: &SigningKey) -> Result<(String, String), Materializer
         r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#
     ));
     let public = serde_json::json!({
-        "kty":"EC", "crv":"P-256", "x":x, "y":y, "kid":kid,
-        "alg":"ES256", "use":"sig", "key_ops":["verify"]
+        "keys": [{
+            "kty":"EC", "crv":"P-256", "x":x, "y":y, "kid":kid,
+            "alg":"ES256", "use":"sig", "key_ops":["verify"]
+        }]
     });
     let private = serde_json::json!({
-        "kty":"EC", "crv":"P-256", "x":x, "y":y, "d":b64(key.to_bytes()), "kid":kid,
-        "alg":"ES256", "use":"sig", "key_ops":["sign"]
+        "keys": [{
+            "kty":"EC", "crv":"P-256", "x":x, "y":y, "d":b64(key.to_bytes()), "kid":kid,
+            "alg":"ES256", "use":"sig", "key_ops":["sign"]
+        }]
     });
-    let private_string = serde_json::to_string(&serde_json::json!({"keys": [private]}))
-        .map_err(|_| MaterializerError::Encoding)?;
-    let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
-        .map_err(|_| MaterializerError::Encoding)?;
+    let private_string =
+        serde_json::to_string(&private).map_err(|_| MaterializerError::Encoding)?;
+    let public_jwks = serde_json::to_string(&public).map_err(|_| MaterializerError::Encoding)?;
     Ok((private_string, public_jwks))
 }
 
@@ -582,11 +590,10 @@ pub(super) fn validate_materialized_mtls_registration(
     {
         return Ok(());
     }
-    let expected_dns = [Value::String(MTLS_CLIENT_SAN_DNS.to_owned())];
     let dns_matches = request
         .get("tls_client_auth_san_dns")
         .and_then(Value::as_array)
-        .is_some_and(|values| values.as_slice() == expected_dns);
+        .is_some_and(|values| matches!(values.as_slice(), [value] if value.as_str() == Some(MTLS_CLIENT_SAN_DNS)));
     let other_selectors_absent = request
         .get("tls_client_auth_subject_dn")
         .is_none_or(Value::is_null)
@@ -656,6 +663,25 @@ mod tests {
         },
         pkcs8::DecodePrivateKey as _,
     };
+
+    #[test]
+    fn der_length_encoding_preserves_short_and_long_boundaries() {
+        for (length, header) in [
+            (127, &[0x04, 0x7f][..]),
+            (128, &[0x04, 0x81, 0x80][..]),
+            (255, &[0x04, 0x81, 0xff][..]),
+            (256, &[0x04, 0x82, 0x01, 0x00][..]),
+        ] {
+            let payload = vec![0x5a; length];
+            let encoded = der_tlv(0x04, &payload);
+            assert_eq!(&encoded[..header.len()], header);
+            assert_eq!(&encoded[header.len()..], payload);
+        }
+        assert_eq!(
+            der_sequence(&[vec![0x02, 0x01, 0x01], vec![0x04, 0x01, 0x42]]),
+            [0x30, 0x06, 0x02, 0x01, 0x01, 0x04, 0x01, 0x42]
+        );
+    }
 
     #[test]
     fn rsa_key_size_accepts_only_policy_supported_sizes() {
