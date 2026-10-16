@@ -1,16 +1,15 @@
 //! Client-side ControlOperation construction (goal plan 05 §2, frozen
 //! contract in `nazo-operator-protocol::control_operation`).
 //!
-//! [`build_signed_control_operation`] is the selector-facing entry point for
-//! the only place in ctl that signs a ControlOperation. The dispatch path
+//! This module signs a ControlOperation after the dispatch path
 //! resolves its selector before reaching the signer and passes the resulting
 //! [`InstanceRecord`] directly, so the record is read only once. The signer
 //! loads the active private key via the instance's `controller_key_ref`, fills
 //! the envelope (`deployment_id` from the record; config revision and
 //! operation payload supplied by the caller), mints one UUIDv7
 //! `operation_id`, canonicalizes, computes the request hash, and signs
-//! exactly once. The returned id/hash pair is what the journaling layer (E06)
-//! records before dispatch.
+//! exactly once. The journaling layer records the signed envelope identity
+//! and request hash before dispatch.
 
 use anyhow::{Context, bail};
 use nazo_operator_protocol::{
@@ -18,7 +17,7 @@ use nazo_operator_protocol::{
 };
 use uuid::Uuid;
 
-use crate::registry::{InstanceRecord, RegistryStore};
+use crate::registry::InstanceRecord;
 
 use super::store::{ControllerKeyStore, LoadedControllerKey};
 
@@ -43,12 +42,6 @@ pub struct SignedControlOperation {
     pub compact_jws: String,
     /// Lowercase hex SHA-256 of the canonical payload bytes.
     pub request_hash: String,
-    /// Echo of `operation.operation_id` for journaling ergonomics.
-    pub operation_id: String,
-    /// Echo of the signing controller kid.
-    pub kid: String,
-    /// Echo of the audience deployment id.
-    pub deployment_id: String,
 }
 
 /// Extract the deployment identifier a key reference points at. References
@@ -64,20 +57,6 @@ pub fn deployment_from_key_ref(key_ref: &str) -> anyhow::Result<&str> {
     super::store::validate_instance_identifier(rest)
         .with_context(|| "controller key ref must address exactly one instance key directory")?;
     Ok(rest)
-}
-
-/// Build, hash, and sign one ControlOperation for the selected instance.
-///
-/// Signing requires an already-active local key: this function never mints
-/// keys silently. Unbound instances must go through the bind flow first.
-pub fn build_signed_control_operation(
-    registry: &RegistryStore,
-    keys: &ControllerKeyStore,
-    instance_selector: &str,
-    input: ControlOperationInput,
-) -> anyhow::Result<SignedControlOperation> {
-    let record = registry.resolve_control_instance(instance_selector)?;
-    build_signed_control_operation_for_record(keys, &record, input)
 }
 
 /// Build, hash, and sign a fresh operation for an already resolved record.
@@ -96,13 +75,14 @@ pub(crate) fn build_signed_control_operation_for_record(
             )
         })?;
     let operation_id = Uuid::now_v7().to_string();
-    let operation =
-        build_control_operation_with_id_and_kid(record, input, &operation_id, loaded.kid());
+    let operation = build_control_operation_with_id_and_kid(
+        record,
+        input,
+        operation_id,
+        loaded.kid().to_owned(),
+    );
     let (compact_jws, request_hash) = sign_control_operation(&operation, loaded.signing_key())?;
     Ok(SignedControlOperation {
-        operation_id: operation.operation_id.clone(),
-        kid: operation.kid.clone(),
-        deployment_id: record.deployment_id.clone(),
         request_hash,
         compact_jws,
         operation,
@@ -119,13 +99,13 @@ pub(crate) fn build_signed_control_operation_for_record(
 pub(crate) fn build_control_operation_with_id_and_kid(
     record: &InstanceRecord,
     input: ControlOperationInput,
-    operation_id: &str,
-    kid: &str,
+    operation_id: String,
+    kid: String,
 ) -> ControlOperation {
     ControlOperation {
         schema: CONTROL_OPERATION_SCHEMA,
-        operation_id: operation_id.to_owned(),
-        kid: kid.to_owned(),
+        operation_id,
+        kid,
         deployment_id: record.deployment_id.clone(),
         config_revision: input.config_revision,
         operation: input.operation,
@@ -167,12 +147,22 @@ mod tests {
     use super::*;
     use crate::controller_identity::store::controller_key_ref_for;
     use crate::filesystem;
-    use crate::registry::InstanceRecord;
+    use crate::registry::{InstanceRecord, RegistryStore};
 
     struct Fixture {
         _temp: filesystem::PrivateTempDir,
         registry: RegistryStore,
         keys: ControllerKeyStore,
+    }
+
+    fn build_signed_control_operation(
+        registry: &RegistryStore,
+        keys: &ControllerKeyStore,
+        instance_selector: &str,
+        input: ControlOperationInput,
+    ) -> anyhow::Result<SignedControlOperation> {
+        let record = registry.resolve_control_instance(instance_selector)?;
+        build_signed_control_operation_for_record(keys, &record, input)
     }
 
     fn fixture() -> anyhow::Result<Fixture> {
@@ -254,10 +244,8 @@ mod tests {
         let signed =
             build_signed_control_operation(&f.registry, &f.keys, "production", sample_input())?;
 
-        assert!(is_uuidv7(&signed.operation_id));
-        assert_eq!(signed.operation_id, signed.operation.operation_id);
-        assert_eq!(signed.kid, signed.operation.kid);
-        assert_eq!(signed.deployment_id, "deploy-alpha");
+        assert!(is_uuidv7(&signed.operation.operation_id));
+        assert_eq!(signed.operation.deployment_id, "deploy-alpha");
         assert_eq!(
             signed.request_hash,
             control_operation_request_hash(
@@ -268,7 +256,7 @@ mod tests {
         let store_key = f.keys.load_active("deploy-alpha")?.expect("active");
         let decoded = verify_control_operation_signature(
             &signed.compact_jws,
-            signed.kid.as_str(),
+            signed.operation.kid.as_str(),
             &store_key.verifying_key(),
         )?;
         assert_eq!(decoded, signed.operation);
@@ -301,7 +289,7 @@ mod tests {
         // the signature check itself.
         let error = verify_control_operation_signature(
             &alpha_signed.compact_jws,
-            alpha_signed.kid.as_str(),
+            alpha_signed.operation.kid.as_str(),
             &beta_key.verifying_key(),
         )
         .expect_err("another instance's key must not verify this signature");
@@ -385,8 +373,11 @@ mod tests {
             build_signed_control_operation(&f.registry, &f.keys, "production", sample_input())?;
         let by_id =
             build_signed_control_operation(&f.registry, &f.keys, "deploy-alpha", sample_input())?;
-        assert_eq!(by_alias.kid, by_id.kid);
-        assert_ne!(by_alias.operation_id, by_id.operation_id);
+        assert_eq!(by_alias.operation.kid, by_id.operation.kid);
+        assert_ne!(
+            by_alias.operation.operation_id,
+            by_id.operation.operation_id
+        );
 
         let error = build_signed_control_operation(&f.registry, &f.keys, "missing", sample_input())
             .expect_err("unknown selector");

@@ -353,11 +353,11 @@ impl ConformanceSession {
         let receipt: ControlOperationReceipt = self
             .target
             .execute_control_operation(prepared.request(secret_material)?)?;
-        if receipt.operation_id != prepared.signed.operation_id {
+        if receipt.operation_id != prepared.signed.operation.operation_id {
             bail!(
                 "target returned operation '{}' for controller operation '{}'",
                 receipt.operation_id,
-                prepared.signed.operation_id
+                prepared.signed.operation.operation_id
             );
         }
         if !receipt.accepted {
@@ -375,16 +375,16 @@ impl ConformanceSession {
             "the target accepted the ControlOperation without returning its durable result",
         )?;
         validate_control_result_binding(
-            &prepared.signed.operation_id,
+            &prepared.signed.operation.operation_id,
             &prepared.signed.request_hash,
             &expected_operation,
             &result,
         )?;
         let completion = ConformanceControlCompletion {
             identity: ControlOperationIdentity {
-                operation_id: prepared.signed.operation_id,
+                operation_id: prepared.signed.operation.operation_id,
                 request_hash: prepared.signed.request_hash,
-                kid: prepared.signed.kid,
+                kid: prepared.signed.operation.kid,
             },
             result,
         };
@@ -720,7 +720,7 @@ mod tests {
         );
         assert_eq!(
             journal.load()?.context("journal must remain")?.operation_id,
-            pending.signed.operation_id
+            pending.signed.operation.operation_id
         );
         assert!(
             session
@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(requests.borrow().len(), 1);
         assert_eq!(
             requests.borrow()[0].operation_id,
-            pending.signed.operation_id
+            pending.signed.operation.operation_id
         );
         assert_eq!(requests.borrow()[0].compact_jws, pending.signed.compact_jws);
         assert!(journal.load()?.is_none());

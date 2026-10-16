@@ -849,12 +849,13 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             &plan.invalidation_request_hash,
         ) {
             (None, None) => {
-                plan.invalidation_operation_id = Some(prepared.signed.operation_id.clone());
+                plan.invalidation_operation_id =
+                    Some(prepared.signed.operation.operation_id.clone());
                 plan.invalidation_request_hash = Some(prepared.signed.request_hash.clone());
                 journal.store(&plan)?;
             }
             (Some(operation_id), Some(request_hash))
-                if operation_id == &prepared.signed.operation_id
+                if operation_id == &prepared.signed.operation.operation_id
                     && request_hash == &prepared.signed.request_hash => {}
             _ => bail!(
                 "recover: control-operation journal does not match the recorded recovery invalidation"
@@ -883,12 +884,12 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     https: candidate.https,
                 },
                 plan.state_epoch.clone(),
-                prepared.signed.operation_id.clone(),
+                prepared.signed.operation.operation_id.clone(),
                 prepared.signed.compact_jws.clone(),
             ),
         )?;
         let receipt = crate::target::control_operation_receipt(
-            prepared.signed.operation_id.clone(),
+            prepared.signed.operation.operation_id.clone(),
             host_result.outcome,
         )?;
         let verdict = crate::controller_identity::classify_control_receipt(&prepared, receipt)?;

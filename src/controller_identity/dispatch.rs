@@ -66,8 +66,8 @@ impl PreparedOperation {
             change_set.as_ref().map(SecretMaterial::as_bytes),
         )?;
         Ok(ControlOperationRequest {
-            operation_id: self.signed.operation_id.clone(),
-            deployment_id: self.signed.deployment_id.clone(),
+            operation_id: self.signed.operation.operation_id.clone(),
+            deployment_id: self.signed.operation.deployment_id.clone(),
             compact_jws: self.signed.compact_jws.clone(),
             change_set,
         })
@@ -75,9 +75,9 @@ impl PreparedOperation {
 
     pub fn journal_entry(&self) -> OperationJournalEntry {
         OperationJournalEntry::new(
-            self.signed.operation_id.clone(),
+            self.signed.operation.operation_id.clone(),
             self.signed.request_hash.clone(),
-            self.signed.kid.clone(),
+            self.signed.operation.kid.clone(),
             self.signed.compact_jws.clone(),
         )
     }
@@ -202,8 +202,12 @@ fn prepare_entry_resume(
     record: &InstanceRecord,
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
-    let operation =
-        build_control_operation_with_id_and_kid(record, input, &entry.operation_id, &entry.kid);
+    let operation = build_control_operation_with_id_and_kid(
+        record,
+        input,
+        entry.operation_id.clone(),
+        entry.kid.clone(),
+    );
     let canonical = canonical_control_operation_bytes(&operation)?;
     let request_hash = control_operation_request_hash(&canonical);
     if request_hash != entry.request_hash {
@@ -216,9 +220,6 @@ fn prepare_entry_resume(
     }
     Ok(Some(PreparedOperation {
         signed: SignedControlOperation {
-            operation_id: entry.operation_id.clone(),
-            kid: entry.kid.clone(),
-            deployment_id: record.deployment_id.clone(),
             request_hash,
             compact_jws: entry.compact_jws.clone(),
             operation,
@@ -270,11 +271,11 @@ fn classify_receipt(
     prepared: &PreparedOperation,
     receipt: ControlOperationReceipt,
 ) -> anyhow::Result<DispatchVerdict> {
-    if receipt.operation_id != prepared.signed.operation_id {
+    if receipt.operation_id != prepared.signed.operation.operation_id {
         bail!(
             "target echoed operation id '{}' for request '{}'; refusing to interpret the result",
             receipt.operation_id,
-            prepared.signed.operation_id
+            prepared.signed.operation.operation_id
         );
     }
 
@@ -303,7 +304,7 @@ fn validate_result_binding(
     result: &ControlResult,
 ) -> anyhow::Result<()> {
     validate_control_result_binding(
-        &prepared.signed.operation_id,
+        &prepared.signed.operation.operation_id,
         &prepared.signed.request_hash,
         &prepared.signed.operation.operation,
         result,
@@ -423,7 +424,7 @@ pub fn settle_journal(
             persist_terminal(result).with_context(|| {
                 format!(
                     "failed to persist terminal result for operation '{}'",
-                    prepared.signed.operation_id
+                    prepared.signed.operation.operation_id
                 )
             })?;
             journal.clear_if_matches(&expected)
@@ -641,7 +642,7 @@ mod tests {
         outcome: ControlOutcome,
     ) -> ControlOperationReceipt {
         ControlOperationReceipt {
-            operation_id: prepared.signed.operation_id.clone(),
+            operation_id: prepared.signed.operation.operation_id.clone(),
             accepted: true,
             result: Some(valid_result(&prepared.signed.operation, outcome)),
             rejection_code: None,
@@ -676,7 +677,7 @@ mod tests {
         )?;
         assert_eq!(prepared.kind, AttemptKind::Fresh);
         let entry = journal.load()?.expect("write-ahead entry");
-        assert_eq!(entry.operation_id, prepared.signed.operation_id);
+        assert_eq!(entry.operation_id, prepared.signed.operation.operation_id);
         assert_eq!(entry.state, JournalState::Dispatched);
 
         let target = RecordingTarget::default();
@@ -785,7 +786,7 @@ mod tests {
         assert!(classify_receipt(&prepared, receipt).is_err());
 
         let accepted_without_result = ControlOperationReceipt {
-            operation_id: prepared.signed.operation_id.clone(),
+            operation_id: prepared.signed.operation.operation_id.clone(),
             accepted: true,
             result: None,
             rejection_code: None,
@@ -793,7 +794,7 @@ mod tests {
         assert!(classify_receipt(&prepared, accepted_without_result).is_err());
 
         let rejected_with_result = ControlOperationReceipt {
-            operation_id: prepared.signed.operation_id.clone(),
+            operation_id: prepared.signed.operation.operation_id.clone(),
             accepted: false,
             result: Some(valid_result(
                 &prepared.signed.operation,
@@ -898,9 +899,12 @@ mod tests {
                 input("rev-1"),
             )?;
             assert_eq!(resumed.kind, AttemptKind::Resumed);
-            assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+            assert_eq!(
+                resumed.signed.operation.operation_id,
+                first.signed.operation.operation_id
+            );
             assert_eq!(resumed.signed.request_hash, first.signed.request_hash);
-            assert_eq!(resumed.signed.kid, old_kid);
+            assert_eq!(resumed.signed.operation.kid, old_kid);
             assert_eq!(resumed.signed.compact_jws, first.signed.compact_jws);
             assert!(resumed.journal_entry().has_same_identity(&journaled));
             assert_eq!(journal.load()?.context("retained journal")?, journaled);
@@ -979,7 +983,10 @@ mod tests {
             input("rev-1"),
         )?;
         assert_eq!(second.kind, AttemptKind::Resumed);
-        assert_eq!(second.signed.operation_id, first.signed.operation_id);
+        assert_eq!(
+            second.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         assert_eq!(second.signed.compact_jws, first.signed.compact_jws);
         assert_eq!(second.signed.request_hash, first.signed.request_hash);
 
@@ -1041,7 +1048,10 @@ mod tests {
             input("rev-2"),
         )?;
         assert_eq!(second.kind, AttemptKind::Fresh);
-        assert_ne!(second.signed.operation_id, first.signed.operation_id);
+        assert_ne!(
+            second.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         Ok(())
     }
 
@@ -1071,7 +1081,10 @@ mod tests {
             input("rev-1"),
         )?;
         assert_eq!(resumed.kind, AttemptKind::Resumed);
-        assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+        assert_eq!(
+            resumed.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         drop(key);
         Ok(())
     }
@@ -1100,7 +1113,7 @@ mod tests {
         let verdict = classify_receipt(
             &prepared,
             ControlOperationReceipt {
-                operation_id: prepared.signed.operation_id.clone(),
+                operation_id: prepared.signed.operation.operation_id.clone(),
                 accepted: false,
                 result: None,
                 rejection_code: Some(crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED.to_owned()),
@@ -1150,7 +1163,7 @@ mod tests {
         );
         assert_eq!(
             journal.load()?.unwrap().operation_id,
-            first.signed.operation_id
+            first.signed.operation.operation_id
         );
         Ok(())
     }
@@ -1202,7 +1215,7 @@ mod tests {
         );
         assert_eq!(
             journal.load()?.unwrap().operation_id,
-            first.signed.operation_id
+            first.signed.operation.operation_id
         );
 
         let resumed = prepare_pending_control_operation(
@@ -1214,9 +1227,12 @@ mod tests {
         )?
         .context("exact pending operation must be recoverable")?;
         assert_eq!(resumed.kind, AttemptKind::Resumed);
-        assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+        assert_eq!(
+            resumed.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         assert_eq!(resumed.signed.request_hash, first.signed.request_hash);
-        assert_eq!(resumed.signed.kid, first.signed.kid);
+        assert_eq!(resumed.signed.operation.kid, first.signed.operation.kid);
         assert_eq!(resumed.signed.compact_jws, first.signed.compact_jws);
         Ok(())
     }
@@ -1246,7 +1262,7 @@ mod tests {
             store_key.kid(),
             &store_key.verifying_key(),
         )?;
-        assert_eq!(decoded.operation_id, first.signed.operation_id);
+        assert_eq!(decoded.operation_id, first.signed.operation.operation_id);
 
         Ok(())
     }

@@ -72,7 +72,7 @@ pub use dispatch::{
 pub use journal::{JournalState, OperationJournal, OperationJournalEntry};
 pub use operation::{
     CONTROLLER_KEY_REF_PREFIX, ControlOperationInput, SignedControlOperation,
-    build_signed_control_operation, deployment_from_key_ref,
+    deployment_from_key_ref,
 };
 pub use store::{
     ControllerKeyStore, ControllerKeySummary, LoadedControllerKey, controller_key_ref_for,

@@ -177,7 +177,7 @@ pub(crate) fn run_update(
         },
     )
     .context("preparing the migration operation failed; the update changed nothing")?;
-    let lifecycle_id = prepared.signed.operation_id.clone();
+    let lifecycle_id = prepared.signed.operation.operation_id.clone();
 
     // 5.-7. Stage + activate + local health + commit inside ONE journaled
     // HostOperation carrying the single lifecycle operation id and signed migration.
