@@ -5,12 +5,13 @@
 //! Suite identifiers, test-client shortcuts, or privileged decision route.
 
 use crate::{HttpMethod, HttpRequest, HttpResponse, Transport, TransportError};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
 use url::Url;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const BACKCHANNEL_RESPONSE_SOURCE: &str = "CallBackchannelAuthenticationEndpoint";
@@ -30,13 +31,6 @@ impl std::fmt::Debug for CibaUserApprovalClient {
             .debug_struct("CibaUserApprovalClient")
             .field("issuer", &self.issuer)
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for CibaUserApprovalClient {
-    fn drop(&mut self) {
-        self.email.zeroize();
-        self.password.zeroize();
     }
 }
 
@@ -77,11 +71,24 @@ impl CibaUserApprovalClient {
         if auth_req_id.trim().is_empty() || auth_req_id.len() > 2048 {
             return Err(CibaUserApprovalError::InvalidAuthRequestId);
         }
+        #[derive(Serialize)]
+        struct LoginRequest<'a> {
+            email: &'a str,
+            password: &'a str,
+        }
+        #[derive(Serialize)]
+        struct DecisionRequest<'a> {
+            decision: &'a str,
+            csrf_token: &'a str,
+        }
         let login = self.send_json(
             HttpMethod::Post,
             "auth/login",
             &[],
-            json!({"email": self.email.as_str(), "password": self.password.as_str()}),
+            LoginRequest {
+                email: self.email.as_str(),
+                password: self.password.as_str(),
+            },
         )?;
         if login.status != 200 {
             return Err(CibaUserApprovalError::LoginRejected(login.status));
@@ -103,9 +110,10 @@ impl CibaUserApprovalClient {
         let cookies = cookie_header(&login, csrf)?;
         let encoded_id =
             url::form_urlencoded::byte_serialize(auth_req_id.as_bytes()).collect::<String>();
+        let path = format!("auth/ciba/{encoded_id}");
         let verification = self.send(
             HttpMethod::Get,
-            &format!("auth/ciba/{encoded_id}"),
+            &path,
             vec![("Cookie".to_owned(), cookies.clone())],
             None,
         )?;
@@ -129,9 +137,12 @@ impl CibaUserApprovalClient {
         }
         let response = self.send_json(
             HttpMethod::Post,
-            &format!("auth/ciba/{encoded_id}"),
+            &path,
             &[("Cookie", cookies.as_str())],
-            json!({"decision": if approve { "approve" } else { "deny" }, "csrf_token": csrf}),
+            DecisionRequest {
+                decision: if approve { "approve" } else { "deny" },
+                csrf_token: csrf,
+            },
         )?;
         if response.status != 200 {
             return Err(CibaUserApprovalError::DecisionRejected(response.status));
@@ -144,7 +155,7 @@ impl CibaUserApprovalClient {
         method: HttpMethod,
         path: &str,
         headers: &[(&str, &str)],
-        body: Value,
+        body: impl Serialize,
     ) -> Result<HttpResponse, CibaUserApprovalError> {
         let mut values = vec![("Content-Type".to_owned(), "application/json".to_owned())];
         values.extend(
@@ -206,15 +217,16 @@ pub fn ciba_approval_requests(raw_log: &Value) -> Result<Vec<String>, CibaUserAp
         if source != Some(BACKCHANNEL_RESPONSE_SOURCE) {
             continue;
         }
+        let decoded;
         let response = match entry.get("backchannel_authentication_endpoint_response") {
-            Some(Value::String(response)) => serde_json::from_str::<Value>(response)
-                .map_err(|_| CibaUserApprovalError::MalformedSuiteLog)?,
-            Some(Value::Object(_)) => entry
-                .get("backchannel_authentication_endpoint_response")
-                .cloned()
-                .expect("matched response exists"),
+            Some(Value::String(response)) => {
+                decoded = serde_json::from_str::<Value>(response)
+                    .map_err(|_| CibaUserApprovalError::MalformedSuiteLog)?;
+                &decoded
+            }
+            Some(response @ Value::Object(_)) => response,
             Some(_) => return Err(CibaUserApprovalError::MalformedSuiteLog),
-            None => entry.clone(),
+            None => entry,
         };
         let Some(auth_req_id) = response.get("auth_req_id").and_then(Value::as_str) else {
             continue;
@@ -234,22 +246,31 @@ fn cookie_header(
     response: &HttpResponse,
     csrf_token: &str,
 ) -> Result<String, CibaUserApprovalError> {
-    let values = response
+    let mut cookies = String::new();
+    let mut count = 0;
+    let mut has_csrf = false;
+    for (_, value) in response
         .headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-        .filter_map(|(_, value)| value.split(';').next())
-        .filter(|pair| pair.contains('='))
-        .collect::<Vec<_>>();
-    if values.len() < 2
-        || !values.iter().any(|pair| {
-            pair.split_once('=')
-                .is_some_and(|(_, value)| value == csrf_token)
-        })
     {
+        let pair = value
+            .split_once(';')
+            .map_or(value.as_str(), |(pair, _)| pair);
+        let Some((_, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if count > 0 {
+            cookies.push_str("; ");
+        }
+        cookies.push_str(pair);
+        count += 1;
+        has_csrf |= value == csrf_token;
+    }
+    if count < 2 || !has_csrf {
         return Err(CibaUserApprovalError::MissingSessionCookies);
     }
-    Ok(values.join("; "))
+    Ok(cookies)
 }
 
 #[derive(Debug, Error)]
@@ -340,6 +361,7 @@ impl CibaUserApprovalError {
 mod tests {
     use super::*;
     use crate::TransportFailureStage;
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
