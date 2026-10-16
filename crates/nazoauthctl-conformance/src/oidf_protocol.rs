@@ -153,16 +153,14 @@ pub fn canonical_openid4vp_evidence_context_sha256(
     context: &Openid4vpEvidenceContext,
 ) -> Result<String, ProtocolError> {
     validate_evidence_context(context)?;
-    let bytes = serde_json::to_vec(context).map_err(|_| ProtocolError::Json)?;
-    Ok(hex_sha256(&bytes))
+    json_sha256(context)
 }
 
 pub fn canonical_openid4vp_presentation_binding_sha256(
     binding: &Openid4vpPresentationBinding,
 ) -> Result<String, ProtocolError> {
     validate_presentation_binding(binding)?;
-    let bytes = serde_json::to_vec(binding).map_err(|_| ProtocolError::Json)?;
-    Ok(hex_sha256(&bytes))
+    json_sha256(binding)
 }
 
 pub fn openid4vp_verification_capability_sha256(capability: &str) -> Result<String, ProtocolError> {
@@ -175,9 +173,10 @@ pub fn openid4vp_verification_capability_sha256(capability: &str) -> Result<Stri
             "invalid OpenID4VP verification capability",
         ));
     }
-    let mut binding = b"nazoauth-openid4vp-verification-capability-v1\0".to_vec();
-    binding.extend_from_slice(capability.as_bytes());
-    Ok(hex_sha256(&binding))
+    let mut digest = Sha256::new();
+    digest.update(b"nazoauth-openid4vp-verification-capability-v1\0");
+    digest.update(capability.as_bytes());
+    Ok(hex::encode(digest.finalize()))
 }
 
 pub fn verify_openid4vp_verification_receipt(
@@ -189,9 +188,8 @@ pub fn verify_openid4vp_verification_receipt(
     let receipt: Openid4vpVerificationReceipt =
         verify_compact(compact, expected.instance_key_id, RECEIPT_JWS_TYPE, key)?;
     validate_receipt(&receipt)?;
-    let context_sha256 = canonical_openid4vp_evidence_context_sha256(&receipt.evidence_context)?;
-    let presentation_binding_sha256 =
-        canonical_openid4vp_presentation_binding_sha256(&receipt.presentation_binding)?;
+    let context_sha256 = json_sha256(&receipt.evidence_context)?;
+    let presentation_binding_sha256 = json_sha256(&receipt.presentation_binding)?;
     if receipt.iss != expected.issuer
         || receipt.aud != expected.audience
         || receipt.deployment_id != expected.deployment_id
@@ -227,9 +225,8 @@ pub fn verify_openid4vp_verification_intent(
     let intent: Openid4vpVerificationIntent =
         verify_compact(compact, expected.instance_key_id, INTENT_JWS_TYPE, key)?;
     validate_intent(&intent)?;
-    let context_sha256 = canonical_openid4vp_evidence_context_sha256(&intent.evidence_context)?;
-    let presentation_binding_sha256 =
-        canonical_openid4vp_presentation_binding_sha256(&intent.presentation_binding)?;
+    let context_sha256 = json_sha256(&intent.evidence_context)?;
+    let presentation_binding_sha256 = json_sha256(&intent.presentation_binding)?;
     if intent.iss != expected.issuer
         || intent.aud != expected.audience
         || intent.deployment_id != expected.deployment_id
@@ -237,7 +234,6 @@ pub fn verify_openid4vp_verification_intent(
         || intent.instance_key_id != expected.instance_key_id
         || intent.tenant_id != expected.tenant_id
         || intent.transaction_id != expected.transaction_id
-        || intent.jti != expected.transaction_id
         || context_sha256 != expected.evidence_context_sha256
         || presentation_binding_sha256 != expected.presentation_binding_sha256
         || now < intent.iat
@@ -319,7 +315,6 @@ fn verify_compact<T: DeserializeOwned>(
     expected_type: &str,
     key: &VerifyingKey,
 ) -> Result<T, ProtocolError> {
-    validate_file_identifier(expected_key_id).map_err(|_| ProtocolError::Header)?;
     if compact.len() > nazo_operator_protocol::MAX_COMPACT_JWS_BYTES {
         return Err(ProtocolError::TooLarge);
     }
@@ -349,7 +344,7 @@ fn verify_compact<T: DeserializeOwned>(
         .decode(signature)
         .map_err(|_| ProtocolError::Base64)?;
     key.verify(
-        format!("{protected}.{payload}").as_bytes(),
+        &compact.as_bytes()[..protected.len() + 1 + payload.len()],
         &signature_bytes,
     )
     .map_err(|_| ProtocolError::Signature)?;
@@ -528,6 +523,7 @@ fn validate_lower_hex(value: &str, length: usize) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+fn json_sha256(value: &impl Serialize) -> Result<String, ProtocolError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| ProtocolError::Json)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
