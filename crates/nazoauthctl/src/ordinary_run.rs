@@ -3299,22 +3299,25 @@ fn recover_pending_runs(
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
             let (directory_revision, tenant_present) =
                 tenant_directory_presence(session, &recovery.ordinary_binding().tenant_id)?;
-            let terminal_failure = recovery.terminal_failure().cloned();
-            if let Some(failure) = terminal_failure {
+            if let Some(failure) = recovery.terminal_failure() {
+                let failure = format!(
+                    "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}",
+                    failure.operation_id,
+                    failure.request_hash,
+                    failure
+                        .result
+                        .error
+                        .as_ref()
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| "missing".to_owned()),
+                );
                 let tenant_cleanup = if tenant_present {
                     cleanup_ephemeral_tenant(session, &mut recovery)
                 } else {
                     recovery.mark_tenant_absent(directory_revision)
                 };
                 bail!(
-                    "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}; tenant_cleanup={}",
-                    failure.operation_id,
-                    failure.request_hash,
-                    failure
-                        .result
-                        .error
-                        .map(|error| format!("{error:?}"))
-                        .unwrap_or_else(|| "missing".to_owned()),
+                    "{failure}; tenant_cleanup={}",
                     tenant_cleanup
                         .err()
                         .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}")),
