@@ -155,9 +155,9 @@ impl AdminApiTransport for HttpsAdminTransport {
     fn send(&self, request: AdminHttpRequest) -> anyhow::Result<AdminHttpResponse> {
         let mut builder = http::Request::builder()
             .method(request.method)
-            .uri(request.url.as_str());
-        for (name, value) in &request.headers {
-            builder = builder.header(*name, value);
+            .uri(request.url);
+        for (name, value) in request.headers {
+            builder = builder.header(name, value);
         }
         let outgoing = builder
             .body(http_body_util::Full::new(bytes::Bytes::from(
