@@ -17,7 +17,7 @@ pub(super) fn verify_public(
     public_url: &Url,
     hostname: &str,
     expected_leaf_sha256: &str,
-    roots: RootCertStore,
+    roots: Arc<RootCertStore>,
     provider: &ProviderConfig,
     expected_configuration_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -40,13 +40,14 @@ pub(super) fn verify_public(
     if addresses.iter().any(|address| !is_public_ip(address.ip())) {
         bail!("TLS public hostname resolved to a non-public address");
     }
+    let tls_config = client_config(roots)?;
     for address in addresses {
         verify_public_address(
             public_url,
             hostname,
             address,
             expected_leaf_sha256,
-            roots.clone(),
+            Arc::clone(&tls_config),
             provider,
             expected_configuration_sha256,
         )
@@ -59,7 +60,7 @@ pub(super) fn verify_public_not_leaf(
     public_url: &Url,
     hostname: &str,
     forbidden_leaf_sha256: &str,
-    roots: RootCertStore,
+    roots: Arc<RootCertStore>,
     provider: &ProviderConfig,
     require_closed: bool,
 ) -> anyhow::Result<()> {
@@ -82,6 +83,7 @@ pub(super) fn verify_public_not_leaf(
     if addresses.iter().any(|address| !is_public_ip(address.ip())) {
         bail!("TLS public hostname resolved to a non-public address");
     }
+    let tls_config = client_config(roots)?;
     for address in addresses {
         if require_closed {
             match TcpStream::connect_timeout(
@@ -103,12 +105,24 @@ pub(super) fn verify_public_not_leaf(
             hostname,
             address,
             forbidden_leaf_sha256,
-            roots.clone(),
+            Arc::clone(&tls_config),
             provider,
         )
         .with_context(|| format!("TLS rollback proof failed for public address {address}"))?;
     }
     Ok(())
+}
+
+pub(super) fn client_config(roots: Arc<RootCertStore>) -> anyhow::Result<Arc<ClientConfig>> {
+    let crypto = rustls::crypto::aws_lc_rs::default_provider();
+    let mut config = ClientConfig::builder_with_provider(Arc::new(crypto))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // Each probe must observe the currently served certificate, not a resumed
+    // session's cached peer identity from before the provider reload.
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(Arc::new(config))
 }
 
 fn resolve_public_addresses(
@@ -135,7 +149,7 @@ pub(super) fn verify_public_address(
     hostname: &str,
     address: SocketAddr,
     expected_leaf_sha256: &str,
-    roots: RootCertStore,
+    tls_config: Arc<ClientConfig>,
     provider: &ProviderConfig,
     expected_configuration_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -145,7 +159,7 @@ pub(super) fn verify_public_address(
             public_url,
             hostname,
             address,
-            roots.clone(),
+            Arc::clone(&tls_config),
             provider,
             deadline,
             expected_configuration_sha256.is_some(),
@@ -174,12 +188,12 @@ pub(super) fn verify_public_address_not_leaf(
     hostname: &str,
     address: SocketAddr,
     forbidden_leaf_sha256: &str,
-    roots: RootCertStore,
+    tls_config: Arc<ClientConfig>,
     provider: &ProviderConfig,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(provider.request_timeout_seconds);
     let observed = observe_public_address(
-        public_url, hostname, address, roots, provider, deadline, false,
+        public_url, hostname, address, tls_config, provider, deadline, false,
     )?;
     if observed.0 == forbidden_leaf_sha256 {
         bail!("TLS public endpoint still presents the rolled-back candidate certificate");
@@ -191,7 +205,7 @@ fn observe_public_address(
     public_url: &Url,
     hostname: &str,
     address: SocketAddr,
-    roots: RootCertStore,
+    tls_config: Arc<ClientConfig>,
     provider: &ProviderConfig,
     deadline: Instant,
     require_configuration: bool,
@@ -204,14 +218,9 @@ fn observe_public_address(
     let mut tcp = TcpStream::connect_timeout(&address, connect_timeout)
         .with_context(|| format!("failed to connect to TLS public address {address}"))?;
     tcp.set_nonblocking(true)?;
-    let crypto = rustls::crypto::aws_lc_rs::default_provider();
-    let config = ClientConfig::builder_with_provider(Arc::new(crypto))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
     let server_name = ServerName::try_from(hostname.to_owned())
         .context("TLS hostname cannot be represented as SNI")?;
-    let mut connection = ClientConnection::new(Arc::new(config), server_name)?;
+    let mut connection = ClientConnection::new(tls_config, server_name)?;
     let target = if public_url.path().is_empty() {
         "/"
     } else {

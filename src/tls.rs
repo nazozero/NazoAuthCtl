@@ -8,6 +8,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -712,7 +713,7 @@ fn apply(
             &provider.public_url,
             &hostname,
             &material.leaf_sha256,
-            material.root_store.clone(),
+            material.root_store,
             &provider.config,
             transaction.proxy_configuration_sha256.as_deref(),
         )?;
@@ -1276,7 +1277,7 @@ fn rollback_transaction(
                 &provider.public_url,
                 &transaction.hostname,
                 &transaction.leaf_certificate_sha256,
-                root_store_from_pem(&provider.trust_anchors)?,
+                Arc::new(root_store_from_pem(&provider.trust_anchors)?),
                 &transaction.provider,
                 transaction.provider.native_proxy_program.is_some(),
             )?,
@@ -1305,7 +1306,7 @@ fn restore_previous_activation(transaction: &CertificateTransaction) -> anyhow::
 fn validate_rollback_material(
     receipt: &CertificateReceipt,
     provider: &LoadedProvider,
-) -> anyhow::Result<RootCertStore> {
+) -> anyhow::Result<Arc<RootCertStore>> {
     validate_receipt_provider_authority(receipt, provider)?;
     let material = material::load_valid_material(
         &receipt.generation.join("fullchain.pem"),
