@@ -3272,8 +3272,11 @@ fn resume_pending_conformance_operation(
         }
     }
     let mut matching = Vec::new();
-    for candidate in candidates {
-        if session.pending_control_operation_matches(&expected, candidate.operation.clone())? {
+    for mut candidate in candidates {
+        if let Some(operation) =
+            session.match_pending_control_operation(&expected, candidate.operation)?
+        {
+            candidate.operation = operation;
             matching.push(candidate);
         }
     }

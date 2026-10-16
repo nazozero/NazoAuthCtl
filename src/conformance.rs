@@ -209,11 +209,12 @@ impl ConformanceSession {
 
     /// Compare candidates against the one loaded journal snapshot. Dispatch
     /// reopens the journal and checks that identity before resuming anything.
-    pub fn pending_control_operation_matches(
+    /// Return the matching payload so recovery can dispatch it without cloning.
+    pub fn match_pending_control_operation(
         &self,
         expected: &crate::controller_identity::OperationJournalEntry,
         operation: ControlOperationPayload,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<ControlOperationPayload>> {
         let operation = build_control_operation_with_id_and_kid(
             &self.deployment_id,
             ControlOperationInput {
@@ -224,7 +225,10 @@ impl ConformanceSession {
             expected.kid.clone(),
         );
         let canonical = canonical_control_operation_bytes(&operation)?;
-        Ok(control_operation_request_hash(&canonical) == expected.request_hash)
+        Ok(
+            (control_operation_request_hash(&canonical) == expected.request_hash)
+                .then_some(operation.operation),
+        )
     }
 
     pub fn resume_pending_control_operation<F>(
@@ -620,17 +624,19 @@ mod tests {
         // journal changes. Only dispatch may consume the live journal.
         let journal_bytes = std::fs::read(journal.path())?;
         std::fs::write(journal.path(), b"invalid journal")?;
-        assert!(
-            session.pending_control_operation_matches(
+        assert_eq!(
+            session.match_pending_control_operation(
                 &expected,
                 ControlOperationPayload::KeysValidate,
-            )?
+            )?,
+            Some(ControlOperationPayload::KeysValidate),
         );
-        assert!(
-            !session.pending_control_operation_matches(
+        assert_eq!(
+            session.match_pending_control_operation(
                 &expected,
                 ControlOperationPayload::MigrateApply,
-            )?
+            )?,
+            None,
         );
         assert!(
             session
