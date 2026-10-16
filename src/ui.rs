@@ -643,6 +643,9 @@ mod tests {
             lines[0].split('|').next().unwrap().width(),
             lines[2].split('|').next().unwrap().width()
         );
-        assert_eq!(table, "实例      | Host\n----------+------\n生产 环境 | local");
+        assert_eq!(
+            table,
+            "实例      | Host\n----------+------\n生产 环境 | local"
+        );
     }
 }
