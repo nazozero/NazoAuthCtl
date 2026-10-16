@@ -1306,6 +1306,10 @@ fn answer_update(
         current_artifact,
         current_version,
         expected_revision,
+        applied_migration_operation_id: state
+            .applied_migration
+            .as_ref()
+            .map(|migration| migration.operation_id.as_str()),
         artifact,
         config: config.as_ref(),
         migration_jws: migration_jws.as_deref(),
