@@ -12,9 +12,7 @@ struct PlanWork {
     index: usize,
     group_index: usize,
     matrix_plan_id: String,
-    group: GroupProgress,
-    report: PlanReport,
-    plan: PlannedPlan,
+    report_index: usize,
 }
 
 enum WorkerMessage {
@@ -79,16 +77,16 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
     }
 
     let mut prepared = prepared;
-    let work = plan_work(&mut prepared);
+    let (work, queue) = plan_work(&mut prepared);
     let worker_count = runner.config.jobs.min(work.len());
-    let queue = Arc::new(Mutex::new(VecDeque::from_iter(0..work.len())));
+    let queue = Arc::new(Mutex::new(queue));
     let stop_launching = Arc::new(AtomicBool::new(false));
     let mut snapshots = vec![None::<ProgressSnapshot>; work.len()];
     let mut finished = vec![false; work.len()];
     let mut results = vec![None::<RunSummary>; work.len()];
     let mut worker_panicked = false;
 
-    let work_ref = &work;
+    let prepared_ref = &prepared;
     thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel::<WorkerMessage>();
         for worker_index in 0..worker_count {
@@ -107,7 +105,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                             Ok(mut queue) => queue.pop_front(),
                             Err(_) => None,
                         };
-                        let Some(next_index) = next else {
+                        let Some((next_index, plan)) = next else {
                             break;
                         };
                         let mut progress = ChannelSink {
@@ -118,7 +116,7 @@ pub(super) fn run<S: ProgressSink>(runner: &ConformanceRunner, sink: &mut S) -> 
                         };
                         let summary = runner.run_prepared(
                             &mut progress,
-                            worker_prepared(&work_ref[next_index]),
+                            worker_prepared(plan, &prepared_ref.groups, &prepared_ref.plans),
                             runner.config.automation.get(worker_index),
                         );
                         if has_unsettled_suite_resources(&summary.report)
@@ -214,25 +212,29 @@ fn completed_plan_stops_dispatch(report: &ConformanceReport) -> bool {
         || report.errors.iter().any(|error| error != "run interrupted")
 }
 
-fn plan_work(prepared: &mut PreparedRun) -> Vec<PlanWork> {
-    std::mem::take(&mut prepared.planned)
-        .into_iter()
+fn plan_work(prepared: &mut PreparedRun) -> (Vec<PlanWork>, VecDeque<(usize, PlannedPlan)>) {
+    let planned = std::mem::take(&mut prepared.planned);
+    let work = planned
+        .iter()
         .enumerate()
         .map(|(index, plan)| PlanWork {
             index,
             group_index: plan.group_index,
             matrix_plan_id: plan.matrix_plan_id.clone(),
-            group: prepared.groups[plan.group_index].clone(),
-            report: prepared.plans[plan.report_index].clone(),
-            plan,
+            report_index: plan.report_index,
         })
-        .collect()
+        .collect();
+    (work, planned.into_iter().enumerate().collect())
 }
 
-fn worker_prepared(work: &PlanWork) -> PreparedRun {
-    let mut group = work.group.clone();
+fn worker_prepared(
+    mut plan: PlannedPlan,
+    groups: &[GroupProgress],
+    reports: &[PlanReport],
+) -> PreparedRun {
+    let mut group = groups[plan.group_index].clone();
     group.completed = 0;
-    group.total = work.plan.modules.len();
+    group.total = plan.modules.len();
     group.status = GroupStatus::Remaining;
     group.passed = 0;
     group.reviewed = 0;
@@ -242,13 +244,13 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
     group.incomplete = 0;
     group.running = 0;
     group.remaining = group.total;
-    let mut plan = work.plan.clone();
+    let mut report = reports[plan.report_index].clone();
+    report.created_instances = 0;
     plan.group_index = 0;
     plan.report_index = 0;
-    let mut report = work.report.clone();
-    report.created_instances = 0;
     PreparedRun {
         current_profile: Some(group.profile.clone()),
+        current_variant: Some(redacted_variant(&plan.variant)),
         groups: vec![group],
         plans: vec![report],
         planned: vec![plan],
@@ -260,7 +262,6 @@ fn worker_prepared(work: &PlanWork) -> PreparedRun {
         matrix_expectations_satisfied: true,
         all_selected_plan_definitions_enumerated: true,
         auth_probe: None,
-        current_variant: Some(redacted_variant(&work.plan.variant)),
     }
 }
 
@@ -384,7 +385,7 @@ fn merge_reports(
         };
         let report = summary.report;
         if let Some(plan_report) = report.plans.first() {
-            plans[work[index].plan.report_index].created_instances = plan_report.created_instances;
+            plans[work[index].report_index].created_instances = plan_report.created_instances;
         }
         for error in report.errors {
             if error == "run interrupted" {

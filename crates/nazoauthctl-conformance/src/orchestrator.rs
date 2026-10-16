@@ -146,7 +146,6 @@ pub struct ConformanceRunner {
 /// module definitions enumerated before any module is started, freezing the
 /// progress denominator and ensuring later failures can clean up everything
 /// already allocated by the Suite.
-#[derive(Clone)]
 struct PlannedPlan {
     group_index: usize,
     matrix_plan_id: String,
@@ -163,10 +162,8 @@ struct PlannedPlan {
 
 impl Drop for PlannedPlan {
     fn drop(&mut self) {
-        // Suite responses and materialized Matrix configs may contain private
-        // client material. Every worker-owned clone must clear its own config;
-        // clearing only the parent Matrix cannot cover these independent
-        // allocations. ModuleDefinition clears its own variant values.
+        // Materialized plan configs own private client material independently
+        // of the parent Matrix. ModuleDefinition clears its own variant values.
         zeroize_json_value(&mut self.config);
     }
 }
