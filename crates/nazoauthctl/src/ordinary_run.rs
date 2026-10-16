@@ -494,9 +494,9 @@ fn execute_with_progress<S: ProgressSink>(
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
     let deployment = session.deployment_evidence();
-    let recovery_directory = session.recovery_directory()?;
+    let recovery_directory = session.recovery_directory();
     let recovery_store =
-        ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
+        ConformanceRecoveryStore::open(recovery_directory, &deployment.deployment_id)?;
     let _orchestration_lock = recovery_store.acquire_orchestration_lock()?;
     recover_pending_runs(&session, &recovery_store, None)?;
     let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
@@ -579,7 +579,7 @@ fn execute_with_progress<S: ProgressSink>(
     // module ceiling instead of treating an old per-plan count as immutable.
     selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
     let request_jti = format!("request-{}", hex::encode(rand::random::<[u8; 16]>()));
-    let evidence_directory = create_evidence_directory(&recovery_directory, &request_jti)?;
+    let evidence_directory = create_evidence_directory(recovery_directory, &request_jti)?;
     let ephemeral_tenant = EphemeralTenant::new(
         &invocation.tenant_id,
         session.oidf_tenant_domain(),
@@ -974,7 +974,7 @@ fn execute_with_progress<S: ProgressSink>(
                 artifact: Box::new(driver_plan.artifact),
             },
             control: EvidenceControlIdentity {
-                deployment_id: deployment.deployment_id,
+                deployment_id: deployment.deployment_id.clone(),
                 tenant_id: invocation.tenant_id.clone(),
                 operations: cleanup_operations,
                 cleanup_complete,
