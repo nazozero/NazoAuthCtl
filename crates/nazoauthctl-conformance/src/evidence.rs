@@ -990,10 +990,8 @@ mod tests {
         );
         // A runtime signs the receipt after presentation completion. Both the
         // evidence writer and recovery reader use this historical verifier.
-        use crate::oidf_protocol::{
-            Openid4vpVerificationReceipt, canonical_openid4vp_presentation_binding_sha256,
-            sign_openid4vp_verification_receipt,
-        };
+        use crate::oidf_protocol::Openid4vpVerificationReceipt;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         binding.resource_identities.push(TenantResourceIdentity {
             kind: nazo_operator_protocol::TenantResourceKind::Openid4vcTrustPolicy,
             resource_id: "policy".into(),
@@ -1024,12 +1022,22 @@ mod tests {
                 "trust_policy":{"binding_id":Uuid::now_v7(),"resource_id":"policy","resource_digest":"d".repeat(64)}
             }
         })).unwrap();
-        let compact = sign_openid4vp_verification_receipt(&signed, &key_id, &signing).unwrap();
+        let protected = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "alg": "EdDSA", "kid": key_id,
+                "typ": "nazoauth-openid4vp-verification-receipt+jwt",
+            }))
+            .unwrap(),
+        );
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&signed).unwrap());
+        let input = format!("{protected}.{payload}");
+        let signature = signing.sign(input.as_bytes());
+        let compact = format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature));
         audit["verification_receipt"]["receipt_sha256"] = json!(sha256(compact.as_bytes()));
         audit["verification_receipt"]["receipt_jws"] = json!(compact);
-        audit["verification_receipt"]["presentation_binding_sha256"] = json!(
-            canonical_openid4vp_presentation_binding_sha256(&signed.presentation_binding).unwrap()
-        );
+        audit["verification_receipt"]["presentation_binding_sha256"] = json!(sha256(
+            &serde_json::to_vec(&signed.presentation_binding).unwrap()
+        ));
         let valid_bytes = serde_json::to_vec(&audit).unwrap();
         crate::secure_file::write_atomic(&receipt_path, &valid_bytes, true).unwrap();
         let valid = write_private_control_evidence_bundle(&report, &root, &identity, &binding)

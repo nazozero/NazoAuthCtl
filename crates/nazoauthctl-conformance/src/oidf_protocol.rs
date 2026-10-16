@@ -1,8 +1,6 @@
 //! Receipt contract for reading and verifying retained historical VP evidence.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-#[cfg(test)]
-use nazo_crypto::ed25519::SigningKey;
 use nazo_crypto::ed25519::VerifyingKey;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
@@ -90,14 +88,6 @@ pub fn canonical_openid4vp_evidence_context_sha256(
     json_sha256(context)
 }
 
-#[cfg(test)]
-pub fn canonical_openid4vp_presentation_binding_sha256(
-    binding: &Openid4vpPresentationBinding,
-) -> Result<String, ProtocolError> {
-    validate_presentation_binding(binding)?;
-    json_sha256(binding)
-}
-
 pub fn verify_openid4vp_verification_receipt(
     compact: &str,
     expected: &Openid4vpVerificationReceiptExpectations<'_>,
@@ -133,54 +123,6 @@ pub fn verify_openid4vp_verification_receipt(
         ));
     }
     Ok(receipt)
-}
-
-#[cfg(test)]
-pub fn sign_openid4vp_verification_receipt(
-    receipt: &Openid4vpVerificationReceipt,
-    key_id: &str,
-    key: &SigningKey,
-) -> Result<String, ProtocolError> {
-    validate_receipt(receipt)?;
-    if receipt.instance_key_id != key_id {
-        return Err(ProtocolError::Policy(
-            "OpenID4VP verification receipt key id does not match signer",
-        ));
-    }
-    sign_compact(receipt, key_id, RECEIPT_JWS_TYPE, key)
-}
-
-#[cfg(test)]
-fn sign_compact<T: Serialize>(
-    claims: &T,
-    key_id: &str,
-    expected_type: &str,
-    key: &SigningKey,
-) -> Result<String, ProtocolError> {
-    validate_file_identifier(key_id)?;
-    #[derive(Serialize)]
-    struct Header<'a> {
-        alg: &'static str,
-        kid: &'a str,
-        typ: &'a str,
-    }
-    let protected = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&Header {
-            alg: "EdDSA",
-            kid: key_id,
-            typ: expected_type,
-        })
-        .map_err(|_| ProtocolError::Json)?,
-    );
-    let payload =
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).map_err(|_| ProtocolError::Json)?);
-    let signing_input = format!("{protected}.{payload}");
-    let signature = key.sign(signing_input.as_bytes());
-    let compact = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature));
-    if compact.len() > nazo_operator_protocol::MAX_COMPACT_JWS_BYTES {
-        return Err(ProtocolError::TooLarge);
-    }
-    Ok(compact)
 }
 
 fn verify_compact<T: DeserializeOwned>(
