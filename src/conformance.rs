@@ -113,13 +113,13 @@ impl ConformanceSession {
     pub fn open(selector: Option<&str>) -> anyhow::Result<Self> {
         let registry = RegistryStore::open_default()?;
         let record = crate::fleet::resolve_instance(&registry, selector, "conformance")?;
-        let oidf_tenant_domain = record.oidf_tenant_domain.clone().with_context(|| {
+        let oidf_tenant_domain = record.oidf_tenant_domain.with_context(|| {
             format!(
                 "OIDF tenant domain is not configured for instance '{}'; run `nazoauthctl --instance {} oidf configure --tenant-domain <domain> --suite <https-origin>` once",
                 record.alias, record.alias
             )
         })?;
-        let oidf_suite_origin = record.oidf_suite_origin.clone().with_context(|| {
+        let oidf_suite_origin = record.oidf_suite_origin.with_context(|| {
             format!(
                 "OIDF Suite origin is not configured for instance '{}'; run `nazoauthctl --instance {} oidf configure --tenant-domain <domain> --suite <https-origin>` once",
                 record.alias, record.alias
@@ -147,12 +147,11 @@ impl ConformanceSession {
             inspection.current_instance_identity.as_ref(),
         )?;
 
-        let artifact = inspection.artifact.current.clone().context(
+        let artifact = inspection.artifact.current.context(
             "conformance requires a verified current artifact in target DeploymentState",
         )?;
         let identity = inspection
             .current_release
-            .as_ref()
             .context("conformance requires verified release version in target DeploymentState")?;
         let runtime = match inspection.runtime.kind {
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
@@ -166,7 +165,7 @@ impl ConformanceSession {
                 ConformanceRuntimeEvidence::HostBinary { sha256 }
             }
         };
-        let release = identity.version.clone();
+        let release = identity.version;
 
         let evidence = ConformanceDeploymentEvidence {
             deployment_id: record.deployment_id.clone(),
@@ -282,7 +281,6 @@ impl ConformanceSession {
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
         validate_control_change_set(&operation, change_set.as_deref())?;
-        let expected_operation = operation.clone();
         let journal =
             OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
         let Some(prepared) = prepare_pending_control_operation(
@@ -298,7 +296,7 @@ impl ConformanceSession {
         else {
             return Ok(None);
         };
-        self.complete_control_operation(&journal, prepared, expected_operation, change_set, persist)
+        self.complete_control_operation(&journal, prepared, change_set, persist)
             .map(Some)
     }
 
@@ -317,7 +315,6 @@ impl ConformanceSession {
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
         validate_control_change_set(&operation, change_set.as_deref())?;
-        let expected_operation = operation.clone();
 
         let journal =
             OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
@@ -331,14 +328,13 @@ impl ConformanceSession {
                 config_revision: self.config_revision.clone(),
             },
         )?;
-        self.complete_control_operation(&journal, prepared, expected_operation, change_set, persist)
+        self.complete_control_operation(&journal, prepared, change_set, persist)
     }
 
     fn complete_control_operation<F>(
         &self,
         journal: &OperationJournal,
         prepared: PreparedOperation,
-        expected_operation: ControlOperationPayload,
         change_set: Option<Vec<u8>>,
         persist: F,
     ) -> anyhow::Result<ConformanceControlOutcome>
@@ -377,7 +373,7 @@ impl ConformanceSession {
         validate_control_result_binding(
             &prepared.signed.operation.operation_id,
             &prepared.signed.request_hash,
-            &expected_operation,
+            &prepared.signed.operation.operation,
             &result,
         )?;
         let completion = ConformanceControlCompletion {
@@ -388,9 +384,9 @@ impl ConformanceSession {
             },
             result,
         };
-        let outcome = match completion.result.outcome {
-            ControlOutcome::Succeeded => ConformanceControlOutcome::Succeeded(completion.clone()),
-            ControlOutcome::Failed => ConformanceControlOutcome::Failed(completion.clone()),
+        let succeeded = match completion.result.outcome {
+            ControlOutcome::Succeeded => true,
+            ControlOutcome::Failed => false,
             ControlOutcome::InProgress => {
                 bail!(
                     "the ControlOperation is durably in progress; its accepted journal entry was preserved for replay"
@@ -399,7 +395,11 @@ impl ConformanceSession {
         };
         persist(&completion)?;
         journal.clear_if_matches(&expected_journal)?;
-        Ok(outcome)
+        Ok(if succeeded {
+            ConformanceControlOutcome::Succeeded(completion)
+        } else {
+            ConformanceControlOutcome::Failed(completion)
+        })
     }
 
     pub fn openid4vp_management_token(
@@ -442,20 +442,19 @@ impl ConformanceSession {
         &self,
         name: &str,
         label: &str,
-    ) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
         let path = self.secrets_dir.join(name);
         let bytes =
             crate::filesystem::read_secure_secret_file(&path, label, MAX_PROFILE_TOKEN_BYTES)?;
         let value = std::str::from_utf8(&bytes).with_context(|| format!("{label} is not UTF-8"))?;
         if value.len() < 32
-            || value.len() > MAX_PROFILE_TOKEN_BYTES as usize
             || value
                 .chars()
                 .any(|character| character.is_control() || character.is_whitespace())
         {
             bail!("{label} is invalid");
         }
-        Ok(zeroize::Zeroizing::new(value.to_owned()))
+        Ok(bytes)
     }
 
     fn derive_tenant_token(
@@ -470,12 +469,8 @@ impl ConformanceSession {
         let root = self.read_profile_secret(name, label)?;
         let tenant_id = uuid::Uuid::parse_str(tenant_id)
             .with_context(|| format!("{label} tenant ID is invalid"))?;
-        let token = nazo_operator_protocol::hkdf_sha256_v1(
-            root.as_bytes(),
-            tenant_id.as_bytes(),
-            purpose,
-            32,
-        );
+        let token =
+            nazo_operator_protocol::hkdf_sha256_v1(&root, tenant_id.as_bytes(), purpose, 32);
         Ok(zeroize::Zeroizing::new(
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token),
         ))
