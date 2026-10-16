@@ -92,8 +92,6 @@ pub enum OidfPlanError {
     CacheIdentity,
     #[error("verified artifact Matrix could not be decoded")]
     MalformedMatrix,
-    #[error("verified artifact Matrix identity changed before planning")]
-    MatrixIdentity,
     #[error("plan selection contains an invalid or duplicate identifier")]
     InvalidSelection,
     #[error("plan selection names an unknown group or plan")]
@@ -182,7 +180,7 @@ pub fn bundled_oidf_selection_choices() -> Result<Vec<String>, OidfPlanError> {
 
 pub fn resolve_bundled_oidf_plan_id(reference: &str) -> Result<String, OidfPlanError> {
     let matrix = bundled_oidf_matrix()?;
-    let matches = matrix
+    let mut matches = matrix
         .groups
         .iter()
         .flat_map(|group| group.plans.iter())
@@ -194,12 +192,10 @@ pub fn resolve_bundled_oidf_plan_id(reference: &str) -> Result<String, OidfPlanE
                     .next()
                     .is_some_and(|segment| segment == reference)
         })
-        .map(|plan| plan.id.clone())
-        .collect::<Vec<_>>();
-    if matches.len() == 1 {
-        Ok(matches.into_iter().next().expect("one match"))
-    } else {
-        Err(OidfPlanError::UnknownSelection)
+        .map(|plan| plan.id.as_str());
+    match (matches.next(), matches.next()) {
+        (Some(id), None) => Ok(id.to_owned()),
+        _ => Err(OidfPlanError::UnknownSelection),
     }
 }
 
@@ -248,7 +244,10 @@ pub fn open_bundled_oidf_driver_plan(
         serde_json::from_slice(BUNDLED_DRIVER).map_err(|_| OidfPlanError::CacheIdentity)?;
     let driver_sha256 = sha256(BUNDLED_DRIVER);
     let matrix_sha256 = sha256(BUNDLED_MATRIX);
-    let artifact_digest = sha256([BUNDLED_DRIVER, BUNDLED_MATRIX].concat().as_slice());
+    let mut artifact_hasher = Sha256::new();
+    artifact_hasher.update(BUNDLED_DRIVER);
+    artifact_hasher.update(BUNDLED_MATRIX);
+    let artifact_digest = hex::encode(artifact_hasher.finalize());
     let artifact = VerifiedOidfArtifact {
         artifact_id: "nazoauthctl-bundled-oidf-v5.2.2".to_owned(),
         revision: BUNDLED_SOURCE_REVISION.to_owned(),
@@ -299,8 +298,8 @@ pub fn open_bundled_oidf_driver_plan(
             cache_entry: PathBuf::new(),
             artifact,
         },
-        BUNDLED_DRIVER,
-        BUNDLED_MATRIX,
+        driver,
+        matrix,
         &BTreeSet::from(["nazoauth.client.create".to_owned()]),
         selection,
         now,
@@ -309,57 +308,36 @@ pub fn open_bundled_oidf_driver_plan(
 
 pub(crate) fn compile_oidf_driver_inspection_plan(
     cached: CachedOidfArtifact,
-    driver_bytes: &[u8],
-    matrix_bytes: &[u8],
+    driver: crate::OidfDriverProgram,
+    matrix: OidfArtifactMatrix,
     caller_declared_capabilities: &BTreeSet<String>,
     selection: OidfPlanSelection,
     now: i64,
 ) -> Result<OidfDriverInspectionPlan, OidfPlanError> {
-    if cached.schema != crate::OIDF_ARTIFACT_CACHE_SCHEMA_VERSION {
-        return Err(OidfPlanError::CacheIdentity);
-    }
-    let driver = crate::artifact_driver::validate_oidf_driver(
-        driver_bytes,
-        cached.artifact.driver_schema,
-        cached.artifact.driver_size,
-        &cached.artifact.driver_sha256,
-        cached.artifact.engine_protocol,
-    )
-    .map_err(|_| OidfPlanError::CacheIdentity)?;
     let driver_handlers = driver
         .handlers
-        .into_iter()
-        .map(|handler| (handler.id.clone(), handler))
+        .iter()
+        .map(|handler| (handler.id.as_str(), handler))
         .collect::<BTreeMap<_, _>>();
-    if matrix_bytes.len() as u64 != cached.artifact.matrix_size
-        || sha256(matrix_bytes) != cached.artifact.matrix_sha256
-    {
-        return Err(OidfPlanError::MatrixIdentity);
-    }
-    let matrix: OidfArtifactMatrix =
-        serde_json::from_slice(matrix_bytes).map_err(|_| OidfPlanError::MalformedMatrix)?;
-    if matrix.schema != crate::OIDF_MATRIX_SCHEMA_VERSION {
-        return Err(OidfPlanError::MalformedMatrix);
-    }
     let groups = selection_set(&selection.groups)?;
     let plans = selection_set(&selection.plans)?;
     let excluded_plans = selection_set(&selection.excluded_plans)?;
     if groups
         .iter()
-        .any(|wanted| !matrix.groups.iter().any(|group| &group.id == wanted))
+        .any(|wanted| !matrix.groups.iter().any(|group| group.id == *wanted))
         || plans.iter().any(|wanted| {
             !matrix
                 .groups
                 .iter()
                 .flat_map(|group| &group.plans)
-                .any(|plan| &plan.id == wanted)
+                .any(|plan| plan.id == *wanted)
         })
         || excluded_plans.iter().any(|wanted| {
             !matrix
                 .groups
                 .iter()
                 .flat_map(|group| &group.plans)
-                .any(|plan| &plan.id == wanted)
+                .any(|plan| plan.id == *wanted)
         })
     {
         return Err(OidfPlanError::UnknownSelection);
@@ -367,14 +345,14 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     let selected_before_exclusions = matrix
         .groups
         .iter()
-        .filter(|group| groups.is_empty() || groups.contains(&group.id))
+        .filter(|group| groups.is_empty() || groups.contains(group.id.as_str()))
         .flat_map(|group| group.plans.iter())
-        .filter(|plan| plans.is_empty() || plans.contains(&plan.id))
+        .filter(|plan| plans.is_empty() || plans.contains(plan.id.as_str()))
         .map(|plan| plan.id.as_str())
         .collect::<BTreeSet<_>>();
     if excluded_plans
         .iter()
-        .any(|plan| !selected_before_exclusions.contains(plan.as_str()))
+        .any(|plan| !selected_before_exclusions.contains(plan))
     {
         return Err(OidfPlanError::UnknownSelection);
     }
@@ -387,14 +365,14 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
         wall_clock_seconds: 0,
     };
     for group in matrix.groups {
-        if !groups.is_empty() && !groups.contains(&group.id) {
+        if !groups.is_empty() && !groups.contains(group.id.as_str()) {
             continue;
         }
         for plan in group.plans {
-            if !plans.is_empty() && !plans.contains(&plan.id) {
+            if !plans.is_empty() && !plans.contains(plan.id.as_str()) {
                 continue;
             }
-            if excluded_plans.contains(&plan.id) {
+            if excluded_plans.contains(plan.id.as_str()) {
                 continue;
             }
             selected_resource_budget.modules = selected_resource_budget
@@ -411,8 +389,8 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
                 .ok_or(OidfPlanError::ResourceBound)?;
             selected_groups.insert(group.id.clone());
             let driver_handler = driver_handlers
-                .get(&plan.driver_handler)
-                .cloned()
+                .get(plan.driver_handler.as_str())
+                .map(|handler| (*handler).clone())
                 .ok_or(OidfPlanError::CacheIdentity)?;
             entries.push(OidfDriverPlanEntry {
                 task_jti: uuid::Uuid::now_v7().to_string(),
@@ -462,8 +440,6 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     }
     let selected_group_count =
         u32::try_from(selected_groups.len()).map_err(|_| OidfPlanError::ResourceBound)?;
-    let maximum_jobs =
-        u32::try_from(crate::MAX_PARALLEL_JOBS).map_err(|_| OidfPlanError::ResourceBound)?;
     Ok(OidfDriverInspectionPlan {
         schema: OIDF_DRIVER_INSPECTION_PLAN_SCHEMA,
         plan_jti: uuid::Uuid::now_v7().to_string(),
@@ -480,7 +456,7 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
         runner: OidfBoundedRunnerContract {
             protocol: crate::BOUNDED_PLAN_RUNNER_PROTOCOL.to_owned(),
             minimum_jobs: if selected_plan_count > 1 { 2 } else { 1 },
-            maximum_jobs,
+            maximum_jobs: crate::MAX_PARALLEL_JOBS as u32,
             independent_plan_tasks_required: true,
             independent_evidence_required: true,
             failure_collection_required: true,
@@ -490,11 +466,11 @@ pub(crate) fn compile_oidf_driver_inspection_plan(
     })
 }
 
-fn selection_set(values: &[String]) -> Result<BTreeSet<String>, OidfPlanError> {
+fn selection_set(values: &[String]) -> Result<BTreeSet<&str>, OidfPlanError> {
     let mut selected = BTreeSet::new();
     for value in values {
         if crate::artifact::validate_identifier(value, 128).is_err()
-            || !selected.insert(value.clone())
+            || !selected.insert(value.as_str())
         {
             return Err(OidfPlanError::InvalidSelection);
         }
@@ -736,36 +712,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_changed_matrix_identity_and_plan_count_above_signed_bound() {
+    fn rejects_plan_count_above_signed_bound() {
         let matrix = matrix_bytes();
         let capabilities = BTreeSet::from(["nazoauth.client.create".to_owned()]);
-        let mut unsupported_cache = cached(&matrix);
-        unsupported_cache.schema += 1;
-        assert_eq!(
-            compile_oidf_driver_inspection_plan(
-                unsupported_cache,
-                &matrix,
-                &capabilities,
-                OidfPlanSelection::default(),
-                1_800_000_000,
-            )
-            .unwrap_err(),
-            OidfPlanError::CacheIdentity
-        );
-        let mut changed = matrix.clone();
-        changed.push(b' ');
-        assert_eq!(
-            compile_oidf_driver_inspection_plan(
-                cached(&matrix),
-                &changed,
-                &capabilities,
-                OidfPlanSelection::default(),
-                1_800_000_000,
-            )
-            .unwrap_err(),
-            OidfPlanError::MatrixIdentity
-        );
-
         let mut bounded = cached(&matrix);
         bounded.artifact.resource_bounds.max_plans = 2;
         assert_eq!(
@@ -785,7 +734,7 @@ mod tests {
     fn selection_uses_the_signed_matrix_identifier_contract() {
         assert_eq!(
             selection_set(&["profile:v1/plan@issuer+wallet".to_owned()]).unwrap(),
-            BTreeSet::from(["profile:v1/plan@issuer+wallet".to_owned()])
+            BTreeSet::from(["profile:v1/plan@issuer+wallet"])
         );
         assert_eq!(
             selection_set(&["not allowed".to_owned()]).unwrap_err(),
@@ -897,8 +846,8 @@ mod tests {
     ) -> Result<OidfDriverInspectionPlan, OidfPlanError> {
         super::compile_oidf_driver_inspection_plan(
             cached,
-            &driver_bytes(),
-            matrix_bytes,
+            serde_json::from_slice(&driver_bytes()).unwrap(),
+            serde_json::from_slice(matrix_bytes).unwrap(),
             caller_declared_capabilities,
             selection,
             now,

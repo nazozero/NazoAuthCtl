@@ -247,15 +247,15 @@ impl ArtifactTrustPolicy {
         Ok(key)
     }
 
-    fn validate(&self) -> Result<Url, ArtifactError> {
-        self.verifying_key()?;
+    fn validate(&self) -> Result<(Url, VerifyingKey), ArtifactError> {
+        let key = self.verifying_key()?;
         let source = self.validated_source()?;
         if self.schema != OIDF_TRUST_POLICY_SCHEMA_VERSION
             || !valid_signer_identity(&self.signer_identity)
         {
             return Err(ArtifactError::TrustPolicy);
         }
-        Ok(source)
+        Ok((source, key))
     }
 
     fn validated_source(&self) -> Result<Url, ArtifactError> {
@@ -268,7 +268,7 @@ impl ArtifactTrustPolicy {
     }
 
     pub(crate) fn accepts_url(&self, value: &str) -> bool {
-        let Ok(source) = self.validate() else {
+        let Ok((source, _)) = self.validate() else {
             return false;
         };
         validated_https_url(value, false)
@@ -294,7 +294,7 @@ pub fn verify_oidf_driver_manifest(
     available_capabilities: &BTreeSet<String>,
     now: i64,
 ) -> Result<VerifiedOidfDriverManifest, ArtifactError> {
-    trust.validate()?;
+    let (source, key) = trust.validate()?;
     if compact_manifest.is_empty() || compact_manifest.len() > MAX_SIGNED_DRIVER_BYTES {
         return Err(ArtifactError::Oversize);
     }
@@ -322,18 +322,14 @@ pub fn verify_oidf_driver_manifest(
     let signature_bytes = decode_base64url(signature, ArtifactError::Signature)?;
     let signature =
         Signature::from_slice(&signature_bytes).map_err(|_| ArtifactError::Signature)?;
-    trust
-        .verifying_key()?
-        .verify(format!("{protected}.{payload}").as_bytes(), &signature)
+    let signing_input = &compact_manifest.as_bytes()[..protected.len() + 1 + payload.len()];
+    key.verify(signing_input, &signature)
         .map_err(|_| ArtifactError::Signature)?;
 
     let payload_bytes = decode_base64url(payload, ArtifactError::MalformedManifest)?;
-    if payload_bytes.is_empty() || payload_bytes.len() > MAX_SIGNED_DRIVER_BYTES {
-        return Err(ArtifactError::Oversize);
-    }
     let manifest: OidfDriverManifest =
         serde_json::from_slice(&payload_bytes).map_err(|_| ArtifactError::MalformedManifest)?;
-    validate_manifest(&manifest, trust, available_capabilities, now)?;
+    validate_manifest(&manifest, trust, &source, available_capabilities, now)?;
     Ok(VerifiedOidfDriverManifest {
         manifest,
         signer_key_id: trust.key_id.clone(),
@@ -350,13 +346,14 @@ pub fn verify_oidf_matrix(
 ) -> Result<VerifiedOidfArtifact, ArtifactError> {
     let driver_program = driver.verify_driver_payload(driver_bytes)?;
     verify_oidf_matrix_with_driver(driver, driver_program, matrix_bytes)
+        .map(|(artifact, _, _)| artifact)
 }
 
 pub(crate) fn verify_oidf_matrix_with_driver(
     driver: VerifiedOidfDriverManifest,
     driver_program: OidfDriverProgram,
     matrix_bytes: &[u8],
-) -> Result<VerifiedOidfArtifact, ArtifactError> {
+) -> Result<(VerifiedOidfArtifact, OidfDriverProgram, OidfArtifactMatrix), ArtifactError> {
     let (matrix, matrix_budget) = validate_matrix(matrix_bytes, &driver.manifest, &driver_program)?;
     let matrix_plans = matrix
         .groups
@@ -364,7 +361,7 @@ pub(crate) fn verify_oidf_matrix_with_driver(
         .map(|group| group.plans.len())
         .sum::<usize>();
     let manifest = driver.manifest;
-    Ok(VerifiedOidfArtifact {
+    let artifact = VerifiedOidfArtifact {
         artifact_id: manifest.artifact_id,
         revision: manifest.revision,
         source: manifest.source,
@@ -392,7 +389,8 @@ pub(crate) fn verify_oidf_matrix_with_driver(
         not_before: manifest.not_before,
         expires_at: manifest.expires_at,
         resource_bounds: manifest.resource_bounds,
-    })
+    };
+    Ok((artifact, driver_program, matrix))
 }
 
 impl VerifiedOidfDriverManifest {
@@ -454,6 +452,7 @@ pub fn read_artifact_driver(path: &Path) -> Result<Vec<u8>, ArtifactError> {
 fn validate_manifest(
     manifest: &OidfDriverManifest,
     trust: &ArtifactTrustPolicy,
+    source: &Url,
     available_capabilities: &BTreeSet<String>,
     now: i64,
 ) -> Result<(), ArtifactError> {
@@ -467,17 +466,16 @@ fn validate_manifest(
             "artifact source or signer is not trusted",
         ));
     }
-    let source = trust.validated_source()?;
     let driver_url =
         validated_https_url(&manifest.driver.url, false).map_err(ArtifactError::ManifestPolicy)?;
-    if !url_is_below_source(&driver_url, &source) {
+    if !url_is_below_source(&driver_url, source) {
         return Err(ArtifactError::ManifestPolicy(
             "driver URL is outside the trusted source",
         ));
     }
     let matrix_url =
         validated_https_url(&manifest.matrix.url, false).map_err(ArtifactError::ManifestPolicy)?;
-    if !url_is_below_source(&matrix_url, &source) {
+    if !url_is_below_source(&matrix_url, source) {
         return Err(ArtifactError::ManifestPolicy(
             "matrix URL is outside the trusted source",
         ));
@@ -536,10 +534,7 @@ fn validate_manifest(
             "resource bounds are outside controller policy",
         ));
     }
-    if manifest.expires_at - manifest.not_before
-        <= i64::try_from(bounds.max_wall_clock_seconds)
-            .map_err(|_| ArtifactError::ManifestPolicy("wall-clock bound exceeds i64"))?
-    {
+    if manifest.expires_at - manifest.not_before <= bounds.max_wall_clock_seconds as i64 {
         return Err(ArtifactError::ManifestPolicy(
             "artifact validity cannot contain its signed wall-clock bound",
         ));
@@ -869,9 +864,7 @@ pub(crate) fn validate_identifier(value: &str, maximum: usize) -> Result<(), &'s
 fn valid_bounded_text(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
-        && !value
-            .chars()
-            .any(|character| character.is_control() || character == '\0')
+        && !value.chars().any(|character| character.is_control())
 }
 
 fn valid_signer_identity(value: &str) -> bool {
@@ -899,9 +892,6 @@ fn valid_sha256_digest(value: &str) -> bool {
 }
 
 fn decode_base64url<T>(value: &str, error: T) -> Result<Vec<u8>, T> {
-    if value.contains('=') {
-        return Err(error);
-    }
     URL_SAFE_NO_PAD.decode(value).map_err(|_| error)
 }
 
