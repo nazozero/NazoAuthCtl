@@ -56,10 +56,8 @@ use crate::error_codes::{STATE_RESET_REQUIRED, TARGET_IDENTITY_MISMATCH};
 pub(crate) fn verify_registered_target_identity(
     host_id: Uuid,
     host_alias: &str,
-    hello: &RemoteHello,
+    observed: Uuid,
 ) -> anyhow::Result<()> {
-    let observed = Uuid::parse_str(&hello.target_id)
-        .context("the verified target hello carries an invalid target identity")?;
     if observed != host_id {
         bail!(
             "{TARGET_IDENTITY_MISMATCH}: registered host alias '{host_alias}' names target {host_id}, but the live helper owns target {observed}; refusing to read or change that target"
@@ -440,11 +438,9 @@ impl DiscoveryEvidence {
             );
         }
         validate_key(&self.host_alias, "evidence host alias")?;
-        verify_remote_hello(&self.hello).map_err(|reason| {
+        let target_id = verify_remote_hello(&self.hello).map_err(|reason| {
             anyhow::anyhow!("evidence helper identity is not verifiable: {reason}")
         })?;
-        let target_id = Uuid::parse_str(&self.hello.target_id)
-            .context("evidence target identity is not a UUID")?;
         if target_id != self.host_id {
             bail!(
                 "evidence target identity {target_id} does not match evidence host {}",
@@ -475,8 +471,7 @@ fn local_target_id(_registry_root: &Path) -> anyhow::Result<Uuid> {
         bail!("local target did not complete its identity hello")
     };
     verify_remote_hello(&hello)
-        .map_err(|reason| anyhow::anyhow!("local target hello is not verifiable: {reason}"))?;
-    Uuid::parse_str(&hello.target_id).context("local target hello has an invalid target identity")
+        .map_err(|reason| anyhow::anyhow!("local target hello is not verifiable: {reason}"))
 }
 
 fn validate_key(value: &str, label: &str) -> anyhow::Result<()> {

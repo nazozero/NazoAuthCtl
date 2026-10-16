@@ -1633,13 +1633,14 @@ pub(crate) fn local_hello_for_target(
 /// Task C08 handshake check: the announced helper identity must equal this
 /// binary's constants exactly. Any difference is a mismatch — there is no
 /// compatibility range and no fallback.
-pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
+pub fn verify_remote_hello(hello: &RemoteHello) -> Result<Uuid, String> {
     if !valid_token(&hello.product, 64) {
         return Err("hello product is not a valid token".to_owned());
     }
-    if !matches!(Uuid::parse_str(&hello.target_id), Ok(id) if id.get_version_num() == 7) {
-        return Err("hello target_id is not a UUIDv7".to_owned());
-    }
+    let target_id = match Uuid::parse_str(&hello.target_id) {
+        Ok(id) if id.get_version_num() == 7 => id,
+        _ => return Err("hello target_id is not a UUIDv7".to_owned()),
+    };
     if !valid_token(&hello.version, 64) {
         return Err("hello version is not a valid token".to_owned());
     }
@@ -1668,7 +1669,7 @@ pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
             hello.remote_exec_schema
         ));
     }
-    Ok(())
+    Ok(target_id)
 }
 
 /// Serialize a HostOperation for a target's stdin, enforcing the size cap.

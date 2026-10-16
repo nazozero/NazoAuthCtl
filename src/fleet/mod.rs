@@ -154,14 +154,14 @@ fn probe_target(
             bail!("the target helper answered failure {code}: {detail}")
         }
     };
-    verify_remote_hello(&hello).map_err(|reason| {
+    let observed = verify_remote_hello(&hello).map_err(|reason| {
         anyhow::anyhow!(
             "{REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first \
              (`nazoauthctl self update` on the host), then retry; no fallback exists."
         )
     })?;
     if let Some(host) = expected_host {
-        verify_registered_target_identity(host.host_id, &host.alias, &hello)?;
+        verify_registered_target_identity(host.host_id, &host.alias, observed)?;
     }
 
     Ok(hello)
