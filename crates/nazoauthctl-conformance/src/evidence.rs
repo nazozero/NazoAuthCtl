@@ -17,12 +17,6 @@ use crate::{ConformanceReport, VerifiedOidfArtifact};
 
 #[cfg(unix)]
 const EVIDENCE_BUNDLE_SCHEMA: u32 = 4;
-/// Shared writer/retention-reader ceiling for the public screenshot manifest.
-pub(crate) const MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES: usize = 1024 * 1024;
-/// Schema 6 retains the runtime-signed OpenID4VP receipt provenance needed to
-/// re-verify a NazoAuthWeb result after process restart.
-pub(crate) const REVIEW_SCREENSHOT_MANIFEST_SCHEMA: u32 = 6;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceRuntimeIdentity {
@@ -93,16 +87,6 @@ pub struct EvidenceBundleReceipt {
     pub directory: PathBuf,
     pub manifest_sha256: String,
     pub module_count: u32,
-}
-
-/// Digest-bound local capture manifest that can be embedded in the Suite
-/// retention journal without carrying any image bytes, URLs, secrets, or
-/// Suite credentials.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewScreenshotManifestReceipt {
-    pub path: PathBuf,
-    pub sha256: String,
 }
 
 #[cfg(unix)]
@@ -316,7 +300,7 @@ pub fn write_private_control_evidence_bundle(
                         .verification_receipt
                         .as_ref()
                         .ok_or(EvidenceError::Identity)?;
-                    let context = ControlVpReceiptContext {
+                    let context = crate::recovery::VpReceiptContext {
                         artifact_digest: &identity.source.artifact.driver_manifest_sha256,
                         matrix_sha256: &report.matrix_digest,
                         suite_plan_id: &module.suite_plan_id,
@@ -325,7 +309,12 @@ pub fn write_private_control_evidence_bundle(
                         variant: &module.variant,
                         trigger_origin: &audit.trigger_origin,
                     };
-                    if !verify_control_vp_receipt(receipt, anchor, recovery_binding, &context) {
+                    if !crate::recovery::verify_vp_receipt_provenance(
+                        receipt,
+                        anchor,
+                        recovery_binding,
+                        &context,
+                    ) {
                         return Err(EvidenceError::Identity);
                     }
                 }
@@ -409,291 +398,6 @@ fn validate_review_screenshot_path(path: &Path) -> Result<(), EvidenceError> {
 }
 
 #[cfg(unix)]
-struct ControlVpReceiptContext<'a> {
-    artifact_digest: &'a str,
-    matrix_sha256: &'a str,
-    suite_plan_id: &'a str,
-    suite_module_id: &'a str,
-    test_name: &'a str,
-    variant: &'a std::collections::BTreeMap<String, String>,
-    trigger_origin: &'a str,
-}
-
-#[cfg(unix)]
-fn verify_control_vp_receipt(
-    receipt: &crate::OpenId4VpVerificationReceiptProvenance,
-    anchor: &crate::recovery::OpenId4VpEvidenceTrustAnchor,
-    binding: &crate::recovery::TenantResourceRecoveryBinding,
-    context: &ControlVpReceiptContext<'_>,
-) -> bool {
-    use time::format_description::well_known::Rfc3339;
-
-    if receipt.issuer != anchor.target_issuer
-        || receipt.deployment_id != anchor.deployment_id
-        || receipt.tenant_id != binding.tenant_id
-        || receipt.runtime_instance_id != anchor.runtime_instance_id
-        || receipt.instance_key_id != anchor.instance_key_id
-        || receipt.instance_public_key_base64 != anchor.instance_public_key_base64
-        || context.trigger_origin != anchor.target_issuer
-        || receipt.receipt_api_url
-            != format!("{}/openid4vp/verification-receipts", anchor.target_issuer)
-        || sha256(receipt.receipt_jws.as_bytes()) != receipt.receipt_sha256
-        || !lower_hex(&receipt.receipt_sha256, 64)
-        || !lower_hex(&receipt.capability_sha256, 64)
-        || uuid::Uuid::parse_str(&receipt.issuance_request_jti).is_err()
-        || !lower_hex(&receipt.presentation_binding_sha256, 64)
-        || !lower_hex(&receipt.intent_sha256, 64)
-    {
-        return false;
-    }
-    let Ok(key) =
-        nazo_operator_protocol::decode_instance_public_key(&anchor.instance_public_key_base64)
-    else {
-        return false;
-    };
-    if nazo_operator_protocol::instance_key_id(&key) != receipt.instance_key_id {
-        return false;
-    }
-    let Ok(variant_bytes) = serde_json::to_vec(context.variant) else {
-        return false;
-    };
-    let context = crate::oidf_protocol::Openid4vpEvidenceContext {
-        run_jti: binding.run_id.clone(),
-        artifact_sha256: context.artifact_digest.to_owned(),
-        matrix_sha256: context.matrix_sha256.to_owned(),
-        suite_plan_id: context.suite_plan_id.to_owned(),
-        suite_module_id: context.suite_module_id.to_owned(),
-        test_name: context.test_name.to_owned(),
-        variant_sha256: sha256(&variant_bytes),
-    };
-    let Ok(context_sha256) =
-        crate::oidf_protocol::canonical_openid4vp_evidence_context_sha256(&context)
-    else {
-        return false;
-    };
-    let Ok(completed_at) = time::OffsetDateTime::parse(&receipt.completed_at, &Rfc3339) else {
-        return false;
-    };
-    let Ok(expires_at) = time::OffsetDateTime::parse(&receipt.expires_at, &Rfc3339) else {
-        return false;
-    };
-    if completed_at.format(&Rfc3339).ok().as_deref() != Some(receipt.completed_at.as_str())
-        || expires_at.format(&Rfc3339).ok().as_deref() != Some(receipt.expires_at.as_str())
-        || expires_at <= completed_at
-    {
-        return false;
-    }
-    let receipt_id = receipt.receipt_id.to_string();
-    let transaction_id = receipt.transaction_id.to_string();
-    let expected = crate::oidf_protocol::Openid4vpVerificationReceiptExpectations {
-        issuer: &anchor.target_issuer,
-        audience: &receipt.receipt_api_url,
-        deployment_id: &anchor.deployment_id,
-        runtime_instance_id: &anchor.runtime_instance_id,
-        instance_key_id: &anchor.instance_key_id,
-        tenant_id: &binding.tenant_id,
-        transaction_id: &transaction_id,
-        receipt_id: &receipt_id,
-        issuance_request_jti: &receipt.issuance_request_jti,
-        evidence_context_sha256: &context_sha256,
-        presentation_binding_sha256: &receipt.presentation_binding_sha256,
-        intent_sha256: &receipt.intent_sha256,
-        capability_sha256: &receipt.capability_sha256,
-    };
-    let Ok(verified) = crate::oidf_protocol::verify_openid4vp_verification_receipt(
-        &receipt.receipt_jws,
-        &expected,
-        &key,
-        completed_at.unix_timestamp(),
-    ) else {
-        return false;
-    };
-    verified.completed_at == receipt.completed_at
-        && verified.exp == expires_at.unix_timestamp()
-        && crate::recovery::exact_vp_trust_policy_binding(
-            binding,
-            &verified.presentation_binding.trust_policy,
-        )
-}
-
-/// Commits the screenshot-to-current-module binding before Suite plan
-/// ownership can be retained. It intentionally references the root-private
-/// image files in place; the full evidence bundle later copies and
-/// rebinds the same verified files into its own committed directory.
-pub fn write_review_screenshot_manifest(
-    report: &ConformanceReport,
-    root: &Path,
-    run_jti: &str,
-    artifact_digest: &str,
-    target_issuer: &str,
-) -> Result<ReviewScreenshotManifestReceipt, EvidenceError> {
-    #[cfg(not(unix))]
-    {
-        let _ = (report, root, run_jti, artifact_digest, target_issuer);
-        Err(EvidenceError::UnsupportedPlatform)
-    }
-    #[cfg(unix)]
-    {
-        let suite_origin = crate::Origin::parse_suite(&report.suite_origin)
-            .map_err(|_| EvidenceError::Identity)?;
-        if suite_origin.as_str() != report.suite_origin {
-            return Err(EvidenceError::Identity);
-        }
-        validate_review_screenshot_run_limit(&report.modules)?;
-        if crate::artifact::validate_identifier(run_jti, 128).is_err() {
-            return Err(EvidenceError::Identity);
-        }
-        let root =
-            crate::secure_file::validate_directory(root, true).map_err(map_secure_file_error)?;
-        if !lower_hex(artifact_digest, 64) {
-            return Err(EvidenceError::Identity);
-        }
-        let target_issuer = url::Url::parse(target_issuer).map_err(|_| EvidenceError::Identity)?;
-        if target_issuer.scheme() != "https"
-            || target_issuer.host_str().is_none()
-            || !target_issuer.username().is_empty()
-            || target_issuer.password().is_some()
-            || target_issuer.query().is_some()
-            || target_issuer.fragment().is_some()
-            || !matches!(target_issuer.path(), "" | "/")
-        {
-            return Err(EvidenceError::Identity);
-        }
-        let target_issuer = target_issuer.as_str().trim_end_matches('/').to_owned();
-        let mut modules = Vec::with_capacity(report.modules.len());
-        let mut screenshots = Vec::new();
-        let mut paths = BTreeSet::new();
-        for module in &report.modules {
-            validate_review_screenshot_obligations(module)?;
-            let mut obligations = BTreeSet::new();
-            let total_attempts =
-                module.review_screenshots.len() + module.review_screenshots_missing;
-            let mut required_captured = 0usize;
-            modules.push(ReviewScreenshotModuleManifest {
-                matrix_plan_id: module.matrix_plan_id.clone(),
-                suite_plan_id: module.suite_plan_id.clone(),
-                module_id: module.module_id.clone().ok_or(EvidenceError::Identity)?,
-                test_name: module.test_name.clone(),
-                variant: module.variant.clone(),
-                required: module.review_screenshots_required,
-                captured_required: module.review_screenshots_required_captured,
-                missing_optional: module.review_screenshots_missing,
-            });
-            for screenshot in &module.review_screenshots {
-                let module_id = module.module_id.as_deref().ok_or(EvidenceError::Identity)?;
-                if !paths.insert(&screenshot.path) {
-                    return Err(EvidenceError::Identity);
-                }
-                validate_review_screenshot_path(&screenshot.path)?;
-                let source = root.join(&screenshot.path);
-                let image = crate::secure_file::read_bounded(&source, 500 * 1024, true)
-                    .map_err(map_secure_file_error)?;
-                crate::browser::validate_png_screenshot(&image)
-                    .map_err(|_| EvidenceError::Identity)?;
-                if image.len() != screenshot.size || sha256(&image) != screenshot.sha256 {
-                    return Err(EvidenceError::Identity);
-                }
-                let receipt = crate::secure_file::read_bounded(
-                    &source.with_extension("png.receipt.json"),
-                    16 * 1024,
-                    true,
-                )
-                .map_err(map_secure_file_error)?;
-                let audit: ReviewScreenshotAudit =
-                    serde_json::from_slice(&receipt).map_err(|_| EvidenceError::Identity)?;
-                let trigger_url =
-                    url::Url::parse(&format!("{}{}", audit.trigger_origin, audit.trigger_path))
-                        .map_err(|_| EvidenceError::Identity)?;
-                if audit.suite_plan_id != module.suite_plan_id
-                    || audit.module_id != module_id
-                    || audit.test_name != module.test_name
-                    || audit.variant != module.variant
-                    || audit.obligation_index >= total_attempts
-                    || !obligations.insert(audit.obligation_index)
-                    || audit.path != screenshot.path
-                    || audit.sha256 != screenshot.sha256
-                    || audit.size != screenshot.size
-                    || !valid_review_screenshot_trigger(
-                        &audit,
-                        &trigger_url,
-                        &report.suite_origin,
-                        &target_issuer,
-                        module_id,
-                    )
-                {
-                    return Err(EvidenceError::Identity);
-                }
-                if matches!(audit.marker, crate::ReviewScreenshotMarker::Required) {
-                    required_captured += 1;
-                }
-                screenshots.push(EvidenceScreenshotManifest {
-                    matrix_plan_id: &module.matrix_plan_id,
-                    suite_plan_id: &module.suite_plan_id,
-                    module_id,
-                    test_name: audit.test_name,
-                    variant: audit.variant,
-                    marker: audit.marker,
-                    obligation_index: audit.obligation_index,
-                    path: &screenshot.path,
-                    sha256: &screenshot.sha256,
-                    size: screenshot.size,
-                    receipt_sha256: sha256(&receipt),
-                    trigger_origin: audit.trigger_origin,
-                    trigger_path: audit.trigger_path,
-                    trigger_url_sha256: audit.trigger_url_sha256,
-                    source: audit.source,
-                    verification_receipt: audit.verification_receipt,
-                });
-            }
-            if required_captured != module.review_screenshots_required {
-                return Err(EvidenceError::Identity);
-            }
-        }
-        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": REVIEW_SCREENSHOT_MANIFEST_SCHEMA,
-            "run_jti": run_jti,
-            "artifact_digest": artifact_digest,
-            "matrix_sha256": report.matrix_digest,
-            "suite_origin": report.suite_origin,
-            "target_issuer": target_issuer,
-            "modules": modules,
-            "screenshots": screenshots,
-        }))
-        .map_err(|_| EvidenceError::Encoding)?;
-        if bytes.len() > MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES {
-            return Err(EvidenceError::Encoding);
-        }
-        let path = root
-            .join("review-screenshot-manifests")
-            .join(format!("{run_jti}.json"));
-        write_private_new_or_exact(&path, &bytes)?;
-        Ok(ReviewScreenshotManifestReceipt {
-            path,
-            sha256: sha256(&bytes),
-        })
-    }
-}
-
-#[cfg(unix)]
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewScreenshotModuleManifest {
-    matrix_plan_id: String,
-    suite_plan_id: String,
-    module_id: String,
-    test_name: String,
-    variant: std::collections::BTreeMap<String, String>,
-    required: usize,
-    captured_required: usize,
-    missing_optional: usize,
-}
-
-#[cfg(unix)]
-fn write_private_new_or_exact(path: &Path, bytes: &[u8]) -> Result<(), EvidenceError> {
-    crate::secure_file::write_new_or_exact(path, bytes, true).map_err(map_secure_file_error)
-}
-
-#[cfg(unix)]
 fn write_private_screenshot_pair(
     image_path: &Path,
     image: &[u8],
@@ -744,9 +448,7 @@ fn valid_review_screenshot_trigger(
                 && sha256(trigger_url.as_str().as_bytes()) == audit.trigger_url_sha256
         }
         crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => {
-            audit.verification_receipt.as_ref().is_some_and(|receipt| {
-                valid_vp_verification_receipt_provenance(receipt, target_issuer)
-            }) && audit.trigger_origin == target_issuer
+            audit.trigger_origin == target_issuer
                 && trigger_url.scheme() == "https"
                 && trigger_url.host_str().is_some()
                 && trigger_url.path() == "/ui/verification-result"
@@ -774,33 +476,6 @@ fn valid_review_screenshot_trigger(
                     == audit.trigger_url_sha256
         }
     }
-}
-
-#[cfg(unix)]
-fn valid_vp_verification_receipt_provenance(
-    receipt: &crate::OpenId4VpVerificationReceiptProvenance,
-    target_issuer: &str,
-) -> bool {
-    receipt.issuer == target_issuer
-        && receipt.receipt_api_url == format!("{target_issuer}/openid4vp/verification-receipts")
-        && !receipt.receipt_jws.is_empty()
-        && receipt.receipt_jws.len() <= 16 * 1024
-        && lower_hex(&receipt.receipt_sha256, 64)
-        && lower_hex(&receipt.capability_sha256, 64)
-        && !receipt.deployment_id.is_empty()
-        && uuid::Uuid::parse_str(&receipt.tenant_id)
-            .is_ok_and(|tenant_id| tenant_id.to_string() == receipt.tenant_id)
-        && !receipt.runtime_instance_id.is_empty()
-        && !receipt.instance_key_id.is_empty()
-        && uuid::Uuid::parse_str(&receipt.issuance_request_jti).is_ok()
-        && lower_hex(&receipt.presentation_binding_sha256, 64)
-        && lower_hex(&receipt.intent_sha256, 64)
-        && nazo_operator_protocol::decode_instance_public_key(&receipt.instance_public_key_base64)
-            .is_ok_and(|key| {
-                nazo_operator_protocol::instance_key_id(&key) == receipt.instance_key_id
-            })
-        && !receipt.completed_at.is_empty()
-        && !receipt.expires_at.is_empty()
 }
 
 fn validate_review_screenshot_run_limit(
@@ -1312,13 +987,76 @@ mod tests {
             write_private_control_evidence_bundle(&report, &root, &identity, &binding),
             Err(EvidenceError::Identity)
         );
+        // A runtime signs the receipt after presentation completion. Both the
+        // evidence writer and recovery reader use this historical verifier.
+        use crate::oidf_protocol::{
+            Openid4vpVerificationReceipt, canonical_openid4vp_presentation_binding_sha256,
+            sign_openid4vp_verification_receipt,
+        };
+        binding.resource_identities.push(TenantResourceIdentity {
+            kind: nazo_operator_protocol::TenantResourceKind::Openid4vcTrustPolicy,
+            resource_id: "policy".into(),
+            digest: "d".repeat(64),
+        });
+        let provenance = &audit["verification_receipt"];
+        let completed =
+            chrono::DateTime::parse_from_rfc3339(provenance["completed_at"].as_str().unwrap())
+                .unwrap();
+        let expires =
+            chrono::DateTime::parse_from_rfc3339(provenance["expires_at"].as_str().unwrap())
+                .unwrap();
+        let signed: Openid4vpVerificationReceipt = serde_json::from_value(json!({
+            "schema":1,"iss":provenance["issuer"],"aud":provenance["receipt_api_url"],
+            "jti":provenance["receipt_id"],"iat":completed.timestamp()+5,"exp":expires.timestamp(),
+            "deployment_id":provenance["deployment_id"],"runtime_instance_id":provenance["runtime_instance_id"],
+            "instance_key_id":provenance["instance_key_id"],"tenant_id":provenance["tenant_id"],
+            "transaction_id":provenance["transaction_id"],"issuance_request_jti":provenance["issuance_request_jti"],
+            "status":"verified","completed_at":provenance["completed_at"],
+            "intent_sha256":provenance["intent_sha256"],"capability_sha256":provenance["capability_sha256"],
+            "evidence_context":{
+                "run_jti":binding.run_id,"artifact_sha256":identity.source.artifact.driver_manifest_sha256,
+                "matrix_sha256":report.matrix_digest,"suite_plan_id":"suite-plan","suite_module_id":"module",
+                "test_name":"test","variant_sha256":sha256(b"{}")
+            },
+            "presentation_binding":{
+                "presentation_request_sha256":"d".repeat(64),
+                "trust_policy":{"binding_id":Uuid::now_v7(),"resource_id":"policy","resource_digest":"d".repeat(64)}
+            }
+        })).unwrap();
+        let compact = sign_openid4vp_verification_receipt(&signed, &key_id, &signing).unwrap();
+        audit["verification_receipt"]["receipt_sha256"] = json!(sha256(compact.as_bytes()));
+        audit["verification_receipt"]["receipt_jws"] = json!(compact);
+        audit["verification_receipt"]["presentation_binding_sha256"] = json!(
+            canonical_openid4vp_presentation_binding_sha256(&signed.presentation_binding).unwrap()
+        );
+        let valid_bytes = serde_json::to_vec(&audit).unwrap();
+        crate::secure_file::write_atomic(&receipt_path, &valid_bytes, true).unwrap();
+        let valid = write_private_control_evidence_bundle(&report, &root, &identity, &binding)
+            .expect("receipt issued after completion must be accepted");
+        assert_eq!(
+            std::fs::read(
+                valid
+                    .directory
+                    .join(&path)
+                    .with_extension("png.receipt.json")
+            )
+            .unwrap(),
+            valid_bytes
+        );
+        audit["verification_receipt"]["tenant_id"] = json!(Uuid::now_v7());
+        crate::secure_file::write_atomic(&receipt_path, &serde_json::to_vec(&audit).unwrap(), true)
+            .unwrap();
+        assert_eq!(
+            write_private_control_evidence_bundle(&report, &root, &identity, &binding),
+            Err(EvidenceError::Identity)
+        );
         assert_eq!(
             std::fs::read_dir(&root)
                 .unwrap()
                 .filter_map(Result::ok)
                 .filter(|entry| entry.path().join("manifest.json").exists())
                 .count(),
-            1
+            2
         );
         std::fs::remove_dir_all(root).unwrap();
     }

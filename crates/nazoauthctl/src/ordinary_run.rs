@@ -33,11 +33,11 @@ use nazoauthctl_conformance::{
     OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage,
     ProgressActivity, ProgressEvent, ProgressSink, RunControl, StableRenderer, SuiteClient,
     SuiteClientError, SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
-    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
-    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
-    TenantResourceRecoveryPhase, Transport, activity_label, bundled_oidf_matrix,
-    current_matrix_label, open_bundled_oidf_driver_plan, recover_proxy_trust,
-    recover_suite_resources, write_private_control_evidence_bundle,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, TenantResourceApplyOutput,
+    TenantResourceControlOperation, TenantResourceRecoveryBinding, TenantResourceRecoveryPhase,
+    Transport, activity_label, bundled_oidf_matrix, current_matrix_label,
+    open_bundled_oidf_driver_plan, recover_proxy_trust, recover_suite_resources,
+    write_private_control_evidence_bundle,
 };
 use serde::Serialize;
 use url::Url;
@@ -817,7 +817,6 @@ fn execute_with_progress<S: ProgressSink>(
     } else {
         Vec::new()
     };
-    let review_screenshot_manifest = None;
     if run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
@@ -832,7 +831,6 @@ fn execute_with_progress<S: ProgressSink>(
                     .expect("retention eligibility requires report"),
                 &artifact_digest,
                 &deployment_report.matrix_sha256,
-                review_screenshot_manifest.as_ref(),
             )?;
             let manifest_path = suite_retention_manifest_path(&evidence_directory, &manifest);
             recovery.prepare_suite_plan_retention(manifest, manifest_path)
@@ -2568,7 +2566,6 @@ fn suite_retention_manifest(
     report: &nazoauthctl_conformance::ConformanceReport,
     artifact_digest: &str,
     matrix_sha256: &str,
-    review_screenshot_manifest: Option<&nazoauthctl_conformance::ReviewScreenshotManifestReceipt>,
 ) -> anyhow::Result<SuiteRetentionManifest> {
     let binding = recovery.ordinary_binding();
     let retained_plan_ids = report
@@ -2602,12 +2599,7 @@ fn suite_retention_manifest(
         deployment_id: binding.deployment_id.clone(),
         tenant_id: binding.tenant_id.clone(),
         run_id: binding.run_id.clone(),
-        review_screenshot_manifest: review_screenshot_manifest.map(|manifest| {
-            SuiteRetentionScreenshotManifest {
-                path: manifest.path.clone(),
-                sha256: manifest.sha256.clone(),
-            }
-        }),
+        review_screenshot_manifest: None,
         deferred_review_pending: report
             .modules
             .iter()

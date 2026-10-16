@@ -71,8 +71,8 @@ pub use credentials::{BearerToken, CredentialStore, CredentialStoreError};
 pub use evidence::{
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
     EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceError, EvidenceRuntimeIdentity,
-    EvidenceSourceIdentity, ReviewScreenshotManifestReceipt, validate_private_evidence_directory,
-    write_private_control_evidence_bundle, write_review_screenshot_manifest,
+    EvidenceSourceIdentity, validate_private_evidence_directory,
+    write_private_control_evidence_bundle,
 };
 pub use materializer::{
     ArtifactMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
