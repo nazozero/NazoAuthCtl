@@ -4,10 +4,10 @@ use sha2::{Digest as _, Sha256};
 
 /// Hash serialized bytes directly, without retaining a second document buffer.
 #[derive(Default)]
-pub(super) struct Sha256Writer(Sha256);
+pub(crate) struct Sha256Writer(Sha256);
 
 impl Sha256Writer {
-    pub(super) fn finish(self) -> String {
+    pub(crate) fn finish(self) -> String {
         hex::encode(self.0.finalize())
     }
 }

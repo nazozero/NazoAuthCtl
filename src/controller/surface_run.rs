@@ -10,8 +10,7 @@ use anyhow::{Context as _, bail};
 
 use crate::admin_credentials::{AdminCredentialsInput, read_admin_credentials};
 use crate::clean_install::{
-    CleanInstallContext, CleanInstallRequest, CurlPublicProber, admin_provision_password_material,
-    verify_public,
+    CleanInstallContext, CleanInstallRequest, CurlPublicProber, verify_public,
 };
 use crate::cli::{
     AdminCommand, AdminCreateArgs, BackupArgs, BackupCommand, Cli, Command, InstallArgs,
@@ -1342,7 +1341,7 @@ fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Resu
         merged.as_deref(),
         "admin create",
     )?;
-    let credentials = read_admin_credentials(
+    let mut credentials = read_admin_credentials(
         if args.credentials_stdin {
             AdminCredentialsInput::Stdin
         } else {
@@ -1350,7 +1349,9 @@ fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Resu
         },
         "admin create",
     )?;
-    let password = admin_provision_password_material(&credentials)?;
+    let password = crate::target::SecretMaterial::try_new(
+        std::mem::take(&mut *credentials.password).into_bytes(),
+    )?;
     let operation_id = admin_operation_id();
     let operation = crate::target::HostOperation::admin_create(
         operation_id,

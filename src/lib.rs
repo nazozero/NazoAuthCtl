@@ -3,6 +3,7 @@ mod clean_install;
 mod cli;
 mod conformance;
 pub mod controller_identity;
+mod digest;
 mod discover_adopt;
 mod error_codes;
 mod file_lock;

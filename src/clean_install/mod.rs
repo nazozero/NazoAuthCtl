@@ -10,8 +10,6 @@
 //!
 //! Module map:
 //!
-//! * [`admin`] — deployment-root administrator provisioning credentials and
-//!   validation shared by the CLI and target operation builder.
 //! * [`public_verify`] — G08: the explicit, separate public verification
 //!   report. It consumes no lifecycle state and can never roll one back.
 //!
@@ -19,13 +17,11 @@
 //! [`ExecutionTarget`], so local and SSH installs share this exact code and
 //! this exact test suite.
 
-mod admin;
 mod install_journal;
 mod public_verify;
 
 // CLI-surface re-exports (I wave): the dispatcher consumes these without the
 // private module paths.
-pub(crate) use admin::admin_provision_password_material;
 pub(crate) use public_verify::{CurlPublicProber, verify_public};
 
 use anyhow::{Context as _, bail};
@@ -33,7 +29,6 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error_codes::REMOTE_HELPER_MISMATCH;
 use crate::fleet::{live_probe, production_target, resolve_host_selector, summarize_inspection};
@@ -316,10 +311,10 @@ fn target_path(path: &std::path::Path, flag: &str) -> anyhow::Result<String> {
 /// HTTPS defaults to `trusted-proxy`. An explicit Direct TLS document selects
 /// the two container TLS listeners and a declared read-only material root.
 /// A loopback HTTP issuer keeps the server-side default (loopback-http).
-struct RuntimeSeedConfig {
+struct RuntimeSeedConfig<'a> {
     bind: String,
     trusted_proxy_cidrs: String,
-    direct_tls_config: Option<String>,
+    direct_tls_config: Option<&'a str>,
     data_dir: String,
     database_url: String,
     valkey_url: String,
@@ -333,23 +328,25 @@ struct RuntimeSeedConfig {
     openid4vp_management_token_file: String,
 }
 
-#[derive(Zeroize, ZeroizeOnDrop)]
 struct DeploymentSecurityRoots {
-    signing_key_encryption_key: Vec<u8>,
-    client_secret_pepper: Vec<u8>,
-    dynamic_registration_token: Vec<u8>,
-    openid4vc_data_encryption_key: Vec<u8>,
-    openid4vci_management_token: Vec<u8>,
-    openid4vp_management_token: Vec<u8>,
+    signing_key_encryption_key: SecretMaterial,
+    client_secret_pepper: SecretMaterial,
+    dynamic_registration_token: SecretMaterial,
+    openid4vc_data_encryption_key: SecretMaterial,
+    openid4vci_management_token: SecretMaterial,
+    openid4vp_management_token: SecretMaterial,
 }
 
 impl DeploymentSecurityRoots {
     #[cfg(test)]
     fn generate() -> Self {
         let token = || {
-            URL_SAFE_NO_PAD
-                .encode(rand::random::<[u8; 32]>())
-                .into_bytes()
+            SecretMaterial::try_new(
+                URL_SAFE_NO_PAD
+                    .encode(rand::random::<[u8; 32]>())
+                    .into_bytes(),
+            )
+            .expect("generated 32-byte secret")
         };
         Self {
             signing_key_encryption_key: token(),
@@ -368,23 +365,30 @@ fn load_or_create_deployment_security_roots(
 ) -> anyhow::Result<DeploymentSecurityRoots> {
     let directory = registry_root.join("secrets").join(deployment_id);
     crate::filesystem::ensure_private_directory(&directory, "deployment secret directory")?;
-    let value = |name: &str| -> anyhow::Result<Vec<u8>> {
+    let value = |name: &str| -> anyhow::Result<SecretMaterial> {
         let path = directory.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => crate::filesystem::read_secure_secret_file(&path, name, 4 * 1024)
-                .map(|value| value.to_vec()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let generated = URL_SAFE_NO_PAD
-                    .encode(rand::random::<[u8; 32]>())
-                    .into_bytes();
-                crate::filesystem::atomic_write(&path, &generated, 0o600)?;
+        match crate::filesystem::read_secure_secret_file(&path, name, 4 * 1024) {
+            Ok(mut value) => Ok(SecretMaterial::try_new(std::mem::take(&mut *value))?),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                let generated = SecretMaterial::try_new(
+                    URL_SAFE_NO_PAD
+                        .encode(rand::random::<[u8; 32]>())
+                        .into_bytes(),
+                )?;
+                crate::filesystem::atomic_write(&path, generated.as_bytes(), 0o600)?;
                 Ok(generated)
             }
-            Err(error) => Err(error).with_context(|| format!("failed to inspect {name}")),
+            Err(error) => Err(error),
         }
     };
     let signing_key_encryption_key = value("signing-key-encryption-key")?;
-    crate::target::install_exec::validate_signing_key_encryption_key(&signing_key_encryption_key)?;
+    crate::target::install_exec::validate_signing_key_encryption_key(
+        signing_key_encryption_key.as_bytes(),
+    )?;
     Ok(DeploymentSecurityRoots {
         signing_key_encryption_key,
         client_secret_pepper: value("client-secret-pepper")?,
@@ -399,13 +403,13 @@ fn render_config_yaml(
     issuer: &str,
     deployment_id: &str,
     state_epoch: &str,
-    runtime: &RuntimeSeedConfig,
+    runtime: &RuntimeSeedConfig<'_>,
 ) -> anyhow::Result<String> {
     if issuer.contains(['"', '\\']) || issuer.chars().any(|c| c.is_control()) {
         bail!("issuer must not contain YAML-special characters");
     }
-    let transport_mode = if let Some(content) = &runtime.direct_tls_config {
-        render_direct_tls_config(content)?
+    let transport_mode = if let Some(content) = runtime.direct_tls_config {
+        std::borrow::Cow::Borrowed(content)
     } else if issuer.starts_with("https://") {
         // The engine-default bridge networks and the host loopback are the
         // only sources that can reach the loopback-published container port.
@@ -415,9 +419,9 @@ fn render_config_yaml(
         // A generic TLS proxy is not proof of client-certificate verification.
         // Header-based mTLS requires a separately configured, sanitizing proxy contract.
         let mtls = "MTLS_CERTIFICATE_SOURCE: \"disabled\"\n";
-        format!("TRANSPORT_MODE: \"trusted-proxy\"\n{cidrs}{mtls}")
+        format!("TRANSPORT_MODE: \"trusted-proxy\"\n{cidrs}{mtls}").into()
     } else {
-        String::new()
+        std::borrow::Cow::Borrowed("")
     };
     Ok(format!(
         "BIND: \"{}\"\n\
@@ -530,7 +534,8 @@ fn build_install_order(
     deployment_id: &str,
     state_epoch: &str,
     loopback_port: u16,
-    security_roots: &DeploymentSecurityRoots,
+    direct_tls_config: Option<&str>,
+    security_roots: DeploymentSecurityRoots,
 ) -> anyhow::Result<InstallOrder> {
     let database_runtime_url_file =
         target_os.join(&paths.secrets_dir, &["database-runtime-url"])?;
@@ -542,7 +547,7 @@ fn build_install_order(
         target_os.join(&paths.secrets_dir, &["signing-key-encryption-key"])?;
     let signing_key_encryption_key_id = format!(
         "deployment-{}",
-        &hex_digest(&security_roots.signing_key_encryption_key)[..16]
+        &hex_digest(security_roots.signing_key_encryption_key.as_bytes())[..16]
     );
     let client_secret_pepper_file =
         target_os.join(&paths.secrets_dir, &["client-secret-pepper"])?;
@@ -600,7 +605,7 @@ fn build_install_order(
             ),
             bind: format!("127.0.0.1:{loopback_port}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128".to_owned(),
-            direct_tls_config: request.direct_tls_config.clone(),
+            direct_tls_config,
         }
     } else {
         RuntimeSeedConfig {
@@ -638,7 +643,7 @@ fn build_install_order(
             ),
             bind: format!("0.0.0.0:{CONTAINER_PORT}"),
             trusted_proxy_cidrs: "127.0.0.0/8,::1/128,10.88.0.0/16".to_owned(),
-            direct_tls_config: request.direct_tls_config.clone(),
+            direct_tls_config,
         }
     };
     let config_content = render_config_yaml(&request.issuer, deployment_id, state_epoch, &runtime)?;
@@ -692,44 +697,32 @@ fn build_install_order(
             PlannedSecret {
                 purpose: "signing-key-encryption-key".to_owned(),
                 path: signing_key_encryption_key_file,
-                value: Some(SecretMaterial::try_new(
-                    security_roots.signing_key_encryption_key.clone(),
-                )?),
+                value: Some(security_roots.signing_key_encryption_key),
             },
             PlannedSecret {
                 purpose: "client-secret-pepper".to_owned(),
-                path: target_os.join(&paths.secrets_dir, &["client-secret-pepper"])?,
-                value: Some(SecretMaterial::try_new(
-                    security_roots.client_secret_pepper.clone(),
-                )?),
+                path: client_secret_pepper_file,
+                value: Some(security_roots.client_secret_pepper),
             },
             PlannedSecret {
                 purpose: "dynamic-registration-token".to_owned(),
-                path: target_os.join(&paths.secrets_dir, &["dynamic-registration-token"])?,
-                value: Some(SecretMaterial::try_new(
-                    security_roots.dynamic_registration_token.clone(),
-                )?),
+                path: dynamic_registration_token_file,
+                value: Some(security_roots.dynamic_registration_token),
             },
             PlannedSecret {
                 purpose: "openid4vc-data-encryption-key".to_owned(),
-                path: target_os.join(&paths.secrets_dir, &["openid4vc-data-encryption-key"])?,
-                value: Some(SecretMaterial::try_new(
-                    security_roots.openid4vc_data_encryption_key.clone(),
-                )?),
+                path: openid4vc_data_encryption_key_file,
+                value: Some(security_roots.openid4vc_data_encryption_key),
             },
             PlannedSecret {
                 purpose: "openid4vci-management-token".to_owned(),
-                path: target_os.join(&paths.secrets_dir, &["openid4vci-management-token"])?,
-                value: Some(SecretMaterial::try_new(
-                    security_roots.openid4vci_management_token.clone(),
-                )?),
+                path: openid4vci_management_token_file,
+                value: Some(security_roots.openid4vci_management_token),
             },
             PlannedSecret {
                 purpose: "openid4vp-management-token".to_owned(),
-                path: target_os.join(&paths.secrets_dir, &["openid4vp-management-token"])?,
-                value: Some(SecretMaterial::try_new(
-                    security_roots.openid4vp_management_token.clone(),
-                )?),
+                path: openid4vp_management_token_file,
+                value: Some(security_roots.openid4vp_management_token),
             },
         ],
         database_runtime_endpoint: request.database_runtime_endpoint.clone(),
@@ -752,7 +745,7 @@ fn deployment_loopback_port(deployment_id: &str) -> u16 {
 #[derive(Serialize)]
 struct CanonicalInstallRequest<'a> {
     schema: u32,
-    host_id: String,
+    host_id: Uuid,
     issuer: &'a str,
     version: &'a Option<String>,
     runtime: &'a Option<RuntimeBackendKind>,
@@ -782,7 +775,7 @@ fn canonical_install_request_hash(
         .transpose()?;
     let canonical = CanonicalInstallRequest {
         schema: 1,
-        host_id: host_id.to_string(),
+        host_id,
         issuer: &request.issuer,
         version: &request.version,
         runtime: &request.runtime,
@@ -793,7 +786,9 @@ fn canonical_install_request_hash(
         database_lifecycle_endpoint: &request.database_lifecycle_endpoint,
         valkey_endpoint: &request.valkey_endpoint,
     };
-    Ok(hex_digest(&serde_json::to_vec(&canonical)?))
+    let mut writer = crate::digest::Sha256Writer::default();
+    serde_json::to_writer(&mut writer, &canonical)?;
+    Ok(writer.finish())
 }
 
 /// Everything one install operation consists of, fully generated from the
@@ -821,7 +816,7 @@ fn prepare_install_operation(
         operation_id,
         state_epoch,
         runtime_kind,
-        &DeploymentSecurityRoots::generate(),
+        DeploymentSecurityRoots::generate(),
     )
 }
 
@@ -832,7 +827,7 @@ fn prepare_install_operation_with_identity(
     operation_id: Uuid,
     state_epoch: Uuid,
     runtime_kind: RuntimeBackendKind,
-    security_roots: &DeploymentSecurityRoots,
+    security_roots: DeploymentSecurityRoots,
 ) -> anyhow::Result<PreparedInstallOperation> {
     validate_key(deployment_id, "generated deployment id")?;
     let target_os = TargetOs::parse(&hello.os)?;
@@ -858,8 +853,12 @@ fn prepare_install_operation_with_identity(
         bail!("Direct TLS clean install requires a Linux Podman or Docker target");
     }
     let mut loopback_port = deployment_loopback_port(deployment_id);
-    if let Some(content) = &request.direct_tls_config {
-        let rendered = render_direct_tls_config(content)?;
+    let direct_tls_config = request
+        .direct_tls_config
+        .as_deref()
+        .map(render_direct_tls_config)
+        .transpose()?;
+    if let Some(rendered) = &direct_tls_config {
         let public_ports = crate::target::install_exec::direct_tls_public_ports(
             &request.issuer,
             rendered.as_bytes(),
@@ -877,6 +876,7 @@ fn prepare_install_operation_with_identity(
         deployment_id,
         &state_epoch.to_string(),
         loopback_port,
+        direct_tls_config.as_deref(),
         security_roots,
     )?;
     let mut resources = declare_resources(
@@ -1018,15 +1018,11 @@ pub(crate) fn run_clean_install(
     let resumed = stored_plan.is_some();
     let prepared = match stored_plan {
         Some(plan) => {
-            if plan.host_id != host_record.host_id.to_string() || plan.target_os != hello.os {
+            if plan.host_id != host_record.host_id || plan.target_os != hello.os {
                 bail!(
                     "prepared install target identity drifted; refusing to create another instance"
                 );
             }
-            let operation_id = Uuid::parse_str(&plan.operation_id)
-                .context("prepared install operation id is invalid")?;
-            let state_epoch = Uuid::parse_str(&plan.state_epoch)
-                .context("prepared install state epoch is invalid")?;
             let security_roots = load_or_create_deployment_security_roots(
                 context.registry.root(),
                 &plan.deployment_id,
@@ -1035,12 +1031,10 @@ pub(crate) fn run_clean_install(
                 &mut request,
                 &hello,
                 &plan.deployment_id,
-                operation_id,
-                state_epoch,
-                plan.runtime_kind
-                    .parse::<RuntimeBackendKind>()
-                    .context("prepared install journal contains an unsupported runtime kind")?,
-                &security_roots,
+                plan.operation_id,
+                plan.state_epoch,
+                plan.runtime_kind,
+                security_roots,
             )?
         }
         None => {
@@ -1057,15 +1051,15 @@ pub(crate) fn run_clean_install(
                 operation_id,
                 state_epoch,
                 runtime_kind,
-                &security_roots,
+                security_roots,
             )?;
             let plan = install_journal::PreparedInstallPlan::new(
                 request_hash,
-                host_record.host_id.to_string(),
+                host_record.host_id,
                 deployment_id,
-                operation_id.to_string(),
-                state_epoch.to_string(),
-                runtime_kind.as_str().to_owned(),
+                operation_id,
+                state_epoch,
+                runtime_kind,
                 hello.os.clone(),
             );
             lease.persist(&plan)?;

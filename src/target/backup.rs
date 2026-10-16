@@ -197,7 +197,7 @@ impl SnapshotManifest {
     }
 
     pub fn computed_sha256(&self) -> anyhow::Result<String> {
-        let mut writer = super::digest::Sha256Writer::default();
+        let mut writer = crate::digest::Sha256Writer::default();
         self.serialize_with_hash(&mut serde_json::Serializer::new(&mut writer), "")?;
         Ok(writer.finish())
     }

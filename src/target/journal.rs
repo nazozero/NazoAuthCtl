@@ -410,7 +410,7 @@ impl TargetJournal {
 
     /// Enforce the H04 retention bounds: once the file exceeds
     /// [`JournalBounds::max_bytes`], rewrite it keeping exactly the lines
-    /// [`keep_mask`] selects. Compaction runs under the exclusive journal lock
+    /// [`compact_lines`] selects. Compaction runs under the exclusive journal lock
     /// and commits through the platform-atomic write path, so a crash leaves
     /// either the old or the new complete journal — never a torn mixture.
     fn compact_if_needed(&self, path: &Path) -> anyhow::Result<Option<Vec<JournalLine>>> {
@@ -421,18 +421,8 @@ impl TargetJournal {
             return Ok(None);
         }
         let mut lines = read_lines_with(path, self.bounds.read_cap)?;
-        let mask = keep_mask(&lines, &self.bounds);
-        let mut keep = mask.into_iter();
-        lines.retain(|_| {
-            keep.next()
-                .expect("one retention decision per journal line")
-        });
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        for line in &lines {
-            serde_json::to_writer(&mut bytes, line)
-                .with_context(|| format!("failed to re-encode the journal {}", path.display()))?;
-            bytes.push(b'\n');
-        }
+        let bytes = compact_lines(&mut lines, &self.bounds)
+            .with_context(|| format!("failed to re-encode the journal {}", path.display()))?;
         filesystem::atomic_write(path, &bytes, 0o600)
             .with_context(|| format!("failed to compact the journal {}", path.display()))?;
         Ok(Some(lines))
@@ -485,7 +475,7 @@ fn project_entry(line: JournalLine) -> OperationLogEntry {
     }
 }
 
-/// Pure retention decision for compaction (H04): walk newest → oldest and keep
+/// Encode each line once, then retain its byte range in place. Walk newest → oldest and keep
 ///
 /// * the newest `pending` line for an operation only when no newer terminal
 ///   line settles it;
@@ -495,7 +485,18 @@ fn project_entry(line: JournalLine) -> OperationLogEntry {
 /// Superseded and duplicate pending lines carry no recovery information. If
 /// retained forever, every successful operation permanently consumes journal
 /// space and eventually makes the journal exceed its own hard read cap.
-pub(crate) fn keep_mask(lines: &[JournalLine], bounds: &JournalBounds) -> Vec<bool> {
+fn compact_lines(
+    lines: &mut Vec<JournalLine>,
+    bounds: &JournalBounds,
+) -> serde_json::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut ranges = Vec::with_capacity(lines.len());
+    for line in lines.iter() {
+        let start = bytes.len();
+        serde_json::to_writer(&mut bytes, line)?;
+        bytes.push(b'\n');
+        ranges.push(start..bytes.len());
+    }
     let mut mask = vec![false; lines.len()];
     let mut budget = bounds.target_bytes;
     let mut retained_terminals = 0usize;
@@ -506,14 +507,26 @@ pub(crate) fn keep_mask(lines: &[JournalLine], bounds: &JournalBounds) -> Vec<bo
             mask[index] = newest;
             continue;
         }
-        let size = serde_json::to_vec(&lines[index]).map_or(0, |bytes| bytes.len() as u64);
+        let size = ranges[index].len() as u64;
         if retained_terminals < bounds.min_terminal_retained || budget >= size {
             mask[index] = true;
             retained_terminals += 1;
             budget = budget.saturating_sub(size);
         }
     }
-    mask
+    let mut retained_bytes = 0;
+    let mut decisions = mask.into_iter().zip(ranges);
+    lines.retain(|_| {
+        let (keep, range) = decisions.next().expect("one range per encoded line");
+        if keep {
+            let len = range.len();
+            bytes.copy_within(range, retained_bytes);
+            retained_bytes += len;
+        }
+        keep
+    });
+    bytes.truncate(retained_bytes);
+    Ok(bytes)
 }
 
 /// Deployment ids become path components here, so they are re-validated at
@@ -1073,8 +1086,38 @@ mod tests {
         }
     }
 
+    fn assert_compaction(lines: &[JournalLine], bounds: &JournalBounds, expected: &[usize]) {
+        let mut retained = lines.to_vec();
+        let bytes = compact_lines(&mut retained, bounds).unwrap();
+        let expected: Vec<_> = expected.iter().map(|index| lines[*index].clone()).collect();
+        assert_eq!(retained, expected);
+        let decoded: Vec<JournalLine> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            decoded, expected,
+            "persisted bytes must match the returned retained lines"
+        );
+        assert!(bytes.is_empty() || bytes.ends_with(b"\n"));
+    }
+
     #[test]
-    fn keep_mask_keeps_only_unsettled_pendings_and_the_newest_terminal_window() {
+    fn compaction_byte_budget_includes_line_delimiters() {
+        let line = synthetic_line(Uuid::now_v7().to_string(), JournalStatus::Completed);
+        let size = serde_json::to_vec(&line).unwrap().len() as u64 + 1;
+        let lines = vec![line.clone(), line];
+        let mut bounds = tiny_bounds();
+        bounds.min_terminal_retained = 0;
+        bounds.target_bytes = size * 2 - 1;
+        assert_compaction(&lines, &bounds, &[1]);
+        bounds.target_bytes += 1;
+        assert_compaction(&lines, &bounds, &[0, 1]);
+    }
+
+    #[test]
+    fn compaction_keeps_only_unsettled_pendings_and_the_newest_terminal_window() {
         // Oldest -> newest: [terminal_old, pending, terminal_mid, recent1,
         // recent2]. With a zero byte budget and a floor of two retained
         // terminals, exactly the two newest terminals plus the pending line
@@ -1093,10 +1136,7 @@ mod tests {
             min_terminal_retained: 2,
             read_cap: 64 * 1024,
         };
-        assert_eq!(
-            keep_mask(&lines, &bounds),
-            vec![false, true, false, true, true]
-        );
+        assert_compaction(&lines, &bounds, &[1, 3, 4]);
 
         // A generous budget keeps everything terminal as well.
         let generous = JournalBounds {
@@ -1105,10 +1145,7 @@ mod tests {
             min_terminal_retained: 0,
             read_cap: 64 * 1024,
         };
-        assert_eq!(
-            keep_mask(&lines, &generous),
-            vec![true, true, true, true, true]
-        );
+        assert_compaction(&lines, &generous, &[0, 1, 2, 3, 4]);
 
         let settled_id = Uuid::now_v7().to_string();
         let unresolved_id = Uuid::now_v7().to_string();
@@ -1118,11 +1155,7 @@ mod tests {
             synthetic_line(unresolved_id.clone(), JournalStatus::Pending),
             synthetic_line(unresolved_id, JournalStatus::Pending),
         ];
-        assert_eq!(
-            keep_mask(&lines, &generous),
-            vec![false, true, false, true],
-            "settled and duplicate pending lines carry no recovery state"
-        );
+        assert_compaction(&lines, &generous, &[1, 3]);
     }
 
     #[test]

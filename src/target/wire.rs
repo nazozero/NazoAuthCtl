@@ -1777,7 +1777,7 @@ fn canonical_operation_value(operation: &HostOperation) -> anyhow::Result<serde_
 /// conflicts.
 pub fn canonical_operation_hash(operation: &HostOperation) -> anyhow::Result<String> {
     // The projection already has sorted map keys (no `preserve_order` feature).
-    let mut writer = super::digest::Sha256Writer::default();
+    let mut writer = crate::digest::Sha256Writer::default();
     serde_json::to_writer(&mut writer, &canonical_operation_value(operation)?)?;
     Ok(writer.finish())
 }

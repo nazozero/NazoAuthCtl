@@ -16,7 +16,6 @@ pub(crate) mod backup;
 pub(crate) mod backup_exec;
 pub(crate) mod control_exec;
 pub mod deployment_state;
-mod digest;
 pub(crate) mod install_exec;
 pub mod journal;
 pub mod persistence;
