@@ -478,9 +478,6 @@ impl SuiteClient {
                 body: body.as_ref().map(|body| body.bytes.clone()),
             };
             let response = self.transport.send(request, max_response_bytes)?;
-            if response.body.len() > max_response_bytes {
-                return Err(SuiteClientError::Transport(TransportError::Oversize));
-            }
             if (300..400).contains(&response.status) {
                 let location = response
                     .header("location")
@@ -747,8 +744,11 @@ mod tests {
     }
 
     impl Transport for Capture {
-        fn send(&self, request: HttpRequest, _max: usize) -> Result<HttpResponse, TransportError> {
+        fn send(&self, request: HttpRequest, max: usize) -> Result<HttpResponse, TransportError> {
             *self.request.lock().expect("lock") = Some(request);
+            if self.response.body.len() > max {
+                return Err(TransportError::Oversize);
+            }
             Ok(HttpResponse {
                 status: self.response.status,
                 headers: self.response.headers.clone(),
@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn bearer_is_header_only_and_oversize_is_rejected() {
+    fn bearer_is_header_only_and_transport_oversize_is_propagated() {
         let capture = Arc::new(Capture {
             request: Mutex::new(None),
             response: HttpResponse {
@@ -777,11 +777,15 @@ mod tests {
             },
         )
         .expect("client");
-        let error = client.probe_auth().unwrap_err();
+        let error = client.start_module("module-1").unwrap_err();
         assert!(matches!(
             error,
             SuiteClientError::Transport(TransportError::Oversize)
         ));
+        let request = capture.request.lock().expect("request");
+        let request = request.as_ref().expect("captured request");
+        assert_eq!(request.header("Authorization"), Some("Bearer secret-token"));
+        assert_eq!(request.url().query_pairs().count(), 0);
     }
 
     struct AuthCapture {
