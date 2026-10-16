@@ -26,8 +26,7 @@ pub use cli::language::chinese_output;
 pub use cli::{GlobalOptions, parse_global_options};
 pub use conformance::{
     ConformanceControlCompletion, ConformanceControlOutcome, ConformanceDeploymentEvidence,
-    ConformanceRuntimeEvidence, ConformanceSession, ControlOperationIdentity,
-    OpenId4VpEvidenceVerifierInputs, configure_oidf,
+    ConformanceRuntimeEvidence, ConformanceSession, ControlOperationIdentity, configure_oidf,
 };
 pub use ui::{
     configure as configure_presentation, print_value as print_presentation_value,

@@ -34,10 +34,8 @@ pub use openid4vci::{
     OpenId4VciModule,
 };
 pub use openid4vp::{
-    ConformanceBinding, OpenId4VpCompletionOutcome, OpenId4VpError,
-    OpenId4VpEvidenceBindingDiagnostic, OpenId4VpEvidenceContext, OpenId4VpEvidenceRunContext,
-    OpenId4VpEvidenceVerifier, OpenId4VpPresentation, OpenId4VpStartRequest,
-    OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
+    ConformanceBinding, OpenId4VpCompletionOutcome, OpenId4VpError, OpenId4VpPresentation,
+    OpenId4VpStartRequest, OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier,
     OpenId4VpVerifierClient,
 };
 pub use plan::BrowserRunnerState;

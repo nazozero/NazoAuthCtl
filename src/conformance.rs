@@ -50,20 +50,6 @@ pub struct ConformanceSession {
     target: Box<dyn ExecutionTarget>,
     controller_keys: ControllerKeyStore,
     config_revision: String,
-    openid4vp_evidence_verifier_inputs: OpenId4VpEvidenceVerifierInputs,
-}
-
-/// Target-inspected runtime identity used to verify OpenID4VP evidence. The
-/// public key is sourced from the managed runtime identity directory and is
-/// cryptographically bound to this deployment and issuer by NazoAuth's signed
-/// deployment statement. It is never a controller key.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OpenId4VpEvidenceVerifierInputs {
-    pub target_issuer: String,
-    pub deployment_id: String,
-    pub runtime_instance_id: String,
-    pub instance_key_id: String,
-    pub instance_public_key_base64: String,
 }
 
 /// Immutable controller authorization identity persisted with conformance
@@ -88,30 +74,6 @@ pub struct ConformanceControlCompletion {
 pub enum ConformanceControlOutcome {
     Succeeded(ConformanceControlCompletion),
     Failed(ConformanceControlCompletion),
-}
-
-fn openid4vp_verifier_inputs(
-    target_issuer: &str,
-    deployment_id: &str,
-    identity: Option<&crate::target::RuntimeInstanceIdentity>,
-) -> anyhow::Result<OpenId4VpEvidenceVerifierInputs> {
-    let identity =
-        identity.context("conformance requires the target's current runtime instance identity")?;
-    let instance_public_key =
-        nazo_operator_protocol::decode_instance_public_key(&identity.instance_public_key_base64)
-            .context("target returned an invalid runtime instance public key")?;
-    if nazo_operator_protocol::instance_key_id(&instance_public_key) != identity.instance_key_id {
-        bail!("target runtime instance key id does not match its public key");
-    }
-    Ok(OpenId4VpEvidenceVerifierInputs {
-        target_issuer: target_issuer.to_owned(),
-        deployment_id: deployment_id.to_owned(),
-        runtime_instance_id: identity.runtime_instance_id.clone(),
-        instance_key_id: identity.instance_key_id.clone(),
-        instance_public_key_base64: nazo_operator_protocol::encode_instance_public_key(
-            &instance_public_key,
-        ),
-    })
 }
 
 impl ConformanceSession {
@@ -146,11 +108,6 @@ impl ConformanceSession {
                 inspection.issuer
             );
         }
-        let openid4vp_evidence_verifier_inputs = openid4vp_verifier_inputs(
-            &inspection.issuer,
-            &inspection.deployment_id,
-            inspection.current_instance_identity.as_ref(),
-        )?;
 
         let artifact = inspection.artifact.current.context(
             "conformance requires a verified current artifact in target DeploymentState",
@@ -203,7 +160,6 @@ impl ConformanceSession {
             target,
             controller_keys,
             config_revision,
-            openid4vp_evidence_verifier_inputs,
         })
     }
 
@@ -217,10 +173,6 @@ impl ConformanceSession {
 
     pub fn oidf_suite_origin(&self) -> &str {
         &self.oidf_suite_origin
-    }
-
-    pub fn openid4vp_evidence_verifier_inputs(&self) -> &OpenId4VpEvidenceVerifierInputs {
-        &self.openid4vp_evidence_verifier_inputs
     }
 
     pub fn deployment_evidence(&self) -> ConformanceDeploymentEvidence {
@@ -595,34 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn openid4vp_verifier_inputs_require_the_exact_runtime_public_key_binding() {
-        let key = nazo_crypto::ed25519::SigningKey::from_bytes(&[41; 32]).verifying_key();
-        let encoded = nazo_operator_protocol::encode_instance_public_key(&key);
-        let key_id = nazo_operator_protocol::instance_key_id(&key);
-        assert!(
-            openid4vp_verifier_inputs("https://auth.example.com", "deploy-alpha", None).is_err()
-        );
-        let mut identity = crate::target::RuntimeInstanceIdentity {
-            runtime_instance_id: "runtime-alpha".to_owned(),
-            instance_key_id: "wrong-key-id".to_owned(),
-            instance_public_key_base64: encoded.clone(),
-        };
-        assert!(
-            openid4vp_verifier_inputs("https://auth.example.com", "deploy-alpha", Some(&identity))
-                .is_err()
-        );
-        identity.instance_key_id = key_id.clone();
-        let inputs =
-            openid4vp_verifier_inputs("https://auth.example.com", "deploy-alpha", Some(&identity))
-                .expect("valid runtime identity");
-        assert_eq!(inputs.target_issuer, "https://auth.example.com");
-        assert_eq!(inputs.deployment_id, "deploy-alpha");
-        assert_eq!(inputs.runtime_instance_id, "runtime-alpha");
-        assert_eq!(inputs.instance_key_id, key_id);
-        assert_eq!(inputs.instance_public_key_base64, encoded);
-    }
-
-    #[test]
     fn result_binding_and_callback_persistence_both_gate_journal_clear() -> anyhow::Result<()> {
         let temp = crate::filesystem::PrivateTempDir::new("conformance-control-test")?;
         let registry = RegistryStore::open(temp.path().join("registry"))?;
@@ -678,13 +602,6 @@ mod tests {
             }),
             controller_keys,
             config_revision: "revision-1".to_owned(),
-            openid4vp_evidence_verifier_inputs: OpenId4VpEvidenceVerifierInputs {
-                target_issuer: "https://auth.example.com".to_owned(),
-                deployment_id: deployment_id.to_owned(),
-                runtime_instance_id: "runtime-1".to_owned(),
-                instance_key_id: "instance-key-1".to_owned(),
-                instance_public_key_base64: "unused-in-this-test".to_owned(),
-            },
         };
 
         let journal = OperationJournal::open(

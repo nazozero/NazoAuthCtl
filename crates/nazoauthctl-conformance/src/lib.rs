@@ -55,10 +55,9 @@ pub use browser::{
     BrowserError, BrowserPolicy, BrowserReviewScreenshotSource, BrowserRunnerState,
     BrowserTargetOrigin, ConformanceBinding, OpenId4VciError, OpenId4VciIssuerClient,
     OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpCompletionOutcome,
-    OpenId4VpError, OpenId4VpEvidenceBindingDiagnostic, OpenId4VpEvidenceContext,
-    OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier, OpenId4VpPresentation,
-    OpenId4VpStartRequest, OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, ReviewScreenshotMarker,
+    OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest,
+    OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    ReviewScreenshotMarker,
 };
 pub use ciba_approval::{
     CibaApprovalFailureStage, CibaUserApprovalClient, CibaUserApprovalError, ciba_approval_requests,

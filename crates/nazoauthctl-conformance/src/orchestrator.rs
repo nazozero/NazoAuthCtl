@@ -2008,11 +2008,9 @@ mod tests {
 
     #[cfg(unix)]
     struct DeferredReviewVerifier {
-        attached: Option<crate::browser::OpenId4VpEvidenceContext>,
         expected_delivery_host: &'static str,
         starts: usize,
         completes: usize,
-        issuances: usize,
         completion_outcome: OpenId4VpCompletionOutcome,
     }
 
@@ -2282,31 +2280,6 @@ mod tests {
             assert_eq!(delivery_url.query(), Some("request=opaque"));
             self.completes += 1;
             Ok(self.completion_outcome)
-        }
-
-        fn attach_evidence_context(
-            &mut self,
-            _presentation: &mut crate::browser::OpenId4VpPresentation,
-            context: crate::browser::OpenId4VpEvidenceContext,
-        ) -> Result<(), OpenId4VpError> {
-            self.attached = Some(context);
-            Ok(())
-        }
-
-        fn verification_evidence(
-            &mut self,
-            _presentation: &crate::browser::OpenId4VpPresentation,
-        ) -> Result<crate::browser::OpenId4VpVerificationEvidence, OpenId4VpError> {
-            self.issuances += 1;
-            Ok(
-                crate::browser::OpenId4VpVerificationEvidence::test_verified(
-                    self.attached
-                        .clone()
-                        .expect("evidence is attached before issuance"),
-                    &"c".repeat(64),
-                    "https://issuer.example/ui/verification-result#receipt=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO12",
-                ),
-            )
         }
     }
 
@@ -4111,11 +4084,9 @@ mod tests {
             ("response_mode".to_owned(), "direct_post.jwt".to_owned()),
         ]);
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
-            attached: None,
             expected_delivery_host: "suite.example",
             starts: 0,
             completes: 0,
-            issuances: 0,
             completion_outcome: OpenId4VpCompletionOutcome::Completed,
         }));
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
@@ -4209,11 +4180,7 @@ mod tests {
         assert!(integrity.all_modules_terminal, "{fixture_diagnostic}");
 
         let verifier = verifier_state.lock().expect("verifier");
-        assert_eq!(
-            (verifier.starts, verifier.completes, verifier.issuances),
-            (1, 1, 0)
-        );
-        assert!(verifier.attached.is_none());
+        assert_eq!((verifier.starts, verifier.completes), (1, 1));
         let requests = transport.requests.lock().expect("requests");
         assert!(
             requests
@@ -4291,11 +4258,9 @@ mod tests {
         matrix.digest = "b".repeat(64);
         matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
         let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
-            attached: None,
             expected_delivery_host: "www.certification.openid.net",
             starts: 0,
             completes: 0,
-            issuances: 0,
             completion_outcome: OpenId4VpCompletionOutcome::ExpectedImmediateRejection,
         }));
         let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
@@ -4336,11 +4301,7 @@ mod tests {
         assert!(report.modules[0].review_screenshots.is_empty());
 
         let verifier = verifier_state.lock().expect("verifier");
-        assert_eq!(
-            (verifier.starts, verifier.completes, verifier.issuances),
-            (1, 1, 0)
-        );
-        assert!(verifier.attached.is_none());
+        assert_eq!((verifier.starts, verifier.completes), (1, 1));
         drop(verifier);
         let requests = transport.requests.lock().expect("requests");
         assert!(requests.iter().all(|(method, path)| {
