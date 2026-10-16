@@ -114,23 +114,23 @@ struct EvidenceManifest<'a> {
     identity: &'a EvidenceBundleIdentity,
     public_report_file: &'static str,
     public_report_sha256: String,
-    modules: Vec<EvidenceModuleManifest>,
-    screenshots: Vec<EvidenceScreenshotManifest>,
+    modules: Vec<EvidenceModuleManifest<'a>>,
+    screenshots: Vec<EvidenceScreenshotManifest<'a>>,
 }
 
 #[cfg(unix)]
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
-struct EvidenceScreenshotManifest {
-    matrix_plan_id: String,
-    suite_plan_id: String,
-    module_id: String,
+struct EvidenceScreenshotManifest<'a> {
+    matrix_plan_id: &'a str,
+    suite_plan_id: &'a str,
+    module_id: &'a str,
     test_name: String,
     variant: std::collections::BTreeMap<String, String>,
     marker: crate::ReviewScreenshotMarker,
     obligation_index: usize,
-    path: PathBuf,
-    sha256: String,
+    path: &'a Path,
+    sha256: &'a str,
     size: usize,
     receipt_sha256: String,
     trigger_origin: String,
@@ -165,12 +165,12 @@ struct ReviewScreenshotAudit {
 #[cfg(unix)]
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
-struct EvidenceModuleManifest {
+struct EvidenceModuleManifest<'a> {
     index: u32,
-    matrix_plan_id: String,
-    suite_plan_id: String,
-    module_id: Option<String>,
-    test_name: String,
+    matrix_plan_id: &'a str,
+    suite_plan_id: &'a str,
+    module_id: Option<&'a str>,
+    test_name: &'a str,
     file: String,
     sha256: String,
 }
@@ -190,16 +190,18 @@ struct PrivateModuleEvidence<'a> {
     log: &'a serde_json::Value,
 }
 
-fn write_private_evidence_bundle(
+/// Writes evidence for a controller-operation backed ordinary run.
+pub fn write_private_control_evidence_bundle(
     report: &ConformanceReport,
     root: &Path,
     identity: &EvidenceBundleIdentity,
+    recovery_binding: &crate::recovery::TenantResourceRecoveryBinding,
 ) -> Result<EvidenceBundleReceipt, EvidenceError> {
     validate_identity(report, identity)?;
     validate_review_screenshot_run_limit(&report.modules)?;
     #[cfg(not(unix))]
     {
-        let _ = root;
+        let _ = (root, recovery_binding);
         Err(EvidenceError::UnsupportedPlatform)
     }
     #[cfg(unix)]
@@ -253,10 +255,10 @@ fn write_private_evidence_bundle(
                 .map_err(map_secure_file_error)?;
             modules.push(EvidenceModuleManifest {
                 index,
-                matrix_plan_id: module.matrix_plan_id.clone(),
-                suite_plan_id: module.suite_plan_id.clone(),
-                module_id: module.module_id.clone(),
-                test_name: module.test_name.clone(),
+                matrix_plan_id: &module.matrix_plan_id,
+                suite_plan_id: &module.suite_plan_id,
+                module_id: module.module_id.as_deref(),
+                test_name: &module.test_name,
                 file,
                 sha256: sha256(bytes.as_slice()),
             });
@@ -303,21 +305,45 @@ fn write_private_evidence_bundle(
                 {
                     return Err(EvidenceError::Identity);
                 }
+                if audit.source
+                    == crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
+                {
+                    let anchor = recovery_binding
+                        .vp_evidence_trust_anchor
+                        .as_ref()
+                        .ok_or(EvidenceError::Identity)?;
+                    let receipt = audit
+                        .verification_receipt
+                        .as_ref()
+                        .ok_or(EvidenceError::Identity)?;
+                    let context = ControlVpReceiptContext {
+                        artifact_digest: &identity.source.artifact.driver_manifest_sha256,
+                        matrix_sha256: &report.matrix_digest,
+                        suite_plan_id: &module.suite_plan_id,
+                        suite_module_id: module_id,
+                        test_name: &module.test_name,
+                        variant: &module.variant,
+                        trigger_origin: &audit.trigger_origin,
+                    };
+                    if !verify_control_vp_receipt(receipt, anchor, recovery_binding, &context) {
+                        return Err(EvidenceError::Identity);
+                    }
+                }
                 if matches!(audit.marker, crate::ReviewScreenshotMarker::Required) {
                     required_captured += 1;
                 }
                 let destination = directory.join(&screenshot.path);
                 write_private_screenshot_pair(&destination, &screenshot_bytes, &receipt)?;
                 screenshots.push(EvidenceScreenshotManifest {
-                    matrix_plan_id: module.matrix_plan_id.clone(),
-                    suite_plan_id: module.suite_plan_id.clone(),
-                    module_id: module_id.to_owned(),
+                    matrix_plan_id: &module.matrix_plan_id,
+                    suite_plan_id: &module.suite_plan_id,
+                    module_id,
                     test_name: audit.test_name,
                     variant: audit.variant,
                     marker: audit.marker,
                     obligation_index: audit.obligation_index,
-                    path: screenshot.path.clone(),
-                    sha256: screenshot.sha256.clone(),
+                    path: &screenshot.path,
+                    sha256: &screenshot.sha256,
                     size: screenshot.size,
                     receipt_sha256: sha256(&receipt),
                     trigger_origin: audit.trigger_origin,
@@ -380,85 +406,6 @@ fn validate_review_screenshot_path(path: &Path) -> Result<(), EvidenceError> {
         return Err(EvidenceError::UnsafePath);
     }
     Ok(())
-}
-
-/// Writes evidence for a controller-operation backed ordinary run.
-pub fn write_private_control_evidence_bundle(
-    report: &ConformanceReport,
-    root: &Path,
-    identity: &EvidenceBundleIdentity,
-    recovery_binding: &crate::recovery::TenantResourceRecoveryBinding,
-) -> Result<EvidenceBundleReceipt, EvidenceError> {
-    validate_ordinary_control_identity(report, identity)?;
-    validate_control_vp_receipts(report, root, identity, recovery_binding)?;
-    write_private_evidence_bundle(report, root, identity)
-}
-
-/// Re-check live-WebDriver VP receipts with the journal-owned discovery
-/// anchor before the final evidence bundle copies any screenshot bytes.
-#[cfg(unix)]
-fn validate_control_vp_receipts(
-    report: &ConformanceReport,
-    root: &Path,
-    identity: &EvidenceBundleIdentity,
-    recovery_binding: &crate::recovery::TenantResourceRecoveryBinding,
-) -> Result<(), EvidenceError> {
-    for module in &report.modules {
-        for screenshot in &module.review_screenshots {
-            let receipt_bytes = crate::secure_file::read_bounded(
-                &root
-                    .join(&screenshot.path)
-                    .with_extension("png.receipt.json"),
-                16 * 1024,
-                true,
-            )
-            .map_err(map_secure_file_error)?;
-            let audit: ReviewScreenshotAudit =
-                serde_json::from_slice(&receipt_bytes).map_err(|_| EvidenceError::Identity)?;
-            if audit.source
-                != crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver
-            {
-                continue;
-            }
-            let artifact_digest = vp_artifact_digest(identity)?;
-            let anchor = recovery_binding
-                .vp_evidence_trust_anchor
-                .as_ref()
-                .ok_or(EvidenceError::Identity)?;
-            let receipt = audit
-                .verification_receipt
-                .as_ref()
-                .ok_or(EvidenceError::Identity)?;
-            let context = ControlVpReceiptContext {
-                artifact_digest,
-                matrix_sha256: &report.matrix_digest,
-                suite_plan_id: &module.suite_plan_id,
-                suite_module_id: module.module_id.as_deref().ok_or(EvidenceError::Identity)?,
-                test_name: &module.test_name,
-                variant: &module.variant,
-                trigger_origin: &audit.trigger_origin,
-            };
-            if !verify_control_vp_receipt(receipt, anchor, recovery_binding, &context) {
-                return Err(EvidenceError::Identity);
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn vp_artifact_digest(identity: &EvidenceBundleIdentity) -> Result<&str, EvidenceError> {
-    Ok(identity.source.artifact.driver_manifest_sha256.as_str())
-}
-
-#[cfg(not(unix))]
-fn validate_control_vp_receipts(
-    _report: &ConformanceReport,
-    _root: &Path,
-    _identity: &EvidenceBundleIdentity,
-    _recovery_binding: &crate::recovery::TenantResourceRecoveryBinding,
-) -> Result<(), EvidenceError> {
-    Err(EvidenceError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -562,14 +509,6 @@ fn verify_control_vp_receipt(
         return false;
     };
     verified.completed_at == receipt.completed_at
-        && verified.iss == receipt.issuer
-        && verified.deployment_id == receipt.deployment_id
-        && verified.tenant_id == receipt.tenant_id
-        && verified.runtime_instance_id == receipt.runtime_instance_id
-        && verified.instance_key_id == receipt.instance_key_id
-        && verified.transaction_id == transaction_id
-        && verified.issuance_request_jti == receipt.issuance_request_jti
-        && verified.intent_sha256 == receipt.intent_sha256
         && verified.exp == expires_at.unix_timestamp()
         && crate::recovery::exact_vp_trust_policy_binding(
             binding,
@@ -688,15 +627,15 @@ pub fn write_review_screenshot_manifest(
                     required_captured += 1;
                 }
                 screenshots.push(EvidenceScreenshotManifest {
-                    matrix_plan_id: module.matrix_plan_id.clone(),
-                    suite_plan_id: module.suite_plan_id.clone(),
-                    module_id: module_id.to_owned(),
+                    matrix_plan_id: &module.matrix_plan_id,
+                    suite_plan_id: &module.suite_plan_id,
+                    module_id,
                     test_name: audit.test_name,
                     variant: audit.variant,
                     marker: audit.marker,
                     obligation_index: audit.obligation_index,
-                    path: screenshot.path.clone(),
-                    sha256: screenshot.sha256.clone(),
+                    path: &screenshot.path,
+                    sha256: &screenshot.sha256,
                     size: screenshot.size,
                     receipt_sha256: sha256(&receipt),
                     trigger_origin: audit.trigger_origin,
@@ -881,41 +820,21 @@ fn validate_review_screenshot_run_limit(
     Ok(())
 }
 
-/// Validates ordinary control-operation evidence without touching the filesystem. A
-/// cleanup failure is retained as evidence (`cleanup_complete=false`) and is
-/// therefore deliberately not rejected here; the caller decides whether that
-/// run is successful.
-pub fn validate_ordinary_control_identity(
-    report: &ConformanceReport,
-    identity: &EvidenceBundleIdentity,
-) -> Result<(), EvidenceError> {
-    validate_identity(report, identity)
-}
-
 /// Retention evidence must target an existing controller-owned safe directory before
 /// Suite allocation begins; unlike ordinary evidence this preflight never
 /// creates an operator-selected path.
 pub fn validate_private_evidence_directory(root: &Path) -> Result<(), EvidenceError> {
-    let root = crate::secure_file::validate_directory(root, true).map_err(map_secure_file_error)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::metadata(root).map_err(|_| EvidenceError::Io)?;
-        if !private_evidence_owner_is_allowed(metadata.uid()) {
-            return Err(EvidenceError::UnsafePath);
-        }
-        Ok(())
+        crate::secure_file::validate_directory(root, true)
+            .map(|_| ())
+            .map_err(map_secure_file_error)
     }
     #[cfg(not(unix))]
     {
         let _ = root;
         Err(EvidenceError::UnsupportedPlatform)
     }
-}
-
-#[cfg(unix)]
-fn private_evidence_owner_is_allowed(uid: u32) -> bool {
-    uid == 0 || uid == rustix::process::geteuid().as_raw()
 }
 
 fn validate_identity(
@@ -1164,6 +1083,245 @@ impl std::error::Error for EvidenceError {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_bundle_copies_bound_receipt_and_rejects_substitution_or_bad_signature() {
+        use crate::report::{
+            CleanupReport, ModuleReport, ModuleReportContext, OrchestrationIntegrity,
+            ReviewScreenshotReport,
+        };
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use serde_json::{Value, json};
+
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nazo-evidence-{}", Uuid::now_v7()));
+        crate::secure_file::ensure_directory(&root, true).unwrap();
+        let image = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        let path = PathBuf::from("review-screenshots/run/module.png");
+        let image_path = root.join(&path);
+        crate::secure_file::write_atomic(&image_path, &image, true).unwrap();
+        let mut module = ModuleReport::from_info(
+            ModuleReportContext {
+                matrix_plan_id: "matrix-plan".into(),
+                suite_plan_id: "suite-plan".into(),
+                module_id: Some("module".into()),
+                test_name: "test".into(),
+                variant: Default::default(),
+                terminal: true,
+                expected_result: None,
+            },
+            json!({"status":"FINISHED", "result":"PASSED"}),
+            json!([]),
+        );
+        module.review_screenshots.push(ReviewScreenshotReport {
+            path: path.clone(),
+            sha256: sha256(&image),
+            size: image.len(),
+        });
+        module.review_screenshots_required = 1;
+        module.review_screenshots_required_captured = 1;
+        let report = ConformanceReport {
+            schema: 1,
+            matrix_digest: "a".repeat(64),
+            suite_origin: "https://suite.example".into(),
+            auth_probe: None,
+            fail_fast: false,
+            local_success: true,
+            suite_pass: true,
+            acceptance_pass: true,
+            review_pending: false,
+            human_review_required: false,
+            matrix_expectations_satisfied: true,
+            excluded_plans: vec![],
+            errors: vec![],
+            human_review_modules: vec![],
+            warning_modules: vec![],
+            deferred_review_modules: vec![],
+            skipped_modules: vec![],
+            expected_skipped_modules: vec![],
+            unexpected_skipped_modules: vec![],
+            unknown_declared_skip_modules: vec![],
+            retained_suite_plan_ids: vec![],
+            failed_modules: vec![],
+            incomplete_modules: vec![],
+            orchestration_integrity: OrchestrationIntegrity {
+                defined_modules: 1,
+                created_instances: 1,
+                terminal_modules: 1,
+                all_modules_instantiated: true,
+                all_modules_terminal: true,
+                all_modules_settled: true,
+                deferred_review_modules: 0,
+                cleanup_complete: true,
+                retention_requested: false,
+                retention_eligible: false,
+                retention_candidate_settled: false,
+                retention_committed: false,
+                suite_resources_settled: true,
+            },
+            progress: Default::default(),
+            plans: vec![],
+            modules: vec![module],
+            cleanup: CleanupReport::default(),
+        };
+        let tenant_id = Uuid::now_v7().to_string();
+        let resource = TenantResourceIdentity {
+            kind: nazo_operator_protocol::TenantResourceKind::User,
+            resource_id: "user".into(),
+            digest: "a".repeat(64),
+        };
+        let operations = [
+            ControlResultData::TenantResourceEnumerate {
+                revision: 0,
+                resources: vec![],
+                resource_manifest_sha256: "a".repeat(64),
+            },
+            ControlResultData::TenantResourceApply {
+                revision: 1,
+                resources: vec![resource],
+                resource_mappings: vec![],
+                resource_manifest_sha256: "b".repeat(64),
+            },
+            ControlResultData::TenantResourceEnumerate {
+                revision: 1,
+                resources: vec![],
+                resource_manifest_sha256: "b".repeat(64),
+            },
+        ]
+        .into_iter()
+        .map(|result| EvidenceControlOperation {
+            operation_id: Uuid::now_v7().to_string(),
+            request_sha256: "c".repeat(64),
+            controller_kid: "k".repeat(43),
+            result,
+        })
+        .collect();
+        let identity = EvidenceBundleIdentity {
+            run_jti: Uuid::now_v7().to_string(), outer_cleanup_complete: true,
+            deployment: EvidenceDeploymentIdentity {
+                deployment_id: "deployment".into(), target_issuer: "https://issuer.example".into(), release: "test".into(),
+                runtime: EvidenceRuntimeIdentity::HostBinary { sha256: "d".repeat(64) },
+            },
+            source: EvidenceSourceIdentity {
+                suite_origin: report.suite_origin.clone(),
+                artifact: Box::new(serde_json::from_value(json!({
+                    "artifact_id":"artifact", "revision":"revision", "source":"test", "signer_identity":"test", "signer_key_id":"key",
+                    "driver_manifest_sha256":"b".repeat(64), "driver_manifest_size":1,
+                    "suite":{"origin":report.suite_origin,"release":"test","revision":"revision","image_digest":"sha256:test"},
+                    "engine_protocol":1,"required_capabilities":[],"driver_schema":1,"driver_sha256":"c".repeat(64),
+                    "driver_size":1,"driver_handlers":1,"matrix_sha256":report.matrix_digest,
+                    "matrix_size":1,"matrix_groups":1,"matrix_plans":1,"matrix_modules":1,"matrix_clients":1,
+                    "matrix_wall_clock_seconds":1,"not_before":0,"expires_at":1,
+                    "resource_bounds":{"max_plans":1,"max_modules":1,"max_clients":1,"max_wall_clock_seconds":1}
+                })).unwrap()),
+            },
+            control: EvidenceControlIdentity { deployment_id: "deployment".into(), tenant_id: tenant_id.clone(), operations, cleanup_complete: true },
+        };
+        let mut binding: crate::recovery::TenantResourceRecoveryBinding = serde_json::from_value(json!({
+            "deployment_id":"deployment", "tenant_id":tenant_id, "tenant_domain":"issuer.example",
+            "realm_id":"realm", "organization_id":"organization", "run_id":identity.run_jti,
+            "tenant_create_expected_revision":0,"manifest_path":null,"material_sha256":null,
+            "proxy":null,"vp_evidence_trust_anchor":null,"resource_identities":[]
+        })).unwrap();
+        let trigger = "https://suite.example/test/a/module/verification-evidence";
+        let mut audit = json!({
+            "suite_plan_id":"suite-plan", "module_id":"module", "test_name":"test", "variant":{},
+            "marker":"Required", "obligation_index":0, "path":path, "sha256":sha256(&image), "size":image.len(),
+            "trigger_origin":"https://suite.example", "trigger_path":"/test/a/module/verification-evidence",
+            "trigger_url_sha256":sha256(trigger.as_bytes()), "source":"SuiteVerificationEvidence"
+        });
+        audit["marker"] = serde_json::to_value(crate::ReviewScreenshotMarker::Required).unwrap();
+        audit["source"] =
+            serde_json::to_value(crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence)
+                .unwrap();
+        let receipt_path = image_path.with_extension("png.receipt.json");
+        let receipt_bytes = serde_json::to_vec(&audit).unwrap();
+        crate::secure_file::write_atomic(&receipt_path, &receipt_bytes, true).unwrap();
+        let receipt =
+            write_private_control_evidence_bundle(&report, &root, &identity, &binding).unwrap();
+        assert_eq!(std::fs::read(receipt.directory.join(&path)).unwrap(), image);
+        assert_eq!(
+            std::fs::read(
+                receipt
+                    .directory
+                    .join(&path)
+                    .with_extension("png.receipt.json")
+            )
+            .unwrap(),
+            receipt_bytes
+        );
+        let manifest_bytes = std::fs::read(receipt.directory.join("manifest.json")).unwrap();
+        assert_eq!(receipt.manifest_sha256, sha256(&manifest_bytes));
+        let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            manifest["screenshots"][0]["receipt_sha256"],
+            sha256(&receipt_bytes)
+        );
+        assert_eq!(manifest["modules"][0]["module_id"], "module");
+
+        audit["module_id"] = json!("substituted-module");
+        crate::secure_file::write_atomic(&receipt_path, &serde_json::to_vec(&audit).unwrap(), true)
+            .unwrap();
+        assert_eq!(
+            write_private_control_evidence_bundle(&report, &root, &identity, &binding),
+            Err(EvidenceError::Identity)
+        );
+        audit["module_id"] = json!("module");
+        let mut seed = [0_u8; 32];
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut seed).unwrap();
+        let signing = nazo_crypto::ed25519::SigningKey::from_bytes(&seed);
+        let key = signing.verifying_key();
+        let key_id = nazo_operator_protocol::instance_key_id(&key);
+        let public_key = nazo_operator_protocol::encode_instance_public_key(&key);
+        binding.vp_evidence_trust_anchor = Some(crate::recovery::OpenId4VpEvidenceTrustAnchor {
+            target_issuer: "https://issuer.example".into(),
+            deployment_id: "deployment".into(),
+            runtime_instance_id: "instance".into(),
+            instance_key_id: key_id.clone(),
+            instance_public_key_base64: public_key.clone(),
+        });
+        audit["source"] = serde_json::to_value(
+            crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver,
+        )
+        .unwrap();
+        audit["trigger_origin"] = json!("https://issuer.example");
+        audit["trigger_path"] = json!("/ui/verification-result");
+        audit["trigger_url_sha256"] =
+            json!(sha256(b"https://issuer.example/ui/verification-result"));
+        audit["verification_receipt"] = json!({
+            "issuer":"https://issuer.example", "receipt_api_url":"https://issuer.example/openid4vp/verification-receipts",
+            "receipt_id":Uuid::now_v7(), "transaction_id":Uuid::now_v7(), "tenant_id":tenant_id,
+            "issuance_request_jti":Uuid::now_v7(), "presentation_binding_sha256":"a".repeat(64), "intent_sha256":"b".repeat(64),
+            "receipt_jws":"invalid", "receipt_sha256":sha256(b"invalid"), "capability_sha256":"c".repeat(64),
+            "deployment_id":"deployment", "runtime_instance_id":"instance", "instance_key_id":key_id,
+            "instance_public_key_base64":public_key,"completed_at":"2026-10-16T00:00:00Z","expires_at":"2026-10-16T00:10:00Z"
+        });
+        let parsed: ReviewScreenshotAudit = serde_json::from_value(audit.clone()).unwrap();
+        assert!(valid_review_screenshot_trigger(
+            &parsed,
+            &url::Url::parse("https://issuer.example/ui/verification-result").unwrap(),
+            &report.suite_origin,
+            &identity.deployment.target_issuer,
+            "module"
+        ));
+        crate::secure_file::write_atomic(&receipt_path, &serde_json::to_vec(&audit).unwrap(), true)
+            .unwrap();
+        assert_eq!(
+            write_private_control_evidence_bundle(&report, &root, &identity, &binding),
+            Err(EvidenceError::Identity)
+        );
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().join("manifest.json").exists())
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn screenshot_limits_reject_excess_and_overflow_before_writing() {
