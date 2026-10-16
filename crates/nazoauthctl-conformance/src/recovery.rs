@@ -990,12 +990,9 @@ impl ConformanceRecoveryGuard {
             _ => bail!("Suite retention has not been prepared"),
         };
         let bytes = canonical_suite_retention_manifest(&record.manifest)?;
-        if sha256_hex(&bytes) != record.manifest_sha256 {
-            bail!("Suite retention manifest digest conflicts with journal");
-        }
         let pending = self.suite_retention_pending_path()?;
         match crate::secure_file::read_bounded(&pending, MAX_SUITE_RETENTION_MANIFEST_BYTES, true) {
-            Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => return Ok(pending),
+            Ok(existing) if existing == bytes => return Ok(pending),
             Ok(_) => bail!("retained Suite manifest conflicts with recovery journal"),
             Err(crate::secure_file::SecureFileError::NotFound) => {}
             Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
@@ -1015,7 +1012,7 @@ impl ConformanceRecoveryGuard {
         }
         let pending = self.suite_retention_pending_path()?;
         let record = match &self.journal.suite_retention {
-            SuiteRetentionDisposition::RetentionPrepared { record } => record.clone(),
+            SuiteRetentionDisposition::RetentionPrepared { record } => record,
             _ => bail!("Suite retention has not been prepared"),
         };
         validate_suite_retention_evidence(&record.manifest, &self.journal.binding)?;
@@ -1034,7 +1031,12 @@ impl ConformanceRecoveryGuard {
             .context("Suite retention has no persisted allocation")?;
         suite.plan_ids.clear();
         suite.module_ids.clear();
-        committed.suite_retention = SuiteRetentionDisposition::Retained { record };
+        committed.suite_retention = match committed.suite_retention {
+            SuiteRetentionDisposition::RetentionPrepared { record } => {
+                SuiteRetentionDisposition::Retained { record }
+            }
+            _ => unreachable!("prepared retention was checked before cloning"),
+        };
         // Rename can succeed before its directory sync fails. Until a later
         // claim resolves disk state, neither publication nor deletion is safe.
         self.retention_commit_resolution = SuiteRetentionCommitResolution::Ambiguous;
@@ -2699,7 +2701,12 @@ mod tests {
         guard
             .prepare_suite_plan_retention(manifest, work.path().join("retained-suite-run-1.json"))
             .unwrap();
-        guard.stage_suite_retention_manifest().unwrap();
+        let pending = guard.stage_suite_retention_manifest().unwrap();
+        let original = fs::read(&pending).unwrap();
+        assert_eq!(guard.stage_suite_retention_manifest().unwrap(), pending);
+        crate::secure_file::write_atomic(&pending, b"substituted", true).unwrap();
+        assert!(guard.stage_suite_retention_manifest().is_err());
+        crate::secure_file::write_atomic(&pending, &original, true).unwrap();
         let journal = guard.journal_path.clone();
         let saved = journal.with_extension("saved");
         fs::rename(&journal, &saved).unwrap();
