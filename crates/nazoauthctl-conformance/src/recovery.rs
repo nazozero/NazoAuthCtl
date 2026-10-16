@@ -1624,25 +1624,58 @@ fn validate_review_screenshot_manifest_binding(
         .iter()
         .map(|plan| (&plan.matrix_plan_id, &plan.suite_plan_id))
         .collect::<std::collections::BTreeSet<_>>();
-    let mut modules = std::collections::BTreeSet::new();
+    let mut modules = std::collections::BTreeMap::new();
     for module in &document.modules {
         if !plans.contains(&(&module.matrix_plan_id, &module.suite_plan_id))
             || module.module_id.is_empty()
             || module.test_name.is_empty()
             || module.required != module.captured_required
-            || !modules.insert((
-                &module.matrix_plan_id,
-                &module.suite_plan_id,
-                &module.module_id,
-                &module.test_name,
-                &module.variant,
-            ))
+            || modules
+                .insert(
+                    (
+                        &module.matrix_plan_id,
+                        &module.suite_plan_id,
+                        &module.module_id,
+                        &module.test_name,
+                        &module.variant,
+                    ),
+                    (module, 0usize, 0usize, std::collections::BTreeSet::new()),
+                )
+                .is_some()
         {
             bail!("review screenshot manifest module graph is invalid");
         }
     }
+    for image in &document.screenshots {
+        let (_, captured, required, obligations) = modules
+            .get_mut(&(
+                &image.matrix_plan_id,
+                &image.suite_plan_id,
+                &image.module_id,
+                &image.test_name,
+                &image.variant,
+            ))
+            .context("review screenshot has no exact module tuple")?;
+        *captured += 1;
+        *required += usize::from(image.marker == crate::ReviewScreenshotMarker::Required);
+        if !obligations.insert(image.obligation_index) {
+            bail!("review screenshot manifest obligation graph is invalid");
+        }
+    }
+    for (module, captured, required, obligations) in modules.values() {
+        let total_attempts = captured
+            .checked_add(module.missing_optional)
+            .context("review screenshot attempt count overflows")?;
+        if *required != module.required
+            || total_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
+            || obligations
+                .last()
+                .is_some_and(|index| *index >= total_attempts)
+        {
+            bail!("review screenshot manifest obligation count is invalid");
+        }
+    }
     let mut images = std::collections::BTreeSet::new();
-    let mut obligations = std::collections::BTreeSet::new();
     let mut expected_files = std::collections::BTreeSet::new();
     let evidence_root = screenshot
         .path
@@ -1662,127 +1695,71 @@ fn validate_review_screenshot_manifest_binding(
                 Some(std::path::Component::Normal(_))
             )
             && path_components.next().is_none();
+        let trigger = format!("{}{}", image.trigger_origin, image.trigger_path);
         let source_valid = match image.source {
             crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
                 image.verification_receipt.is_none()
                     && image.trigger_origin == document.suite_origin
                     && image.trigger_path
                         == format!("/test/a/{}/verification-evidence", image.module_id)
-                    && sha256_hex(
-                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
-                    ) == image.trigger_url_sha256
             }
             crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => {
-                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
-                    .is_ok_and(|url| {
-                        url.scheme() == "https"
-                            && url.host_str().is_some()
-                            && url.username().is_empty()
-                            && url.password().is_none()
-                            && url.query().is_none()
-                            && url.fragment().is_none()
+                url::Url::parse(&trigger).is_ok_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                }) && target_issuer
+                    .zip(vp_trust_anchor)
+                    .is_some_and(|(target_issuer, anchor)| {
+                        target_issuer == anchor.target_issuer
+                            && image.verification_receipt.as_ref().is_some_and(|receipt| {
+                                verify_vp_receipt_provenance(
+                                    receipt,
+                                    anchor,
+                                    binding,
+                                    &VpReceiptContext {
+                                        artifact_digest: &retention.artifact_digest,
+                                        matrix_sha256: &retention.matrix_sha256,
+                                        suite_plan_id: &image.suite_plan_id,
+                                        suite_module_id: &image.module_id,
+                                        test_name: &image.test_name,
+                                        variant: &image.variant,
+                                        trigger_origin: &image.trigger_origin,
+                                    },
+                                )
+                            })
                     })
-                    && target_issuer
-                        .zip(vp_trust_anchor)
-                        .is_some_and(|(target_issuer, anchor)| {
-                            target_issuer == anchor.target_issuer
-                                && image.verification_receipt.as_ref().is_some_and(|receipt| {
-                                    verify_vp_receipt_provenance(
-                                        receipt,
-                                        anchor,
-                                        binding,
-                                        &VpReceiptContext {
-                                            artifact_digest: &retention.artifact_digest,
-                                            matrix_sha256: &retention.matrix_sha256,
-                                            suite_plan_id: &image.suite_plan_id,
-                                            suite_module_id: &image.module_id,
-                                            test_name: &image.test_name,
-                                            variant: &image.variant,
-                                            trigger_origin: &image.trigger_origin,
-                                        },
-                                    )
-                                })
-                        })
                     && image.trigger_path == "/ui/verification-result"
-                    && sha256_hex(
-                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
-                    ) == image.trigger_url_sha256
             }
             crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver => {
-                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
-                    .is_ok_and(|url| {
-                        url.scheme() == "https"
-                            && url.host_str().is_some()
-                            && url.username().is_empty()
-                            && url.password().is_none()
-                            && url.query().is_none()
-                            && url.fragment().is_none()
-                    })
-                    && image.verification_receipt.is_none()
+                url::Url::parse(&trigger).is_ok_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                }) && image.verification_receipt.is_none()
                     && target_issuer
                         .is_some_and(|target_issuer| target_issuer == image.trigger_origin)
                     && image
                         .trigger_path
                         .strip_prefix("/openid4vp/complete/")
                         .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
-                    && sha256_hex(
-                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
-                    ) == image.trigger_url_sha256
             }
         };
-        if !plans.contains(&(&image.matrix_plan_id, &image.suite_plan_id))
-            || !modules.contains(&(
-                &image.matrix_plan_id,
-                &image.suite_plan_id,
-                &image.module_id,
-                &image.test_name,
-                &image.variant,
-            ))
-            || !valid_path
+        if !valid_path
             || image.size == 0
             || !lower_hex(&image.sha256, 64)
             || !lower_hex(&image.receipt_sha256, 64)
-            || !lower_hex(&image.trigger_url_sha256, 64)
+            || sha256_hex(trigger.as_bytes()) != image.trigger_url_sha256
             || !source_valid
             || !images.insert(&image.path)
         {
             bail!("review screenshot manifest screenshot graph is invalid");
-        }
-        let module = document
-            .modules
-            .iter()
-            .find(|module| {
-                module.matrix_plan_id == image.matrix_plan_id
-                    && module.suite_plan_id == image.suite_plan_id
-                    && module.module_id == image.module_id
-                    && module.test_name == image.test_name
-                    && module.variant == image.variant
-            })
-            .context("review screenshot has no exact module tuple")?;
-        let total_attempts = document
-            .screenshots
-            .iter()
-            .filter(|candidate| {
-                candidate.matrix_plan_id == module.matrix_plan_id
-                    && candidate.suite_plan_id == module.suite_plan_id
-                    && candidate.module_id == module.module_id
-                    && candidate.test_name == module.test_name
-                    && candidate.variant == module.variant
-            })
-            .count()
-            .checked_add(module.missing_optional)
-            .context("review screenshot attempt count overflows")?;
-        if image.obligation_index >= total_attempts
-            || !obligations.insert((
-                &image.matrix_plan_id,
-                &image.suite_plan_id,
-                &image.module_id,
-                &image.test_name,
-                &image.variant,
-                image.obligation_index,
-            ))
-        {
-            bail!("review screenshot manifest obligation graph is invalid");
         }
         let image_path = evidence_root.join(&image.path);
         expected_files.insert(image.path.clone());
@@ -1819,42 +1796,6 @@ fn validate_review_screenshot_manifest_binding(
             || audit.verification_receipt != image.verification_receipt
         {
             bail!("review screenshot receipt conflicts with the manifest");
-        }
-    }
-    for module in &document.modules {
-        let required_captured = document
-            .screenshots
-            .iter()
-            .filter(|image| {
-                image.matrix_plan_id == module.matrix_plan_id
-                    && image.suite_plan_id == module.suite_plan_id
-                    && image.module_id == module.module_id
-                    && image.test_name == module.test_name
-                    && image.variant == module.variant
-                    && matches!(image.marker, crate::ReviewScreenshotMarker::Required)
-            })
-            .count();
-        let optional_captured = document
-            .screenshots
-            .iter()
-            .filter(|image| {
-                image.matrix_plan_id == module.matrix_plan_id
-                    && image.suite_plan_id == module.suite_plan_id
-                    && image.module_id == module.module_id
-                    && image.test_name == module.test_name
-                    && image.variant == module.variant
-                    && matches!(image.marker, crate::ReviewScreenshotMarker::Optional)
-            })
-            .count();
-        let total_attempts = required_captured
-            .checked_add(optional_captured)
-            .and_then(|attempts| attempts.checked_add(module.missing_optional))
-            .context("review screenshot optional attempt count overflows")?;
-        if required_captured != module.required
-            || module.captured_required != module.required
-            || total_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
-        {
-            bail!("review screenshot manifest optional obligation count is invalid");
         }
     }
     if expected_files.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN * 2 {
@@ -2603,6 +2544,121 @@ mod tests {
     fn retention_accepts_the_explicit_configured_suite_origin() {
         let binding = binding();
         validate_suite_retention_manifest(&retention_manifest(&binding), &binding, None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_screenshots_bind_exact_variants_obligations_and_files() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use serde_json::{Value, json};
+
+        let work =
+            nazoauthctl_runtime::filesystem::PrivateTempDir::new("oidf-retained-images").unwrap();
+        let binding = binding();
+        let mut retention = retention_manifest(&binding);
+        let target = "https://issuer.example";
+        let trigger_path = "/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000";
+        let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        let mut modules = Vec::new();
+        let mut screenshots = Vec::new();
+        for (index, variant) in [json!({}), json!({"mode":"optional"})]
+            .into_iter()
+            .enumerate()
+        {
+            let required = usize::from(index == 0);
+            let marker = if required == 1 {
+                crate::ReviewScreenshotMarker::Required
+            } else {
+                crate::ReviewScreenshotMarker::Optional
+            };
+            let path = PathBuf::from(format!("review-screenshots/run-1/image-{index}.png"));
+            let source = work.path().join(&path);
+            crate::secure_file::write_atomic(&source, &png, true).unwrap();
+            let audit = json!({
+                "suite_plan_id":"suite-plan-1","module_id":"module-1","test_name":"test",
+                "variant":variant,"marker":marker,"obligation_index":0,"path":path,
+                "sha256":sha256_hex(&png),"size":png.len(),"trigger_origin":target,
+                "trigger_path":trigger_path,"trigger_url_sha256":sha256_hex(format!("{target}{trigger_path}").as_bytes()),
+                "source":crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver,
+                "verification_receipt":null
+            });
+            let receipt = serde_json::to_vec(&audit).unwrap();
+            crate::secure_file::write_atomic(
+                &source.with_extension("png.receipt.json"),
+                &receipt,
+                true,
+            )
+            .unwrap();
+            let mut image = audit;
+            image["matrix_plan_id"] = json!("openid4vc-vp-p038");
+            image["receipt_sha256"] = json!(sha256_hex(&receipt));
+            screenshots.push(image);
+            modules.push(json!({
+                "matrix_plan_id":"openid4vc-vp-p038","suite_plan_id":"suite-plan-1",
+                "module_id":"module-1","test_name":"test","variant":variant,
+                "required":required,"captured_required":required,"missing_optional":0
+            }));
+        }
+        retention
+            .deferred_review_pending
+            .push(SuiteRetentionDeferredReview {
+                matrix_plan_id: "openid4vc-vp-p038".into(),
+                suite_plan_id: "suite-plan-1".into(),
+                module_id: "module-1".into(),
+                test_name: "test".into(),
+                variant: Default::default(),
+                placeholder_path: "/test/a/module-1/verification-evidence".into(),
+                marker: crate::ReviewScreenshotMarker::Required,
+                obligation_index: 0,
+            });
+        let document = json!({
+            "schema":REVIEW_SCREENSHOT_MANIFEST_SCHEMA,"run_jti":binding.run_id,
+            "artifact_digest":retention.artifact_digest,"matrix_sha256":retention.matrix_sha256,
+            "suite_origin":retention.suite_origin,"target_issuer":target,
+            "modules":modules,"screenshots":screenshots
+        });
+        let path = work.path().join("review-screenshot-manifests/run-1.json");
+        let check = |document: &Value, retention: &SuiteRetentionManifest| {
+            let bytes = serde_json::to_vec(document).unwrap();
+            crate::secure_file::write_atomic(&path, &bytes, true).unwrap();
+            let mut retention = retention.clone();
+            retention.review_screenshot_manifest = Some(SuiteRetentionScreenshotManifest {
+                path: path.clone(),
+                sha256: sha256_hex(&bytes),
+            });
+            validate_suite_retention_evidence(&retention, &binding)
+        };
+        check(&document, &retention).expect("same module ID with distinct variants is valid");
+
+        let mut duplicate = document.clone();
+        duplicate["screenshots"]
+            .as_array_mut()
+            .unwrap()
+            .push(document["screenshots"][0].clone());
+        assert!(check(&duplicate, &retention).is_err());
+        let mut unknown = document.clone();
+        unknown["screenshots"][1]["variant"] = json!({"mode":"unknown"});
+        assert!(check(&unknown, &retention).is_err());
+        let mut wrong_index = document.clone();
+        wrong_index["screenshots"][1]["obligation_index"] = json!(1);
+        assert!(check(&wrong_index, &retention).is_err());
+        let mut wrong_count = document.clone();
+        wrong_count["modules"][1]["required"] = json!(1);
+        wrong_count["modules"][1]["captured_required"] = json!(1);
+        assert!(check(&wrong_count, &retention).is_err());
+        let mut overflow = document.clone();
+        overflow["modules"][1]["missing_optional"] = json!(usize::MAX);
+        assert!(check(&overflow, &retention).is_err());
+        let mut wrong_retention = retention.clone();
+        wrong_retention.deferred_review_pending[0].module_id = "different-module".into();
+        assert!(check(&document, &wrong_retention).is_err());
+        crate::secure_file::write_atomic(
+            &work.path().join("review-screenshots/run-1/image-1.png"),
+            b"substituted",
+            true,
+        )
+        .unwrap();
+        assert!(check(&document, &retention).is_err());
     }
 
     #[test]
