@@ -22,18 +22,18 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use url::Url;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 pub(super) const MTLS_CLIENT_SAN_DNS: &str = "nazoauthctl-client";
 
 pub(super) struct GeneratedClientCrypto {
     pub(super) client_secret: Zeroizing<String>,
     pub(super) rsa_private_jwks: Zeroizing<String>,
-    pub(super) rsa_public_jwks: Zeroizing<String>,
+    pub(super) rsa_public_jwks: String,
     pub(super) ec_private_jwks: Zeroizing<String>,
-    pub(super) ec_public_jwks: Zeroizing<String>,
-    pub(super) mtls_ca_certificate: Zeroizing<String>,
-    pub(super) mtls_client_certificate: Zeroizing<String>,
+    pub(super) ec_public_jwks: String,
+    pub(super) mtls_ca_certificate: String,
+    pub(super) mtls_client_certificate: String,
     pub(super) mtls_client_key: Zeroizing<String>,
     pub(super) mtls_client_certificate_sha256: String,
 }
@@ -44,21 +44,12 @@ pub(super) struct GeneratedClientCrypto {
 /// Private JWKs remain only in the prepared Suite configuration and are
 /// zeroized with the preparation state.
 pub(super) struct GeneratedAttestationMaterial {
-    pub(super) trust_anchor_pem: Zeroizing<String>,
+    pub(super) trust_anchor_pem: String,
     pub(super) attester_private_jwks: Zeroizing<String>,
     pub(super) attester_public_jwks: Value,
     pub(super) key_attestation_private_jwks: Zeroizing<String>,
     pub(super) key_attestation_public_jwks: Value,
     pub(super) credential_signing_private_jwk: Zeroizing<String>,
-}
-
-impl Zeroize for GeneratedAttestationMaterial {
-    fn zeroize(&mut self) {
-        self.trust_anchor_pem.zeroize();
-        self.attester_private_jwks.zeroize();
-        self.key_attestation_private_jwks.zeroize();
-        self.credential_signing_private_jwk.zeroize();
-    }
 }
 
 pub(super) fn generate_client_crypto(
@@ -99,11 +90,11 @@ pub(super) fn generate_client_crypto(
     Ok(GeneratedClientCrypto {
         client_secret,
         rsa_private_jwks,
-        rsa_public_jwks: Zeroizing::new(rsa_public_jwks),
+        rsa_public_jwks,
         ec_private_jwks: Zeroizing::new(ec_private_jwks),
-        ec_public_jwks: Zeroizing::new(ec_public_jwks),
-        mtls_ca_certificate: Zeroizing::new(mtls_ca_certificate),
-        mtls_client_certificate: Zeroizing::new(mtls_client_certificate),
+        ec_public_jwks,
+        mtls_ca_certificate,
+        mtls_client_certificate,
         mtls_client_key: Zeroizing::new(mtls_client_key),
         mtls_client_certificate_sha256,
     })
@@ -172,7 +163,7 @@ pub(super) fn generate_attestation_material(
         KeyPair::try_from(ca_key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
     let ca = CertifiedIssuer::self_signed(ca_params, ca_key_pair)
         .map_err(|_| MaterializerError::Crypto)?;
-    let trust_anchor_pem = Zeroizing::new(ca.pem().replace("\r\n", "\n"));
+    let trust_anchor_pem = ca.pem().replace("\r\n", "\n");
 
     let (attester_private_jwks, attester_public_jwks) =
         generate_attestation_leaf(&ca, "NazoAuth client attestation")?;

@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::matrix::{
     MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix, zeroize_json_value,
@@ -71,8 +71,8 @@ struct MaterializationBindings {
 }
 
 /// Preparation state is deliberately neither serializable nor printable.
-/// Its `Zeroize`/`ZeroizeOnDrop` implementation clears every private field;
-/// descriptor/public metadata is retained only for the duration of finalize.
+/// Private fields own their zeroizing buffers; each client clears its private
+/// request JSON on drop. Public metadata is retained until finalize completes.
 pub struct PreparedMaterialization {
     descriptor: MatrixDescriptor,
     target_issuer: String,
@@ -85,27 +85,6 @@ pub struct PreparedMaterialization {
     attestation: Option<GeneratedAttestationMaterial>,
     dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
     clients: BTreeMap<String, PreparedClient>,
-}
-
-impl Zeroize for PreparedMaterialization {
-    fn zeroize(&mut self) {
-        self.applicant_password.zeroize();
-        self.applicant_email.zeroize();
-        self.tx_code.zeroize();
-        self.attestation.zeroize();
-        self.dynamic_registration_initial_access_token.zeroize();
-        for client in self.clients.values_mut() {
-            client.zeroize();
-        }
-    }
-}
-
-impl ZeroizeOnDrop for PreparedMaterialization {}
-
-impl Drop for PreparedMaterialization {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
 }
 
 impl PreparedMaterialization {
@@ -335,26 +314,18 @@ fn materialize_openid4vc_dataset_claims(configuration_id: &str, claims: &Value) 
 struct PreparedClient {
     client_secret: Zeroizing<String>,
     rsa_private_jwks: Zeroizing<String>,
-    rsa_public_jwks: Zeroizing<String>,
+    rsa_public_jwks: String,
     ec_private_jwks: Zeroizing<String>,
-    ec_public_jwks: Zeroizing<String>,
-    mtls_ca_certificate: Zeroizing<String>,
-    mtls_client_certificate: Zeroizing<String>,
+    ec_public_jwks: String,
+    mtls_ca_certificate: String,
+    mtls_client_certificate: String,
     mtls_client_key: Zeroizing<String>,
     mtls_client_certificate_sha256: String,
     request: Value,
 }
 
-impl Zeroize for PreparedClient {
-    fn zeroize(&mut self) {
-        self.client_secret.zeroize();
-        self.rsa_private_jwks.zeroize();
-        self.rsa_public_jwks.zeroize();
-        self.ec_private_jwks.zeroize();
-        self.ec_public_jwks.zeroize();
-        self.mtls_ca_certificate.zeroize();
-        self.mtls_client_certificate.zeroize();
-        self.mtls_client_key.zeroize();
+impl Drop for PreparedClient {
+    fn drop(&mut self) {
         zeroize_json_value(&mut self.request);
     }
 }
@@ -362,7 +333,6 @@ impl Zeroize for PreparedClient {
 /// Private bytes are zeroized and can only be written using the owner-only
 /// atomic writer.  The bundle record below intentionally excludes private JWK
 /// values and the mTLS private key.
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecureBytes(Zeroizing<Vec<u8>>);
 
 impl SecureBytes {
@@ -417,12 +387,6 @@ impl std::fmt::Debug for TenantResourceManifestResource {
 impl TenantResourceManifestResource {
     pub fn digest(&self) -> &str {
         &self.digest
-    }
-}
-
-impl Drop for TenantResourceManifestResource {
-    fn drop(&mut self) {
-        self.payload_base64url.zeroize();
     }
 }
 

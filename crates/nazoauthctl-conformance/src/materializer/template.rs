@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 use url::Url;
-use zeroize::Zeroizing;
 
 use super::crypto::GeneratedAttestationMaterial;
 use super::{
@@ -134,7 +133,7 @@ pub(super) fn materialize_vci_config(
     let attestation = attestation.ok_or(MaterializerError::InvalidField(
         "generated.vci_key_attestation",
     ))?;
-    let key_attestation_jwks = jwks_value(&attestation.key_attestation_private_jwks)?;
+    let key_attestation_jwks = json_value(&attestation.key_attestation_private_jwks)?;
     if let Some(existing) = vci.get("key_attestation_jwks")
         && existing != &key_attestation_jwks
     {
@@ -152,7 +151,7 @@ pub(super) fn materialize_vci_config(
                 "issuer": format!("{}/", suite_origin.trim_end_matches('/')),
                 "trust_anchor": attestation.trust_anchor_pem.to_string(),
                 "key_attestation_trust_anchor_pem": attestation.trust_anchor_pem.to_string(),
-                "attester_jwks": jwks_value(&attestation.attester_private_jwks)?,
+                "attester_jwks": json_value(&attestation.attester_private_jwks)?,
                 "key_attestation_jwks": key_attestation_jwks,
             }),
         );
@@ -475,10 +474,6 @@ fn validate_tx_code(value: &str) -> Result<(), MaterializerError> {
     Ok(())
 }
 
-fn jwks_value(value: &Zeroizing<String>) -> Result<Value, MaterializerError> {
-    serde_json::from_str(value.as_str()).map_err(|_| MaterializerError::Encoding)
-}
-
 fn resolve_reference<'a>(
     mut name: &'a str,
     bindings: &'a BTreeMap<String, String>,
@@ -625,8 +620,8 @@ fn resolve_client_reference(
     }
 }
 
-fn json_value(value: &Zeroizing<String>) -> Result<Value, MaterializerError> {
-    serde_json::from_str(value.as_str()).map_err(|_| MaterializerError::Encoding)
+fn json_value(value: &str) -> Result<Value, MaterializerError> {
+    serde_json::from_str(value).map_err(|_| MaterializerError::Encoding)
 }
 
 #[allow(clippy::too_many_arguments)]
