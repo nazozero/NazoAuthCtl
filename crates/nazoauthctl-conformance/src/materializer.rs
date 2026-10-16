@@ -34,9 +34,6 @@ const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TENANT_RESOURCE_PAYLOAD_BYTES: usize = 512 * 1024;
 const MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TENANT_RESOURCE_ID_BYTES: usize = 128;
-const MAX_TENANT_RESOURCE_USERNAME_BYTES: usize = 150;
-const MAX_TENANT_RESOURCE_EMAIL_BYTES: usize = 254;
-const MAX_TENANT_RESOURCE_PASSWORD_BYTES: usize = 512;
 const MAX_TENANT_RESOURCE_CERTIFICATE_BYTES: usize = 256 * 1024;
 const MAX_TENANT_RESOURCE_CONFIGURATION_ID_BYTES: usize = 255;
 
@@ -175,32 +172,16 @@ impl PreparedMaterialization {
             return Err(MaterializerError::RequestMismatch);
         }
         let run_suffix = run_namespace_suffix(run_namespace);
-        let user_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix)?;
+        let user_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix);
         let trust_policy_resource_id = self
             .attestation
             .as_ref()
-            .map(|_| run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix))
-            .transpose()?;
+            .map(|_| run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix));
         let username = self
             .applicant_email
             .split_once('@')
             .map(|(local, _)| local)
             .ok_or(MaterializerError::InvalidField("generated.applicant_email"))?;
-        validate_bounded_text(
-            username,
-            MAX_TENANT_RESOURCE_USERNAME_BYTES,
-            "generated.applicant_email",
-        )?;
-        validate_bounded_text(
-            self.applicant_email.as_str(),
-            MAX_TENANT_RESOURCE_EMAIL_BYTES,
-            "generated.applicant_email",
-        )?;
-        validate_bounded_text(
-            self.applicant_password.as_str(),
-            MAX_TENANT_RESOURCE_PASSWORD_BYTES,
-            "generated.applicant_password",
-        )?;
         let applicant_profile_origin = self.target_issuer.trim_end_matches('/');
 
         let mut resources = Vec::with_capacity(
@@ -245,19 +226,18 @@ impl PreparedMaterialization {
 
         for (logical_client_id, client) in &self.clients {
             let client_resource_id =
-                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix)?;
-            validate_manifest_client_request(&client.request)?;
+                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix);
             let supplied_secret =
-                (!client.client_secret.is_empty()).then(|| client.client_secret.to_string());
+                (!client.client_secret.is_empty()).then_some(client.client_secret.as_str());
             push_manifest_resource(
                 &mut resources,
                 &mut payload_total,
                 TenantResourceKind::OauthClient,
                 client_resource_id.clone(),
                 serde_json::json!({
-                    "request": client.request.clone(),
+                    "request": client.request,
                     "supplied_secret": supplied_secret,
-                    "trust_policy_resource_id": trust_policy_resource_id.clone(),
+                    "trust_policy_resource_id": trust_policy_resource_id,
                 }),
             )?;
 
@@ -270,7 +250,7 @@ impl PreparedMaterialization {
                     &mut resources,
                     &mut payload_total,
                     TenantResourceKind::MtlsTrustAnchor,
-                    run_scoped_resource_id("mtls-trust-anchor", logical_client_id, &run_suffix)?,
+                    run_scoped_resource_id("mtls-trust-anchor", logical_client_id, &run_suffix),
                     serde_json::json!({
                         "client_resource_id": client_resource_id,
                         "certificate_pem": client.mtls_ca_certificate.as_str(),
@@ -289,7 +269,7 @@ impl PreparedMaterialization {
                 &mut resources,
                 &mut payload_total,
                 TenantResourceKind::Openid4vcDataset,
-                run_scoped_resource_id("openid4vc-dataset", configuration_id, &run_suffix)?,
+                run_scoped_resource_id("openid4vc-dataset", configuration_id, &run_suffix),
                 serde_json::json!({
                     "user_resource_id": user_resource_id,
                     "configuration_id": configuration_id,
@@ -307,12 +287,8 @@ impl PreparedMaterialization {
                     "{}/",
                     self.suite_base_url.trim_end_matches('/')
                 ),
-                client_attestation_jwks: strict_openid4vc_trust_jwks(
-                    attestation.attester_public_jwks.as_str(),
-                )?,
-                key_attestation_jwks: strict_openid4vc_trust_jwks(
-                    attestation.key_attestation_public_jwks.as_str(),
-                )?,
+                client_attestation_jwks: attestation.attester_public_jwks.clone(),
+                key_attestation_jwks: attestation.key_attestation_public_jwks.clone(),
                 wallet_authorization_origins: vec![self.suite_base_url.clone()],
                 credential_trust_anchor_pem: combine_openid4vc_credential_trust_anchors(
                     attestation.trust_anchor_pem.as_str(),
@@ -354,55 +330,6 @@ fn materialize_openid4vc_dataset_claims(configuration_id: &str, claims: &Value) 
         }
     }
     claims
-}
-
-fn strict_openid4vc_trust_jwks(encoded: &str) -> Result<Value, MaterializerError> {
-    const PUBLIC_MEMBERS: [&str; 6] = ["alg", "crv", "kid", "kty", "x", "y"];
-    const PROVIDER_METADATA_MEMBERS: [&str; 2] = ["use", "x5c"];
-    const PRIVATE_MEMBERS: [&str; 8] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
-
-    let source: Value = serde_json::from_str(encoded).map_err(|_| MaterializerError::Encoding)?;
-    let object = source.as_object().ok_or(MaterializerError::InvalidField(
-        "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-    ))?;
-    if object.keys().any(|name| name != "keys") {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-        ));
-    }
-    let keys = object
-        .get("keys")
-        .and_then(Value::as_array)
-        .filter(|keys| !keys.is_empty())
-        .ok_or(MaterializerError::InvalidField(
-            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-        ))?;
-    let mut public_keys = Vec::with_capacity(keys.len());
-    for key in keys {
-        let source_key = key.as_object().ok_or(MaterializerError::InvalidField(
-            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-        ))?;
-        if source_key
-            .keys()
-            .any(|name| PRIVATE_MEMBERS.contains(&name.as_str()))
-            || source_key.keys().any(|name| {
-                !PUBLIC_MEMBERS.contains(&name.as_str())
-                    && !PROVIDER_METADATA_MEMBERS.contains(&name.as_str())
-            })
-        {
-            return Err(MaterializerError::InvalidField(
-                "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-            ));
-        }
-        let mut public_key = serde_json::Map::new();
-        for name in PUBLIC_MEMBERS {
-            if let Some(value) = source_key.get(name) {
-                public_key.insert(name.to_owned(), value.clone());
-            }
-        }
-        public_keys.push(Value::Object(public_key));
-    }
-    Ok(serde_json::json!({ "keys": public_keys }))
 }
 
 struct PreparedClient {
@@ -852,25 +779,9 @@ fn run_namespace_suffix(run_namespace: &str) -> String {
     digest_hex(run_namespace.as_bytes())[..32].to_owned()
 }
 
-fn run_scoped_resource_id(
-    prefix: &str,
-    value: &str,
-    run_suffix: &str,
-) -> Result<String, MaterializerError> {
-    if run_suffix.len() != 32
-        || !run_suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.run_namespace",
-        ));
-    }
-    if prefix.is_empty() || value.is_empty() {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.resource_id",
-        ));
-    }
+// Prefixes are fixed call-site constants; values come from the validated descriptor,
+// and run_suffix is produced by run_namespace_suffix.
+fn run_scoped_resource_id(prefix: &str, value: &str, run_suffix: &str) -> String {
     let normalized = value
         .chars()
         .map(|character| {
@@ -885,7 +796,7 @@ fn run_scoped_resource_id(
     let normalized = normalized.trim_matches('-');
     let available_base_bytes = MAX_TENANT_RESOURCE_ID_BYTES - "-run-".len() - run_suffix.len();
     let base_length = prefix.len() + 1 + normalized.len() + if needs_hash_suffix { 17 } else { 0 };
-    let candidate = if base_length > available_base_bytes {
+    if base_length > available_base_bytes {
         format!(
             "{prefix}-{}-run-{run_suffix}",
             &digest_hex(value.as_bytes())[..32]
@@ -897,9 +808,7 @@ fn run_scoped_resource_id(
         )
     } else {
         format!("{prefix}-{normalized}-run-{run_suffix}")
-    };
-    validate_resource_id(&candidate)?;
-    Ok(candidate)
+    }
 }
 
 fn validate_resource_id(value: &str) -> Result<(), MaterializerError> {
@@ -945,10 +854,6 @@ fn validate_manifest_certificate_pem(
         return Err(MaterializerError::InvalidField(field));
     }
     Ok(())
-}
-
-fn validate_manifest_client_request(request: &Value) -> Result<(), MaterializerError> {
-    reject_manifest_private_or_suite_value(request)
 }
 
 fn reject_manifest_private_or_suite_value(value: &Value) -> Result<(), MaterializerError> {
@@ -1333,9 +1238,9 @@ impl DescriptorMaterializer {
         }
 
         let run_suffix = run_namespace_suffix(prepared.request_jti());
-        let applicant_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix)?;
+        let applicant_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix);
         let trust_policy_resource_id =
-            run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix)?;
+            run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix);
         let trust_policy_identity = apply_output
             .delta_resources()
             .iter()
@@ -1364,7 +1269,7 @@ impl DescriptorMaterializer {
         let mut clients = BTreeMap::new();
         for logical_client_id in prepared.clients.keys() {
             let resource_id =
-                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix)?;
+                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix);
             let public_id = mappings
                 .get(&(TenantResourceKind::OauthClient, resource_id.as_str()))
                 .ok_or(MaterializerError::MissingClientMapping)?;
@@ -1749,20 +1654,10 @@ mod tests {
         ];
         for (value, expected_base) in cases {
             assert_eq!(
-                run_scoped_resource_id("oauth-client", &value, suffix).unwrap(),
+                run_scoped_resource_id("oauth-client", &value, suffix),
                 format!("{expected_base}-run-{suffix}")
             );
         }
-        for (prefix, value, suffix) in [
-            ("", "client", suffix),
-            ("oauth-client", "", suffix),
-            ("invalid/prefix", "client", suffix),
-            ("oauth-client", "client", "short"),
-            ("oauth-client", "client", "0123456789ABCDEF0123456789ABCDEF"),
-        ] {
-            assert!(run_scoped_resource_id(prefix, value, suffix).is_err());
-        }
-        assert!(run_scoped_resource_id(&"p".repeat(100), "client", suffix).is_err());
     }
 
     #[test]
@@ -1850,8 +1745,16 @@ mod tests {
     fn registration_template_rejects_forbidden_control_fields() {
         for field in ["conformance_lease_id", "conformance_task_jti"] {
             let request = Value::Object([(field.to_owned(), Value::Null)].into_iter().collect());
+            let mut resources = Vec::new();
+            let mut total = 0;
             assert_eq!(
-                validate_manifest_client_request(&request),
+                push_manifest_resource(
+                    &mut resources,
+                    &mut total,
+                    TenantResourceKind::OauthClient,
+                    "client".to_owned(),
+                    serde_json::json!({"request": request}),
+                ),
                 Err(MaterializerError::InvalidField(
                     "tenant_resource_manifest.forbidden_field"
                 ))
@@ -2160,10 +2063,25 @@ mod tests {
                         serde_json::from_value(payload.clone()).expect("trust policy payload");
                     validate_openid4vc_trust_policy(&policy)
                         .expect("ordinary trust policy must satisfy the shared wire contract");
-                    for jwks in [
-                        &policy.client_attestation_jwks,
-                        &policy.key_attestation_jwks,
+                    let attestation = prepared.attestation.as_ref().expect("attestation");
+                    for (jwks, private) in [
+                        (
+                            &policy.client_attestation_jwks,
+                            &attestation.attester_private_jwks,
+                        ),
+                        (
+                            &policy.key_attestation_jwks,
+                            &attestation.key_attestation_private_jwks,
+                        ),
                     ] {
+                        let private: Value = serde_json::from_str(private).expect("private JWKS");
+                        assert_eq!(jwks["keys"].as_array().unwrap().len(), 1);
+                        for name in ["alg", "crv", "kid", "kty", "x", "y"] {
+                            assert_eq!(jwks["keys"][0][name], private["keys"][0][name]);
+                        }
+                        assert!(private["keys"][0]["d"].is_string());
+                        assert_eq!(private["keys"][0]["use"], "sig");
+                        assert!(private["keys"][0]["x5c"][0].is_string());
                         assert_eq!(
                             jwks.as_object()
                                 .expect("JWKS object")
@@ -2243,22 +2161,6 @@ mod tests {
         assert!(!profile.contains_key("username"));
         assert!(!profile.contains_key("email"));
         assert!(!profile.contains_key("password"));
-    }
-
-    #[test]
-    fn ordinary_trust_policy_jwks_rejects_private_and_unknown_members() {
-        for encoded in [
-            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y","d":"secret"}]}"#,
-            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y","provider":"state"}]}"#,
-            r#"{"keys":[],"issuer":"https://unexpected.example"}"#,
-        ] {
-            assert!(matches!(
-                strict_openid4vc_trust_jwks(encoded),
-                Err(MaterializerError::InvalidField(
-                    "tenant_resource_manifest.openid4vc_trust_policy_jwks"
-                ))
-            ));
-        }
     }
 
     #[test]

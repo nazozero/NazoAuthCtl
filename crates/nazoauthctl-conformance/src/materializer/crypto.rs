@@ -46,9 +46,9 @@ pub(super) struct GeneratedClientCrypto {
 pub(super) struct GeneratedAttestationMaterial {
     pub(super) trust_anchor_pem: Zeroizing<String>,
     pub(super) attester_private_jwks: Zeroizing<String>,
-    pub(super) attester_public_jwks: Zeroizing<String>,
+    pub(super) attester_public_jwks: Value,
     pub(super) key_attestation_private_jwks: Zeroizing<String>,
-    pub(super) key_attestation_public_jwks: Zeroizing<String>,
+    pub(super) key_attestation_public_jwks: Value,
     pub(super) credential_signing_private_jwk: Zeroizing<String>,
 }
 
@@ -56,9 +56,7 @@ impl Zeroize for GeneratedAttestationMaterial {
     fn zeroize(&mut self) {
         self.trust_anchor_pem.zeroize();
         self.attester_private_jwks.zeroize();
-        self.attester_public_jwks.zeroize();
         self.key_attestation_private_jwks.zeroize();
-        self.key_attestation_public_jwks.zeroize();
         self.credential_signing_private_jwk.zeroize();
     }
 }
@@ -195,7 +193,7 @@ pub(super) fn generate_attestation_material(
 fn generate_attestation_leaf<'a>(
     ca: &CertifiedIssuer<'a, KeyPair>,
     common_name: &str,
-) -> Result<(Zeroizing<String>, Zeroizing<String>), MaterializerError> {
+) -> Result<(Zeroizing<String>, Value), MaterializerError> {
     let signing_key = p256::ecdsa::SigningKey::generate();
     let key_der = Zeroizing::new(ec_pkcs8_der(&signing_key));
     let key_pair = KeyPair::try_from(key_der.as_slice()).map_err(|_| MaterializerError::Crypto)?;
@@ -218,32 +216,31 @@ fn generate_attestation_leaf<'a>(
     let y = URL_SAFE_NO_PAD.encode(point.y().ok_or(MaterializerError::Crypto)?);
     let d = URL_SAFE_NO_PAD.encode(signing_key.to_bytes());
     let kid = format!("nazo-openid4vc-attestation-{}", random_hex(8));
-    let public = serde_json::json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "alg": "ES256",
-        "use": "sig",
-        "kid": kid,
-        "x": x,
-        "y": y,
-        "x5c": [encoded_certificate]
+    let public_jwks = serde_json::json!({
+        "keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "alg": "ES256",
+            "kid": kid,
+            "x": x,
+            "y": y
+        }]
     });
-    let private = serde_json::json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "alg": "ES256",
-        "use": "sig",
-        "kid": kid,
-        "x": x,
-        "y": y,
-        "d": d,
-        "x5c": [encoded_certificate]
-    });
-    let public_jwks = serde_json::to_string(&serde_json::json!({"keys": [public]}))
-        .map_err(|_| MaterializerError::Encoding)?;
-    let private_jwks = serde_json::to_string(&serde_json::json!({"keys": [private]}))
-        .map_err(|_| MaterializerError::Encoding)?;
-    Ok((Zeroizing::new(private_jwks), Zeroizing::new(public_jwks)))
+    let private_jwks = serde_json::to_string(&serde_json::json!({
+        "keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "alg": "ES256",
+            "use": "sig",
+            "kid": kid,
+            "x": x,
+            "y": y,
+            "d": d,
+            "x5c": [encoded_certificate]
+        }]
+    }))
+    .map_err(|_| MaterializerError::Encoding)?;
+    Ok((Zeroizing::new(private_jwks), public_jwks))
 }
 
 /// Generate the Suite-side credential issuer identity for one conformance
@@ -358,16 +355,12 @@ fn issuer_alternative_name(suite_origin: &str) -> CustomExtension {
 }
 
 fn subject_alternative_name(suite_origin: &str) -> Result<CustomExtension, MaterializerError> {
-    let suite_host = Url::parse(suite_origin)
-        .map_err(|_| MaterializerError::Crypto)?
-        .host_str()
-        .ok_or(MaterializerError::Crypto)?
-        .as_bytes()
-        .to_vec();
+    let suite_url = Url::parse(suite_origin).map_err(|_| MaterializerError::Crypto)?;
+    let suite_host = suite_url.host_str().ok_or(MaterializerError::Crypto)?;
     Ok(CustomExtension::from_oid_content(
         &[2, 5, 29, 17],
         der_sequence(&[
-            der_tlv(0x82, &suite_host),
+            der_tlv(0x82, suite_host.as_bytes()),
             der_tlv(0x86, suite_origin.as_bytes()),
         ]),
     ))
