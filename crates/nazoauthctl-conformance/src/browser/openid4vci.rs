@@ -370,9 +370,6 @@ impl OpenId4VciIssuerClient {
         transport: Arc<dyn Transport>,
     ) -> Result<Self, OpenId4VciError> {
         validate_secret(&issuer_management_token)?;
-        if suite_token.is_empty() {
-            return Err(OpenId4VciError::InvalidInput);
-        }
         Ok(Self {
             target_origin: config.target_origin,
             suite_origin: config.suite_origin,

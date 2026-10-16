@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::Origin;
 
@@ -13,32 +13,28 @@ const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
 /// A bearer token that cannot accidentally be printed through `Debug` or
 /// `Display`. The token is only exposed to the request builder internally.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone)]
 pub struct BearerToken(Zeroizing<String>);
 
 impl BearerToken {
     pub fn new(value: impl Into<String>) -> Result<Self, CredentialStoreError> {
-        let value = Zeroizing::new(value.into());
-        let trimmed = value.trim();
-        if trimmed.is_empty() || trimmed.len() > MAX_TOKEN_BYTES {
-            return Err(CredentialStoreError::InvalidToken);
-        }
-        if trimmed
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
+        let mut value = Zeroizing::new(value.into());
+        let leading = value.len() - value.trim_start().len();
+        let trimmed = value[leading..].trim_end();
+        if trimmed.is_empty()
+            || trimmed.len() > MAX_TOKEN_BYTES
             || !trimmed.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err(CredentialStoreError::InvalidToken);
         }
-        Ok(Self(Zeroizing::new(trimmed.to_owned())))
+        let len = trimmed.len();
+        value.drain(..leading);
+        value.truncate(len);
+        Ok(Self(value))
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -57,10 +53,10 @@ impl std::fmt::Display for BearerToken {
 #[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredCredential {
+struct StoredCredential<S> {
     schema: u32,
-    origin: String,
-    token: String,
+    origin: S,
+    token: S,
 }
 
 /// A per-origin credential store. Unix uses an owner-only file with descriptor
@@ -82,7 +78,6 @@ impl CredentialStore {
     }
 
     pub fn save(&self, origin: &Origin, token: &BearerToken) -> Result<(), CredentialStoreError> {
-        ensure_private_directory(&self.root)?;
         #[cfg(windows)]
         {
             windows_save(&self.root, origin, token)
@@ -97,8 +92,8 @@ impl CredentialStore {
             let path = self.path_for(origin);
             let record = StoredCredential {
                 schema: STORE_SCHEMA,
-                origin: origin.as_str().to_owned(),
-                token: token.as_str().to_owned(),
+                origin: origin.as_str(),
+                token: token.as_str(),
             };
             let bytes = serde_json::to_vec(&record).map_err(|_| CredentialStoreError::Encoding)?;
             crate::secure_file::write_atomic(&path, &bytes, true).map_err(map_secure_file_error)
@@ -123,14 +118,12 @@ impl CredentialStore {
                 Err(crate::secure_file::SecureFileError::NotFound) => return Ok(None),
                 Err(error) => return Err(map_secure_file_error(error)),
             };
-            let record: StoredCredential =
+            let record: StoredCredential<String> =
                 serde_json::from_slice(&bytes).map_err(|_| CredentialStoreError::Malformed)?;
             if record.schema != STORE_SCHEMA || record.origin != origin.as_str() {
                 return Err(CredentialStoreError::OriginMismatch);
             }
-            BearerToken::new(record.token)
-                .map(Some)
-                .map_err(|_| CredentialStoreError::InvalidToken)
+            BearerToken::new(record.token).map(Some)
         }
     }
 
@@ -227,12 +220,7 @@ fn windows_save(
 #[cfg(windows)]
 fn windows_load(root: &Path, origin: &Origin) -> Result<Option<BearerToken>, CredentialStoreError> {
     match windows_entry(root, origin)?.get_password() {
-        Ok(value) => {
-            let value = Zeroizing::new(value);
-            BearerToken::new(value.as_str().to_owned())
-                .map(Some)
-                .map_err(|_| CredentialStoreError::InvalidToken)
-        }
+        Ok(value) => BearerToken::new(value).map(Some),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(_) => Err(CredentialStoreError::Io),
     }
@@ -283,6 +271,38 @@ fn map_secure_file_error(error: crate::secure_file::SecureFileError) -> Credenti
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use zeroize::Zeroize;
+
+    #[test]
+    fn token_normalization_reuses_owned_storage_and_rejects_non_header_bytes() {
+        for input in ["token", " \r\ntoken\t", "\u{2003}token\u{a0}"] {
+            let owned = input.to_owned();
+            let storage = owned.as_ptr();
+            let token = BearerToken::new(owned).unwrap();
+            assert_eq!(token.as_str(), "token");
+            assert_eq!(token.as_str().as_ptr(), storage);
+        }
+        for invalid in [
+            "",
+            " \r\n\t",
+            "to ken",
+            "to\tken",
+            "to\0ken",
+            "to\u{7f}ken",
+            "tökén",
+        ] {
+            assert!(matches!(
+                BearerToken::new(invalid),
+                Err(CredentialStoreError::InvalidToken)
+            ));
+        }
+        assert!(BearerToken::new("a".repeat(MAX_TOKEN_BYTES)).is_ok());
+        assert!(matches!(
+            BearerToken::new("a".repeat(MAX_TOKEN_BYTES + 1)),
+            Err(CredentialStoreError::InvalidToken)
+        ));
+    }
 
     #[test]
     fn token_does_not_debug_print() {
