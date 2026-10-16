@@ -412,7 +412,6 @@ impl ControllerKeyStore {
     /// where both records still exist but never one where none does.
     pub fn retire_kid(&self, deployment_id: &str, kid: &str) -> anyhow::Result<()> {
         validate_instance_identifier(deployment_id)?;
-        validate_kid_shape(kid)?;
         let dir = self.instance_dir_unchecked(deployment_id);
         let _lock = FileLock::acquire(&Self::lock_path(&dir))?;
         if let Some(pointer) = self.read_active_pointer(&dir)?
@@ -581,10 +580,11 @@ impl ControllerKeyStore {
                 path.display()
             );
         }
-        let public_bytes: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(record.public_key.as_bytes())
+        let mut public_bytes = [0_u8; 32];
+        URL_SAFE_NO_PAD
+            .decode_slice(record.public_key.as_bytes(), &mut public_bytes)
             .ok()
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .filter(|length| *length == public_bytes.len())
             .with_context(|| {
                 format!(
                     "{STATE_RESET_REQUIRED}: controller key record public material is not 32 \
