@@ -393,7 +393,7 @@ impl InstallOrder {
                     super::wire::RejectionCode::OperationMalformed,
                     format!(
                         "install secret purpose '{}' is outside the closed set or duplicated",
-                        sanitize(secret.purpose.clone())
+                        sanitize(&secret.purpose)
                     ),
                 ));
             }
@@ -1167,10 +1167,7 @@ fn start_container_runtime(
             other => {
                 return Err(Failure::new(
                     HOST_ERR_OPERATION_INVALID,
-                    format!(
-                        "unsupported install secret purpose '{}'",
-                        sanitize(other.to_owned())
-                    ),
+                    format!("unsupported install secret purpose '{}'", sanitize(other)),
                 ));
             }
         };
@@ -1239,8 +1236,7 @@ fn start_container_runtime(
         .inspect(&job.runtime.object)
         .map_err(|error| Failure::new(RUNTIME_START_FAILED, sanitize(error.to_string())))?;
     if !observed.running
-        || super::update_exec::observation_digest(&observed).as_deref()
-            != Some(verified.digest.as_str())
+        || super::update_exec::observation_digest(&observed) != Some(verified.digest.as_str())
     {
         return Err(Failure::new(
             TARGET_IDENTITY_MISMATCH,

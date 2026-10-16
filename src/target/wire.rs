@@ -1363,13 +1363,13 @@ impl HostResult {
     /// Build a failed result. `detail` must be target-generated diagnostic
     /// text (static strings or validated identifiers); transports never echo
     /// raw input into this field, and [`sanitize`] bounds whatever is passed.
-    pub fn failed(operation_id: impl Into<String>, code: &str, detail: impl Into<String>) -> Self {
+    pub fn failed(operation_id: impl Into<String>, code: &str, detail: impl AsRef<str>) -> Self {
         Self {
             schema: HOST_PROTOCOL_SCHEMA,
             operation_id: operation_id.into(),
             outcome: HostOutcome::Failed {
                 code: code.to_owned(),
-                detail: sanitize(detail.into()),
+                detail: sanitize(detail),
             },
         }
     }
@@ -1659,7 +1659,7 @@ pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
     if hello.product != HELLO_PRODUCT {
         return Err(format!(
             "target answered as product '{}' instead of '{HELLO_PRODUCT}'",
-            sanitize(hello.product.clone())
+            sanitize(&hello.product)
         ));
     }
     if hello.remote_exec_schema != HOST_PROTOCOL_SCHEMA {
@@ -1793,9 +1793,8 @@ fn valid_token(value: &str, max_chars: usize) -> bool {
 }
 
 /// Bound diagnostic text without destroying printable Unicode.
-pub(super) fn sanitize(value: impl Into<String>) -> String {
-    let value: String = value.into();
-    let mut characters = value.chars();
+pub(super) fn sanitize(value: impl AsRef<str>) -> String {
+    let mut characters = value.as_ref().chars();
     let mut bounded: String = characters
         .by_ref()
         .take(200)

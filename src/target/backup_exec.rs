@@ -2678,9 +2678,7 @@ fn fetch_runtime(port: u16, path: &str, issuer: &str, config: &[u8]) -> anyhow::
                 );
                 return Ok(output.stdout);
             }
-            Ok(output) => {
-                last = sanitize(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-            }
+            Ok(output) => last = sanitize(String::from_utf8_lossy(&output.stderr).trim()),
             Err(error) => last = sanitize(error.to_string()),
         }
         std::thread::sleep(Duration::from_millis(500));

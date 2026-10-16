@@ -385,7 +385,7 @@ impl SshTarget {
     /// none are ever passed to the child.
     fn transport_failure(&self, status: std::process::ExitStatus, stderr: &[u8]) -> String {
         let lossy = String::from_utf8_lossy(stderr);
-        let excerpt = sanitize(lossy.trim().to_owned());
+        let excerpt = sanitize(lossy.trim());
         let lowercase = lossy.to_ascii_lowercase();
         if sudo_password_required(&lowercase) {
             format!(

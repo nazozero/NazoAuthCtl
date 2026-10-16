@@ -636,7 +636,7 @@ fn validate_entry(entry: &JournalLine, line_number: usize) -> anyhow::Result<()>
     if !HOST_OPERATION_KINDS.contains(&entry.action.as_str()) {
         bail!(
             "{TARGET_JOURNAL_INVALID}: journal line {line_number} carries unknown action '{}'",
-            crate::target::wire::sanitize(entry.action.clone())
+            crate::target::wire::sanitize(&entry.action)
         );
     }
     match entry.status {

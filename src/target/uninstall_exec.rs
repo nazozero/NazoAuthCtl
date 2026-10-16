@@ -75,7 +75,7 @@ impl DeletionExecutor for HostDeletionExecutor {
                     format!(
                         "runtime object '{}' exists without this deployment's ownership label; \
                          refusing to remove a possibly foreign object",
-                        sanitize(job.runtime_object.to_owned())
+                        sanitize(job.runtime_object)
                     ),
                 ));
             }
@@ -150,7 +150,7 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
                         "refusing to delete directory '{}': not a deep absolute path",
-                        sanitize(locator.to_owned())
+                        sanitize(locator)
                     ),
                 ));
             }
@@ -172,7 +172,7 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
                         "refusing to delete directory '{}': locator is not a real directory",
-                        sanitize(locator.to_owned())
+                        sanitize(locator)
                     ),
                 ));
             }
@@ -192,7 +192,7 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
                         "refusing to delete file '{}': not a deep absolute path",
-                        sanitize(locator.to_owned())
+                        sanitize(locator)
                     ),
                 ));
             }
@@ -213,7 +213,7 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
                         super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                         format!(
                             "refusing to delete file '{}': locator is not a real file",
-                            sanitize(locator.to_owned())
+                            sanitize(locator)
                         ),
                     ));
                 }
@@ -239,7 +239,7 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
             format!(
                 "managed resource kind '{}' has no deletion procedure; extend the vocabulary \
                  explicitly before deleting such objects",
-                sanitize(other.to_owned())
+                sanitize(other)
             ),
         )),
     }

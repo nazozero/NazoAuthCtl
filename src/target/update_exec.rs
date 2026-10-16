@@ -421,7 +421,7 @@ impl HostLifecycleExecutor {
             )
         })?;
         let recorded_current_was_live =
-            require_host_artifact_continuity(kind, &live_digest, job.current_artifact)?;
+            require_host_artifact_continuity(kind, live_digest, job.current_artifact)?;
 
         // 1. Verify + pull the selected official artifact (download-on-target;
         // re-running verify/pull is idempotent for interrupted resumes).
@@ -441,7 +441,7 @@ impl HostLifecycleExecutor {
         // rollback generation, or advance the config revision.
         if !performed.migration_applied
             && update_is_noop(
-                &live_digest,
+                live_digest,
                 job.current_artifact,
                 &new_digest,
                 job.config.is_some(),
@@ -475,21 +475,18 @@ impl HostLifecycleExecutor {
         require_shared_signing_key_root(job.secrets_root, config_text, kind, &observation.mounts)?;
         // Build and validate the executable replacement before any migration
         // can mutate external state. Activation consumes this exact plan.
-        let replacement = runtime_replacement_required(
-            Some(live_digest.as_str()),
-            &new_digest,
-            job.config.is_some(),
-        )
-        .then(|| {
-            let mut replacement = replacement_from_observation(
-                &observation,
-                job.runtime_object,
-                &verified.runtime_artifact,
-            )?;
-            replacement.local_artifact_id = None;
-            Ok::<_, Failure>(replacement)
-        })
-        .transpose()?;
+        let replacement =
+            runtime_replacement_required(Some(live_digest), &new_digest, job.config.is_some())
+                .then(|| {
+                    let mut replacement = replacement_from_observation(
+                        &observation,
+                        job.runtime_object,
+                        &verified.runtime_artifact,
+                    )?;
+                    replacement.local_artifact_id = None;
+                    Ok::<_, Failure>(replacement)
+                })
+                .transpose()?;
 
         if replacement.is_some() && kind.is_container() {
             performed.runtime_before_update = Some(exact_replacement_from_observation(
@@ -697,9 +694,7 @@ impl HostLifecycleExecutor {
         // 5. Embedded identity check: the running object must now report the
         // verified digest and be running.
         let activated = live_observation(backend.as_ref(), job.runtime_object)?;
-        if !activated.running
-            || observation_digest(&activated).as_deref() != Some(new_digest.as_str())
-        {
+        if !activated.running || observation_digest(&activated) != Some(new_digest.as_str()) {
             return Err(Failure::new(
                 TARGET_IDENTITY_MISMATCH,
                 "the started runtime does not serve the verified artifact",
@@ -861,9 +856,7 @@ impl HostLifecycleExecutor {
 
         // 4. Identity + local health gates.
         let activated = live_observation(backend.as_ref(), job.runtime_object)?;
-        if !activated.running
-            || observation_digest(&activated).as_deref() != Some(previous_digest.as_str())
-        {
+        if !activated.running || observation_digest(&activated) != Some(previous_digest.as_str()) {
             return Err(Failure::new(
                 TARGET_IDENTITY_MISMATCH,
                 "the rolled-back runtime does not serve the previous verified artifact",
@@ -1519,12 +1512,12 @@ fn live_observation(
 /// The digest half of an Oci observation reference (`sha256:` stripped).
 pub(crate) fn observation_digest(
     observation: &runtime_backend::RuntimeObservation,
-) -> Option<String> {
+) -> Option<&str> {
     match &observation.artifact {
         runtime_backend::ArtifactReference::Oci { digest, .. } => {
-            Some(digest.trim_start_matches("sha256:").to_owned())
+            Some(digest.trim_start_matches("sha256:"))
         }
-        runtime_backend::ArtifactReference::HostBinary { sha256, .. } => Some(sha256.clone()),
+        runtime_backend::ArtifactReference::HostBinary { sha256, .. } => Some(sha256),
         runtime_backend::ArtifactReference::Unknown => None,
     }
 }
@@ -1601,7 +1594,7 @@ fn require_observation_serves(
             format!(
                 "runtime object serves {} while the deployment state records {}",
                 sanitize(digest),
-                sanitize(expected.to_owned())
+                sanitize(expected)
             ),
         ));
     }

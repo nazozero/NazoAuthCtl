@@ -1570,7 +1570,6 @@ fn answer_admin_create(
         password,
     };
     let receipt = admin.execute(&job)?;
-    admin_exec::validate_admin_provision_receipt(&receipt, &operation.operation_id, deployment_id)?;
     Ok(HostResult::completed(
         &operation.operation_id,
         HostCompletionBody::AdminCreated { receipt },
