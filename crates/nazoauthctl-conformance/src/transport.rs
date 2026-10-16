@@ -77,6 +77,8 @@ impl HttpResponse {
 }
 
 pub trait Transport: Send + Sync {
+    /// Bound the response body and total header bytes by `max_response_bytes`
+    /// while receiving them. Callers may rely on this limit.
     fn send(
         &self,
         request: HttpRequest,
@@ -221,6 +223,70 @@ impl std::error::Error for TransportError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_http_transport_bounds_headers_and_declared_or_streamed_bodies() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let transport = HttpTransport {
+            client: Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("test client"),
+        };
+        let limit = 128;
+        for (response, oversize) in [
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 128\r\n\r\n{}",
+                    "x".repeat(limit)
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 129\r\n\r\n{}",
+                    "x".repeat(limit + 1)
+                ),
+                true,
+            ),
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}",
+                    "x".repeat(limit + 1)
+                ),
+                true,
+            ),
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Long: {}\r\n\r\n",
+                    "x".repeat(limit)
+                ),
+                true,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
+            let endpoint =
+                Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0; 1024];
+                assert!(stream.read(&mut request).expect("read request") > 0);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            });
+            let result = transport.send(HttpRequest::get(endpoint), limit);
+            server.join().expect("test server");
+            if oversize {
+                assert!(matches!(result, Err(TransportError::Oversize)));
+            } else {
+                assert_eq!(result.expect("bounded response").body.len(), limit);
+            }
+        }
+    }
 
     #[test]
     fn send_failure_stages_are_static_and_specific() {
