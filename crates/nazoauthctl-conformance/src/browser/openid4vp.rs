@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use thiserror::Error;
 use url::Url;
@@ -395,14 +396,6 @@ impl OpenId4VpVerifierClient {
             .filter(|value| !value.is_empty())
             .cloned()
             .unwrap_or_else(|| "x509_hash".to_owned());
-        if response_mode.len() > MAX_VARIANT_VALUE_BYTES
-            || client_id_prefix.len() > MAX_VARIANT_VALUE_BYTES
-            || response_mode.chars().any(char::is_control)
-            || client_id_prefix.chars().any(char::is_control)
-        {
-            return Err(OpenId4VpError::InvalidInput);
-        }
-
         let wallet_authorization_endpoint = self
             .suite_origin
             .url(&format!("/test/a/{}/authorize", request.alias))
@@ -411,9 +404,9 @@ impl OpenId4VpVerifierClient {
         endpoint.set_path("/openid4vp/presentations");
         endpoint.set_query(None);
         endpoint.set_fragment(None);
-        let create_request_jti = Uuid::new_v4().to_string();
-        nazo_operator_protocol::validate_openid4vp_create_request_jti(&create_request_jti)
-            .map_err(|_| OpenId4VpError::InvalidInput)?;
+        let idempotency = nazo_operator_protocol::Openid4vpCreateIdempotencyRequest {
+            create_request_jti: Uuid::new_v4().to_string(),
+        };
         let dcql_query = serde_json::json!({
             "credentials": [{
                 "id": "credential",
@@ -422,52 +415,35 @@ impl OpenId4VpVerifierClient {
                 "require_cryptographic_holder_binding": true,
             }]
         });
-        let trust_policy_resource_id = Some(self.binding.resource_id.clone());
-        let trust_policy_digest = Some(self.binding.digest.clone());
         let normalized = nazo_operator_protocol::Openid4vpNormalizedCreateRequest {
-            wallet_authorization_endpoint: wallet_authorization_endpoint.as_str().to_owned(),
-            dcql_query: dcql_query.clone(),
+            wallet_authorization_endpoint: wallet_authorization_endpoint.into(),
+            dcql_query,
             haip: request.haip,
-            client_id_prefix: client_id_prefix.clone(),
+            client_id_prefix,
             request_method: request_method.to_owned(),
-            response_mode: response_mode.clone(),
+            response_mode,
             transaction_data: None,
-            openid4vc_trust_policy_resource_id: trust_policy_resource_id,
-            openid4vc_trust_policy_digest: trust_policy_digest,
+            openid4vc_trust_policy_resource_id: Some(self.binding.resource_id.clone()),
+            openid4vc_trust_policy_digest: Some(self.binding.digest.clone()),
         };
         let (_, create_request_sha256) =
             nazo_operator_protocol::canonical_openid4vp_normalized_create_request(&normalized)
                 .map_err(|_| OpenId4VpError::InvalidInput)?;
-        let mut body = serde_json::json!({
-            "wallet_authorization_endpoint": wallet_authorization_endpoint.as_str(),
-            "dcql_query": dcql_query,
-            "haip": request.haip,
-            "client_id_prefix": client_id_prefix,
-            "request_method": request_method,
-            "response_mode": response_mode,
-        });
-        let body_object = body.as_object_mut().ok_or(OpenId4VpError::InvalidInput)?;
-        let idempotency =
-            serde_json::to_value(nazo_operator_protocol::Openid4vpCreateIdempotencyRequest {
-                create_request_jti: create_request_jti.clone(),
-            })
-            .map_err(|_| OpenId4VpError::InvalidInput)?;
-        let idempotency = idempotency
-            .as_object()
-            .ok_or(OpenId4VpError::InvalidInput)?;
-        body_object.extend(idempotency.clone());
-        body_object.insert(
-            "openid4vc_trust_policy_resource_id".to_owned(),
-            Value::String(self.binding.resource_id.clone()),
-        );
-        body_object.insert(
-            "openid4vc_trust_policy_digest".to_owned(),
-            Value::String(self.binding.digest.clone()),
-        );
-        let body = serde_json::to_vec(&body).map_err(|_| OpenId4VpError::InvalidInput)?;
+        #[derive(Serialize)]
+        struct CreateRequest<'a> {
+            #[serde(flatten)]
+            normalized: &'a nazo_operator_protocol::Openid4vpNormalizedCreateRequest,
+            #[serde(flatten)]
+            idempotency: &'a nazo_operator_protocol::Openid4vpCreateIdempotencyRequest,
+        }
+        let body = serde_json::to_vec(&CreateRequest {
+            normalized: &normalized,
+            idempotency: &idempotency,
+        })
+        .map_err(|_| OpenId4VpError::InvalidInput)?;
         let mut attempts = 0usize;
         let response = loop {
-            attempts = attempts.saturating_add(1);
+            attempts += 1;
             let request = HttpRequest {
                 method: HttpMethod::Post,
                 url: endpoint.clone(),
@@ -493,7 +469,7 @@ impl OpenId4VpVerifierClient {
         let response: CreatePresentationResponse = serde_json::from_slice(&response.body)
             .map_err(|_| OpenId4VpError::MalformedResponse)?;
         if response.expires_in == 0
-            || response.idempotency.create_request_jti != create_request_jti
+            || response.idempotency.create_request_jti != idempotency.create_request_jti
             || response.idempotency.create_request_sha256 != create_request_sha256
         {
             return Err(OpenId4VpError::MalformedResponse);

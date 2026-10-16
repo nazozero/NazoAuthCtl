@@ -151,16 +151,10 @@ fn validate_cookie_value(value: &str) -> Result<(), OpenId4VciError> {
 pub enum OpenId4VciError {
     #[error("OpenID4VCI input is invalid")]
     InvalidInput,
-    #[error("OpenID4VCI target origin is invalid")]
-    InvalidTargetOrigin,
     #[error("OpenID4VCI Suite callback is invalid")]
     InvalidSuiteCallback,
-    #[error("OpenID4VCI runner data is unavailable")]
-    MissingRunnerData,
     #[error("OpenID4VCI runner is waiting for browser data")]
     Pending,
-    #[error("OpenID4VCI credential offer endpoint is unavailable")]
-    MissingOfferEndpoint,
     #[error("OpenID4VCI credential configuration is unavailable")]
     MissingCredentialConfiguration,
     #[error("OpenID4VCI pre-authorized transaction code is unavailable")]
@@ -169,8 +163,6 @@ pub enum OpenId4VciError {
     TransactionCodeMismatch,
     #[error("OpenID4VCI credential offer response is invalid")]
     InvalidOfferResponse,
-    #[error("OpenID4VCI browser task configuration is unavailable")]
-    MissingBrowserTasks,
     #[error("OpenID4VCI browser authorization URL is invalid or ambiguous")]
     InvalidAuthorizationUrl,
     #[error("OpenID4VCI hosted authorization response is invalid")]
