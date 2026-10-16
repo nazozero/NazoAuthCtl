@@ -31,12 +31,12 @@ use nazoauthctl_conformance::{
     MatrixSelection, ModuleOutcome, OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane,
     OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
     OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage,
-    ProgressActivity, ProgressEvent, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer,
-    SuiteClient, SuiteClientError, SuiteResourceObserver, SuiteRetentionDeferredReview,
-    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
-    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, activity_label,
-    bundled_oidf_matrix, current_matrix_label, open_bundled_oidf_driver_plan,
+    ProgressActivity, ProgressEvent, ProgressSink, RunControl, StableRenderer, SuiteClient,
+    SuiteClientError, SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, SuiteRetentionScreenshotManifest,
+    TenantResourceApplyOutput, TenantResourceControlOperation, TenantResourceRecoveryBinding,
+    TenantResourceRecoveryPhase, Transport, activity_label, bundled_oidf_matrix,
+    current_matrix_label, open_bundled_oidf_driver_plan, recover_proxy_trust,
     recover_suite_resources, write_private_control_evidence_bundle,
 };
 use serde::Serialize;
@@ -3323,7 +3323,7 @@ fn recover_pending_runs(
             let proxy_result = (|| -> anyhow::Result<()> {
                 if !recovery.proxy_cleanup_complete() {
                     if let Some(proxy) = binding.proxy.as_ref() {
-                        ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                        recover_proxy_trust(&proxy.bundle_path, &proxy.reload_executable)?;
                     }
                     recovery.mark_proxy_cleanup_complete()?;
                 }
