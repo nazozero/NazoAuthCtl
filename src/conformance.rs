@@ -1,12 +1,17 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use nazo_operator_protocol::{ControlOperationPayload, ControlOutcome, ControlResult};
+use nazo_operator_protocol::{
+    ControlOperationPayload, ControlOutcome, ControlResult, canonical_control_operation_bytes,
+    control_operation_request_hash,
+};
 
 use crate::{
     controller_identity::{
-        OperationJournal, PreparedOperation, operation::ControlOperationInput,
-        prepare_control_operation, prepare_pending_control_operation, store::ControllerKeyStore,
+        OperationJournal, PreparedOperation,
+        operation::{ControlOperationInput, build_control_operation_with_id_and_kid},
+        prepare_control_operation, prepare_pending_control_operation,
+        store::ControllerKeyStore,
         validate_control_change_set, validate_control_result_binding,
     },
     filesystem::ensure_private_directory,
@@ -250,24 +255,24 @@ impl ConformanceSession {
         journal.load()
     }
 
+    /// Compare candidates against the one loaded journal snapshot. Dispatch
+    /// reopens the journal and checks that identity before resuming anything.
     pub fn pending_control_operation_matches(
         &self,
         expected: &crate::controller_identity::OperationJournalEntry,
         operation: ControlOperationPayload,
     ) -> anyhow::Result<bool> {
-        let journal =
-            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
-        Ok(prepare_pending_control_operation(
-            &self.registry,
-            &journal,
-            expected,
+        let operation = build_control_operation_with_id_and_kid(
             &self.deployment_id,
             ControlOperationInput {
                 operation,
                 config_revision: self.config_revision.clone(),
             },
-        )?
-        .is_some())
+            expected.operation_id.clone(),
+            expected.kid.clone(),
+        );
+        let canonical = canonical_control_operation_bytes(&operation)?;
+        Ok(control_operation_request_hash(&canonical) == expected.request_hash)
     }
 
     pub fn resume_pending_control_operation<F>(
@@ -698,6 +703,34 @@ mod tests {
             },
         )?;
         let expected = journal.load()?.context("journaled operation")?;
+        // Candidate selection uses the loaded snapshot even if the backing
+        // journal changes. Only dispatch may consume the live journal.
+        let journal_bytes = std::fs::read(journal.path())?;
+        std::fs::write(journal.path(), b"invalid journal")?;
+        assert!(
+            session.pending_control_operation_matches(
+                &expected,
+                ControlOperationPayload::KeysValidate,
+            )?
+        );
+        assert!(
+            !session.pending_control_operation_matches(
+                &expected,
+                ControlOperationPayload::MigrateApply,
+            )?
+        );
+        assert!(
+            session
+                .resume_pending_control_operation(
+                    &expected,
+                    ControlOperationPayload::KeysValidate,
+                    None,
+                    |_| Ok(()),
+                )
+                .is_err()
+        );
+        assert!(requests.borrow().is_empty());
+        std::fs::write(journal.path(), journal_bytes)?;
         assert!(
             session
                 .resume_pending_control_operation(

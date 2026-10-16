@@ -203,7 +203,7 @@ fn prepare_entry_resume(
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
     let operation = build_control_operation_with_id_and_kid(
-        record,
+        &record.deployment_id,
         input,
         entry.operation_id.clone(),
         entry.kid.clone(),

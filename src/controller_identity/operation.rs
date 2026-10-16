@@ -76,7 +76,7 @@ pub(crate) fn build_signed_control_operation_for_record(
         })?;
     let operation_id = Uuid::now_v7().to_string();
     let operation = build_control_operation_with_id_and_kid(
-        record,
+        &record.deployment_id,
         input,
         operation_id,
         loaded.kid().to_owned(),
@@ -97,7 +97,7 @@ pub(crate) fn build_signed_control_operation_for_record(
 /// the original key has been retired; it never authorizes a new operation or
 /// revalidates the current registry key binding.
 pub(crate) fn build_control_operation_with_id_and_kid(
-    record: &InstanceRecord,
+    deployment_id: &str,
     input: ControlOperationInput,
     operation_id: String,
     kid: String,
@@ -106,7 +106,7 @@ pub(crate) fn build_control_operation_with_id_and_kid(
         schema: CONTROL_OPERATION_SCHEMA,
         operation_id,
         kid,
-        deployment_id: record.deployment_id.clone(),
+        deployment_id: deployment_id.to_owned(),
         config_revision: input.config_revision,
         operation: input.operation,
     }
