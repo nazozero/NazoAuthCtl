@@ -49,6 +49,26 @@ mod tests {
     use crate::{filesystem::PrivateTempDir, test_support::write_shell_executable};
 
     #[test]
+    fn inspect_document_keeps_first_array_member_or_original_non_array() {
+        let work = PrivateTempDir::new("runtime-inspect-shapes").unwrap();
+        let engine = work.path().join("fake-engine");
+        for (input, expected) in [
+            (
+                r#"[{"Id":"first"},{"Id":"second"}]"#,
+                serde_json::json!({"Id":"first"}),
+            ),
+            (r#"{"Id":"only"}"#, serde_json::json!({"Id":"only"})),
+            ("[]", serde_json::json!([])),
+        ] {
+            write_shell_executable(&engine, &format!("printf '%s' '{input}'"));
+            assert_eq!(
+                super::inspect_document(engine.as_os_str(), &["inspect"], "test").unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn image_identity_uses_valid_engine_templates() {
         let work = PrivateTempDir::new("runtime-image-inspect-template").unwrap();
         let engine = work.path().join("fake-podman");

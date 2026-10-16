@@ -78,56 +78,36 @@ pub(crate) fn assert_container_image(
     expected_image: &str,
     backend_name: &str,
 ) -> anyhow::Result<()> {
-    require_digest_pinned_image(expected_image, backend_name)?;
     let expected_digest = expected_image
-        .rsplit_once("@sha256:")
-        .map(|(_, digest)| format!("sha256:{digest}"))
+        .rsplit_once('@')
+        .map(|(_, digest)| digest)
         .filter(|digest| super::valid_digest(digest))
-        .context("managed dependency image has an invalid digest")?;
-    let mut actual = Vec::new();
-    for value in [
+        .with_context(|| format!("{backend_name} managed dependency image is not digest-pinned"))?;
+    let mut actual = [
         document.pointer("/Config/Image"),
         document.get("ImageName"),
         document.pointer("/Config/ImageName"),
     ]
     .into_iter()
     .flatten()
-    .filter_map(serde_json::Value::as_str)
-    {
-        actual.push(value.to_owned());
-    }
-    if let Some(values) = document
-        .get("RepoDigests")
-        .and_then(serde_json::Value::as_array)
-    {
-        actual.extend(
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-        );
-    }
-    if actual.iter().any(|value| {
+    .chain(
+        document
+            .get("RepoDigests")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten(),
+    )
+    .filter_map(serde_json::Value::as_str);
+    if actual.any(|value| {
         value == expected_image
-            || value == &expected_digest
-            || value.ends_with(&format!("@{expected_digest}"))
+            || value == expected_digest
+            || value
+                .rsplit_once('@')
+                .is_some_and(|(_, digest)| digest == expected_digest)
     }) {
         return Ok(());
     }
     bail!("refusing to manage a {backend_name} container whose immutable image does not match")
-}
-
-pub(crate) fn require_digest_pinned_image(
-    expected_image: &str,
-    backend_name: &str,
-) -> anyhow::Result<()> {
-    let Some((_, digest)) = expected_image.rsplit_once('@') else {
-        bail!("{backend_name} managed dependency image is not digest-pinned");
-    };
-    if super::valid_digest(digest) {
-        return Ok(());
-    }
-    bail!("{backend_name} managed dependency image is not digest-pinned")
 }
 
 pub(crate) fn inspect_image_environment(
@@ -192,11 +172,10 @@ pub(crate) fn inspect_document_optional(
     }
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("{backend_name} inspect returned invalid JSON"))?;
-    let value = parsed
-        .as_array()
-        .and_then(|values| values.first())
-        .cloned()
-        .unwrap_or(parsed);
+    let value = match parsed {
+        serde_json::Value::Array(mut values) if !values.is_empty() => values.swap_remove(0),
+        value => value,
+    };
     Ok(Some(value))
 }
 
@@ -499,10 +478,7 @@ pub(crate) fn assert_managed_container_policy(
         let (name, value) = entry
             .split_once('=')
             .context("managed container contains an invalid environment entry")?;
-        if observed_environment
-            .insert(name.to_owned(), value.to_owned())
-            .is_some()
-        {
+        if observed_environment.insert(name, value).is_some() {
             bail!("{backend_name} managed container environment is ambiguous");
         }
         if !expected_names.contains(name)
@@ -511,14 +487,8 @@ pub(crate) fn assert_managed_container_policy(
         {
             bail!("{backend_name} managed container contains an undeclared environment variable");
         }
-    }
-    for name in env
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .filter_map(|value| value.split_once('=').map(|(name, _)| name))
-    {
-        if (name.to_ascii_uppercase().contains("PASSWORD")
-            || name.to_ascii_uppercase().contains("SECRET"))
+        let normalized_name = name.to_ascii_uppercase();
+        if (normalized_name.contains("PASSWORD") || normalized_name.contains("SECRET"))
             && !expected_names.contains(name)
         {
             bail!(
@@ -531,16 +501,12 @@ pub(crate) fn assert_managed_container_policy(
         {
             continue;
         }
-        if observed_environment.get(name) != Some(expected) {
+        if observed_environment.get(name.as_str()).copied() != Some(expected.as_str()) {
             bail!("{backend_name} managed container image environment drifted");
         }
     }
     for (name, expected) in expected_environment {
-        let prefix = format!("{name}=");
-        let observed = env
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .find_map(|value| value.strip_prefix(&prefix));
+        let observed = observed_environment.get(name).copied();
         if observed != Some(*expected) {
             bail!("{backend_name} managed container environment policy drifted");
         }
@@ -728,4 +694,97 @@ pub(crate) fn remove_replacement_source(
         .context("replacement source has no immutable container ID")?;
     // No --force: a runtime restarted after inspection must not be killed.
     Process::new(command).args(["rm", id]).run_quiet()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_index_preserves_declared_image_and_duplicate_rules() {
+        let policy = ContainerRuntimePolicy::managed_default();
+        let image = std::collections::BTreeMap::from([
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("MODE".to_owned(), "image-default".to_owned()),
+        ]);
+        for (env, error) in [
+            (
+                vec!["PATH=/bin", "MODE=managed", "API_SECRET=approved"],
+                None,
+            ),
+            (
+                vec![
+                    "PATH=/bin",
+                    "MODE=managed",
+                    "MODE=managed",
+                    "API_SECRET=approved",
+                ],
+                Some("ambiguous"),
+            ),
+            (
+                vec!["PATH=/other", "MODE=managed", "API_SECRET=approved"],
+                Some("undeclared environment"),
+            ),
+            (
+                vec!["PATH=/bin", "MODE=image-default", "API_SECRET=approved"],
+                Some("environment policy drifted"),
+            ),
+            (
+                vec!["MODE=managed", "API_SECRET=approved"],
+                Some("image environment drifted"),
+            ),
+            (
+                vec!["PATH=/bin", "MODE=managed"],
+                Some("environment policy drifted"),
+            ),
+        ] {
+            let document = serde_json::json!({
+                "HostConfig": {
+                    "RestartPolicy": {"Name":"unless-stopped"},
+                    "ReadonlyRootfs":true, "SecurityOpt":["no-new-privileges"],
+                    "CapDrop":["ALL"], "PidsLimit":512, "Memory":1073741824_i64,
+                    "NanoCpus":2000000000_i64,
+                    "Tmpfs":{
+                        "/tmp":"rw,noexec,nosuid,nodev,size=67108864",
+                        "/run/postgresql":"rw,noexec,nosuid,nodev,size=16777216"
+                    }
+                },
+                "NetworkSettings":{"Networks":{"managed":{}}},
+                "Mounts":[], "Config":{"Env":env}
+            });
+            let result = assert_managed_container_policy(
+                &document,
+                "test",
+                &policy,
+                "managed",
+                &[],
+                &[("MODE", "managed"), ("API_SECRET", "approved")],
+                &image,
+            );
+            match error {
+                Some(error) => assert!(result.unwrap_err().to_string().contains(error)),
+                None => result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn image_identity_accepts_each_inspect_field_only_for_the_expected_digest() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let reference = format!("registry.example/image@{digest}");
+        let alternate = format!("mirror.example/image@{digest}");
+        for document in [
+            serde_json::json!({"Config":{"Image":reference}}),
+            serde_json::json!({"Config":{"Image":digest}}),
+            serde_json::json!({"ImageName":alternate}),
+            serde_json::json!({"Config":{"ImageName":alternate}}),
+            serde_json::json!({"RepoDigests":["invalid",alternate]}),
+        ] {
+            assert_container_image(&document, &reference, "test").unwrap();
+            assert!(assert_container_image(&document, "image:tag", "test").is_err());
+            assert!(assert_container_image(&document, "image@sha256:short", "test").is_err());
+        }
+        let wrong = serde_json::json!({"ImageName":format!("image@sha256:{}", "b".repeat(64))});
+        assert!(assert_container_image(&wrong, &reference, "test").is_err());
+    }
 }

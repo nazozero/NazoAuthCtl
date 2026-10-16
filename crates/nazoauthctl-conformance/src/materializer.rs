@@ -171,7 +171,6 @@ impl PreparedMaterialization {
         &self,
         run_namespace: &str,
     ) -> Result<TenantResourceManifest, MaterializerError> {
-        validate_request_jti(run_namespace)?;
         if run_namespace != self.request_jti {
             return Err(MaterializerError::RequestMismatch);
         }
@@ -205,11 +204,7 @@ impl PreparedMaterialization {
         let applicant_profile_origin = self.target_issuer.trim_end_matches('/');
 
         let mut resources = Vec::with_capacity(
-            1usize
-                .saturating_add(self.clients.len())
-                .saturating_add(self.clients.len())
-                .saturating_add(self.descriptor.openid4vc_credential_datasets.len())
-                .saturating_add(1),
+            2 + 2 * self.clients.len() + self.descriptor.openid4vc_credential_datasets.len(),
         );
         let mut payload_total = 0usize;
 
@@ -557,22 +552,14 @@ impl TenantResourceManifest {
         resources.sort_by(|left, right| {
             (left.kind, &left.resource_id).cmp(&(right.kind, &right.resource_id))
         });
-        let mut seen = BTreeSet::new();
         let identities = resources
             .iter()
-            .map(|resource| {
-                if !seen.insert((resource.kind, resource.resource_id.clone())) {
-                    return Err(MaterializerError::InvalidField(
-                        "tenant_resource_manifest.resources",
-                    ));
-                }
-                Ok(TenantResourceIdentity {
-                    kind: resource.kind,
-                    resource_id: resource.resource_id.clone(),
-                    digest: resource.digest.clone(),
-                })
+            .map(|resource| TenantResourceIdentity {
+                kind: resource.kind,
+                resource_id: resource.resource_id.clone(),
+                digest: resource.digest.clone(),
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         #[derive(Serialize)]
         struct Document<'a> {
             schema: u32,
@@ -583,7 +570,7 @@ impl TenantResourceManifest {
             resources: &resources,
         };
         let bytes = serde_json::to_vec(&document).map_err(|_| MaterializerError::Encoding)?;
-        if bytes.is_empty() || bytes.len() > MAX_TENANT_RESOURCE_MANIFEST_BYTES {
+        if bytes.len() > MAX_TENANT_RESOURCE_MANIFEST_BYTES {
             return Err(MaterializerError::Oversize);
         }
         let resource_manifest_sha256 =
@@ -754,31 +741,28 @@ impl TenantResourceApplyOutput {
 
 fn collect_identity_map(
     resources: &[TenantResourceIdentity],
-) -> Result<BTreeMap<(TenantResourceKind, String), String>, MaterializerError> {
+) -> Result<BTreeMap<(TenantResourceKind, &str), &str>, MaterializerError> {
     let mut seen_resource_ids = BTreeSet::new();
     let mut identities = BTreeMap::new();
     for resource in resources {
         validate_resource_id(&resource.resource_id)?;
         validate_digest(&resource.digest, "tenant_resource_identity.digest")?;
-        if !seen_resource_ids.insert(resource.resource_id.clone())
-            || identities
-                .insert(
-                    (resource.kind, resource.resource_id.clone()),
-                    resource.digest.clone(),
-                )
-                .is_some()
-        {
+        if !seen_resource_ids.insert(resource.resource_id.as_str()) {
             return Err(MaterializerError::TenantResourceResultMismatch(
                 "duplicate resource identity",
             ));
         }
+        identities.insert(
+            (resource.kind, resource.resource_id.as_str()),
+            resource.digest.as_str(),
+        );
     }
     Ok(identities)
 }
 
 fn validate_apply_mappings(
     mappings: &[TenantResourceMapping],
-    delta: &BTreeMap<(TenantResourceKind, String), String>,
+    delta: &BTreeMap<(TenantResourceKind, &str), &str>,
 ) -> Result<(), MaterializerError> {
     let expected = delta
         .keys()
@@ -788,13 +772,13 @@ fn validate_apply_mappings(
                 TenantResourceKind::User | TenantResourceKind::OauthClient
             )
         })
-        .cloned()
+        .copied()
         .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
     let mut public_client_ids = BTreeSet::new();
     for mapping in mappings {
         validate_resource_id(&mapping.resource_id)?;
-        if !actual.insert((mapping.kind, mapping.resource_id.clone())) {
+        if !actual.insert((mapping.kind, mapping.resource_id.as_str())) {
             return Err(MaterializerError::TenantResourceResultMismatch(
                 "duplicate mapping",
             ));
@@ -812,7 +796,7 @@ fn validate_apply_mappings(
             }
             TenantResourceKind::OauthClient => {
                 validate_public_id(&mapping.public_id, "OAuth client mapping", 512)?;
-                if !public_client_ids.insert(mapping.public_id.clone()) {
+                if !public_client_ids.insert(mapping.public_id.as_str()) {
                     return Err(MaterializerError::DuplicateClientMapping);
                 }
             }
@@ -843,16 +827,10 @@ fn push_manifest_resource(
     validate_resource_id(&resource_id)?;
     reject_manifest_private_or_suite_value(&payload)?;
     let payload_bytes = serde_json::to_vec(&payload).map_err(|_| MaterializerError::Encoding)?;
-    if payload_bytes.is_empty() || payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
-        return Err(if payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
-            MaterializerError::Oversize
-        } else {
-            MaterializerError::InvalidField("tenant_resource_manifest.payload")
-        });
+    if payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
+        return Err(MaterializerError::Oversize);
     }
-    *payload_total = payload_total
-        .checked_add(payload_bytes.len())
-        .ok_or(MaterializerError::Oversize)?;
+    *payload_total += payload_bytes.len();
     if *payload_total > MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES {
         return Err(MaterializerError::Oversize);
     }
@@ -1835,6 +1813,67 @@ mod tests {
     }
 
     #[test]
+    fn manifest_canonicalization_rejects_duplicate_resource_identities() {
+        let resources = (0..2)
+            .map(|_| TenantResourceManifestResource {
+                kind: TenantResourceKind::User,
+                resource_id: "same-user".to_owned(),
+                payload_base64url: Zeroizing::new("e30".to_owned()),
+                digest: "a".repeat(64),
+            })
+            .collect();
+        assert!(matches!(
+            TenantResourceManifest::from_resources(resources),
+            Err(MaterializerError::InvalidField(
+                "tenant_resource_manifest.resources"
+            ))
+        ));
+    }
+
+    #[test]
+    fn manifest_payload_limits_accept_exact_total_and_reject_the_next_resource() {
+        let mut resources = Vec::new();
+        let mut total = 0;
+        // A JSON string adds two quote bytes to the ASCII payload.
+        for index in 0..MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES / MAX_TENANT_RESOURCE_PAYLOAD_BYTES
+        {
+            push_manifest_resource(
+                &mut resources,
+                &mut total,
+                TenantResourceKind::User,
+                format!("user-{index}"),
+                Value::String("a".repeat(MAX_TENANT_RESOURCE_PAYLOAD_BYTES - 2)),
+            )
+            .unwrap();
+        }
+        assert_eq!(total, MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES);
+        let count = resources.len();
+        assert!(matches!(
+            push_manifest_resource(
+                &mut resources,
+                &mut total,
+                TenantResourceKind::User,
+                "next-user".to_owned(),
+                Value::Null
+            ),
+            Err(MaterializerError::Oversize)
+        ));
+        assert_eq!(resources.len(), count);
+        let mut fresh_total = 0;
+        assert!(matches!(
+            push_manifest_resource(
+                &mut resources,
+                &mut fresh_total,
+                TenantResourceKind::User,
+                "oversized-user".to_owned(),
+                Value::String("a".repeat(MAX_TENANT_RESOURCE_PAYLOAD_BYTES - 1))
+            ),
+            Err(MaterializerError::Oversize)
+        ));
+        assert_eq!(fresh_total, 0);
+    }
+
+    #[test]
     fn registration_template_rejects_forbidden_control_fields() {
         for field in ["conformance_lease_id", "conformance_task_jti"] {
             let request = Value::Object([(field.to_owned(), Value::Null)].into_iter().collect());
@@ -2304,6 +2343,10 @@ mod tests {
         assert_eq!(first.bytes().as_bytes(), rebuilt.bytes().as_bytes());
         assert!(matches!(
             first_prepared.tenant_resource_manifest(second_namespace),
+            Err(MaterializerError::RequestMismatch)
+        ));
+        assert!(matches!(
+            first_prepared.tenant_resource_manifest("invalid"),
             Err(MaterializerError::RequestMismatch)
         ));
         let second = second_prepared

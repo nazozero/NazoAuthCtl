@@ -588,40 +588,30 @@ fn assert_candidate_command(
     document: &serde_json::Value,
     backend_name: &str,
 ) -> anyhow::Result<()> {
-    let mut values = Vec::new();
-    if backend_name == "Docker" {
-        if let Some(path) = document.get("Path").and_then(serde_json::Value::as_str) {
-            values.push(path.to_owned());
-        }
-        values.extend(
-            document
-                .get("Args")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-        );
+    let (executable, arguments) = if backend_name == "Docker" {
+        (document.get("Path"), document.get("Args"))
     } else {
         let config = document
             .get("Config")
             .context("recovery candidate inspect omitted Config")?;
-        if let Some(entrypoint) = config.get("Entrypoint").and_then(serde_json::Value::as_str) {
-            values.push(entrypoint.to_owned());
-        }
-        values.extend(
-            config
-                .get("Command")
-                .or_else(|| config.get("Cmd"))
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-        );
-    }
+        (
+            config.get("Entrypoint"),
+            config.get("Command").or_else(|| config.get("Cmd")),
+        )
+    };
     ensure!(
-        super::super::server_command_verified(&values),
+        super::super::server_command_verified(
+            executable
+                .and_then(serde_json::Value::as_str)
+                .into_iter()
+                .chain(
+                    arguments
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str),
+                ),
+        ),
         "{backend_name} recovery candidate command is not the NazoAuth server"
     );
     Ok(())

@@ -44,21 +44,20 @@ pub(super) fn discover(command: &OsStr) -> anyhow::Result<Vec<RuntimeObservation
 }
 
 fn is_server_document(value: &serde_json::Value) -> bool {
-    let mut command_values = value
-        .get("Path")
-        .and_then(serde_json::Value::as_str)
-        .map(|value| vec![value.to_owned()])
-        .unwrap_or_default();
-    command_values.extend(
+    server_command_verified(
         value
-            .get("Args")
-            .and_then(serde_json::Value::as_array)
+            .get("Path")
+            .and_then(serde_json::Value::as_str)
             .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
-    );
-    server_command_verified(&command_values)
+            .chain(
+                value
+                    .get("Args")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            ),
+    )
 }
 
 pub(super) fn inspect(
