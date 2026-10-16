@@ -361,11 +361,10 @@ pub struct SlotsSnapshot {
 }
 
 impl SlotsSnapshot {
-    pub fn active_slots(&self) -> Vec<&ControllerSlotView> {
+    pub fn active_slots(&self) -> impl Iterator<Item = &ControllerSlotView> {
         self.items
             .iter()
             .filter(|slot| slot.status == SlotStatus::Active)
-            .collect()
     }
 }
 
@@ -1687,7 +1686,7 @@ mod tests {
         let snapshot = client.list_slots("deploy alpha?x").expect("snapshot");
         assert_eq!(snapshot.deployment_id, "deploy-alpha");
         assert_eq!(snapshot.max_active_slots, 3);
-        assert_eq!(snapshot.active_slots().len(), 1);
+        assert_eq!(snapshot.active_slots().count(), 1);
         let slot = snapshot.items[0].clone();
         assert_eq!(slot.status, SlotStatus::Active);
         assert_eq!(slot.warning, None);

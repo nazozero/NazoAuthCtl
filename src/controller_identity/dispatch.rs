@@ -434,8 +434,6 @@ pub fn settle_journal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller_identity::admin_api::SlotsSnapshot;
-    use crate::controller_identity::expiry;
     use crate::controller_identity::journal::JournalState;
     use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
     use crate::filesystem;
@@ -1250,14 +1248,6 @@ mod tests {
         )?;
         assert_eq!(decoded.operation_id, first.signed.operation_id);
 
-        // Slots snapshot helpers stay importable for command layers.
-        let empty: SlotsSnapshot = SlotsSnapshot {
-            deployment_id: "d".to_owned(),
-            total: 0,
-            max_active_slots: 3,
-            items: vec![],
-        };
-        assert!(!expiry::has_active_slot(&empty));
         Ok(())
     }
 }

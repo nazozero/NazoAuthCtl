@@ -405,18 +405,6 @@ impl ControllerKeyStore {
             .with_context(|| format!("failed to clear {}", path.display()))
     }
 
-    /// Newest non-active candidate kid, or `None` when every stored key is
-    /// active (or none exist). Bind resume reuses this candidate instead of
-    /// minting another keypair for a repeated proposal (task D04).
-    pub fn newest_candidate_kid(&self, deployment_id: &str) -> anyhow::Result<Option<String>> {
-        Ok(self
-            .list_keys(deployment_id)?
-            .into_iter()
-            .rev()
-            .find(|summary| !summary.active)
-            .map(|summary| summary.kid))
-    }
-
     /// Durable local retirement of one non-active key record (tasks D07/D08):
     /// the old private key is unlinked only after callers have confirmed the
     /// server-side change. The active pointer can never be retired through
@@ -987,39 +975,8 @@ mod tests {
         // bind may adopt it back if the server still lists the kid.
         assert_eq!(store.list_keys("deploy-alpha")?.len(), 1);
         assert!(!store.list_keys("deploy-alpha")?[0].active);
-        assert_eq!(
-            store.newest_candidate_kid("deploy-alpha")?,
-            Some(active.kid().to_owned())
-        );
+        assert_eq!(store.list_keys("deploy-alpha")?[0].kid, active.kid());
         store.clear_active("deploy-alpha")?; // idempotent
-        Ok(())
-    }
-
-    #[test]
-    fn newest_candidate_prefers_the_freshest_non_active_record() -> anyhow::Result<()> {
-        let (_temp, store) = test_store()?;
-        assert!(store.newest_candidate_kid("deploy-alpha")?.is_none());
-
-        let first = store.get_or_create_active("deploy-alpha")?;
-        assert!(
-            store.newest_candidate_kid("deploy-alpha")?.is_none(),
-            "an all-active instance has no candidate"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = store.generate_candidate("deploy-alpha")?;
-        assert_eq!(
-            store.newest_candidate_kid("deploy-alpha")?,
-            Some(second.kid.clone())
-        );
-
-        // After activating the newest candidate it stops being a candidate;
-        // the previously active key is superseded into one, so the freshest
-        // candidate is the third key.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let third = store.generate_candidate("deploy-alpha")?;
-        store.set_active_kid("deploy-alpha", &second.kid)?;
-        assert_eq!(store.newest_candidate_kid("deploy-alpha")?, Some(third.kid));
-        assert_ne!(first.kid(), second.kid);
         Ok(())
     }
 }

@@ -49,7 +49,7 @@ use super::admin_api::{
 };
 use super::expiry;
 use super::recovery::{self as recovery, generate_material, material_from_display};
-use super::store::{ControllerKeyStore, controller_key_ref_for};
+use super::store::{ControllerKeyStore, ControllerKeySummary, controller_key_ref_for};
 
 const PENDING_BIND_RECOVERY_SCHEMA: u32 = 1;
 const PENDING_BIND_RECOVERY_FILE: &str = "bind-recovery-pending.json";
@@ -149,23 +149,22 @@ fn clear_pending_bind_recovery(
 
 /// Exact public proposal facts used for display and approval issuance.
 #[derive(Clone, Debug)]
-pub struct ProposalPresentation {
+pub struct ProposalPresentation<'a> {
     pub action: &'static str,
-    pub alias: String,
-    pub deployment_id: String,
-    pub issuer: String,
-    pub label: String,
+    pub deployment_id: &'a str,
+    pub issuer: &'a str,
+    pub label: &'a str,
     /// Present for rotate/revoke, absent for bind/add.
-    pub controller_id: Option<String>,
-    pub kid: String,
-    pub public_key_b64: String,
+    pub controller_id: Option<&'a str>,
+    pub kid: &'a str,
+    pub public_key_b64: &'a str,
     /// P0-3 atomic first binding: present ONLY for bind, so approval and
     /// commit cover the same recovery material.
-    pub recovery_kid: Option<String>,
-    pub recovery_public_key_b64: Option<String>,
+    pub recovery_kid: Option<&'a str>,
+    pub recovery_public_key_b64: Option<&'a str>,
 }
 
-impl ProposalPresentation {
+impl ProposalPresentation<'_> {
     pub fn render(&self) -> String {
         let mut text = crate::ui::message!(
             "Controller identity change requires fresh administrator 2FA.\n\
@@ -188,7 +187,7 @@ impl ProposalPresentation {
         text.push_str(&crate::ui::message!(
             "  new kid:    {}\n  public key: {}…\n",
             "新密钥编号：{}\n公钥：{}…\n",
-            short_kid(&self.kid),
+            short_kid(self.kid),
             &self.public_key_b64[..self.public_key_b64.len().min(16)]
         ));
         if let (Some(recovery_kid), Some(recovery_public_key)) =
@@ -221,14 +220,13 @@ fn select_pending_candidate(
     keys: &ControllerKeyStore,
     deployment_id: &str,
     snapshot: &SlotsSnapshot,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<ControllerKeySummary>> {
     Ok(keys
         .list_keys(deployment_id)?
         .into_iter()
+        .rev()
         .filter(|summary| !summary.active)
-        .filter(|summary| !snapshot.items.iter().any(|slot| slot.kid == summary.kid))
-        .max_by_key(|summary| summary.created_at)
-        .map(|summary| summary.kid))
+        .find(|summary| !snapshot.items.iter().any(|slot| slot.kid == summary.kid)))
 }
 
 /// Adopt a committed-but-not-yet-activated identity after a crash, and retire
@@ -251,7 +249,6 @@ fn reconcile_from_snapshot(
     // A committed candidate waiting for local activation?
     if let Some(slot) = snapshot
         .active_slots()
-        .into_iter()
         .find(|slot| local_kids.iter().any(|kid| kid == &slot.kid))
     {
         let previous_active = keys.load_active(deployment)?;
@@ -354,8 +351,8 @@ fn persist_binding_fields(
     Ok(())
 }
 
-fn require_bound(record: &InstanceRecord) -> anyhow::Result<String> {
-    record.controller_id.clone().with_context(|| {
+fn require_bound(record: &InstanceRecord) -> anyhow::Result<&str> {
+    record.controller_id.as_deref().with_context(|| {
         format!(
             "instance '{}' has no bound controller identity; run `nazoauthctl bind` first",
             record.alias
@@ -432,26 +429,26 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     keys: &ControllerKeyStore,
     record: InstanceRecord,
     label: &str,
-    approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
+    approval: impl FnOnce(&ProposalPresentation<'_>) -> anyhow::Result<String>,
     delivery: &dyn recovery::ReplacementSecretDelivery,
 ) -> anyhow::Result<String> {
     validate_label(label)?;
-    let deployment = record.deployment_id.clone();
-    let instance_dir = keys.instance_dir(&deployment)?;
+    let deployment = record.deployment_id.as_str();
+    let instance_dir = keys.instance_dir(deployment)?;
     filesystem::ensure_private_directory(&instance_dir, "controller key directory")?;
     let _bind_lock = FileLock::acquire(&instance_dir.join("bind.lock"))?;
-    let snapshot = api.list_slots(&deployment)?;
+    let snapshot = api.list_slots(deployment)?;
 
     // D06: a previous run may have committed server-side already.
     if let Some(report) = reconcile_from_snapshot(registry, keys, &record, &snapshot)? {
-        clear_pending_bind_recovery(keys, &deployment)?;
+        clear_pending_bind_recovery(keys, deployment)?;
         return Ok(crate::ui::message!(
             "bind complete via crash recovery.\n{report}",
             "已继续上次中断的绑定操作。\n{report}"
         ));
     }
 
-    if !snapshot.active_slots().is_empty() || record.controller_id.is_some() {
+    if snapshot.active_slots().next().is_some() || record.controller_id.is_some() {
         bail!(
             "instance '{}' already has an active controller identity; use `controller rotate` \
              (same controller) or `controller add` (additional slot up to three)",
@@ -462,8 +459,8 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     // D04.6: resume the exact still-pending proposal. The controller key and
     // Recovery Root are one approval/commit unit; neither may change after a
     // secret has been delivered.
-    let pending_recovery = load_pending_bind_recovery(keys, &deployment)?;
-    let kid = match pending_recovery.as_ref() {
+    let pending_recovery = load_pending_bind_recovery(keys, deployment)?;
+    let (kid, public_key) = match pending_recovery.as_ref() {
         Some(pending) => {
             if pending.label != label {
                 bail!(
@@ -480,24 +477,29 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
                     "pending first-bind controller key is already present server-side but was not reconcilable"
                 );
             }
-            pending.controller_kid.clone()
+            (
+                pending.controller_kid.clone(),
+                keys.public_key(deployment, &pending.controller_kid)?,
+            )
         }
-        None => match select_pending_candidate(keys, &deployment, &snapshot)? {
-            Some(pending) => pending,
-            None => keys.generate_candidate(&deployment)?.kid,
-        },
+        None => {
+            let candidate = match select_pending_candidate(keys, deployment, &snapshot)? {
+                Some(pending) => pending,
+                None => keys.generate_candidate(deployment)?,
+            };
+            (candidate.kid, candidate.public_key)
+        }
     };
-    let public_key = keys.public_key(&deployment, &kid)?;
 
     let recovery_material = match pending_recovery {
-        Some(pending) => material_from_display(&deployment, &pending.recovery_secret)?,
+        Some(pending) => material_from_display(deployment, &pending.recovery_secret)?,
         None => {
-            let material = generate_material(&deployment);
+            let material = generate_material(deployment);
             save_pending_bind_recovery(
                 keys,
                 &PendingBindRecovery {
                     schema: PENDING_BIND_RECOVERY_SCHEMA,
-                    deployment_id: deployment.clone(),
+                    deployment_id: deployment.to_owned(),
                     controller_kid: kid.clone(),
                     label: label.to_owned(),
                     recovery_secret: material.display.clone(),
@@ -507,17 +509,17 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
         }
     };
 
+    let recovery_public_key = b64url(&recovery_material.public_key);
     let presentation = ProposalPresentation {
         action: "bind",
-        alias: record.alias.clone(),
-        deployment_id: deployment.clone(),
-        issuer: record.issuer.clone(),
-        label: label.to_owned(),
+        deployment_id: deployment,
+        issuer: &record.issuer,
+        label,
         controller_id: None,
-        kid: kid.clone(),
-        public_key_b64: public_key.clone(),
-        recovery_kid: Some(recovery_material.kid.clone()),
-        recovery_public_key_b64: Some(b64url(&recovery_material.public_key)),
+        kid: &kid,
+        public_key_b64: &public_key,
+        recovery_kid: Some(&recovery_material.kid),
+        recovery_public_key_b64: Some(&recovery_public_key),
     };
     let token = approval(&presentation)?;
 
@@ -529,17 +531,17 @@ pub(crate) fn bind_flow<A: ControllerRegistryApi>(
     let slot = api.commit_slot(&SlotCommitBody {
         approval_token: token,
         action: "bind",
-        deployment_id: deployment.clone(),
+        deployment_id: deployment.to_owned(),
         label: label.to_owned(),
         public_key,
         kid: kid.clone(),
-        recovery_public_key: Some(b64url(&recovery_material.public_key)),
+        recovery_public_key: Some(recovery_public_key),
         recovery_kid: Some(recovery_material.kid.clone()),
     })?;
-    verify_committed_slot(&slot, &deployment, &kid, "bind")?;
+    verify_committed_slot(&slot, deployment, &kid, "bind")?;
 
-    let report = finish_activation(registry, keys, &record.alias, &deployment, &kid, slot)?;
-    clear_pending_bind_recovery(keys, &deployment)?;
+    let report = finish_activation(registry, keys, &record.alias, deployment, &kid, slot)?;
+    clear_pending_bind_recovery(keys, deployment)?;
     Ok(report)
 }
 
@@ -558,11 +560,11 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
     keys: &ControllerKeyStore,
     record: InstanceRecord,
     label: Option<&str>,
-    approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
+    approval: impl FnOnce(&ProposalPresentation<'_>) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    let deployment = record.deployment_id.clone();
+    let deployment = record.deployment_id.as_str();
     let controller_id = require_bound(&record)?;
-    let snapshot = api.list_slots(&deployment)?;
+    let snapshot = api.list_slots(deployment)?;
 
     // D07.3: an interrupted rotation finishes through reconciliation first —
     // never by proposing yet another key.
@@ -585,31 +587,30 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
                  instead",
                 record.issuer
             )
-        })?
-        .clone();
+        })?;
     let label = match label {
         Some(label) => {
             validate_label(label)?;
-            label.to_owned()
+            label
         }
-        None => ours.label,
+        None => ours.label.as_str(),
     };
 
-    let kid = match select_pending_candidate(keys, &deployment, &snapshot)? {
+    let ControllerKeySummary {
+        kid, public_key, ..
+    } = match select_pending_candidate(keys, deployment, &snapshot)? {
         Some(pending) => pending,
-        None => keys.generate_candidate(&deployment)?.kid,
+        None => keys.generate_candidate(deployment)?,
     };
-    let public_key = keys.public_key(&deployment, &kid)?;
 
     let presentation = ProposalPresentation {
         action: "rotate",
-        alias: record.alias.clone(),
-        deployment_id: deployment.clone(),
-        issuer: record.issuer.clone(),
-        label: label.clone(),
-        controller_id: Some(controller_id.clone()),
-        kid: kid.clone(),
-        public_key_b64: public_key.clone(),
+        deployment_id: deployment,
+        issuer: &record.issuer,
+        label,
+        controller_id: Some(controller_id),
+        kid: &kid,
+        public_key_b64: &public_key,
         recovery_kid: None,
         recovery_public_key_b64: None,
     };
@@ -617,13 +618,13 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
 
     let slot = api.rotate_slot(&RotateCommitBody {
         approval_token: token,
-        deployment_id: deployment.clone(),
-        controller_id: controller_id.clone(),
-        label,
+        deployment_id: deployment.to_owned(),
+        controller_id: controller_id.to_owned(),
+        label: label.to_owned(),
         public_key,
         kid: kid.clone(),
     })?;
-    verify_committed_slot(&slot, &deployment, &kid, "rotate")?;
+    verify_committed_slot(&slot, deployment, &kid, "rotate")?;
     if slot.controller_id != controller_id {
         bail!(
             "rotate returned controller {} instead of {controller_id}; refusing to activate \
@@ -633,14 +634,14 @@ pub fn rotate_flow<A: ControllerRegistryApi>(
     }
 
     let previous = keys
-        .load_active(&deployment)?
+        .load_active(deployment)?
         .map(|loaded| loaded.kid().to_owned());
-    let report = finish_activation(registry, keys, &record.alias, &deployment, &kid, slot)?;
+    let report = finish_activation(registry, keys, &record.alias, deployment, &kid, slot)?;
 
     // Retire the old private key only after the confirmed atomic replace
     // (the server row now carries the new kid exclusively).
     if let Some(previous) = previous.filter(|previous| previous.as_str() != kid)
-        && let Err(error) = keys.retire_kid(&deployment, &previous)
+        && let Err(error) = keys.retire_kid(deployment, &previous)
     {
         crate::ui::warning!(
             "nazauthctl: warning: old controller key {previous} could not be unlinked \
@@ -661,12 +662,12 @@ pub fn add_flow<A: ControllerRegistryApi>(
     keys: &ControllerKeyStore,
     record: InstanceRecord,
     label: &str,
-    approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
+    approval: impl FnOnce(&ProposalPresentation<'_>) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     validate_label(label)?;
     require_bound(&record)?;
-    let deployment = record.deployment_id.clone();
-    let snapshot = api.list_slots(&deployment)?;
+    let deployment = record.deployment_id.as_str();
+    let snapshot = api.list_slots(deployment)?;
 
     if let Some(report) = reconcile_from_snapshot(registry, keys, &record, &snapshot)? {
         return Ok(crate::ui::message!(
@@ -679,7 +680,7 @@ pub fn add_flow<A: ControllerRegistryApi>(
     // the server already reports a full board; the transaction-level limit
     // stays server-enforced.
     let max = snapshot.max_active_slots;
-    let active = snapshot.active_slots().len();
+    let active = snapshot.active_slots().count();
     if active >= max as usize {
         let mut message = format!(
             "{}: '{}' already has {active} of {max} active controller slots; \
@@ -700,21 +701,21 @@ pub fn add_flow<A: ControllerRegistryApi>(
         bail!("{message}");
     }
 
-    let kid = match select_pending_candidate(keys, &deployment, &snapshot)? {
+    let ControllerKeySummary {
+        kid, public_key, ..
+    } = match select_pending_candidate(keys, deployment, &snapshot)? {
         Some(pending) => pending,
-        None => keys.generate_candidate(&deployment)?.kid,
+        None => keys.generate_candidate(deployment)?,
     };
-    let public_key = keys.public_key(&deployment, &kid)?;
 
     let presentation = ProposalPresentation {
         action: "add",
-        alias: record.alias.clone(),
-        deployment_id: deployment.clone(),
-        issuer: record.issuer.clone(),
-        label: label.to_owned(),
+        deployment_id: deployment,
+        issuer: &record.issuer,
+        label,
         controller_id: None,
-        kid: kid.clone(),
-        public_key_b64: public_key.clone(),
+        kid: &kid,
+        public_key_b64: &public_key,
         recovery_kid: None,
         recovery_public_key_b64: None,
     };
@@ -723,18 +724,18 @@ pub fn add_flow<A: ControllerRegistryApi>(
     let slot = api.commit_slot(&SlotCommitBody {
         approval_token: token,
         action: "add",
-        deployment_id: deployment.clone(),
+        deployment_id: deployment.to_owned(),
         label: label.to_owned(),
         public_key,
         kid: kid.clone(),
         recovery_public_key: None,
         recovery_kid: None,
     })?;
-    verify_committed_slot(&slot, &deployment, &kid, "add")?;
+    verify_committed_slot(&slot, deployment, &kid, "add")?;
 
     // This ctl adopts its NEW slot as the identity it signs with; the
     // previous key stays enrolled until its own expiry or explicit revocation.
-    let report = finish_activation(registry, keys, &record.alias, &deployment, &kid, slot)?;
+    let report = finish_activation(registry, keys, &record.alias, deployment, &kid, slot)?;
     Ok(crate::ui::message!(
         "{report}note: the previous controller key remains enrolled and valid until its own \
          expiry or explicit revocation\n",
@@ -748,10 +749,10 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
     keys: &ControllerKeyStore,
     record: InstanceRecord,
     controller_id: &str,
-    approval: impl FnOnce(&ProposalPresentation) -> anyhow::Result<String>,
+    approval: impl FnOnce(&ProposalPresentation<'_>) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
-    let deployment = record.deployment_id.clone();
-    let snapshot = api.list_slots(&deployment)?;
+    let deployment = record.deployment_id.as_str();
+    let snapshot = api.list_slots(deployment)?;
 
     let target = snapshot
         .items
@@ -764,8 +765,7 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
                  lists them)",
                 record.alias
             )
-        })?
-        .clone();
+        })?;
     if target.status == SlotStatus::Revoked {
         bail!("controller {controller_id} is already revoked at the server; nothing to do");
     }
@@ -782,13 +782,12 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
 
     let presentation = ProposalPresentation {
         action: "revoke",
-        alias: record.alias.clone(),
-        deployment_id: deployment.clone(),
-        issuer: record.issuer,
-        label: target.label.clone(),
-        controller_id: Some(target.controller_id.clone()),
-        kid: target.kid.clone(),
-        public_key_b64: String::new(),
+        deployment_id: deployment,
+        issuer: &record.issuer,
+        label: &target.label,
+        controller_id: Some(&target.controller_id),
+        kid: &target.kid,
+        public_key_b64: "",
         recovery_kid: None,
         recovery_public_key_b64: None,
     };
@@ -796,8 +795,8 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
 
     let revoked = api.revoke_slot(&RevokeCommitBody {
         approval_token: token,
-        deployment_id: deployment.clone(),
-        controller_id: target.controller_id,
+        deployment_id: deployment.to_owned(),
+        controller_id: target.controller_id.clone(),
     })?;
     if revoked.status != SlotStatus::Revoked {
         bail!(
@@ -817,21 +816,21 @@ pub fn revoke_flow<A: ControllerRegistryApi>(
     );
 
     if self_revoked {
-        persist_binding_fields(registry, &deployment, None)?;
-        keys.clear_active(&deployment)?;
+        persist_binding_fields(registry, deployment, None)?;
+        keys.clear_active(deployment)?;
         report.push_str(crate::ui::text(
             "this machine's active pointer was cleared; remaining local key records stay on \
              disk for diagnostics\n",
             "已清除本机的当前控制器绑定；其余本地密钥记录保留用于诊断。\n",
         ));
     } else if keys
-        .list_keys(&deployment)?
+        .list_keys(deployment)?
         .iter()
         .any(|summary| summary.kid == revoked.kid)
     {
         // Material for a REMOTE controller must not exist here under normal
         // operation; if it does, retire it now that the server confirmed.
-        keys.retire_kid(&deployment, &revoked.kid)?;
+        keys.retire_kid(deployment, &revoked.kid)?;
         report.push_str(crate::ui::text(
             "matching stale local key record retired\n",
             "已清理匹配的旧本地密钥记录。\n",
@@ -850,8 +849,8 @@ pub fn slots_flow<A: ControllerRegistryApi>(
     keys: &ControllerKeyStore,
     record: InstanceRecord,
 ) -> anyhow::Result<String> {
-    let deployment = record.deployment_id.clone();
-    let snapshot = api.list_slots(&deployment)?;
+    let deployment = record.deployment_id.as_str();
+    let snapshot = api.list_slots(deployment)?;
 
     // Opportunistic crash reconciliation keeps status honest about pending
     // activations before rendering.
@@ -1064,28 +1063,30 @@ fn print_totp_enrollment(enrollment: &admin_api::TotpEnrollment) -> anyhow::Resu
     Ok(())
 }
 
-fn approval_request(presentation: &ProposalPresentation) -> anyhow::Result<ApprovalRequestBody> {
+fn approval_request(
+    presentation: &ProposalPresentation<'_>,
+) -> anyhow::Result<ApprovalRequestBody> {
     let common = || ApprovalRequestBody {
         action: presentation.action,
-        deployment_id: presentation.deployment_id.clone(),
-        controller_id: presentation.controller_id.clone(),
-        label: Some(presentation.label.clone()),
-        public_key: Some(presentation.public_key_b64.clone()),
-        kid: Some(presentation.kid.clone()),
+        deployment_id: presentation.deployment_id.to_owned(),
+        controller_id: presentation.controller_id.map(str::to_owned),
+        label: Some(presentation.label.to_owned()),
+        public_key: Some(presentation.public_key_b64.to_owned()),
+        kid: Some(presentation.kid.to_owned()),
         recovery_public_key: None,
         recovery_kid: None,
     };
     Ok(match presentation.action {
         "bind" => ApprovalRequestBody {
-            recovery_public_key: presentation.recovery_public_key_b64.clone(),
-            recovery_kid: presentation.recovery_kid.clone(),
+            recovery_public_key: presentation.recovery_public_key_b64.map(str::to_owned),
+            recovery_kid: presentation.recovery_kid.map(str::to_owned),
             ..common()
         },
         "add" | "rotate" => common(),
         "revoke" => ApprovalRequestBody {
             action: "revoke",
-            deployment_id: presentation.deployment_id.clone(),
-            controller_id: presentation.controller_id.clone(),
+            deployment_id: presentation.deployment_id.to_owned(),
+            controller_id: presentation.controller_id.map(str::to_owned),
             label: None,
             public_key: None,
             kid: None,
@@ -1107,7 +1108,7 @@ fn approval_callback<'a, A: ControllerRegistryApi>(
     api: &'a A,
     token: Option<&'a str>,
     issue_with_admin_access: bool,
-) -> impl FnOnce(&ProposalPresentation) -> anyhow::Result<String> + 'a {
+) -> impl FnOnce(&ProposalPresentation<'_>) -> anyhow::Result<String> + 'a {
     move |presentation| {
         // Keep JSON stdout to the terminal result; this is a human approval preview.
         if !crate::ui::json_mode() {
@@ -1607,7 +1608,7 @@ mod tests {
 
     fn fixed_approval(
         token: &'static str,
-    ) -> impl FnOnce(&ProposalPresentation) -> anyhow::Result<String> {
+    ) -> impl FnOnce(&ProposalPresentation<'_>) -> anyhow::Result<String> {
         move |presentation| {
             assert!(!presentation.deployment_id.is_empty());
             // Bind/add/rotate carry the proposed public key; revoke does not
@@ -2216,15 +2217,14 @@ mod tests {
             .unwrap();
         let presentation = ProposalPresentation {
             action: "bind",
-            alias: "production".to_owned(),
-            deployment_id: "deploy-alpha".to_owned(),
-            issuer: "https://auth.example.com".to_owned(),
-            label: "ops".to_owned(),
+            deployment_id: "deploy-alpha",
+            issuer: "https://auth.example.com",
+            label: "ops",
             controller_id: None,
-            kid: candidate.kid.clone(),
-            public_key_b64: summary.public_key.clone(),
-            recovery_kid: Some("recovery-kid-placeholder".to_owned()),
-            recovery_public_key_b64: Some("recovery-public-key-placeholder".to_owned()),
+            kid: &candidate.kid,
+            public_key_b64: &summary.public_key,
+            recovery_kid: Some("recovery-kid-placeholder"),
+            recovery_public_key_b64: Some("recovery-public-key-placeholder"),
         };
         let rendered = presentation.render();
         assert!(rendered.contains("deployment: deploy-alpha"), "{rendered}");

@@ -10,7 +10,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::controller_identity::admin_api::{ControllerSlotView, SlotsSnapshot};
+use crate::controller_identity::admin_api::ControllerSlotView;
 
 /// Warning threshold in days (D02/D09): remaining validity at or below this
 /// is surfaced as a warning.
@@ -111,31 +111,6 @@ pub(super) fn server_warning(slot: &ControllerSlotView) -> &'static str {
     }
 }
 
-/// Render one slot row for `controller slots` output including the live
-/// classification against `now`.
-pub fn render_slot_line(slot: &ControllerSlotView, now: DateTime<Utc>) -> String {
-    let status = ExpiryStatus::classify(now, slot.expires_at);
-    let warning = server_warning(slot);
-    crate::ui::message!(
-        "slot {} controller {} label '{}' {} [{}]{}\n",
-        "槽位 {} | 控制器 {} | 名称“{}” | 密钥 {} | 状态 {}{}\n",
-        slot.slot_index,
-        slot.controller_id,
-        slot.label,
-        crate::controller_identity::admin_api::short_kid(&slot.kid),
-        slot.status.as_str(),
-        warning,
-    )
-    .trim_end()
-    .to_owned()
-        + &crate::ui::message!("\n  expiry: {}", "\n  有效期：{}", status.render())
-}
-
-/// True when any active slot exists for the deployment (bind/add decisions).
-pub fn has_active_slot(snapshot: &SlotsSnapshot) -> bool {
-    !snapshot.active_slots().is_empty()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_lines_carry_expiry_classification_and_server_warning() {
+    fn server_warning_preserves_authoritative_warning() {
         let now = Utc::now();
         let slot = ControllerSlotView {
             deployment_id: "deploy-alpha".to_owned(),
@@ -226,16 +201,12 @@ mod tests {
             status: SlotStatus::Active,
             warning: Some(crate::controller_identity::admin_api::ExpiryWarningKind::Urgent24h),
         };
-        let line = render_slot_line(&slot, now);
-        assert!(line.contains("server-warning=urgent_24h"), "{line}");
-        assert!(line.contains("expiry: WARNING"), "{line}");
-        assert!(line.contains("[active]"), "{line}");
+        assert!(server_warning(&slot).contains("server-warning=urgent_24h"));
 
         let plain = ControllerSlotView {
             warning: None,
             ..slot
         };
-        let line = render_slot_line(&plain, now);
-        assert!(!line.contains("server-warning"), "{line}");
+        assert!(server_warning(&plain).is_empty());
     }
 }

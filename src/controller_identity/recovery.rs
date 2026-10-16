@@ -384,7 +384,6 @@ pub(crate) fn rotate_root_with_new_secret(
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("reading the current recovery root failed; nothing was changed")?;
     let previous = view.generation;
-    let _ = view.present; // rotation over an existing root IS the D12 use case
 
     let material = generate_material(deployment_id);
     // P0-4: deliver BEFORE anything irreversible. If delivery fails or is
@@ -393,10 +392,11 @@ pub(crate) fn rotate_root_with_new_secret(
         "replacement secret delivery failed; no approval was issued and nothing changed",
     )?;
 
+    let recovery_public_key = b64(&material.public_key);
     let approval = api
         .issue_recovery_root_approval(&RecoveryRootApprovalBody {
             deployment_id: deployment_id.to_owned(),
-            recovery_public_key: b64(&material.public_key),
+            recovery_public_key: recovery_public_key.clone(),
             kid: material.kid.clone(),
         })
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -407,7 +407,7 @@ pub(crate) fn rotate_root_with_new_secret(
         .rotate_recovery_root(&RecoveryRootRotateBody {
             approval_token: token,
             deployment_id: deployment_id.to_owned(),
-            recovery_public_key: b64(&material.public_key),
+            recovery_public_key,
             kid: material.kid.clone(),
         })
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -443,8 +443,6 @@ pub(crate) struct RecoveredIdentity {
 ///
 /// * the candidate controller key exists ONLY locally (inactive) until the
 ///   server commits — a refused challenge leaves no active identity;
-/// * the answer is self-checked against the proposal before submission so a
-///   client bug cannot burn one of the server's five attempts;
 /// * local activation + registry binding happen strictly AFTER the server's
 ///   authoritative commit, and both are derivable from the server state
 ///   (rerunning after a crash reconciles instead of duplicating).
@@ -513,7 +511,7 @@ pub(crate) fn recover_controller_identity(
         .issue_recovery_challenge(&RecoveryChallengeBody {
             deployment_id: deployment_id.to_owned(),
             label: label.to_owned(),
-            controller_public_key: b64(&candidate_public),
+            controller_public_key: candidate.public_key,
             kid: candidate.kid.clone(),
             recovery_public_key: b64(&replacement.public_key),
             recovery_kid: replacement.kid.clone(),
