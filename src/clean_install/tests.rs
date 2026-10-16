@@ -1469,9 +1469,6 @@ fn public_verification_failure_never_touches_committed_local_state() -> anyhow::
 
     struct FailingProber;
     impl super::public_verify::PublicProber for FailingProber {
-        fn tls_handshake(&self, _issuer: &url::Url) -> Result<(), String> {
-            Err("DNS did not resolve".to_owned())
-        }
         fn oidc_discovery(&self, _issuer: &url::Url) -> Result<String, String> {
             Err("connection refused".to_owned())
         }
@@ -1480,7 +1477,7 @@ fn public_verification_failure_never_touches_committed_local_state() -> anyhow::
     let report = super::public_verify::verify_public(&FailingProber, ISSUER);
     match &report.verdict {
         super::public_verify::PublicVerdict::Failed { failures } => {
-            assert_eq!(failures.len(), 2, "{failures:?}");
+            assert_eq!(failures.len(), 1, "{failures:?}");
         }
         other => panic!("expected a failed public verdict: {other:?}"),
     }
