@@ -7,6 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
+    sync::LazyLock,
 };
 
 use serde::{Deserialize, Serialize};
@@ -199,13 +200,17 @@ pub fn resolve_bundled_oidf_plan_id(reference: &str) -> Result<String, OidfPlanE
     }
 }
 
-pub fn bundled_oidf_matrix() -> Result<OidfArtifactMatrix, OidfPlanError> {
-    let matrix: OidfArtifactMatrix =
-        serde_json::from_slice(BUNDLED_MATRIX).map_err(|_| OidfPlanError::MalformedMatrix)?;
-    if matrix.schema != OIDF_MATRIX_SCHEMA_VERSION {
-        return Err(OidfPlanError::MalformedMatrix);
-    }
-    Ok(matrix)
+pub fn bundled_oidf_matrix() -> Result<&'static OidfArtifactMatrix, OidfPlanError> {
+    // Every selector reads the same immutable bytes embedded in this binary.
+    static MATRIX: LazyLock<Result<OidfArtifactMatrix, OidfPlanError>> = LazyLock::new(|| {
+        let matrix: OidfArtifactMatrix =
+            serde_json::from_slice(BUNDLED_MATRIX).map_err(|_| OidfPlanError::MalformedMatrix)?;
+        if matrix.schema != OIDF_MATRIX_SCHEMA_VERSION {
+            return Err(OidfPlanError::MalformedMatrix);
+        }
+        Ok(matrix)
+    });
+    MATRIX.as_ref().map_err(|_| OidfPlanError::MalformedMatrix)
 }
 
 /// Compile the immutable Matrix and driver embedded in the ctl binary. Their
@@ -299,7 +304,7 @@ pub fn open_bundled_oidf_driver_plan(
             artifact,
         },
         driver,
-        matrix,
+        matrix.clone(),
         &BTreeSet::from(["nazoauth.client.create".to_owned()]),
         selection,
         now,

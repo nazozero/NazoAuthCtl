@@ -553,8 +553,7 @@ fn execute_with_progress<S: ProgressSink>(
         }
         return Ok(0);
     }
-    let matrix: OidfArtifactMatrix =
-        bundled_oidf_matrix().context("bundled OIDF Matrix is malformed")?;
+    let matrix = bundled_oidf_matrix().context("bundled OIDF Matrix is malformed")?;
     let selected_plan_ids = driver_plan
         .plans
         .iter()
@@ -3567,14 +3566,33 @@ fn create_evidence_directory(recovery_directory: &Path, run_id: &str) -> anyhow:
 }
 
 fn select_artifact_matrix_for_run(
-    mut matrix: OidfArtifactMatrix,
+    matrix: &OidfArtifactMatrix,
     selected_plan_ids: &BTreeSet<(&str, &str)>,
 ) -> OidfArtifactMatrix {
-    matrix.groups.retain_mut(|group| {
-        group
-            .plans
-            .retain(|plan| selected_plan_ids.contains(&(group.id.as_str(), plan.id.as_str())));
-        !group.plans.is_empty()
-    });
-    matrix
+    let groups = matrix
+        .groups
+        .iter()
+        .filter_map(|group| {
+            let plans: Vec<_> = group
+                .plans
+                .iter()
+                .filter(|plan| selected_plan_ids.contains(&(group.id.as_str(), plan.id.as_str())))
+                .cloned()
+                .collect();
+            (!plans.is_empty()).then(|| nazoauthctl_conformance::OidfArtifactMatrixGroup {
+                id: group.id.clone(),
+                profile: group.profile.clone(),
+                variant: group.variant.clone(),
+                required_roles: group.required_roles.clone(),
+                plans,
+            })
+        })
+        .collect();
+    OidfArtifactMatrix {
+        schema: matrix.schema,
+        name: matrix.name.clone(),
+        openid4vc_credential_datasets: matrix.openid4vc_credential_datasets.clone(),
+        openid4vc_suite_mdoc_trust_anchor_pem: matrix.openid4vc_suite_mdoc_trust_anchor_pem.clone(),
+        groups,
+    }
 }
