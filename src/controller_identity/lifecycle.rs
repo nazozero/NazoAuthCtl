@@ -40,7 +40,7 @@ use crate::admin_credentials::{AdminCredentialsInput, read_admin_credentials};
 use crate::cli::{BindOptions, ControllerCommand};
 use crate::file_lock::FileLock;
 use crate::filesystem;
-use crate::registry::{InstanceRecord, RegistryStore, validate_issuer};
+use crate::registry::{InstanceRecord, RegistryStore};
 
 use super::admin_api::{
     self, AdminAccess, ApprovalRequestBody, ControllerRegistryApi, ControllerSlotView,
@@ -976,7 +976,6 @@ fn obtain_approval_token(flag: Option<&str>, action: &str) -> anyhow::Result<Str
 }
 
 fn make_public_api(issuer: &str) -> anyhow::Result<admin_api::HttpControllerRegistryApi> {
-    validate_issuer(issuer).context("registered issuer is invalid")?;
     admin_api::HttpControllerRegistryApi::new(issuer, AdminAccess::default())
 }
 
@@ -986,12 +985,12 @@ fn make_authenticated_api(
 ) -> anyhow::Result<admin_api::HttpControllerRegistryApi> {
     use std::io::IsTerminal as _;
 
-    validate_issuer(issuer).context("registered issuer is invalid")?;
     if !std::io::stdin().is_terminal() {
         bail!(
             "administrator MFA requires an interactive terminal; use --approval-token for non-interactive controller changes"
         );
     }
+    let mut session = HttpAdminSessionApi::new(issuer)?;
     let credentials = read_admin_credentials(
         credentials_file.map_or(
             AdminCredentialsInput::Interactive,
@@ -999,7 +998,6 @@ fn make_authenticated_api(
         ),
         "controller approval",
     )?;
-    let mut session = HttpAdminSessionApi::new(issuer)?;
     let login = session.login(&credentials.email, credentials.password.as_str())?;
     drop(credentials);
 

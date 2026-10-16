@@ -229,7 +229,7 @@ where
 /// The cap is enforced as each frame arrives so a malicious peer cannot make
 /// ctl collect an oversized response before it notices the limit.
 fn append_response_frame(output: &mut Vec<u8>, frame: &[u8]) -> anyhow::Result<()> {
-    if frame.len() > MAX_RESPONSE_BYTES.saturating_sub(output.len()) {
+    if frame.len() > MAX_RESPONSE_BYTES - output.len() {
         bail!(
             "admin API response exceeds the {} byte limit",
             MAX_RESPONSE_BYTES
@@ -661,17 +661,13 @@ pub struct TotpConfirmation {
 struct AdminCookieJar {
     values: BTreeMap<String, String>,
     csrf_cookie_name: Option<String>,
-    csrf_token: Option<String>,
 }
 
 impl AdminCookieJar {
     fn absorb(&mut self, headers: &[String]) -> anyhow::Result<()> {
         for header in headers {
-            let pair = header
-                .split(';')
-                .next()
-                .context("Set-Cookie header has no cookie pair")?
-                .trim();
+            let (pair, attributes) = header.split_once(';').unwrap_or((header, ""));
+            let pair = pair.trim();
             let (name, value) = pair
                 .split_once('=')
                 .context("Set-Cookie header has no name/value separator")?;
@@ -683,9 +679,8 @@ impl AdminCookieJar {
             {
                 bail!("admin API returned an invalid cookie name");
             }
-            let expires = header
+            let expires = attributes
                 .split(';')
-                .skip(1)
                 .any(|attribute| attribute.trim().eq_ignore_ascii_case("max-age=0"));
             if expires {
                 self.values.remove(name);
@@ -696,37 +691,30 @@ impl AdminCookieJar {
         Ok(())
     }
 
-    fn set_login_csrf(&mut self, token: String) -> anyhow::Result<()> {
+    fn set_login_csrf(&mut self, token: &str) -> anyhow::Result<()> {
         let name = self
             .values
             .iter()
-            .find_map(|(name, value)| (value == &token).then(|| name.clone()))
+            .find_map(|(name, value)| (value == token).then(|| name.clone()))
             .context("login response did not set the matching CSRF cookie")?;
         self.csrf_cookie_name = Some(name);
-        self.csrf_token = Some(token);
         Ok(())
     }
 
-    fn refresh_rotated_csrf(&mut self) -> anyhow::Result<()> {
+    fn csrf_token(&self) -> anyhow::Result<&str> {
         let name = self
             .csrf_cookie_name
             .as_ref()
             .context("administrator session has no CSRF cookie name")?;
-        let token = self
-            .values
+        self.values
             .get(name)
-            .cloned()
-            .context("administrator session rotation omitted the CSRF cookie")?;
-        self.csrf_token = Some(token);
-        Ok(())
+            .map(String::as_str)
+            .context("administrator session has no CSRF cookie")
     }
 
     fn request_headers(&self) -> anyhow::Result<Vec<(&'static str, String)>> {
         let cookie = self.cookie_header()?;
-        let csrf = self
-            .csrf_token
-            .clone()
-            .context("administrator session has no CSRF token")?;
+        let csrf = self.csrf_token()?.to_owned();
         Ok(vec![("Cookie", cookie), ("x-csrf-token", csrf)])
     }
 
@@ -734,19 +722,27 @@ impl AdminCookieJar {
         if self.values.is_empty() {
             bail!("administrator login did not establish a cookie session");
         }
-        Ok(self
-            .values
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; "))
+        let mut cookie = String::new();
+        for (name, value) in &self.values {
+            if !cookie.is_empty() {
+                cookie.push_str("; ");
+            }
+            cookie.push_str(name);
+            cookie.push('=');
+            cookie.push_str(value);
+        }
+        Ok(cookie)
     }
 
-    fn into_access(self) -> anyhow::Result<AdminAccess> {
+    fn into_access(mut self) -> anyhow::Result<AdminAccess> {
         let cookie = self.cookie_header()?;
+        let name = self
+            .csrf_cookie_name
+            .context("administrator session has no CSRF cookie name")?;
         let csrf = self
-            .csrf_token
-            .context("administrator session has no CSRF token")?;
+            .values
+            .remove(&name)
+            .context("administrator session has no CSRF cookie")?;
         Ok(AdminAccess::new(Some(cookie), Some(csrf)))
     }
 }
@@ -824,7 +820,7 @@ impl HttpAdminSessionApi {
         let wire: LoginWire = serde_json::from_slice(&raw)
             .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
         self.cookies
-            .set_login_csrf(wire.csrf_token)
+            .set_login_csrf(&wire.csrf_token)
             .map_err(AdminApiError::MalformedResponse)?;
         Ok(AdminLogin {
             mfa_required: wire.mfa_required,
@@ -862,9 +858,7 @@ impl HttpAdminSessionApi {
                 "MFA verification returned success=false"
             )));
         }
-        self.cookies
-            .refresh_rotated_csrf()
-            .map_err(AdminApiError::MalformedResponse)
+        Ok(())
     }
 
     pub fn confirm_totp(&mut self, code: &str) -> Result<TotpConfirmation, AdminApiError> {
@@ -884,9 +878,6 @@ impl HttpAdminSessionApi {
                 "TOTP confirmation returned mfa_enabled=false"
             )));
         }
-        self.cookies
-            .refresh_rotated_csrf()
-            .map_err(AdminApiError::MalformedResponse)?;
         Ok(TotpConfirmation {
             backup_codes: wire
                 .backup_codes
@@ -1237,12 +1228,14 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
                 "missing 'recovery_root'"
             )));
         };
-        if inner.contains_key("present") {
+        if inner
+            .insert("present".to_owned(), serde_json::Value::Bool(true))
+            .is_some()
+        {
             return Err(malformed_response(anyhow::anyhow!(
                 "recovery_root must not carry 'present'"
             )));
         }
-        inner.insert("present".to_owned(), serde_json::Value::Bool(true));
         decode_recovery_root_view(inner)
     }
 
@@ -1284,12 +1277,15 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
                 "server issued a non-single-use challenge"
             )));
         }
-        let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(wire.nonce.as_bytes())
+        let mut nonce = [0_u8; 32];
+        let length = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode_slice(wire.nonce.as_bytes(), &mut nonce)
             .map_err(malformed_response)?;
-        let nonce: [u8; 32] = nonce_bytes
-            .try_into()
-            .map_err(|_| malformed_response(anyhow::anyhow!("challenge nonce is not 32 bytes")))?;
+        if length != nonce.len() {
+            return Err(malformed_response(anyhow::anyhow!(
+                "challenge nonce is not 32 bytes"
+            )));
+        }
         Ok(IssuedRecoveryChallenge {
             challenge_id: wire.challenge_id,
             nonce,
@@ -1405,11 +1401,10 @@ fn decode_recovery_root_view(
     mut object: serde_json::Map<String, serde_json::Value>,
 ) -> Result<RecoveryRootView, AdminApiError> {
     let present = object
-        .get("present")
-        .and_then(serde_json::Value::as_bool)
+        .remove("present")
+        .and_then(|value| value.as_bool())
         .ok_or_else(|| malformed_response(anyhow::anyhow!("missing boolean 'present'")))?;
     // Strip the discriminant so each branch can stay deny_unknown_fields.
-    object.remove("present");
     let value = serde_json::Value::Object(object);
     if !present {
         #[derive(Deserialize)]
@@ -1538,6 +1533,36 @@ mod tests {
             Box::new(transport),
         )
         .expect("valid issuer")
+    }
+
+    #[test]
+    fn rotated_and_removed_csrf_cookies_control_subsequent_requests() {
+        let mut cookies = AdminCookieJar::default();
+        cookies
+            .absorb(&[
+                "session=login-session; Secure".to_owned(),
+                "csrf=login-csrf; Secure".to_owned(),
+            ])
+            .unwrap();
+        cookies.set_login_csrf("login-csrf").unwrap();
+        cookies
+            .absorb(&["csrf=rotated-csrf; Secure".to_owned()])
+            .unwrap();
+        assert_eq!(
+            cookies.request_headers().unwrap(),
+            vec![
+                (
+                    "Cookie",
+                    "csrf=rotated-csrf; session=login-session".to_owned()
+                ),
+                ("x-csrf-token", "rotated-csrf".to_owned()),
+            ]
+        );
+        cookies
+            .absorb(&["csrf=; Max-Age=0; Secure".to_owned()])
+            .unwrap();
+        assert!(cookies.request_headers().is_err());
+        assert!(cookies.into_access().is_err());
     }
 
     #[test]
