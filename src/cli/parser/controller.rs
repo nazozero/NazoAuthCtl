@@ -13,8 +13,11 @@ use anyhow::Context as _;
 use super::super::types::{ControllerCommand, InstanceSelector};
 use super::fleet::{checked_name, parse_options, selector_parts};
 
-pub(super) fn parse_controller(values: Vec<String>) -> anyhow::Result<ControllerCommand> {
-    let (subcommand, rest) = values.split_first().with_context(|| {
+pub(super) fn parse_controller(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<ControllerCommand> {
+    let mut rest = values.into_iter();
+    let subcommand = rest.next().with_context(|| {
         crate::ui::text(
             "expected controller list|add|rotate|revoke|recover",
             "请指定 controller list、add、rotate、revoke 或 recover",
@@ -43,28 +46,28 @@ struct Common {
 }
 
 fn parse_common(
-    values: Vec<String>,
+    values: impl IntoIterator<Item = String>,
     extra_value_flags: &[&str],
     extra_bool_flags: &[&str],
     command: &str,
 ) -> anyhow::Result<Common> {
     let mut value_flags = extra_value_flags.to_vec();
     value_flags.extend(["--instance", "--approval-token", "--credentials-file"]);
-    let parsed = parse_options(values, &value_flags, extra_bool_flags, command)?;
+    let mut parsed = parse_options(values, &value_flags, extra_bool_flags, command)?;
     if parsed.positionals.len() > 1 {
         crate::ui::fail!(
             "{command} accepts at most one selector argument",
             "{command} 最多接受一个实例选择参数"
         );
     }
-    let named = match parsed.values.get("--instance") {
+    let named = match parsed.values.remove("--instance") {
         Some(instance) => {
-            checked_name("--instance", instance)?;
-            Some(instance.clone())
+            checked_name("--instance", &instance)?;
+            Some(instance)
         }
         None => None,
     };
-    let approval_token = match parsed.values.get("--approval-token") {
+    let approval_token = match parsed.values.remove("--approval-token") {
         Some(token) => {
             if token.trim().is_empty() || token.chars().any(char::is_control) || token.len() > 512 {
                 crate::ui::fail!(
@@ -72,13 +75,11 @@ fn parse_common(
                     "--approval-token 必须是长度符合限制的单行令牌"
                 );
             }
-            // The raw value is kept; trimming happens again at use time so an
-            // accidental trailing newline in scripted input stays harmless.
-            Some(token.clone())
+            Some(token)
         }
         None => None,
     };
-    let credentials_file = match parsed.values.get("--credentials-file") {
+    let credentials_file = match parsed.values.remove("--credentials-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
         Some(_) => crate::ui::fail!(
             "--credentials-file requires a file path",
@@ -105,13 +106,13 @@ fn parse_common(
 }
 
 fn require_label(
-    values: &std::collections::BTreeMap<String, String>,
+    values: &mut std::collections::BTreeMap<String, String>,
     optional: bool,
 ) -> anyhow::Result<Option<String>> {
-    match values.get("--label") {
+    match values.remove("--label") {
         Some(label) => {
-            checked_name("--label", label)?;
-            Ok(Some(label.clone()))
+            checked_name("--label", &label)?;
+            Ok(Some(label))
         }
         None if optional => Ok(None),
         None => crate::ui::fail!(
@@ -121,7 +122,7 @@ fn require_label(
     }
 }
 
-fn parse_list(values: &[String]) -> anyhow::Result<ControllerCommand> {
+fn parse_list(values: impl IntoIterator<Item = String>) -> anyhow::Result<ControllerCommand> {
     let parts = selector_parts(values, &[], &[], "controller list")?;
     Ok(ControllerCommand::List {
         selector: InstanceSelector {
@@ -131,9 +132,9 @@ fn parse_list(values: &[String]) -> anyhow::Result<ControllerCommand> {
     })
 }
 
-fn parse_add(values: &[String]) -> anyhow::Result<ControllerCommand> {
-    let common = parse_common(values.to_vec(), &["--label"], &[], "controller add")?;
-    let label = require_label(&common.values, false)?.expect("required above");
+fn parse_add(values: impl IntoIterator<Item = String>) -> anyhow::Result<ControllerCommand> {
+    let mut common = parse_common(values, &["--label"], &[], "controller add")?;
+    let label = require_label(&mut common.values, false)?.expect("required above");
     Ok(ControllerCommand::Add {
         selector: common.selector,
         label,
@@ -142,9 +143,9 @@ fn parse_add(values: &[String]) -> anyhow::Result<ControllerCommand> {
     })
 }
 
-fn parse_rotate(values: &[String]) -> anyhow::Result<ControllerCommand> {
-    let common = parse_common(values.to_vec(), &["--label"], &[], "controller rotate")?;
-    let label = require_label(&common.values, true)?;
+fn parse_rotate(values: impl IntoIterator<Item = String>) -> anyhow::Result<ControllerCommand> {
+    let mut common = parse_common(values, &["--label"], &[], "controller rotate")?;
+    let label = require_label(&mut common.values, true)?;
     Ok(ControllerCommand::Rotate {
         selector: common.selector,
         label,
@@ -153,15 +154,15 @@ fn parse_rotate(values: &[String]) -> anyhow::Result<ControllerCommand> {
     })
 }
 
-fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
+fn parse_revoke(values: impl IntoIterator<Item = String>) -> anyhow::Result<ControllerCommand> {
     // Grammar per goal plan 09 §1: controller revoke <controller-id>.
-    let parts = selector_parts(
+    let mut parts = selector_parts(
         values,
         &["--approval-token", "--credentials-file"],
         &[],
         "controller revoke",
     )?;
-    let controller_id = parts.positional.clone().with_context(|| {
+    let controller_id = parts.positional.with_context(|| {
         crate::ui::text(
             "controller revoke requires the exact <controller-id>",
             "controller revoke 需要准确的 <controller-id>",
@@ -174,20 +175,20 @@ fn parse_revoke(values: &[String]) -> anyhow::Result<ControllerCommand> {
             named: parts.named,
         },
         controller_id,
-        approval_token: parts.values.get("--approval-token").cloned(),
-        credentials_file: parts.values.get("--credentials-file").map(PathBuf::from),
+        approval_token: parts.values.remove("--approval-token"),
+        credentials_file: parts.values.remove("--credentials-file").map(PathBuf::from),
     })
 }
 
-fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
-    let common = parse_common(
-        values.to_vec(),
+fn parse_recover(values: impl IntoIterator<Item = String>) -> anyhow::Result<ControllerCommand> {
+    let mut common = parse_common(
+        values,
         &["--label", "--secret-file", "--output-secret-file"],
         &["--rotate-secret"],
         "controller recover",
     )?;
     let rotate_secret = common.flags.contains("--rotate-secret");
-    let secret_file = match common.values.get("--secret-file") {
+    let secret_file = match common.values.remove("--secret-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
         Some(_) => crate::ui::fail!(
             "--secret-file requires a file path",
@@ -195,7 +196,7 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
         ),
         None => None,
     };
-    let output_secret_file = match common.values.get("--output-secret-file") {
+    let output_secret_file = match common.values.remove("--output-secret-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
         Some(_) => crate::ui::fail!(
             "--output-secret-file requires a file path",
@@ -230,7 +231,7 @@ fn parse_recover(values: &[String]) -> anyhow::Result<ControllerCommand> {
             "--credentials-file 仅用于 controller recover --rotate-secret"
         );
     }
-    let label = require_label(&common.values, rotate_secret)?;
+    let label = require_label(&mut common.values, rotate_secret)?;
     Ok(ControllerCommand::Recover {
         selector: common.selector,
         label: label.unwrap_or_else(|| "recovered-controller".to_owned()),
@@ -247,9 +248,9 @@ mod tests {
 
     #[test]
     fn list_accepts_only_an_instance_selector() {
-        assert!(parse_list(&["production".to_owned()]).is_ok());
+        assert!(parse_list(["production".to_owned()]).is_ok());
         assert!(
-            parse_list(&[
+            parse_list([
                 "--instance".to_owned(),
                 "production".to_owned(),
                 "--credentials-file".to_owned(),
@@ -258,7 +259,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_list(&[
+            parse_list([
                 "--instance".to_owned(),
                 "production".to_owned(),
                 "--approval-token".to_owned(),

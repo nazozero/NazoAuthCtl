@@ -1,5 +1,4 @@
 use std::env;
-use std::ffi::OsString;
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,13 +33,28 @@ fn main() {
     let args = env::args_os().collect::<Vec<_>>();
     let json_requested = args.iter().any(|value| value == "--json");
     nazoauthctl_core::configure_presentation(json_requested);
+    let args = match args
+        .into_iter()
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                anyhow::anyhow!(nazoauthctl_core::presentation_text(
+                    "command-line arguments must be valid UTF-8",
+                    "命令行参数必须为有效的 UTF-8 文本",
+                ))
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(args) => args,
+        Err(error) => exit_with_error(&error, json_requested),
+    };
     let invocation = match parse_invocation(&args) {
         Ok(invocation) => invocation,
         Err(error) => exit_with_error(&error, json_requested),
     };
     let result = match invocation {
-        Invocation::Core => {
-            nazoauthctl_core::main_entry();
+        Invocation::Core(globals) => {
+            nazoauthctl_core::main_entry(args, globals);
             return;
         }
         Invocation::ArtifactPlan(invocation) => execute_artifact_plan(invocation),
@@ -76,7 +90,7 @@ fn execute_configure(
 }
 
 enum Invocation {
-    Core,
+    Core(nazoauthctl_core::GlobalOptions),
     ArtifactPlan(ArtifactPlanInvocation),
     ArtifactOpen(ArtifactOpenInvocation),
     ArtifactResolve(ArtifactResolveInvocation),
@@ -89,27 +103,15 @@ enum Invocation {
     Run(Box<RunInvocation>),
 }
 
-fn parse_invocation(args: &[OsString]) -> anyhow::Result<Invocation> {
-    let values = args
-        .iter()
-        .skip(1)
-        .map(|value| {
-            value
-                .to_str()
-                .map(ToOwned::to_owned)
-                .context(nazoauthctl_core::presentation_text(
-                    "command-line arguments must be valid UTF-8",
-                    "命令行参数必须为有效的 UTF-8 文本",
-                ))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let globals = nazoauthctl_core::parse_global_options(&values)?;
+fn parse_invocation(args: &[String]) -> anyhow::Result<Invocation> {
+    let values = args.get(1..).unwrap_or_default();
+    let globals = nazoauthctl_core::parse_global_options(values)?;
     let command = &values[globals.consumed..];
     let Some((family, command)) = command.split_first() else {
-        return Ok(Invocation::Core);
+        return Ok(Invocation::Core(globals));
     };
     if family != "oidf" {
-        return Ok(Invocation::Core);
+        return Ok(Invocation::Core(globals));
     }
 
     if command
@@ -929,11 +931,11 @@ fn print_run_help() {
 mod tests {
     use super::*;
 
-    fn args(values: &[&str]) -> Vec<OsString> {
-        values.iter().map(OsString::from).collect()
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
     }
 
-    fn routed_run(args: &[OsString]) -> anyhow::Result<Option<RunInvocation>> {
+    fn routed_run(args: &[String]) -> anyhow::Result<Option<RunInvocation>> {
         match parse_invocation(args)? {
             Invocation::Run(invocation) => Ok(Some(*invocation)),
             _ => Ok(None),
@@ -941,7 +943,7 @@ mod tests {
     }
 
     fn routed_configure(
-        args: &[OsString],
+        args: &[String],
     ) -> anyhow::Result<Option<(Option<String>, String, String)>> {
         match parse_invocation(args)? {
             Invocation::Configure {
@@ -953,14 +955,14 @@ mod tests {
         }
     }
 
-    fn routed_artifact_open(args: &[OsString]) -> anyhow::Result<Option<ArtifactOpenInvocation>> {
+    fn routed_artifact_open(args: &[String]) -> anyhow::Result<Option<ArtifactOpenInvocation>> {
         match parse_invocation(args)? {
             Invocation::ArtifactOpen(invocation) => Ok(Some(invocation)),
             _ => Ok(None),
         }
     }
 
-    fn routed_artifact_plan(args: &[OsString]) -> anyhow::Result<Option<ArtifactPlanInvocation>> {
+    fn routed_artifact_plan(args: &[String]) -> anyhow::Result<Option<ArtifactPlanInvocation>> {
         match parse_invocation(args)? {
             Invocation::ArtifactPlan(invocation) => Ok(Some(invocation)),
             _ => Ok(None),
@@ -968,7 +970,7 @@ mod tests {
     }
 
     fn routed_artifact_resolve(
-        args: &[OsString],
+        args: &[String],
     ) -> anyhow::Result<Option<ArtifactResolveInvocation>> {
         match parse_invocation(args)? {
             Invocation::ArtifactResolve(invocation) => Ok(Some(invocation)),
@@ -976,9 +978,7 @@ mod tests {
         }
     }
 
-    fn routed_artifact_verify(
-        args: &[OsString],
-    ) -> anyhow::Result<Option<ArtifactVerifyInvocation>> {
+    fn routed_artifact_verify(args: &[String]) -> anyhow::Result<Option<ArtifactVerifyInvocation>> {
         match parse_invocation(args)? {
             Invocation::ArtifactVerify(invocation) => Ok(Some(invocation)),
             _ => Ok(None),
@@ -992,6 +992,24 @@ mod tests {
                 .expect("parse")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn core_route_keeps_the_parsed_global_prefix() {
+        let invocation = parse_invocation(&args(&[
+            "nazoauthctl",
+            "--json",
+            "--instance",
+            "production",
+            "status",
+        ]))
+        .expect("parse");
+        let Invocation::Core(globals) = invocation else {
+            panic!("core route")
+        };
+        assert_eq!(globals.instance.as_deref(), Some("production"));
+        assert!(globals.json);
+        assert_eq!(globals.consumed, 3);
     }
 
     #[test]

@@ -7,12 +7,12 @@ use super::super::types::{
     TlsCertificateSource, TlsCommand,
 };
 
-pub(super) fn parse_tls(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
-    let family = values.first().cloned().context(crate::ui::text(
+pub(super) fn parse_tls(values: impl IntoIterator<Item = String>) -> anyhow::Result<TlsCommand> {
+    let mut values = values.into_iter();
+    let family = values.next().context(crate::ui::text(
         "tls requires the certificate or acme command family",
         "tls 需要 certificate 或 acme 子命令",
     ))?;
-    values.remove(0);
     match family.as_str() {
         "certificate" => parse_certificate(values),
         "acme" => parse_acme(values).map(TlsCommand::Acme),
@@ -23,12 +23,12 @@ pub(super) fn parse_tls(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
     }
 }
 
-fn parse_certificate(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
-    let operation = values.first().cloned().context(crate::ui::text(
+fn parse_certificate(values: impl IntoIterator<Item = String>) -> anyhow::Result<TlsCommand> {
+    let mut values = values.into_iter();
+    let operation = values.next().context(crate::ui::text(
         "tls certificate requires check, plan, apply, recover, or show",
         "tls certificate 需要 check、plan、apply、recover 或 show",
     ))?;
-    values.remove(0);
     match operation.as_str() {
         "check" => parse_check_input(values).map(TlsCommand::Check),
         "plan" => parse_material_input(values).map(TlsCommand::Plan),
@@ -48,21 +48,19 @@ fn parse_certificate(mut values: Vec<String>) -> anyhow::Result<TlsCommand> {
     }
 }
 
-fn parse_check_input(values: Vec<String>) -> anyhow::Result<TlsCertificateCheckInput> {
+fn parse_check_input(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<TlsCertificateCheckInput> {
     let mut provider_config = None;
     let mut tenant = None;
     let mut hostname = None;
     let mut warning_window_seconds = None;
-    let mut index = 0;
-    while index < values.len() {
-        let option = values[index].as_str();
-        let value = values
-            .get(index + 1)
-            .with_context(|| {
-                crate::ui::message!("{option} requires a value", "{option} 需要一个值")
-            })?
-            .clone();
-        match option {
+    let mut values = values.into_iter();
+    while let Some(option) = values.next() {
+        let value = values.next().with_context(|| {
+            crate::ui::message!("{option} requires a value", "{option} 需要一个值")
+        })?;
+        match option.as_str() {
             "--provider-config" => set_once(
                 &mut provider_config,
                 PathBuf::from(value),
@@ -83,7 +81,6 @@ fn parse_check_input(values: Vec<String>) -> anyhow::Result<TlsCertificateCheckI
                 "证书检查不支持选项 {other}"
             ),
         }
-        index += 2;
     }
     Ok(TlsCertificateCheckInput {
         provider_config: provider_config.context(crate::ui::text(
@@ -99,16 +96,15 @@ fn parse_check_input(values: Vec<String>) -> anyhow::Result<TlsCertificateCheckI
     })
 }
 
-fn parse_acme(mut values: Vec<String>) -> anyhow::Result<AcmeCommand> {
-    let operation = values.first().cloned().context(crate::ui::text(
+fn parse_acme(values: impl IntoIterator<Item = String>) -> anyhow::Result<AcmeCommand> {
+    let mut values = values.into_iter();
+    let operation = values.next().context(crate::ui::text(
         "tls acme requires plan, issue, recover, or show",
         "tls acme 需要 plan、issue、recover 或 show",
     ))?;
-    values.remove(0);
     match operation.as_str() {
         "plan" => {
-            let (input, agree_terms) = parse_acme_input(values, false)?;
-            debug_assert!(!agree_terms);
+            let (input, _) = parse_acme_input(values, false)?;
             Ok(AcmeCommand::Plan(input))
         }
         "issue" => {
@@ -131,7 +127,7 @@ fn parse_acme(mut values: Vec<String>) -> anyhow::Result<AcmeCommand> {
 }
 
 fn parse_acme_input(
-    values: Vec<String>,
+    values: impl IntoIterator<Item = String>,
     allow_mutation_flags: bool,
 ) -> anyhow::Result<(AcmeCertificateInput, bool)> {
     let mut acme_config = None;
@@ -139,9 +135,8 @@ fn parse_acme_input(
     let mut tenant = None;
     let mut hostname = None;
     let mut agree_terms = false;
-    let mut index = 0;
-    while index < values.len() {
-        let option = values[index].as_str();
+    let mut values = values.into_iter();
+    while let Some(option) = values.next() {
         if option == "--agree-terms" {
             if !allow_mutation_flags {
                 crate::ui::fail!(
@@ -156,16 +151,12 @@ fn parse_acme_input(
                 );
             }
             agree_terms = true;
-            index += 1;
             continue;
         }
-        let value = values
-            .get(index + 1)
-            .with_context(|| {
-                crate::ui::message!("{option} requires a value", "{option} 需要一个值")
-            })?
-            .clone();
-        match option {
+        let value = values.next().with_context(|| {
+            crate::ui::message!("{option} requires a value", "{option} 需要一个值")
+        })?;
+        match option.as_str() {
             "--acme-config" => set_once(&mut acme_config, PathBuf::from(value), "--acme-config")?,
             "--provider-config" => set_once(
                 &mut provider_config,
@@ -176,7 +167,6 @@ fn parse_acme_input(
             "--hostname" => set_once(&mut hostname, value, "--hostname")?,
             other => crate::ui::fail!("unknown tls acme option {other}", "ACME 不支持选项 {other}"),
         }
-        index += 2;
     }
     Ok((
         AcmeCertificateInput {
@@ -198,7 +188,9 @@ fn parse_acme_input(
     ))
 }
 
-fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInput> {
+fn parse_material_input(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<TlsCertificateInput> {
     let mut provider_config = None;
     let mut proxy_config = None;
     let mut tenant = None;
@@ -206,9 +198,8 @@ fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInp
     let mut certificate = None;
     let mut private_key = None;
     let mut from_acme_current = false;
-    let mut index = 0;
-    while index < values.len() {
-        let option = values[index].as_str();
+    let mut values = values.into_iter();
+    while let Some(option) = values.next() {
         if option == "--from-acme-current" {
             if from_acme_current {
                 crate::ui::fail!(
@@ -217,16 +208,12 @@ fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInp
                 );
             }
             from_acme_current = true;
-            index += 1;
             continue;
         }
-        let value = values
-            .get(index + 1)
-            .with_context(|| {
-                crate::ui::message!("{option} requires a value", "{option} 需要一个值")
-            })?
-            .clone();
-        match option {
+        let value = values.next().with_context(|| {
+            crate::ui::message!("{option} requires a value", "{option} 需要一个值")
+        })?;
+        match option.as_str() {
             "--provider-config" => set_once(
                 &mut provider_config,
                 PathBuf::from(value),
@@ -244,7 +231,6 @@ fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInp
                 "证书操作不支持选项 {other}"
             ),
         }
-        index += 2;
     }
     let source = match (certificate, private_key, from_acme_current) {
         (Some(certificate), Some(private_key), false) => TlsCertificateSource::ExternalFiles {
@@ -284,31 +270,26 @@ fn parse_material_input(values: Vec<String>) -> anyhow::Result<TlsCertificateInp
     })
 }
 
-fn parse_binding(values: Vec<String>, command: &str) -> anyhow::Result<(String, String)> {
+fn parse_binding(
+    values: impl IntoIterator<Item = String>,
+    command: &str,
+) -> anyhow::Result<(String, String)> {
     let mut tenant = None;
     let mut hostname = None;
-    let mut index = 0;
-    while index < values.len() {
-        match values[index].as_str() {
-            option @ ("--tenant" | "--hostname") => {
-                let value = values
-                    .get(index + 1)
-                    .with_context(|| {
-                        crate::ui::message!("{option} requires a value", "{option} 需要一个值")
-                    })?
-                    .clone();
-                match option {
-                    "--tenant" => set_once(&mut tenant, value, option)?,
-                    "--hostname" => set_once(&mut hostname, value, option)?,
-                    _ => unreachable!(),
-                }
-                index += 2;
-            }
+    let mut values = values.into_iter();
+    while let Some(option) = values.next() {
+        let slot = match option.as_str() {
+            "--tenant" => &mut tenant,
+            "--hostname" => &mut hostname,
             other => crate::ui::fail!(
                 "unknown {command} option {other}",
                 "{command} 不支持选项 {other}"
             ),
-        }
+        };
+        let value = values.next().with_context(|| {
+            crate::ui::message!("{option} requires a value", "{option} 需要一个值")
+        })?;
+        set_once(slot, value, &option)?;
     }
     Ok((
         tenant.context(crate::ui::text("--tenant is required", "必须提供 --tenant"))?,
