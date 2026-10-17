@@ -412,7 +412,9 @@ pub(super) fn operator_rejection_code(detail: &str) -> Option<&'static str> {
         marker.strip_prefix(OPERATOR_REJECTION_PREFIX)
     })?;
     match class {
-        "request" => Some(crate::error_codes::INPUT_INVALID),
+        // Released servers also emit this class when an accepted result
+        // cannot be encoded. It cannot prove rejection before acceptance.
+        "request" => None,
         "authorization" => Some(crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED),
         "deployment" => Some(crate::error_codes::TARGET_IDENTITY_MISMATCH),
         "revision" => Some(crate::error_codes::CONFIG_REVISION_MISMATCH),
@@ -591,6 +593,10 @@ mod tests {
 
     #[test]
     fn exact_server_rejection_classes_map_once() {
+        assert_eq!(
+            operator_rejection_code("nazoauth-operator-rejection=request"),
+            None
+        );
         assert_eq!(
             operator_rejection_code(
                 "nazoauth failed with status 1: nazoauth-operator-rejection=authorization"
