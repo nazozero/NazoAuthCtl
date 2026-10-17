@@ -130,6 +130,12 @@ only when they contain no private or symmetric key members. `REVIEW` and
 `WARNING` cannot be pre-approved by the matrix, and `SKIPPED` remains a distinct
 classification rather than a pass.
 
+The bundled Matrix follows Suite 5.3.3's VCI plan filtering: plain credential
+variants do not include the unsupported-encryption-algorithm test and declare
+no skip exception for it. Encrypted variants still run that test. The Matrix's
+v5.2.2 source label records its provenance, not the live Suite version. The
+separate external-artifact generator remains pinned to its declared Suite release.
+
 ## Local verification boundary
 
 ```text
