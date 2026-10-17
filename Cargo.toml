@@ -49,7 +49,6 @@ hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1
 # the controller-identity admin client can name request/response body types.
 http-body-util = "0.1.5"
 instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
-libc = "0.2.190"
 nazo-crypto.workspace = true
 nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }

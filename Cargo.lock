@@ -1740,7 +1740,6 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "instant-acme",
- "libc",
  "nazo-crypto",
  "nazo-operator-protocol",
  "nazoauthctl-runtime",
