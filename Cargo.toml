@@ -88,4 +88,4 @@ panic = "abort"
 
 [patch.crates-io]
 # Borrow immutable HTTP frames and move decoded owned strings without a body copy.
-serde_json = { git = "https://github.com/bymoye/json", rev = "23f39e78e333e2e196a3e85fae10f2a1a41f273d" }
+serde_json = { git = "https://github.com/bymoye/json", rev = "7a006a7f6984324a90382d799c0fcddd0bf9606f" }

@@ -2559,7 +2559,7 @@ dependencies = [
 [[package]]
 name = "serde_json"
 version = "1.0.151"
-source = "git+https://github.com/bymoye/json?rev=23f39e78e333e2e196a3e85fae10f2a1a41f273d#23f39e78e333e2e196a3e85fae10f2a1a41f273d"
+source = "git+https://github.com/bymoye/json?rev=7a006a7f6984324a90382d799c0fcddd0bf9606f#7a006a7f6984324a90382d799c0fcddd0bf9606f"
 dependencies = [
  "itoa",
  "memchr",
