@@ -597,7 +597,7 @@ mod tests {
                 .unwrap()
                 .push(Ok(AdminHttpResponse {
                     status,
-                    body: body.as_bytes().to_vec(),
+                    body: bytes::Bytes::copy_from_slice(body.as_bytes()),
                     set_cookie_headers: Vec::new(),
                 }));
         }
@@ -661,7 +661,7 @@ mod tests {
                     .expect("challenge request carries candidate kid");
                 response.body = body
                     .replace("candidate-kid-from-server", &challenge_body)
-                    .into_bytes();
+                    .into();
             }
             Ok(response)
         }

@@ -147,7 +147,7 @@ impl AdminApiTransport for RecoveryCeremonyTransport {
         output.stdout.truncate(marker);
         Ok(AdminHttpResponse {
             status,
-            body: output.stdout,
+            body: output.stdout.into(),
             set_cookie_headers: Vec::new(),
         })
     }

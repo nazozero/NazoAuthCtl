@@ -38,7 +38,9 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
+use http_body_util::BodyExt as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -86,7 +88,7 @@ impl fmt::Debug for AdminHttpRequest {
 #[derive(Clone)]
 pub struct AdminHttpResponse {
     pub status: u16,
-    pub body: Vec<u8>,
+    pub body: Bytes,
     /// Exact Set-Cookie values. Only the administrator-session client reads
     /// them; Debug intentionally reports only the count.
     pub set_cookie_headers: Vec<String>,
@@ -202,17 +204,28 @@ where
                     .context("admin API returned a non-text Set-Cookie header")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (_, mut body) = response.into_parts();
-        let mut bytes = Vec::new();
+        let mut body = http_body_util::Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
+        let mut first = None;
+        let mut combined = BytesMut::new();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(anyhow::Error::from)?;
-            if let Ok(data) = frame.into_data() {
-                append_response_frame(&mut bytes, &data)?;
+            if let Ok(data) = frame.map_err(anyhow::Error::from_boxed)?.into_data()
+                && !data.is_empty()
+            {
+                if first.is_none() && combined.is_empty() {
+                    first = Some(data);
+                } else {
+                    if let Some(first) = first.take() {
+                        combined.reserve(first.len() + data.len());
+                        combined.extend_from_slice(&first);
+                    }
+                    combined.extend_from_slice(&data);
+                }
             }
         }
+        let body = first.unwrap_or_else(|| combined.freeze());
         Ok::<_, anyhow::Error>(AdminHttpResponse {
             status,
-            body: bytes,
+            body,
             set_cookie_headers,
         })
     };
@@ -224,19 +237,6 @@ where
                 REQUEST_TIMEOUT.as_secs()
             )
         })?
-}
-
-/// The cap is enforced as each frame arrives so a malicious peer cannot make
-/// ctl collect an oversized response before it notices the limit.
-fn append_response_frame(output: &mut Vec<u8>, frame: &[u8]) -> anyhow::Result<()> {
-    if frame.len() > MAX_RESPONSE_BYTES - output.len() {
-        bail!(
-            "admin API response exceeds the {} byte limit",
-            MAX_RESPONSE_BYTES
-        );
-    }
-    output.extend_from_slice(frame);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -900,7 +900,7 @@ impl HttpAdminSessionApi {
         path: &str,
         body: Option<Vec<u8>>,
         authenticated: bool,
-    ) -> Result<Vec<u8>, AdminApiError> {
+    ) -> Result<Bytes, AdminApiError> {
         let mut headers = if authenticated {
             self.cookies
                 .request_headers()
@@ -1039,7 +1039,7 @@ impl HttpControllerRegistryApi {
         path: &str,
         query: Option<(&str, &str)>,
         body: Option<Vec<u8>>,
-    ) -> Result<Vec<u8>, AdminApiError> {
+    ) -> Result<Bytes, AdminApiError> {
         // A Recovery Secret is its own authority and must never share an
         // administrator session. This is structural: even the
         // normal `controller recover` command cannot send Cookie/CSRF there.
@@ -1072,7 +1072,7 @@ impl HttpControllerRegistryApi {
 
 /// Shared response decoding: 2xx returns the body, everything else maps onto
 /// the typed taxonomy. Malformed success bodies fail closed.
-fn decode_response(response: AdminHttpResponse) -> Result<Vec<u8>, AdminApiError> {
+fn decode_response(response: AdminHttpResponse) -> Result<Bytes, AdminApiError> {
     if (200..300).contains(&response.status) {
         return Ok(response.body);
     }
@@ -1155,7 +1155,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_slot_envelope(raw)
+        decode_slot_envelope(&raw)
     }
 
     fn rotate_slot(&self, body: &RotateCommitBody) -> Result<ControllerSlotView, AdminApiError> {
@@ -1165,7 +1165,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_slot_envelope(raw)
+        decode_slot_envelope(&raw)
     }
 
     fn revoke_slot(&self, body: &RevokeCommitBody) -> Result<ControllerSlotView, AdminApiError> {
@@ -1175,7 +1175,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_slot_envelope(raw)
+        decode_slot_envelope(&raw)
     }
 
     fn recovery_root_view(&self, deployment_id: &str) -> Result<RecoveryRootView, AdminApiError> {
@@ -1304,12 +1304,12 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_recovery_commit(raw)
+        decode_recovery_commit(&raw)
     }
 }
 
-fn decode_slot_envelope(raw: Vec<u8>) -> Result<ControllerSlotView, AdminApiError> {
-    let wire: SlotEnvelopeWire = serde_json::from_slice(&raw)
+fn decode_slot_envelope(raw: &[u8]) -> Result<ControllerSlotView, AdminApiError> {
+    let wire: SlotEnvelopeWire = serde_json::from_slice(raw)
         .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
     wire.slot
         .into_view()
@@ -1450,8 +1450,8 @@ struct RecoveryCommitWire {
     old_recovery_secret_invalid: Option<bool>,
 }
 
-fn decode_recovery_commit(raw: Vec<u8>) -> Result<RecoveryCommitView, AdminApiError> {
-    let wire: RecoveryCommitWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+fn decode_recovery_commit(raw: &[u8]) -> Result<RecoveryCommitView, AdminApiError> {
+    let wire: RecoveryCommitWire = serde_json::from_slice(raw).map_err(malformed_response)?;
     if wire.old_recovery_secret_invalid != Some(true) {
         return Err(malformed_response(anyhow::anyhow!(
             "recovery commit did not confirm previous-generation invalidation"
@@ -1503,7 +1503,7 @@ mod tests {
                 .unwrap()
                 .push(Ok(AdminHttpResponse {
                     status,
-                    body: body.as_bytes().to_vec(),
+                    body: Bytes::copy_from_slice(body.as_bytes()),
                     set_cookie_headers,
                 }));
             self
@@ -1889,12 +1889,114 @@ mod tests {
     }
 
     #[test]
-    fn response_cap_is_enforced_before_oversized_frame_is_appended() {
-        let mut collected = vec![0; MAX_RESPONSE_BYTES - 1];
-        assert!(append_response_frame(&mut collected, &[1]).is_ok());
-        assert_eq!(collected.len(), MAX_RESPONSE_BYTES);
-        assert!(append_response_frame(&mut collected, &[2]).is_err());
-        assert_eq!(collected.len(), MAX_RESPONSE_BYTES);
+    fn response_collection_preserves_single_frame_and_bounds_multiple_frames() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let bytes = Bytes::from(vec![7; MAX_RESPONSE_BYTES]);
+            let pointer = bytes.as_ptr();
+            let response = complete_admin_request(
+                std::future::ready(Ok::<_, std::io::Error>(http::Response::new(
+                    http_body_util::Full::new(bytes),
+                ))),
+                tokio::time::Instant::now() + REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.body.as_ptr(), pointer);
+            assert_eq!(response.body.len(), MAX_RESPONSE_BYTES);
+
+            for (sizes, oversized) in [
+                (vec![], false),
+                (vec![0, 32, 0], false),
+                (vec![MAX_RESPONSE_BYTES - 2, 1, 1], false),
+                (vec![MAX_RESPONSE_BYTES + 1], true),
+                (vec![MAX_RESPONSE_BYTES - 1, 1], false),
+                (vec![MAX_RESPONSE_BYTES, 1], true),
+            ] {
+                let expected: Vec<u8> = sizes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, size)| std::iter::repeat_n(index as u8, *size))
+                    .collect();
+                let frames = sizes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, size)| Bytes::from(vec![index as u8; size]))
+                    .collect();
+                let result = complete_admin_request(
+                    std::future::ready(Ok::<_, std::io::Error>(http::Response::new(TestBody {
+                        frames,
+                        pending: false,
+                    }))),
+                    tokio::time::Instant::now() + REQUEST_TIMEOUT,
+                )
+                .await;
+                if oversized {
+                    assert_eq!(result.unwrap_err().to_string(), "length limit exceeded");
+                } else {
+                    assert_eq!(result.unwrap().body.as_ref(), expected);
+                }
+            }
+        });
+    }
+
+    struct TestBody {
+        frames: std::collections::VecDeque<Bytes>,
+        pending: bool,
+    }
+
+    impl http_body::Body for TestBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            if let Some(data) = self.frames.pop_front() {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+            } else if self.pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        }
+    }
+
+    #[test]
+    fn response_deadline_covers_stalled_headers_and_body() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let deadline = || tokio::time::Instant::now() + Duration::from_millis(5);
+            let headers = std::future::pending::<
+                Result<http::Response<http_body_util::Full<Bytes>>, std::io::Error>,
+            >();
+            assert!(
+                complete_admin_request(headers, deadline())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("timed out")
+            );
+            let body = TestBody {
+                frames: [Bytes::from_static(b"partial")].into(),
+                pending: true,
+            };
+            let request = std::future::ready(Ok::<_, std::io::Error>(http::Response::new(body)));
+            assert!(
+                complete_admin_request(request, deadline())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("timed out")
+            );
+        });
     }
 
     #[test]

@@ -1737,6 +1737,7 @@ dependencies = [
  "fs2",
  "hex",
  "http",
+ "http-body",
  "http-body-util",
  "hyper-rustls",
  "hyper-util",
