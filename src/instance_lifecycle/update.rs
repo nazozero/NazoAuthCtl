@@ -248,6 +248,15 @@ pub(crate) fn run_update(
             _ => bail!("update: the target answered an unexpected completion body"),
         },
         HostOutcome::Failed { code, detail } => {
+            if code == crate::target::CONTROL_EXECUTION_UNAVAILABLE {
+                // Admission did not reach execution. Both journals retain the
+                // exact request so a retry can proceed after the dependency recovers.
+                bail!(
+                    "{code}: migration was not started because the operator or controller registry \
+                     is unavailable; restore availability and re-run the same update to resume \
+                     operation {lifecycle_id} ({detail})"
+                );
+            }
             if code == "MIGRATION_FAILED" || detail.contains("migration failed durably") {
                 // A terminal FAILED ControlResult means NazoAuth accepted the
                 // signed operation. The exact result remains authoritative in

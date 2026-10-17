@@ -44,7 +44,7 @@ const NEW_REF: &str = "sha256:bbbb0000000000000000000000000000000000000000000000
 /// refusal, driven by the current slot.
 struct ScriptedControl {
     presented: Mutex<Vec<String>>,
-    answer: Mutex<Option<()>>,  // None => outcome unknown
+    answer: Mutex<Result<(), &'static str>>,
     fail_business: Mutex<bool>, // Some(true) => durable Failed result
 }
 
@@ -54,10 +54,9 @@ impl ControlOperationExecutor for ScriptedControl {
             .lock()
             .unwrap()
             .push(job.operation_id.to_owned());
-        let known = self.answer.lock().unwrap().is_some();
-        if !known {
+        if let Err(code) = *self.answer.lock().unwrap() {
             return Err(Failure::new(
-                CONTROL_OUTCOME_UNKNOWN,
+                code,
                 "scripted: the operator produced no parsable answer",
             ));
         }
@@ -335,7 +334,7 @@ impl Fixture {
 
         let control = Arc::new(ScriptedControl {
             presented: Mutex::new(Vec::new()),
-            answer: Mutex::new(Some(())),
+            answer: Mutex::new(Ok(())),
             fail_business: Mutex::new(false),
         });
         let lifecycle = Arc::new(ScriptedLifecycle {
@@ -536,18 +535,31 @@ fn update_activation_failure_commits_nothing_and_reports_stable_code() -> anyhow
 
 #[test]
 fn unknown_outcome_resumes_with_the_same_operation_id() -> anyhow::Result<()> {
+    retry_with_same_operation(CONTROL_OUTCOME_UNKNOWN)
+}
+
+#[test]
+fn unavailable_admission_resumes_with_the_same_operation_id() -> anyhow::Result<()> {
+    retry_with_same_operation(crate::target::CONTROL_EXECUTION_UNAVAILABLE)
+}
+
+fn retry_with_same_operation(code: &'static str) -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
-    *fixture.control.answer.lock().unwrap() = None;
+    *fixture.control.answer.lock().unwrap() = Err(code);
     let error = run_update(&fixture.context, &fixture.keys, fixture.update_request())
         .expect_err("outcome unknown must fail closed");
-    assert!(
-        error.to_string().contains(CONTROL_OUTCOME_UNKNOWN),
-        "{error}"
-    );
+    assert!(error.to_string().contains(code), "{error}");
 
     // The write-ahead journal entry survived so the retry resumes instead of
     // minting a new operation.
-    *fixture.control.answer.lock().unwrap() = Some(());
+    if code == crate::target::CONTROL_EXECUTION_UNAVAILABLE {
+        assert!(error.to_string().contains("migration was not started"));
+        assert!(!error.to_string().contains("outcome is unknown"));
+    }
+    let state = fixture.store()?.load_existing(DEPLOYMENT)?;
+    assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
+    assert_eq!(state.config.revision, 1);
+    *fixture.control.answer.lock().unwrap() = Ok(());
     let second = fixture.control.presented.lock().unwrap().len();
     let _ = run_update(&fixture.context, &fixture.keys, fixture.update_request())?;
     let presented = fixture.control.presented.lock().unwrap();

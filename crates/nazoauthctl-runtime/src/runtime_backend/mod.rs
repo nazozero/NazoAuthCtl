@@ -3,6 +3,10 @@ mod docker;
 mod podman;
 mod systemd;
 
+#[cfg(all(test, unix))]
+#[path = "../../../../tests/unit/operator_capture.rs"]
+mod operator_capture_tests;
+
 use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -330,6 +334,23 @@ impl OneShotTask {
         }
         let output = process.stdin_output(self.stdin.as_slice())?;
         if !output.status.success() && output.stdout.is_empty() {
+            // Only the operator's closed classification may cross this boundary.
+            // Arbitrary child diagnostics can contain database credentials.
+            if let Some(marker) = std::str::from_utf8(&output.stderr).ok().and_then(|stderr| {
+                stderr.lines().find(|line| {
+                    matches!(
+                        *line,
+                        "nazoauth-operator-rejection=request"
+                            | "nazoauth-operator-rejection=authorization"
+                            | "nazoauth-operator-rejection=deployment"
+                            | "nazoauth-operator-rejection=revision"
+                            | "nazoauth-operator-rejection=conflict"
+                            | "nazoauth-operator-rejection=unavailable"
+                    )
+                })
+            }) {
+                anyhow::bail!("{marker}");
+            }
             anyhow::bail!(
                 "operator task exited without a control receipt: {}",
                 output.status

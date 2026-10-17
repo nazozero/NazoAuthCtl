@@ -640,9 +640,9 @@ impl HostLifecycleExecutor {
                 stdin: format!("{}\n", migration_jws).into_bytes(),
             };
             performed.migration_outcome_unknown = true;
-            let stdout = backend.run_one_shot(&task).map_err(|error| {
-                Failure::new("CONTROL_OUTCOME_UNKNOWN", sanitize(error.to_string()))
-            })?;
+            let stdout = backend
+                .run_one_shot(&task)
+                .map_err(|error| migration_dispatch_failure(performed, error))?;
             let control_result =
                 super::control_exec::decode_operator_answer(&stdout, job.operation_id)?;
             validate_migration_result(job.operation_id, request_hash, &control_result)?;
@@ -975,6 +975,51 @@ mod tests {
     use nazo_operator_protocol::{ControlOutcome, ControlResult, ControlResultData};
 
     const OPERATION_ID: &str = "01900000-0000-7000-8000-000000000001";
+
+    #[test]
+    fn migration_admission_failure_does_not_require_stopping_the_writer() {
+        for (class, code) in [
+            (
+                "unavailable",
+                super::super::control_exec::CONTROL_EXECUTION_UNAVAILABLE,
+            ),
+            (
+                "authorization",
+                crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED,
+            ),
+            ("deployment", crate::error_codes::TARGET_IDENTITY_MISMATCH),
+            ("revision", crate::error_codes::CONFIG_REVISION_MISMATCH),
+        ] {
+            let mut performed = PerformedSteps {
+                migration_outcome_unknown: true,
+                ..PerformedSteps::default()
+            };
+            let failure = migration_dispatch_failure(
+                &mut performed,
+                anyhow::anyhow!("nazoauth-operator-rejection={class}"),
+            );
+            assert_eq!(failure.code, code);
+            assert!(!performed.migration_outcome_unknown);
+        }
+        for detail in [
+            "operator task exited without a control receipt: exit status: 1",
+            "nazoauth-operator-rejection=request",
+            "nazoauth-operator-rejection=conflict",
+        ] {
+            let mut performed = PerformedSteps {
+                migration_outcome_unknown: true,
+                migration_applied: true,
+                ..PerformedSteps::default()
+            };
+            let failure = migration_dispatch_failure(&mut performed, anyhow::anyhow!(detail));
+            assert_eq!(
+                failure.code,
+                super::super::control_exec::CONTROL_OUTCOME_UNKNOWN
+            );
+            assert!(performed.migration_outcome_unknown);
+            assert!(performed.migration_applied);
+        }
+    }
 
     #[test]
     fn host_artifact_copy_rejects_changed_bytes_without_replacing_cached_binary()
@@ -2128,6 +2173,28 @@ fn staged_config_change(
     staged: Option<&StagedConfig>,
 ) -> Option<(String, String)> {
     staged.map(|staged| (config_reference.to_owned(), staged.schema.clone()))
+}
+
+fn migration_dispatch_failure(performed: &mut PerformedSteps, error: anyhow::Error) -> Failure {
+    let detail = error.to_string();
+    if let Some(code) = super::control_exec::operator_rejection_code(&detail)
+        && matches!(
+            code,
+            super::control_exec::CONTROL_EXECUTION_UNAVAILABLE
+                | crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED
+                | crate::error_codes::TARGET_IDENTITY_MISMATCH
+                | crate::error_codes::CONFIG_REVISION_MISMATCH
+        )
+    {
+        // These checks run only after proving no accepted journal exists.
+        // Request/result encoding and id conflicts do not prove that boundary.
+        performed.migration_outcome_unknown = false;
+        return Failure::new(code, sanitize(detail));
+    }
+    Failure::new(
+        super::control_exec::CONTROL_OUTCOME_UNKNOWN,
+        sanitize(detail),
+    )
 }
 
 fn stop_writer_for_recovery(job: &UpdateJob<'_>, failure: Failure) -> Failure {

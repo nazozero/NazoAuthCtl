@@ -47,6 +47,12 @@ expiry terminates and reaps the process tree using the platform cleanup primitiv
 borrowed inputs are copied to give the bounded writer thread independent ownership.
 The writer zeroizes its input on completion.
 
+Operator tasks preserve durable stdout receipts even on a nonzero exit. Without
+a receipt, only the server's closed rejection marker is forwarded; arbitrary
+stderr remains private. Registry unavailability before admission retains both
+operation journals for retry and does not stop the writer. A missing receipt
+without proof of pre-admission rejection remains an unknown migration outcome.
+
 The SSH transport preserves the local `SSH_AUTH_SOCK` value for OpenSSH agent
 authentication for ordinary operations, transfer sessions, recovery forwards and
 interactive sudo while retaining the cleaned child environment. This does not enable
