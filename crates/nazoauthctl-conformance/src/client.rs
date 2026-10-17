@@ -362,7 +362,7 @@ impl SuiteClient {
             &format!("/api/log/{module_id}/images/{placeholder_id}"),
             &[],
             Some(RequestBody {
-                bytes: encoded.into_bytes(),
+                bytes: encoded.into(),
                 content_type: "text/plain",
             }),
             true,
@@ -431,7 +431,7 @@ impl SuiteClient {
             path,
             query,
             body_bytes.map(|bytes| RequestBody {
-                bytes,
+                bytes: bytes.into(),
                 content_type: "application/json",
             }),
             authenticated,
@@ -589,7 +589,7 @@ struct RawResponse {
 }
 
 struct RequestBody {
-    bytes: Vec<u8>,
+    bytes: bytes::Bytes,
     content_type: &'static str,
 }
 
@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn redirects_keep_bearer_within_the_ipv6_suite_origin() {
+    fn redirects_share_body_and_keep_bearer_within_the_ipv6_suite_origin() {
         struct Redirect {
             location: &'static str,
             requests: Mutex<Vec<HttpRequest>>,
@@ -886,7 +886,19 @@ mod tests {
                 ClientConfig::default(),
             )
             .unwrap();
-            let result = client.module_info("module");
+            let bytes = bytes::Bytes::from(vec![0x61; 65536]);
+            let body_address = bytes.as_ptr();
+            let result = client.request_bytes(
+                HttpMethod::Post,
+                "/api/info/module",
+                &[],
+                Some(RequestBody {
+                    bytes,
+                    content_type: "application/json",
+                }),
+                true,
+                1024,
+            );
             if allowed {
                 result.unwrap();
             } else {
@@ -896,6 +908,9 @@ mod tests {
             assert_eq!(requests.len(), if allowed { 2 } else { 1 });
             for request in requests.iter() {
                 assert_eq!(request.header("authorization"), Some("Bearer secret-token"));
+                let body = request.body().expect("request body");
+                assert_eq!(body.as_ptr(), body_address);
+                assert_eq!(body, vec![0x61; 65536]);
             }
         }
     }

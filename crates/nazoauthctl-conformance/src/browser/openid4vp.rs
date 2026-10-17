@@ -436,11 +436,12 @@ impl OpenId4VpVerifierClient {
             #[serde(flatten)]
             idempotency: &'a nazo_operator_protocol::Openid4vpCreateIdempotencyRequest,
         }
-        let body = serde_json::to_vec(&CreateRequest {
+        let body: bytes::Bytes = serde_json::to_vec(&CreateRequest {
             normalized: &normalized,
             idempotency: &idempotency,
         })
-        .map_err(|_| OpenId4VpError::InvalidInput)?;
+        .map_err(|_| OpenId4VpError::InvalidInput)?
+        .into();
         let mut attempts = 0usize;
         let response = loop {
             attempts += 1;
@@ -756,7 +757,7 @@ mod tests {
     }
 
     struct RetryingCreateTransport {
-        request_bodies: std::sync::Mutex<Vec<Vec<u8>>>,
+        request_bodies: std::sync::Mutex<Vec<bytes::Bytes>>,
     }
 
     impl Transport for RetryingCreateTransport {
@@ -765,7 +766,7 @@ mod tests {
             request: HttpRequest,
             _max_response_bytes: usize,
         ) -> Result<HttpResponse, TransportError> {
-            let body = request.body().expect("create body").to_vec();
+            let body = request.body.as_ref().expect("create body").clone();
             let mut request_bodies = self.request_bodies.lock().expect("request lock");
             request_bodies.push(body);
             if request_bodies.len() == 1 {
@@ -810,6 +811,7 @@ mod tests {
         let first: Value = serde_json::from_slice(&request_bodies[0]).expect("first body JSON");
         let second: Value = serde_json::from_slice(&request_bodies[1]).expect("second body JSON");
         assert_eq!(request_bodies[0], request_bodies[1]);
+        assert_eq!(request_bodies[0].as_ptr(), request_bodies[1].as_ptr());
         assert_eq!(first["create_request_jti"], second["create_request_jti"]);
         assert!(
             nazo_operator_protocol::validate_openid4vp_create_request_jti(

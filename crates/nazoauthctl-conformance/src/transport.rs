@@ -28,7 +28,7 @@ pub struct HttpRequest {
     pub(crate) method: HttpMethod,
     pub(crate) url: Url,
     pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) body: Option<bytes::Bytes>,
 }
 
 impl HttpRequest {

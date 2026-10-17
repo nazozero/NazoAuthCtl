@@ -1696,6 +1696,7 @@ dependencies = [
  "anyhow",
  "aws-lc-rs",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "fs2",
  "hex",

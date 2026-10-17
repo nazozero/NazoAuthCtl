@@ -184,7 +184,7 @@ impl CibaUserApprovalClient {
                     method,
                     url,
                     headers,
-                    body,
+                    body: body.map(Into::into),
                 },
                 MAX_RESPONSE_BYTES,
             )

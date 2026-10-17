@@ -399,7 +399,7 @@ impl OpenId4VciIssuerClient {
                     method,
                     url,
                     headers,
-                    body,
+                    body: body.map(Into::into),
                 },
                 self.max_response_bytes,
             )
@@ -546,7 +546,8 @@ impl OpenId4VciIssuerClient {
                     ],
                     body: Some(
                         serde_json::to_vec(&Value::Object(body))
-                            .map_err(|_| OpenId4VciError::InvalidInput)?,
+                            .map_err(|_| OpenId4VciError::InvalidInput)?
+                            .into(),
                     ),
                 },
                 self.max_response_bytes,
