@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "nazo-crypto"
 version = "0.3.1"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=d282f755557652569d46c9684fa24353aef1a5fb#d282f755557652569d46c9684fa24353aef1a5fb"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=8ebcfff58f266b69946a99dc2a69bc3d30738803#8ebcfff58f266b69946a99dc2a69bc3d30738803"
 dependencies = [
  "ed25519-dalek",
  "thiserror",
@@ -1657,10 +1657,9 @@ dependencies = [
 [[package]]
 name = "nazo-operator-protocol"
 version = "0.3.1"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=d282f755557652569d46c9684fa24353aef1a5fb#d282f755557652569d46c9684fa24353aef1a5fb"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=8ebcfff58f266b69946a99dc2a69bc3d30738803#8ebcfff58f266b69946a99dc2a69bc3d30738803"
 dependencies = [
  "base64 0.23.1",
- "chrono",
  "hex",
  "hkdf",
  "nazo-crypto",
@@ -1675,7 +1674,6 @@ name = "nazoauthctl"
 version = "0.3.1"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
  "cliclack",
  "ctrlc",
  "hex",
@@ -1699,12 +1697,10 @@ dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
  "chrono",
- "ed25519-dalek",
  "fs2",
  "hex",
  "keyring",
  "keyring-core",
- "libc",
  "nazo-crypto",
  "nazo-operator-protocol",
  "nazoauthctl-runtime",
@@ -1776,7 +1772,6 @@ dependencies = [
  "atomic-write-file",
  "hex",
  "libc",
- "nazo-operator-protocol",
  "rand",
  "rustix",
  "serde",

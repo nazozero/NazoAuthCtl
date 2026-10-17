@@ -15,7 +15,6 @@ hex.workspace = true
 anyhow = "1.0.104"
 atomic-write-file = "0.3.1"
 libc = "0.2.190"
-nazo-operator-protocol.workspace = true
 rand = "0.10.3"
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
