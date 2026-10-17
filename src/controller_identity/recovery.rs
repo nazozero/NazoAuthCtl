@@ -597,7 +597,7 @@ mod tests {
                 .unwrap()
                 .push(Ok(AdminHttpResponse {
                     status,
-                    body: bytes::Bytes::copy_from_slice(body.as_bytes()),
+                    body: bytes::Bytes::copy_from_slice(body.as_bytes()).into(),
                     set_cookie_headers: Vec::new(),
                 }));
         }
@@ -641,7 +641,11 @@ mod tests {
                 .unwrap()
                 .pop()
                 .expect("no canned response left")?;
-            let body = String::from_utf8_lossy(&response.body);
+            let body = response
+                .body
+                .json::<serde_json::Value>()
+                .map(|value| value.to_string())
+                .unwrap_or_default();
             if body.contains("candidate-kid-from-server") {
                 let challenge_body = self
                     .inner
@@ -661,6 +665,7 @@ mod tests {
                     .expect("challenge request carries candidate kid");
                 response.body = body
                     .replace("candidate-kid-from-server", &challenge_body)
+                    .into_bytes()
                     .into();
             }
             Ok(response)
