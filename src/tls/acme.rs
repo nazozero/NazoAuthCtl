@@ -70,8 +70,8 @@ struct AcmeConfig {
 struct LoadedAcmeConfig {
     config: AcmeConfig,
     sha256: String,
-    source_bytes: Vec<u8>,
-    directory_trust_anchor: Option<Vec<u8>>,
+    source_bytes: Zeroizing<Vec<u8>>,
+    directory_trust_anchor: Option<Zeroizing<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -195,15 +195,14 @@ struct AcmeReceipt {
 
 struct LoadedAcmeReceipt {
     receipt: AcmeReceipt,
-    receipt_sha256: String,
+    source_bytes: Zeroizing<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AbortedTransaction {
+#[derive(Serialize)]
+struct AbortedTransaction<'a> {
     schema: u32,
-    transaction: AcmeTransaction,
-    reason: String,
+    transaction: &'a AcmeTransaction,
+    reason: &'a str,
     aborted_at: i64,
 }
 
@@ -252,7 +251,7 @@ pub(super) fn current_install_source(
         &provider.trust_anchors_sha256,
     )?;
     Ok(AcmeInstallSource {
-        receipt_sha256: loaded.receipt_sha256,
+        receipt_sha256: sha256(&loaded.source_bytes),
         issuance_jti: receipt.jti,
         issuance_declaration_revision: receipt.declaration_revision,
         issuance_revision: receipt.revision,
@@ -400,14 +399,6 @@ fn recover(
         &hostname,
         &transaction,
     )?;
-    if acme.sha256 != transaction.acme_config_sha256
-        || provider.config_sha256 != transaction.provider_config_sha256
-        || provider.trust_anchors_sha256 != transaction.trust_anchors_sha256
-        || acme.directory_trust_anchor.as_deref().map(sha256)
-            != transaction.directory_trust_anchor_sha256
-    {
-        bail!("ACME recovery configuration differs from the journal binding");
-    }
     validate_transaction_config(&transaction, &provider, &acme)?;
     let _challenge_lock = store.shared_resource_lock(&challenge_lock_id(&acme.config))?;
     let current = load_receipt(store, &record, &tenant, &hostname)?;
@@ -479,7 +470,7 @@ fn load_config(
     Ok(LoadedAcmeConfig {
         config,
         sha256: sha256(&bytes),
-        source_bytes: bytes.to_vec(),
+        source_bytes: bytes,
         directory_trust_anchor,
     })
 }
@@ -512,7 +503,7 @@ fn load_snapshot_config(
                 bail!("ACME directory trust anchor snapshot differs from the journal binding");
             }
             super::material::root_store_from_pem(&root)?;
-            Some(root.to_vec())
+            Some(root)
         }
         None => {
             if config.directory_trust_anchor.is_some() {
@@ -531,12 +522,12 @@ fn load_snapshot_config(
     Ok(LoadedAcmeConfig {
         config,
         sha256: sha256(&bytes),
-        source_bytes: bytes.to_vec(),
+        source_bytes: bytes,
         directory_trust_anchor,
     })
 }
 
-fn load_directory_trust_anchor(config: &AcmeConfig) -> anyhow::Result<Option<Vec<u8>>> {
+fn load_directory_trust_anchor(config: &AcmeConfig) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     let Some(path) = &config.directory_trust_anchor else {
         return Ok(None);
     };
@@ -547,7 +538,7 @@ fn load_directory_trust_anchor(config: &AcmeConfig) -> anyhow::Result<Option<Vec
         MAX_CERTIFICATE_BYTES,
     )?;
     super::material::root_store_from_pem(&root)?;
-    Ok(Some(root.to_vec()))
+    Ok(Some(root))
 }
 
 fn validate_config(
@@ -569,7 +560,6 @@ fn validate_config(
     {
         bail!("ACME, provider, and requested tenant/hostname bindings differ");
     }
-    validate_https_url(&config.directory_url, "ACME directory URL")?;
     let authority = AuthorityPolicy::from_config(&config.allowed_origins)?;
     authority.require_url(&config.directory_url, "ACME directory URL")?;
     validate_https_url(&config.terms_of_service_url, "ACME terms-of-service URL")?;
@@ -630,9 +620,7 @@ fn build_plan(
     let hostname = canonical_hostname(&acme.config.hostname)?;
     let jti = Uuid::now_v7().to_string();
     let now = Utc::now().timestamp();
-    let expires_at = now
-        .checked_add(i64::try_from(acme.config.transaction_ttl_seconds)?)
-        .context("ACME transaction expiry overflow")?;
+    let expires_at = now + acme.config.transaction_ttl_seconds as i64;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
     let workspace = acme_binding_directory(store, &record.deployment_id, &tenant, &hostname)
         .join("transactions")
@@ -648,7 +636,10 @@ fn build_plan(
         acme_config_sha256: acme.sha256.clone(),
         provider_config_sha256: provider.config_sha256.clone(),
         trust_anchors_sha256: provider.trust_anchors_sha256.clone(),
-        directory_trust_anchor_sha256: acme.directory_trust_anchor.as_deref().map(sha256),
+        directory_trust_anchor_sha256: acme
+            .directory_trust_anchor
+            .as_ref()
+            .map(|root| sha256(root)),
         directory_url: acme.config.directory_url.clone(),
         allowed_origins: acme.config.allowed_origins.clone(),
         terms_of_service_url: acme.config.terms_of_service_url.clone(),
@@ -716,17 +707,6 @@ fn drive_transaction(
     acme: &LoadedAcmeConfig,
     transaction: &mut AcmeTransaction,
 ) -> anyhow::Result<()> {
-    validate_transaction_binding(
-        store,
-        transaction,
-        record,
-        &transaction.tenant,
-        &transaction.hostname,
-    )?;
-    validate_transaction_config(transaction, provider, acme)?;
-    let current = load_receipt(store, record, &transaction.tenant, &transaction.hostname)?;
-    validate_previous_receipt(transaction, current.as_ref())?;
-    ensure_transaction_fresh(transaction)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -859,8 +839,8 @@ async fn load_or_create_account(
     let authority = AuthorityPolicy::from_config(&acme.config.allowed_origins)?;
     let roots = acme
         .directory_trust_anchor
-        .as_deref()
-        .map(super::material::root_store_from_pem)
+        .as_ref()
+        .map(|root| super::material::root_store_from_pem(root))
         .transpose()?;
     let builder = Account::builder_with_http(build_http_client(authority.clone(), roots)?);
     let _account_lock = store.shared_resource_lock(&format!(
@@ -874,15 +854,14 @@ async fn load_or_create_account(
         )
     ))?;
     migrate_account_if_needed(store, transaction, acme)?;
+    let contacts_digest = contacts_sha256(&acme.config.contacts);
     match load_account(&transaction.account_path)? {
         Some(mut account_record) => {
             validate_account_record(&account_record, transaction, acme)?;
             bind_account_key_digest(store, transaction, &account_record.account_key_sha256)?;
             retire_account_key_draft(&transaction.account_path)?;
-            let contacts_changed =
-                account_record.contacts_sha256 != contacts_sha256(&acme.config.contacts);
-            let updated_record = if contacts_changed {
-                account_record.contacts_sha256 = contacts_sha256(&acme.config.contacts);
+            let updated_record = if account_record.contacts_sha256 != contacts_digest {
+                account_record.contacts_sha256 = contacts_digest;
                 Some(Zeroizing::new(serde_json::to_vec_pretty(&account_record)?))
             } else {
                 None
@@ -892,7 +871,7 @@ async fn load_or_create_account(
                 .await
                 .context("failed to restore ACME account")?;
             authority.require_url(account.id(), "restored ACME account URL")?;
-            if contacts_changed {
+            if let Some(bytes) = updated_record {
                 let contacts = acme
                     .config
                     .contacts
@@ -903,9 +882,7 @@ async fn load_or_create_account(
                     .update_contacts(&contacts)
                     .await
                     .context("failed to update ACME account contacts")?;
-                if let Some(bytes) = updated_record {
-                    atomic_write(&transaction.account_path, &bytes, 0o600)?;
-                }
+                atomic_write(&transaction.account_path, &bytes, 0o600)?;
             }
             Ok(account)
         }
@@ -936,7 +913,7 @@ async fn load_or_create_account(
                 acme_config_sha256: acme.sha256.clone(),
                 directory_url: acme.config.directory_url.clone(),
                 allowed_origins: acme.config.allowed_origins.clone(),
-                contacts_sha256: contacts_sha256(&acme.config.contacts),
+                contacts_sha256: contacts_digest,
                 account_key_sha256: key_digest,
                 created_at: Utc::now().timestamp(),
                 credentials,
@@ -994,38 +971,35 @@ fn load_or_create_account_key(
     transaction: &AcmeTransaction,
 ) -> anyhow::Result<(Key, PrivatePkcs8KeyDer<'static>, String)> {
     let path = account_key_draft_path(&transaction.account_path);
-    let bytes = match fs::symlink_metadata(&path) {
+    let (key, key_der) = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            read_secure_regular_file(
+            let mut bytes = read_secure_regular_file(
                 &path,
                 "ACME account private-key draft",
                 true,
                 super::MAX_PRIVATE_KEY_BYTES,
-            )?
+            )?;
+            let key_der = PrivatePkcs8KeyDer::from(std::mem::take(&mut *bytes));
+            let key = Key::from_pkcs8_der(PrivatePkcs8KeyDer::from(key_der.secret_pkcs8_der()))
+                .context("ACME account private-key draft is invalid")?;
+            (key, key_der)
         }
         Ok(_) => bail!("ACME account private-key draft must be a regular non-symlink file"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let (_key, generated) =
+            let (key, key_der) =
                 Key::generate_pkcs8().context("failed to generate ACME account private key")?;
-            let bytes = Zeroizing::new(generated.secret_pkcs8_der().to_vec());
-            atomic_write(&path, &bytes, 0o600)?;
-            bytes
+            atomic_write(&path, key_der.secret_pkcs8_der(), 0o600)?;
+            (key, key_der)
         }
         Err(error) => return Err(error).context("failed to inspect ACME account key draft"),
     };
-    let digest = sha256(&bytes);
+    let digest = sha256(key_der.secret_pkcs8_der());
     if let Some(expected) = &transaction.account_key_sha256
         && *expected != digest
     {
         bail!("ACME account private-key draft differs from the journal binding");
     }
-    let key = Key::from_pkcs8_der(PrivatePkcs8KeyDer::from(bytes.as_slice().to_vec()))
-        .context("ACME account private-key draft is invalid")?;
-    Ok((
-        key,
-        PrivatePkcs8KeyDer::from(bytes.as_slice().to_vec()),
-        digest,
-    ))
+    Ok((key, key_der, digest))
 }
 
 fn bind_account_key_digest(
@@ -1109,12 +1083,13 @@ async fn satisfy_authorization(
         .challenge(ChallengeType::Http01)
         .context("ACME authorization offers no HTTP-01 challenge")?;
     validate_challenge_token(&challenge.token)?;
-    let response = challenge.key_authorization().as_str().as_bytes().to_vec();
+    let response = challenge.key_authorization();
+    let response = response.as_str().as_bytes();
     let path = acme.config.challenge_webroot.join(&challenge.token);
     transaction.challenge_path = Some(path.clone());
-    transaction.challenge_sha256 = Some(sha256(&response));
+    transaction.challenge_sha256 = Some(sha256(response));
     persist_pending(store, transaction)?;
-    atomic_write(&path, &response, 0o644)?;
+    atomic_write(&path, response, 0o644)?;
     transaction.phase = Phase::ChallengePublished;
     persist_pending(store, transaction)?;
     ensure_transaction_fresh(transaction)?;
@@ -1129,7 +1104,7 @@ async fn satisfy_authorization(
 fn load_or_create_csr(
     store: &TlsStore,
     transaction: &mut AcmeTransaction,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let key_path = transaction.workspace.join("private-key.pem");
     let csr_path = transaction.workspace.join("request.csr.der");
     match (&transaction.private_key_sha256, &transaction.csr_sha256) {
@@ -1149,9 +1124,7 @@ fn load_or_create_csr(
             if sha256(&key) != *key_digest || sha256(&csr) != *csr_digest {
                 bail!("ACME private key or CSR differs from the journal binding");
             }
-            KeyPair::from_pem(std::str::from_utf8(&key)?)
-                .context("ACME server private key is invalid")?;
-            Ok(csr.to_vec())
+            Ok(csr)
         }
         (None, None) => {
             let key = KeyPair::generate().context("failed to generate ACME server private key")?;
@@ -1169,7 +1142,7 @@ fn load_or_create_csr(
             transaction.csr_sha256 = Some(sha256(csr.der()));
             transaction.phase = Phase::CsrReady;
             persist_pending(store, transaction)?;
-            Ok(csr.der().to_vec())
+            Ok(Zeroizing::new(csr.der().to_vec()))
         }
         _ => bail!("ACME journal has a partial private-key/CSR binding"),
     }
@@ -1192,7 +1165,8 @@ fn commit_issued_material(
     let certificate_path = transaction.workspace.join("fullchain.pem");
     let private_key_path = transaction.workspace.join("private-key.pem");
     atomic_write(&certificate_path, certificate, 0o644)?;
-    transaction.certificate_sha256 = Some(sha256(certificate));
+    let certificate_sha256 = sha256(certificate);
+    transaction.certificate_sha256 = Some(certificate_sha256.clone());
     persist_pending(store, transaction)?;
     let material = super::material::load_and_validate_material(
         &certificate_path,
@@ -1227,7 +1201,7 @@ fn commit_issued_material(
         order_url: order_url.to_owned(),
         certificate_path,
         private_key_path,
-        certificate_sha256: sha256(certificate),
+        certificate_sha256,
         private_key_sha256: transaction
             .private_key_sha256
             .clone()
@@ -1340,7 +1314,6 @@ fn validate_transaction_binding(
             validate_digest(digest, label)?;
         }
     }
-    validate_https_url(&transaction.directory_url, "ACME journal directory URL")?;
     let authority = AuthorityPolicy::from_config(&transaction.allowed_origins)?;
     authority.require_url(&transaction.directory_url, "ACME journal directory URL")?;
     validate_https_url(
@@ -1348,7 +1321,6 @@ fn validate_transaction_binding(
         "ACME journal terms-of-service URL",
     )?;
     if let Some(order_url) = &transaction.order_url {
-        validate_https_url(order_url, "ACME journal order URL")?;
         authority.require_url(order_url, "ACME journal order URL")?;
     }
     if transaction.challenge_path.is_some() != transaction.challenge_sha256.is_some()
@@ -1368,7 +1340,10 @@ fn validate_transaction_config(
         || transaction.provider_config_sha256 != provider.config_sha256
         || transaction.trust_anchors_sha256 != provider.trust_anchors_sha256
         || transaction.directory_trust_anchor_sha256
-            != acme.directory_trust_anchor.as_deref().map(sha256)
+            != acme
+                .directory_trust_anchor
+                .as_ref()
+                .map(|root| sha256(root))
         || transaction.directory_url != acme.config.directory_url
         || transaction.allowed_origins != acme.config.allowed_origins
         || transaction.terms_of_service_url != acme.config.terms_of_service_url
@@ -1464,15 +1439,12 @@ fn validate_receipt_shape(store: &TlsStore, receipt: &AcmeReceipt) -> anyhow::Re
     if let Some(digest) = &receipt.directory_trust_anchor_sha256 {
         validate_digest(digest, "ACME receipt directory trust-anchor digest")?;
     }
-    validate_https_url(&receipt.directory_url, "ACME receipt directory URL")?;
     let authority = AuthorityPolicy::from_config(&receipt.allowed_origins)?;
     authority.require_url(&receipt.directory_url, "ACME receipt directory URL")?;
     validate_https_url(
         &receipt.terms_of_service_url,
         "ACME receipt terms-of-service URL",
     )?;
-    validate_https_url(&receipt.account_id, "ACME receipt account URL")?;
-    validate_https_url(&receipt.order_url, "ACME receipt order URL")?;
     authority.require_url(&receipt.account_id, "ACME receipt account URL")?;
     authority.require_url(&receipt.order_url, "ACME receipt order URL")?;
     let workspace = acme_binding_directory(
@@ -1536,7 +1508,7 @@ fn load_provider_snapshot(
     }
     let config: super::ProviderConfig =
         serde_json::from_slice(&bytes).context("TLS provider configuration snapshot is invalid")?;
-    super::validate_provider_config(store, &config, tenant, hostname)?;
+    let public_url = super::validate_provider_config(store, &config, tenant, hostname)?;
     let trust_anchors = read_secure_regular_file(
         &transaction.workspace.join("provider-trust-anchors.pem"),
         "TLS provider trust anchor snapshot",
@@ -1547,8 +1519,6 @@ fn load_provider_snapshot(
         bail!("TLS provider trust anchor snapshot differs from the ACME journal binding");
     }
     super::material::root_store_from_pem(&trust_anchors)?;
-    let public_url =
-        Url::parse(&config.public_url).context("TLS provider public URL is invalid")?;
     Ok(LoadedProvider {
         config,
         config_sha256: transaction.provider_config_sha256.clone(),
@@ -1679,7 +1649,7 @@ fn persist_receipt(
         .join("receipts")
         .join(format!("{}.json", receipt.revision));
     match read_optional_private(&archive, "ACME issuance receipt archive", MAX_RECEIPT_BYTES)? {
-        Some(existing) if existing != bytes => {
+        Some(existing) if existing.as_slice() != bytes.as_slice() => {
             bail!("ACME issuance receipt revision archive contains conflicting evidence")
         }
         Some(_) => {}
@@ -1722,7 +1692,7 @@ fn load_receipt_record(
     validate_receipt_shape(store, &receipt)?;
     Ok(Some(LoadedAcmeReceipt {
         receipt,
-        receipt_sha256: sha256(&bytes),
+        source_bytes: bytes,
     }))
 }
 
@@ -1776,10 +1746,10 @@ fn read_optional_private(
     path: &Path,
     label: &str,
     max_bytes: u64,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(Some(
-            read_secure_regular_file(path, label, true, max_bytes)?.to_vec(),
+            read_secure_regular_file(path, label, true, max_bytes)?,
         )),
         Ok(_) => bail!("{label} must be a regular non-symlink file"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1808,8 +1778,8 @@ fn abort_transaction(
         &transaction.workspace.join("aborted.json"),
         &serde_json::to_vec_pretty(&AbortedTransaction {
             schema: 1,
-            transaction: transaction.clone(),
-            reason: reason.to_owned(),
+            transaction,
+            reason,
             aborted_at: Utc::now().timestamp(),
         })?,
         0o600,
@@ -2025,7 +1995,7 @@ mod tests {
         let acme = LoadedAcmeConfig {
             config: test_config(work.path().join("other-webroot")),
             sha256: transaction.acme_config_sha256.clone(),
-            source_bytes: Vec::new(),
+            source_bytes: Zeroizing::new(Vec::new()),
             directory_trust_anchor: None,
         };
         migrate_account_if_needed(&store, &transaction, &acme).unwrap();
@@ -2071,7 +2041,7 @@ mod tests {
         let acme = LoadedAcmeConfig {
             config: test_config(work.path().join("challenge")),
             sha256: transaction.acme_config_sha256.clone(),
-            source_bytes: Vec::new(),
+            source_bytes: Zeroizing::new(Vec::new()),
             directory_trust_anchor: None,
         };
         let provider = LoadedProvider {
@@ -2194,10 +2164,15 @@ mod tests {
         ensure_private_directory(&transaction.workspace, "test ACME workspace").unwrap();
         persist_pending(&store, &transaction).unwrap();
 
-        let (_, _, digest) = load_or_create_account_key(&transaction).unwrap();
+        let (_, generated_der, digest) = load_or_create_account_key(&transaction).unwrap();
         bind_account_key_digest(&store, &mut transaction, &digest).unwrap();
-        let (_, _, resumed_digest) = load_or_create_account_key(&transaction).unwrap();
+        let (_, resumed_der, resumed_digest) = load_or_create_account_key(&transaction).unwrap();
         assert_eq!(digest, resumed_digest);
+        assert_eq!(
+            generated_der.secret_pkcs8_der(),
+            resumed_der.secret_pkcs8_der()
+        );
+        assert_eq!(sha256(generated_der.secret_pkcs8_der()), digest);
         let journal: AcmeTransaction = serde_json::from_slice(
             &read_secure_regular_file(
                 &pending_path(&store, &transaction),
@@ -2209,6 +2184,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(journal.account_key_sha256.as_deref(), Some(digest.as_str()));
+        let (_, replacement) = Key::generate_pkcs8().unwrap();
+        atomic_write(
+            &account_key_draft_path(&transaction.account_path),
+            replacement.secret_pkcs8_der(),
+            0o600,
+        )
+        .unwrap();
+        assert!(load_or_create_account_key(&transaction).is_err());
     }
 
     #[test]

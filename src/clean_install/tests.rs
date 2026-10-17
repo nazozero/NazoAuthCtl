@@ -88,16 +88,16 @@ fn signing_key_root_survives_install_retry_and_is_deployment_scoped() -> anyhow:
     let restarted = load_or_create_deployment_security_roots(root.path(), "deployment-a")?;
     let other = load_or_create_deployment_security_roots(root.path(), "deployment-b")?;
     assert_eq!(
-        first.signing_key_encryption_key,
-        restarted.signing_key_encryption_key
+        first.signing_key_encryption_key.as_bytes(),
+        restarted.signing_key_encryption_key.as_bytes()
     );
     assert_ne!(
-        first.signing_key_encryption_key,
-        other.signing_key_encryption_key
+        first.signing_key_encryption_key.as_bytes(),
+        other.signing_key_encryption_key.as_bytes()
     );
     assert_eq!(
         URL_SAFE_NO_PAD
-            .decode(&first.signing_key_encryption_key)?
+            .decode(first.signing_key_encryption_key.as_bytes())?
             .len(),
         32
     );
@@ -1469,9 +1469,6 @@ fn public_verification_failure_never_touches_committed_local_state() -> anyhow::
 
     struct FailingProber;
     impl super::public_verify::PublicProber for FailingProber {
-        fn tls_handshake(&self, _issuer: &url::Url) -> Result<(), String> {
-            Err("DNS did not resolve".to_owned())
-        }
         fn oidc_discovery(&self, _issuer: &url::Url) -> Result<String, String> {
             Err("connection refused".to_owned())
         }
@@ -1480,7 +1477,7 @@ fn public_verification_failure_never_touches_committed_local_state() -> anyhow::
     let report = super::public_verify::verify_public(&FailingProber, ISSUER);
     match &report.verdict {
         super::public_verify::PublicVerdict::Failed { failures } => {
-            assert_eq!(failures.len(), 2, "{failures:?}");
+            assert_eq!(failures.len(), 1, "{failures:?}");
         }
         other => panic!("expected a failed public verdict: {other:?}"),
     }
@@ -1511,5 +1508,17 @@ fn security_cloud_https_install_does_not_assume_a_certificate_sanitizing_proxy()
     let config: std::collections::BTreeMap<String, yaml_serde::Value> =
         yaml_serde::from_str(&install_order(&prepared.operation).config_content)?;
     assert_eq!(config["MTLS_CERTIFICATE_SOURCE"].as_str(), Some("disabled"));
+    Ok(())
+}
+
+#[test]
+fn prepared_request_hash_preserves_the_serialized_identity() -> anyhow::Result<()> {
+    let mut request = LocalFixture::new(None)?.request(None);
+    request.install_root = None;
+    let host_id = Uuid::parse_str("01926811-9ea0-7000-8000-000000000001")?;
+    assert_eq!(
+        canonical_install_request_hash(&request, host_id)?,
+        "6c1ab6cb89468c2092f7f15320bc824747b725d6ba142ec2a8ccc4af3e30261e"
+    );
     Ok(())
 }

@@ -3,6 +3,7 @@ mod clean_install;
 mod cli;
 mod conformance;
 pub mod controller_identity;
+mod digest;
 mod discover_adopt;
 mod error_codes;
 mod file_lock;
@@ -25,36 +26,21 @@ pub use cli::language::chinese_output;
 pub use cli::{GlobalOptions, parse_global_options};
 pub use conformance::{
     ConformanceControlCompletion, ConformanceControlOutcome, ConformanceDeploymentEvidence,
-    ConformanceRuntimeEvidence, ConformanceSession, ControlOperationIdentity,
-    OpenId4VpEvidenceVerifierInputs, configure_oidf,
+    ConformanceRuntimeEvidence, ConformanceSession, ControlOperationIdentity, configure_oidf,
 };
 pub use ui::{
     configure as configure_presentation, print_value as print_presentation_value,
     text as presentation_text,
 };
 
-pub fn main_entry() {
+pub fn main_entry(args: Vec<String>, globals: GlobalOptions) {
     use std::io::IsTerminal as _;
 
-    let args = match std::env::args_os()
-        .map(|argument| {
-            argument
-                .into_string()
-                .map_err(|_| "command-line arguments must be valid UTF-8")
-        })
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(args) => args,
-        Err(error) => {
-            print_entry_error("Argument parsing failed", error);
-            std::process::exit(2);
-        }
-    };
-    if let Some(topic) = cli::help_topic(&args) {
+    if let Some(topic) = cli::help_topic(&args, &globals) {
         print_help(topic);
         return;
     }
-    let cli = match cli::Cli::parse(args) {
+    let cli = match cli::Cli::parse(args, globals) {
         Ok(Some(cli)) => cli,
         Ok(None) => {
             print_help(cli::HelpTopic::TopLevel);
@@ -65,7 +51,7 @@ pub fn main_entry() {
             std::process::exit(2);
         }
     };
-    let action = command_action(&cli.command).to_owned();
+    let action = command_action(&cli.command);
     let json_mode = cli.json;
     ui::configure(json_mode);
     let envelope_context = cli::envelope::EnvelopeContext {
@@ -80,7 +66,7 @@ pub fn main_entry() {
             .is_none()
         {
             let envelope =
-                cli::envelope::render_failure(&action, &envelope_context, &error, json_mode);
+                cli::envelope::render_failure(action, &envelope_context, &error, json_mode);
             if !json_mode && std::io::stderr().is_terminal() {
                 let title = cli::language::text("Command failed", "命令执行失败");
                 let _ = cliclack::log::error(format!("{title}\n\n{envelope}"));

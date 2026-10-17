@@ -1647,8 +1647,8 @@ dependencies = [
 
 [[package]]
 name = "nazo-crypto"
-version = "0.2.16"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=c647e1d4f417350738ff20c8259e35225e405cc9#c647e1d4f417350738ff20c8259e35225e405cc9"
+version = "0.3.1"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=8ebcfff58f266b69946a99dc2a69bc3d30738803#8ebcfff58f266b69946a99dc2a69bc3d30738803"
 dependencies = [
  "ed25519-dalek",
  "thiserror",
@@ -1656,12 +1656,12 @@ dependencies = [
 
 [[package]]
 name = "nazo-operator-protocol"
-version = "0.2.16"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=c647e1d4f417350738ff20c8259e35225e405cc9#c647e1d4f417350738ff20c8259e35225e405cc9"
+version = "0.3.1"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=8ebcfff58f266b69946a99dc2a69bc3d30738803#8ebcfff58f266b69946a99dc2a69bc3d30738803"
 dependencies = [
  "base64 0.23.1",
- "chrono",
- "hmac",
+ "hex",
+ "hkdf",
  "nazo-crypto",
  "serde",
  "serde_json",
@@ -1674,9 +1674,9 @@ name = "nazoauthctl"
 version = "0.3.1"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
  "cliclack",
  "ctrlc",
+ "hex",
  "nazo-operator-protocol",
  "nazoauthctl-conformance",
  "nazoauthctl-core",
@@ -1696,12 +1696,12 @@ dependencies = [
  "anyhow",
  "aws-lc-rs",
  "base64 0.23.1",
+ "bytes",
  "chrono",
- "ed25519-dalek",
  "fs2",
+ "hex",
  "keyring",
  "keyring-core",
- "libc",
  "nazo-crypto",
  "nazo-operator-protocol",
  "nazoauthctl-runtime",
@@ -1717,7 +1717,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subtle",
  "thiserror",
  "time",
  "url",
@@ -1736,12 +1735,13 @@ dependencies = [
  "chrono",
  "cliclack",
  "fs2",
+ "hex",
  "http",
+ "http-body",
  "http-body-util",
  "hyper-rustls",
  "hyper-util",
  "instant-acme",
- "libc",
  "nazo-crypto",
  "nazo-operator-protocol",
  "nazoauthctl-runtime",
@@ -1771,8 +1771,8 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "atomic-write-file",
+ "hex",
  "libc",
- "nazo-operator-protocol",
  "rand",
  "rustix",
  "serde",
@@ -2361,9 +2361,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -2559,8 +2559,7 @@ dependencies = [
 [[package]]
 name = "serde_json"
 version = "1.0.151"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+source = "git+https://github.com/bymoye/json?rev=7a006a7f6984324a90382d799c0fcddd0bf9606f#7a006a7f6984324a90382d799c0fcddd0bf9606f"
 dependencies = [
  "itoa",
  "memchr",

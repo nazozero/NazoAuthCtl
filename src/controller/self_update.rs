@@ -12,7 +12,7 @@ use crate::filesystem::{
     read_secure_regular_file, remove_file_durable, sha256_file,
 };
 use crate::process::Process;
-use crate::release::compare_versions;
+use crate::release::{compare_versions, parse_release_version};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -105,17 +105,16 @@ impl CurrentSelfState for SelfUpdateJournal {
 }
 
 pub(super) fn controller_state_directory() -> anyhow::Result<PathBuf> {
-    let registry = crate::registry::RegistryStore::open_default()?;
-    Ok(registry.root().join("controller-self"))
+    Ok(crate::registry::RegistryStore::default_root()?.join("controller-self"))
 }
 
 pub(super) fn controller_check(version: Option<&str>) -> anyhow::Result<()> {
     let directory = controller_state_directory()?;
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
-    recover_controller_self_operation()?;
+    recover_controller_self_operation(&directory)?;
     let release = crate::release::VerifiedControllerRelease::verify(version)?;
-    enforce_controller_trust(&release.version, &release.sha256)?;
+    enforce_controller_trust(&directory, &release.version, &release.sha256)?;
     crate::ui::print_value(&json!({
         "installed": env!("CARGO_PKG_VERSION"),
         "candidate": release.version,
@@ -129,15 +128,15 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     let directory = controller_state_directory()?;
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
-    recover_controller_self_operation()?;
+    recover_controller_self_operation(&directory)?;
     let release = crate::release::VerifiedControllerRelease::verify(version)?;
-    enforce_controller_trust(&release.version, &release.sha256)?;
+    let previous_trust = enforce_controller_trust(&directory, &release.version, &release.sha256)?;
     release.persist_evidence(&directory.join("evidence").join(&release.version))?;
     let current = std::env::current_exe().context("failed to resolve the running controller")?;
     let install_path = controller_install_path(&current)?;
     let mut current_file = open_secure_regular_file(&install_path, "running controller", false)?;
     let previous_sha256 = sha256_file(&mut current_file, "running controller")?;
-    let previous_version = controller_trust_state()?
+    let previous_version = previous_trust
         .map(|state| state.version)
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
     let rollback_artifact = directory.join(format!("rollback-{previous_sha256}"));
@@ -158,15 +157,18 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     };
     persist_self_update_journal(&directory, &journal)?;
 
-    copy_atomic_from_file(&mut current_file, &rollback_artifact, 0o500)?;
-    ensure_digest(&rollback_artifact, &previous_sha256, "rollback artifact")?;
+    copy_atomic_from_file(
+        &mut current_file,
+        &rollback_artifact,
+        0o500,
+        Some(&previous_sha256),
+    )?;
     journal.phase = SelfUpdatePhase::RollbackPrepared;
     persist_self_update_journal(&directory, &journal)?;
 
     let mut candidate_file =
         open_secure_regular_file(&release.artifact(), "verified controller candidate", false)?;
-    copy_atomic_from_file(&mut candidate_file, &staged, 0o500)?;
-    ensure_digest(&staged, &release.sha256, "staged controller candidate")?;
+    copy_atomic_from_file(&mut candidate_file, &staged, 0o500, Some(&release.sha256))?;
     journal.phase = SelfUpdatePhase::CandidatePrepared;
     persist_self_update_journal(&directory, &journal)?;
     if let Err(error) = verify_candidate_state(&staged) {
@@ -177,8 +179,12 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     persist_self_update_journal(&directory, &journal)?;
 
     let mut staged_file = open_secure_regular_file(&staged, "staged controller candidate", false)?;
-    copy_atomic_from_file(&mut staged_file, &install_path, 0o755)?;
-    ensure_digest(&install_path, &release.sha256, "installed controller")?;
+    copy_atomic_from_file(
+        &mut staged_file,
+        &install_path,
+        0o755,
+        Some(&release.sha256),
+    )?;
     journal.phase = SelfUpdatePhase::Installed;
     persist_self_update_journal(&directory, &journal)?;
     if let Err(error) = verify_candidate_state(&install_path) {
@@ -209,7 +215,7 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
     let directory = controller_state_directory()?;
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
-    recover_controller_self_operation()?;
+    recover_controller_self_operation(&directory)?;
     let rollback_path = directory.join("rollback.json");
     if !current_self_state_is_present(&rollback_path, "controller rollback state")? {
         bail!(
@@ -230,7 +236,7 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
     let install_path = controller_install_path(&current)?;
     let mut current_file = open_secure_regular_file(&install_path, "running controller", false)?;
     let from_sha256 = sha256_file(&mut current_file, "running controller")?;
-    let from_version = controller_trust_state()?
+    let from_version = controller_trust_state(&directory)?
         .map(|value| value.version)
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
     let mut journal = SelfUpdateJournal {
@@ -239,7 +245,7 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
         operation: SelfUpdateOperation::Rollback,
         phase: SelfUpdatePhase::Intent,
         install_path: install_path.clone(),
-        from_version: from_version.clone(),
+        from_version,
         from_sha256,
         to_version: state.version.clone(),
         to_sha256: state.sha256.clone(),
@@ -250,8 +256,12 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
     persist_self_update_journal(&directory, &journal)?;
     let mut rollback_file =
         open_secure_regular_file(&state.artifact, "controller rollback artifact", false)?;
-    copy_atomic_from_file(&mut rollback_file, &install_path, 0o755)?;
-    ensure_digest(&install_path, &state.sha256, "restored controller")?;
+    copy_atomic_from_file(
+        &mut rollback_file,
+        &install_path,
+        0o755,
+        Some(&state.sha256),
+    )?;
     journal.phase = SelfUpdatePhase::Installed;
     persist_self_update_journal(&directory, &journal)?;
     write_controller_trust(&directory, &state.version, &state.sha256)?;
@@ -266,37 +276,43 @@ pub(super) fn controller_rollback() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn controller_trust_state() -> anyhow::Result<Option<ControllerTrustState>> {
-    let path = controller_state_directory()?.join("trust.json");
+fn controller_trust_state(directory: &Path) -> anyhow::Result<Option<ControllerTrustState>> {
+    let path = directory.join("trust.json");
     if !current_self_state_is_present(&path, "controller trust state")? {
         return Ok(None);
     }
     let state: ControllerTrustState = read_current_self_state(&path, "controller trust state")?;
     validate_digest(&state.sha256, "controller trust state digest")?;
-    compare_versions(&state.version, &state.version)?;
+    parse_release_version(&state.version)?;
     Ok(Some(state))
 }
 
-pub(super) fn enforce_controller_trust(version: &str, sha256: &str) -> anyhow::Result<()> {
+fn enforce_controller_trust(
+    directory: &Path,
+    version: &str,
+    sha256: &str,
+) -> anyhow::Result<Option<ControllerTrustState>> {
     validate_digest(sha256, "controller candidate digest")?;
-    let Some(state) = controller_trust_state()? else {
+    let Some(state) = controller_trust_state(directory)? else {
         // A missing trust file is the bootstrap case, not an unrestricted
         // update window.  The binary that is currently executing establishes
         // the initial version/digest floor until a durable trust state exists.
-        let current =
-            std::env::current_exe().context("failed to resolve the running controller")?;
-        let current = controller_install_path(&current)?;
         let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
-        let current_sha256 = secure_digest(&current, "running controller")?;
         match compare_versions(version, &current_version)? {
             std::cmp::Ordering::Less => {
                 bail!("controller anti-downgrade policy requires explicit self rollback")
             }
-            std::cmp::Ordering::Equal if sha256 != current_sha256 => {
-                bail!("immutable controller Release changed for the running version")
+            std::cmp::Ordering::Equal => {
+                let current =
+                    std::env::current_exe().context("failed to resolve the running controller")?;
+                let current = controller_install_path(&current)?;
+                if sha256 != secure_digest(&current, "running controller")? {
+                    bail!("immutable controller Release changed for the running version");
+                }
             }
-            _ => return Ok(()),
+            std::cmp::Ordering::Greater => {}
         }
+        return Ok(None);
     };
     match compare_versions(version, &state.version)? {
         std::cmp::Ordering::Less => {
@@ -305,7 +321,7 @@ pub(super) fn enforce_controller_trust(version: &str, sha256: &str) -> anyhow::R
         std::cmp::Ordering::Equal if state.sha256 != sha256 => {
             bail!("immutable controller Release changed for an already trusted version")
         }
-        _ => Ok(()),
+        _ => Ok(Some(state)),
     }
 }
 
@@ -342,17 +358,18 @@ pub(super) fn controller_install_path(current: &Path) -> anyhow::Result<PathBuf>
     {
         bail!("controller install path must be a normalized absolute file path");
     }
-    if path_is_present(&path)? {
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             bail!("controller install path must be a regular non-symlink file");
         }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect controller install path"),
     }
     Ok(path)
 }
 
-fn recover_controller_self_operation() -> anyhow::Result<()> {
-    let directory = controller_state_directory()?;
+fn recover_controller_self_operation(directory: &Path) -> anyhow::Result<()> {
     let path = directory.join("update-transaction.json");
     if !current_self_state_is_present(&path, "controller self-update journal")? {
         return Ok(());
@@ -380,8 +397,8 @@ fn recover_controller_self_operation() -> anyhow::Result<()> {
         bail!("controller self-update journal is bound to a different install path");
     }
     match journal.operation {
-        SelfUpdateOperation::Update => recover_update_journal(&directory, &mut journal)?,
-        SelfUpdateOperation::Rollback => recover_rollback_journal(&directory, &mut journal)?,
+        SelfUpdateOperation::Update => recover_update_journal(directory, &mut journal)?,
+        SelfUpdateOperation::Rollback => recover_rollback_journal(directory, &mut journal)?,
     }
     Ok(())
 }
@@ -393,7 +410,7 @@ pub(super) fn repair_interrupted_update() -> anyhow::Result<()> {
         return Ok(());
     }
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
-    recover_controller_self_operation()
+    recover_controller_self_operation(&directory)
 }
 
 /// Parse only: the candidate runs while its parent holds the self-update lock.
@@ -403,7 +420,7 @@ pub(super) fn validate_self_state(directory: &Path) -> anyhow::Result<()> {
         let state: ControllerTrustState =
             read_current_self_state(&trust, "controller trust state")?;
         validate_digest(&state.sha256, "controller trust digest")?;
-        compare_versions(&state.version, &state.version)?;
+        parse_release_version(&state.version)?;
     }
     let rollback = directory.join("rollback.json");
     if current_self_state_is_present(&rollback, "controller rollback state")? {
@@ -508,12 +525,12 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
                         "previous controller",
                         false,
                     )?;
-                    ensure_digest(
-                        &journal.rollback_artifact,
-                        &journal.from_sha256,
-                        "previous controller",
+                    copy_atomic_from_file(
+                        &mut previous,
+                        &journal.install_path,
+                        0o755,
+                        Some(&journal.from_sha256),
                     )?;
-                    copy_atomic_from_file(&mut previous, &journal.install_path, 0o755)?;
                 }
                 discard_unstarted_self_update_journal(directory, journal)?;
                 return Err(error);
@@ -525,11 +542,11 @@ fn recover_update_journal(directory: &Path, journal: &mut SelfUpdateJournal) -> 
                 "staged controller candidate",
                 false,
             )?;
-            copy_atomic_from_file(&mut staged_file, &journal.install_path, 0o755)?;
-            ensure_digest(
+            copy_atomic_from_file(
+                &mut staged_file,
                 &journal.install_path,
-                &journal.to_sha256,
-                "installed controller",
+                0o755,
+                Some(&journal.to_sha256),
             )?;
             journal.phase = SelfUpdatePhase::Installed;
             persist_self_update_journal(directory, journal)?;
@@ -601,11 +618,11 @@ fn recover_rollback_journal(
             "controller rollback artifact",
             false,
         )?;
-        copy_atomic_from_file(&mut artifact, &journal.install_path, 0o755)?;
-        ensure_digest(
+        copy_atomic_from_file(
+            &mut artifact,
             &journal.install_path,
-            &journal.to_sha256,
-            "restored controller",
+            0o755,
+            Some(&journal.to_sha256),
         )?;
         journal.phase = SelfUpdatePhase::Installed;
         persist_self_update_journal(directory, journal)?;
@@ -751,10 +768,17 @@ fn path_is_present(path: &Path) -> anyhow::Result<bool> {
 }
 
 fn optional_secure_digest(path: &Path, label: &str) -> anyhow::Result<Option<String>> {
-    if !path_is_present(path)? {
-        return Ok(None);
+    match open_secure_regular_file(path, label, false) {
+        Ok(mut file) => sha256_file(&mut file, label).map(Some),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
-    secure_digest(path, label).map(Some)
 }
 
 fn secure_digest(path: &Path, label: &str) -> anyhow::Result<String> {
@@ -763,7 +787,6 @@ fn secure_digest(path: &Path, label: &str) -> anyhow::Result<String> {
 }
 
 fn ensure_digest(path: &Path, expected: &str, label: &str) -> anyhow::Result<()> {
-    validate_digest(expected, label)?;
     let actual = secure_digest(path, label)?;
     if actual != expected {
         bail!("{label} digest differs from its trusted binding");
@@ -796,6 +819,45 @@ fn validate_bound_path(path: &Path, label: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_check_reuses_the_record_and_preserves_the_version_floor() -> anyhow::Result<()> {
+        let directory = crate::filesystem::PrivateTempDir::new("ctl-self-trust")?;
+        let digest = "a".repeat(64);
+        write_controller_trust(directory.path(), "v1.0.0", &digest)?;
+        let different_digest = "b".repeat(64);
+        for (version, candidate) in [
+            ("v0.9.0", digest.as_str()),
+            ("v1.0.0", different_digest.as_str()),
+        ] {
+            assert!(enforce_controller_trust(directory.path(), version, candidate).is_err());
+        }
+        let trust = enforce_controller_trust(directory.path(), "v1.1.0", &"b".repeat(64))?.unwrap();
+        assert_eq!(trust.version, "v1.0.0");
+        assert_eq!(trust.sha256, digest);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn isolated_update_test(name: &str) -> anyhow::Result<bool> {
+        if std::env::var("NAZOAUTHCTL_SELF_UPDATE_TEST").as_deref() == Ok(name) {
+            return Ok(false);
+        }
+        // Other test threads may fork while a fixture executable is being
+        // written, briefly inheriting its writable descriptor. Keep creation
+        // and execution in one isolated process, without retrying exec failures.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", name, "--nocapture"])
+            .env("NAZOAUTHCTL_SELF_UPDATE_TEST", name)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "isolated test failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(true)
+    }
 
     #[cfg(unix)]
     fn interrupted_update_fixture(
@@ -847,6 +909,11 @@ mod tests {
     #[test]
     fn incompatible_candidate_preserves_or_restores_the_previous_controller() -> anyhow::Result<()>
     {
+        if isolated_update_test(
+            "controller::self_update::tests::incompatible_candidate_preserves_or_restores_the_previous_controller",
+        )? {
+            return Ok(());
+        }
         for installed in [false, true] {
             let temp = crate::filesystem::PrivateTempDir::new("ctl-self-repair")?;
             let mut journal = interrupted_update_fixture(temp.path(), false, installed)?;
@@ -871,6 +938,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn compatible_interrupted_update_finishes_and_keeps_rollback() -> anyhow::Result<()> {
+        if isolated_update_test(
+            "controller::self_update::tests::compatible_interrupted_update_finishes_and_keeps_rollback",
+        )? {
+            return Ok(());
+        }
         let temp = crate::filesystem::PrivateTempDir::new("ctl-self-repair")?;
         let mut journal = interrupted_update_fixture(temp.path(), true, false)?;
         recover_update_journal(temp.path(), &mut journal)?;

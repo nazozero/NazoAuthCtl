@@ -1,13 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 pub const MATRIX_SCHEMA_VERSION: u32 = 1;
-pub const MAX_MATRIX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Versioned, machine-readable input to orchestration. The CLI never invents
 /// a plan expression or variant: every selected request must originate here.
@@ -54,113 +51,12 @@ pub struct MatrixPlan {
 }
 
 #[derive(Clone)]
-pub struct MatrixArtifact {
-    pub document: MatrixDocument,
-    digest: String,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MatrixSelection {
-    #[serde(default)]
-    pub groups: Vec<String>,
-    #[serde(default)]
-    pub profiles: Vec<String>,
-    #[serde(default)]
-    pub plans: Vec<String>,
-}
-
-#[derive(Clone)]
 pub struct SelectedMatrix {
     pub document: MatrixDocument,
     pub digest: String,
 }
 
-impl MatrixArtifact {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MatrixError> {
-        if bytes.len() > MAX_MATRIX_BYTES {
-            return Err(MatrixError::Oversize);
-        }
-        let document: MatrixDocument =
-            serde_json::from_slice(bytes).map_err(|_| MatrixError::Malformed)?;
-        validate_document(&document)?;
-        Ok(Self {
-            document,
-            digest: digest_hex(bytes),
-        })
-    }
-
-    pub fn from_path(path: &Path) -> Result<Self, MatrixError> {
-        let bytes =
-            crate::secure_file::read_bounded(path, MAX_MATRIX_BYTES, false).map_err(|error| {
-                match error {
-                    crate::secure_file::SecureFileError::Oversize => MatrixError::Oversize,
-                    crate::secure_file::SecureFileError::UnsafePath => MatrixError::UnsafePath,
-                    _ => MatrixError::Io,
-                }
-            })?;
-        Self::from_bytes(&bytes)
-    }
-
-    pub fn digest(&self) -> &str {
-        &self.digest
-    }
-
-    pub fn select(&self, selection: &MatrixSelection) -> Result<SelectedMatrix, MatrixError> {
-        SelectedMatrix {
-            document: self.document.clone(),
-            digest: self.digest.clone(),
-        }
-        .select(selection)
-    }
-}
-
 impl SelectedMatrix {
-    pub fn select(mut self, selection: &MatrixSelection) -> Result<Self, MatrixError> {
-        let groups_filter = filter_set(&selection.groups)?;
-        let profiles_filter = filter_set(&selection.profiles)?;
-        let plans_filter = filter_set(&selection.plans)?;
-        for wanted in &groups_filter {
-            if !self.document.groups.iter().any(|group| &group.id == wanted) {
-                return Err(MatrixError::UnknownSelection(wanted.clone()));
-            }
-        }
-        for wanted in &profiles_filter {
-            if !self
-                .document
-                .groups
-                .iter()
-                .any(|group| &group.profile == wanted)
-            {
-                return Err(MatrixError::UnknownSelection(wanted.clone()));
-            }
-        }
-        for wanted in &plans_filter {
-            if !self
-                .document
-                .groups
-                .iter()
-                .flat_map(|group| &group.plans)
-                .any(|plan| &plan.id == wanted)
-            {
-                return Err(MatrixError::UnknownSelection(wanted.clone()));
-            }
-        }
-        self.document.groups.retain(|group| {
-            (groups_filter.is_empty() || groups_filter.contains(&group.id))
-                && (profiles_filter.is_empty() || profiles_filter.contains(&group.profile))
-        });
-        for group in &mut self.document.groups {
-            group
-                .plans
-                .retain(|plan| plans_filter.is_empty() || plans_filter.contains(&plan.id));
-        }
-        self.document.groups.retain(|group| !group.plans.is_empty());
-        if self.document.groups.is_empty() {
-            return Err(MatrixError::EmptySelection);
-        }
-        Ok(self)
-    }
     /// Build a selected matrix from a trusted, already-materialized document.
     ///
     /// The digest is supplied by the caller because private configuration
@@ -205,7 +101,11 @@ impl MatrixDocument {
 impl MatrixGroup {
     pub fn effective_variant(&self, plan: &MatrixPlan) -> BTreeMap<String, String> {
         let mut values = self.variant.values.clone();
-        values.extend(plan.variant.clone());
+        values.extend(
+            plan.variant
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         values
     }
 
@@ -231,139 +131,27 @@ impl MatrixGroup {
                 ("fapi_response_mode".to_owned(), "plain_response".to_owned()),
             ]);
         }
-        values.extend(self.variant.values.clone());
-        values.extend(plan.variant.clone());
+        values.extend(
+            self.variant
+                .values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        values.extend(
+            plan.variant
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         values
     }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum MatrixError {
-    Io,
-    Oversize,
-    Malformed,
-    UnsupportedSchema(u32),
-    EmptyDocument,
-    DuplicateId(String),
-    EmptyField(&'static str),
-    ConfigNotObject(String),
-    UnsafePath,
-    EmptySelection,
-    UnknownSelection(String),
-}
-
-impl std::fmt::Display for MatrixError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io => formatter.write_str("matrix input could not be read"),
-            Self::Oversize => formatter.write_str("matrix input exceeds the size limit"),
-            Self::Malformed => formatter.write_str("matrix input is malformed JSON"),
-            Self::UnsupportedSchema(version) => {
-                write!(formatter, "unsupported matrix schema {version}")
-            }
-            Self::EmptyDocument => formatter.write_str("matrix has no groups or plans"),
-            Self::DuplicateId(id) => write!(formatter, "matrix contains duplicate id {id}"),
-            Self::EmptyField(field) => write!(formatter, "matrix field {field} must not be empty"),
-            Self::ConfigNotObject(id) => {
-                write!(formatter, "matrix plan {id} config must be a JSON object")
-            }
-            Self::UnsafePath => {
-                formatter.write_str("matrix input path is not a stable regular file")
-            }
-            Self::EmptySelection => formatter.write_str("matrix selection contains no groups"),
-            Self::UnknownSelection(value) => {
-                write!(formatter, "matrix selection is unknown: {value}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for MatrixError {}
-
-fn validate_document(document: &MatrixDocument) -> Result<(), MatrixError> {
-    if document.schema != MATRIX_SCHEMA_VERSION {
-        return Err(MatrixError::UnsupportedSchema(document.schema));
-    }
-    if document.name.trim().is_empty() {
-        return Err(MatrixError::EmptyField("name"));
-    }
-    if document.groups.is_empty() {
-        return Err(MatrixError::EmptyDocument);
-    }
-    let mut group_ids = BTreeSet::new();
-    let mut plan_ids = BTreeSet::new();
-    for group in &document.groups {
-        if group.id.trim().is_empty() {
-            return Err(MatrixError::EmptyField("groups.id"));
-        }
-        if group.profile.trim().is_empty() {
-            return Err(MatrixError::EmptyField("groups.profile"));
-        }
-        if group.variant.id.trim().is_empty() {
-            return Err(MatrixError::EmptyField("groups.variant.id"));
-        }
-        if group.plans.is_empty() {
-            return Err(MatrixError::EmptyField("groups.plans"));
-        }
-        if !group_ids.insert(group.id.clone()) {
-            return Err(MatrixError::DuplicateId(group.id.clone()));
-        }
-        for plan in &group.plans {
-            if plan.id.trim().is_empty() {
-                return Err(MatrixError::EmptyField("plans.id"));
-            }
-            if plan.plan.trim().is_empty() {
-                return Err(MatrixError::EmptyField("plans.plan"));
-            }
-            if !plan.config.is_object() {
-                return Err(MatrixError::ConfigNotObject(plan.id.clone()));
-            }
-            if !plan_ids.insert(plan.id.clone()) {
-                return Err(MatrixError::DuplicateId(plan.id.clone()));
-            }
-            if plan.expected_results.len() > 64
-                || plan.expected_results.iter().any(|(test_name, result)| {
-                    test_name.trim().is_empty()
-                        || test_name.len() > 256
-                        || test_name
-                            .chars()
-                            .any(|character| character.is_control() || character.is_whitespace())
-                        || result != "SKIPPED"
-                })
-            {
-                return Err(MatrixError::Malformed);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn filter_set(values: &[String]) -> Result<BTreeSet<String>, MatrixError> {
-    let mut set = BTreeSet::new();
-    for value in values {
-        if value.trim().is_empty() {
-            return Err(MatrixError::EmptyField("selection"));
-        }
-        if !set.insert(value.clone()) {
-            return Err(MatrixError::DuplicateId(value.clone()));
-        }
-    }
-    Ok(set)
-}
-
-fn digest_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture() -> Vec<u8> {
-        br#"{"schema":1,"name":"fixture","groups":[{"id":"g","profile":"oidc","variant":{"id":"v","values":{"mode":"plain"}},"plans":[{"id":"p","plan":"oidcc-basic-certification-test-plan","config":{"alias":"a"},"expected_results":{"oidcc-expected-skip":"SKIPPED"}}]}]}"#.to_vec()
+    fn fixture() -> SelectedMatrix {
+        SelectedMatrix::from_materialized(serde_json::from_slice(br#"{"schema":1,"name":"fixture","groups":[{"id":"g","profile":"oidc","variant":{"id":"v","values":{"mode":"plain"}},"plans":[{"id":"p","plan":"oidcc-basic-certification-test-plan","config":{"alias":"a"},"expected_results":{"oidcc-expected-skip":"SKIPPED"}}]}]}"#).unwrap(), "fixture-descriptor-digest".into())
     }
 
     #[test]
@@ -415,8 +203,8 @@ mod tests {
     }
 
     #[test]
-    fn digest_and_selection_are_stable() {
-        let artifact = MatrixArtifact::from_bytes(&fixture()).expect("matrix");
+    fn materialized_digest_and_expected_results_are_preserved() {
+        let artifact = fixture();
         assert_eq!(artifact.document.plan_count(), 1);
         assert_eq!(
             artifact.document.groups[0].plans[0]
@@ -425,70 +213,7 @@ mod tests {
                 .map(String::as_str),
             Some("SKIPPED")
         );
-        assert_eq!(
-            artifact
-                .select(&MatrixSelection::default())
-                .expect("selection")
-                .digest,
-            artifact.digest
-        );
-    }
-
-    #[test]
-    fn unknown_selection_is_rejected() {
-        let artifact = MatrixArtifact::from_bytes(&fixture()).expect("matrix");
-        let selection = MatrixSelection {
-            groups: vec!["missing".into()],
-            profiles: vec![],
-            plans: vec![],
-        };
-        assert!(matches!(
-            artifact.select(&selection),
-            Err(MatrixError::UnknownSelection(_))
-        ));
-    }
-
-    #[test]
-    fn plan_selection_filters_without_changing_the_descriptor_digest() {
-        let artifact = MatrixArtifact::from_bytes(&fixture()).expect("matrix");
-        let selected = artifact
-            .select(&MatrixSelection {
-                groups: vec![],
-                profiles: vec![],
-                plans: vec!["p".into()],
-            })
-            .expect("selection");
-        assert_eq!(selected.document.plan_count(), 1);
-        assert_eq!(selected.digest, artifact.digest);
-
-        assert!(matches!(
-            artifact.select(&MatrixSelection {
-                groups: vec![],
-                profiles: vec![],
-                plans: vec!["missing".into()],
-            }),
-            Err(MatrixError::UnknownSelection(_))
-        ));
-    }
-
-    #[test]
-    fn malformed_and_oversize_artifacts_are_rejected_before_selection() {
-        assert!(matches!(
-            MatrixArtifact::from_bytes(br#"{"#),
-            Err(MatrixError::Malformed)
-        ));
-        let bytes = vec![b' '; MAX_MATRIX_BYTES + 1];
-        assert!(matches!(
-            MatrixArtifact::from_bytes(&bytes),
-            Err(MatrixError::Oversize)
-        ));
-        let review = String::from_utf8(fixture())
-            .expect("utf8")
-            .replace("SKIPPED", "REVIEW");
-        assert!(matches!(
-            MatrixArtifact::from_bytes(review.as_bytes()),
-            Err(MatrixError::Malformed)
-        ));
+        assert_eq!(artifact.digest, "fixture-descriptor-digest");
     }
 
     #[test]

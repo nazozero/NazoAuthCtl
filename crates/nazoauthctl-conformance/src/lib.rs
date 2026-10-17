@@ -52,15 +52,12 @@ pub use artifact_plan::{
     open_bundled_oidf_driver_plan, resolve_bundled_oidf_plan_id, resolve_bundled_oidf_selection,
 };
 pub use browser::{
-    BrowserCommand, BrowserEntry, BrowserError, BrowserLimits, BrowserPolicy,
-    BrowserReviewScreenshotSource, BrowserRunnerState, BrowserSelector, BrowserTargetOrigin,
-    BrowserTask, ConformanceBinding, OpenId4VciError, OpenId4VciIssuerClient,
+    BrowserError, BrowserPolicy, BrowserReviewScreenshotSource, BrowserRunnerState,
+    BrowserTargetOrigin, ConformanceBinding, OpenId4VciError, OpenId4VciIssuerClient,
     OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VciModule, OpenId4VpCompletionOutcome,
-    OpenId4VpError, OpenId4VpEvidenceBindingDiagnostic, OpenId4VpEvidenceContext,
-    OpenId4VpEvidenceRunContext, OpenId4VpEvidenceVerifier, OpenId4VpPresentation,
-    OpenId4VpStartRequest, OpenId4VpVerificationEvidence, OpenId4VpVerificationReceiptProvenance,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, ReviewScreenshotMarker, parse_browser_entries,
-    parse_browser_entries_owned,
+    OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest,
+    OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier, OpenId4VpVerifierClient,
+    ReviewScreenshotMarker,
 };
 pub use ciba_approval::{
     CibaApprovalFailureStage, CibaUserApprovalClient, CibaUserApprovalError, ciba_approval_requests,
@@ -73,9 +70,8 @@ pub use credentials::{BearerToken, CredentialStore, CredentialStoreError};
 pub use evidence::{
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
     EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceError, EvidenceRuntimeIdentity,
-    EvidenceSourceIdentity, ReviewScreenshotManifestReceipt, validate_ordinary_control_identity,
-    validate_private_evidence_directory, write_private_control_evidence_bundle,
-    write_review_screenshot_manifest,
+    EvidenceSourceIdentity, validate_private_evidence_directory,
+    write_private_control_evidence_bundle,
 };
 pub use materializer::{
     ArtifactMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
@@ -85,8 +81,7 @@ pub use materializer::{
     TenantResourceManifestResource, TenantResourceMaterializedMatrix,
 };
 pub use matrix::{
-    MATRIX_SCHEMA_VERSION, MAX_MATRIX_BYTES, MatrixArtifact, MatrixDocument, MatrixError,
-    MatrixGroup, MatrixPlan, MatrixSelection, MatrixVariant, SelectedMatrix,
+    MATRIX_SCHEMA_VERSION, MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix,
 };
 pub use orchestrator::{
     BOUNDED_PLAN_RUNNER_PROTOCOL, ConformanceAutomation, ConformanceRunConfig, ConformanceRunner,
@@ -98,7 +93,7 @@ pub use progress::{
     GroupProgress, GroupStatus, OutputLanguage, ProgressActivity, ProgressEvent, ProgressSink,
     ProgressSnapshot, StableRenderer, activity_label, current_matrix_label, redacted_variant,
 };
-pub use proxy_trust::ProxyTrustGuard;
+pub use proxy_trust::recover_proxy_trust;
 pub use recovery::{
     ConformanceProxyRecovery, ConformanceRecoveryGuard, ConformanceRecoveryStore,
     OpenId4VpEvidenceTrustAnchor, SuiteRecoveryState, SuiteRetentionCommitResolution,

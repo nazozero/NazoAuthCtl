@@ -44,7 +44,6 @@ use super::admin_api::{
 use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
 use crate::file_lock::FileLock;
 use crate::filesystem;
-use crate::fleet::resolve_instance;
 use crate::registry::RegistryStore;
 
 const PENDING_RECOVERY_SCHEMA: u32 = 1;
@@ -73,19 +72,22 @@ fn load_pending_recovery(
     deployment_id: &str,
 ) -> anyhow::Result<Option<PendingRecovery>> {
     let path = pending_recovery_path(keys, deployment_id)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    }
-    let bytes = filesystem::read_secure_regular_file(
+    let bytes = match filesystem::read_secure_regular_file(
         &path,
         "pending recovery submission",
         false,
         MAX_PENDING_RECOVERY_BYTES,
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let pending: PendingRecovery = serde_json::from_slice(&bytes)
         .with_context(|| format!("pending recovery submission is invalid: {}", path.display()))?;
     if pending.schema != PENDING_RECOVERY_SCHEMA
@@ -111,9 +113,6 @@ fn save_pending_recovery(
 
 fn clear_pending_recovery(keys: &ControllerKeyStore, deployment_id: &str) -> anyhow::Result<()> {
     let path = pending_recovery_path(keys, deployment_id)?;
-    if std::fs::symlink_metadata(&path).is_err() {
-        return Ok(());
-    }
     filesystem::remove_file_durable(&path)
         .with_context(|| format!("failed to clear {}", path.display()))
 }
@@ -385,7 +384,6 @@ pub(crate) fn rotate_root_with_new_secret(
         .map_err(|error| anyhow::anyhow!("{error}"))
         .context("reading the current recovery root failed; nothing was changed")?;
     let previous = view.generation;
-    let _ = view.present; // rotation over an existing root IS the D12 use case
 
     let material = generate_material(deployment_id);
     // P0-4: deliver BEFORE anything irreversible. If delivery fails or is
@@ -394,10 +392,11 @@ pub(crate) fn rotate_root_with_new_secret(
         "replacement secret delivery failed; no approval was issued and nothing changed",
     )?;
 
+    let recovery_public_key = b64(&material.public_key);
     let approval = api
         .issue_recovery_root_approval(&RecoveryRootApprovalBody {
             deployment_id: deployment_id.to_owned(),
-            recovery_public_key: b64(&material.public_key),
+            recovery_public_key: recovery_public_key.clone(),
             kid: material.kid.clone(),
         })
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -408,7 +407,7 @@ pub(crate) fn rotate_root_with_new_secret(
         .rotate_recovery_root(&RecoveryRootRotateBody {
             approval_token: token,
             deployment_id: deployment_id.to_owned(),
-            recovery_public_key: b64(&material.public_key),
+            recovery_public_key,
             kid: material.kid.clone(),
         })
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -444,8 +443,6 @@ pub(crate) struct RecoveredIdentity {
 ///
 /// * the candidate controller key exists ONLY locally (inactive) until the
 ///   server commits — a refused challenge leaves no active identity;
-/// * the answer is self-checked against the proposal before submission so a
-///   client bug cannot burn one of the server's five attempts;
 /// * local activation + registry binding happen strictly AFTER the server's
 ///   authoritative commit, and both are derivable from the server state
 ///   (rerunning after a crash reconciles instead of duplicating).
@@ -453,15 +450,12 @@ pub(crate) fn recover_controller_identity(
     registry: &RegistryStore,
     keys: &ControllerKeyStore,
     api: &dyn ControllerRegistryApi,
-    selector: Option<&str>,
+    deployment_id: &str,
     old_secret_text: &str,
     label: &str,
     delivery: &dyn ReplacementSecretDelivery,
 ) -> anyhow::Result<RecoveredIdentity> {
-    let action = "controller recovery";
-    let record = resolve_instance(registry, selector, action)?;
-    let deployment_id = record.deployment_id.clone();
-    let instance_dir = keys.instance_dir(&deployment_id)?;
+    let instance_dir = keys.instance_dir(deployment_id)?;
     filesystem::ensure_private_directory(&instance_dir, "controller key directory")?;
     let _recovery_lock = FileLock::acquire(&instance_dir.join("recovery.lock"))?;
 
@@ -469,7 +463,7 @@ pub(crate) fn recover_controller_identity(
     // committed. Resume the exact persisted answer before deriving or
     // generating any new authority. The server returns the atomic receipt
     // only when the signature hash matches the accepted submission.
-    if let Some(pending) = load_pending_recovery(keys, &deployment_id)? {
+    if let Some(pending) = load_pending_recovery(keys, deployment_id)? {
         return submit_pending_recovery(registry, keys, api, &pending);
     }
 
@@ -477,16 +471,16 @@ pub(crate) fn recover_controller_identity(
     // immediately reduced to the derived (zeroizing) seed.
     let mut old_secret = parse_recovery_secret(old_secret_text)
         .map_err(|error| anyhow::anyhow!("{error}: the recovery secret did not parse"))?;
-    let old_seed = Zeroizing::new(derive_recovery_seed(&old_secret, &deployment_id));
+    let old_seed = Zeroizing::new(derive_recovery_seed(&old_secret, deployment_id));
     old_secret.zeroize();
 
     // Replacement root travels inside the signed proposal so the old secret
     // stops verifying the moment the commit lands.
-    let replacement = generate_material(&deployment_id);
+    let replacement = generate_material(deployment_id);
 
     // Candidate controller key: persisted inactive until the commit lands.
     let candidate = keys
-        .generate_candidate(&deployment_id)
+        .generate_candidate(deployment_id)
         .context("staging the recovered controller key failed; nothing was sent")?;
     let candidate_public: [u8; 32] = URL_SAFE_NO_PAD
         .decode(candidate.public_key.as_bytes())
@@ -495,7 +489,7 @@ pub(crate) fn recover_controller_identity(
         .map_err(|_| anyhow::anyhow!("stored candidate public key is not 32 bytes"))?;
 
     let proposal = RecoveryProposal {
-        deployment_id: deployment_id.clone(),
+        deployment_id: deployment_id.to_owned(),
         controller_label: label.to_owned(),
         controller_kid: candidate.kid.clone(),
         controller_public_key: candidate_public,
@@ -515,9 +509,9 @@ pub(crate) fn recover_controller_identity(
 
     let challenge = api
         .issue_recovery_challenge(&RecoveryChallengeBody {
-            deployment_id: deployment_id.clone(),
+            deployment_id: deployment_id.to_owned(),
             label: label.to_owned(),
-            controller_public_key: b64(&candidate_public),
+            controller_public_key: candidate.public_key,
             kid: candidate.kid.clone(),
             recovery_public_key: b64(&replacement.public_key),
             recovery_kid: replacement.kid.clone(),
@@ -541,10 +535,10 @@ pub(crate) fn recover_controller_identity(
 
     let pending = PendingRecovery {
         schema: PENDING_RECOVERY_SCHEMA,
-        deployment_id: deployment_id.clone(),
+        deployment_id: deployment_id.to_owned(),
         candidate_kid: candidate.kid,
         answer: RecoveryAnswerBody {
-            deployment_id,
+            deployment_id: deployment_id.to_owned(),
             challenge_id: challenge.challenge_id,
             nonce: b64(&challenge.nonce),
             signature: b64(&signature),
@@ -603,7 +597,7 @@ mod tests {
                 .unwrap()
                 .push(Ok(AdminHttpResponse {
                     status,
-                    body: body.as_bytes().to_vec(),
+                    body: bytes::Bytes::copy_from_slice(body.as_bytes()).into(),
                     set_cookie_headers: Vec::new(),
                 }));
         }
@@ -647,7 +641,11 @@ mod tests {
                 .unwrap()
                 .pop()
                 .expect("no canned response left")?;
-            let body = String::from_utf8_lossy(&response.body);
+            let body = response
+                .body
+                .json::<serde_json::Value>()
+                .map(|value| value.to_string())
+                .unwrap_or_default();
             if body.contains("candidate-kid-from-server") {
                 let challenge_body = self
                     .inner
@@ -667,7 +665,8 @@ mod tests {
                     .expect("challenge request carries candidate kid");
                 response.body = body
                     .replace("candidate-kid-from-server", &challenge_body)
-                    .into_bytes();
+                    .into_bytes()
+                    .into();
             }
             Ok(response)
         }
@@ -837,7 +836,7 @@ mod tests {
             &fixture.registry,
             &fixture.keys,
             &canned_api(canned.clone()),
-            Some("prod"),
+            DEPLOYMENT,
             &old.display,
             "ops laptop",
             &delivery,
@@ -955,7 +954,7 @@ mod tests {
             &fixture.registry,
             &fixture.keys,
             &canned_api(canned.clone()),
-            Some("prod"),
+            DEPLOYMENT,
             "not-a-secret",
             "ops",
             &delivery,
@@ -987,7 +986,7 @@ mod tests {
             &fixture.registry,
             &fixture.keys,
             &canned_api(first.clone()),
-            Some("prod"),
+            DEPLOYMENT,
             &old.display,
             "recovered",
             &delivered,
@@ -1025,7 +1024,7 @@ mod tests {
             &fixture.registry,
             &fixture.keys,
             &canned_api(resumed.clone()),
-            Some("prod"),
+            DEPLOYMENT,
             "the old secret is not consulted while resuming",
             "ignored",
             &no_second_delivery,

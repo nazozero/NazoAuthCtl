@@ -222,6 +222,7 @@ pub(crate) struct UpdateJob<'a> {
     /// release version, when the target recorded one.
     pub current_version: Option<&'a str>,
     pub expected_revision: u64,
+    pub applied_migration_operation_id: Option<&'a str>,
     pub artifact: &'a OfficialArtifactRef,
     pub config: Option<&'a StagedConfig>,
     pub migration_jws: Option<&'a str>,
@@ -296,7 +297,7 @@ pub(crate) struct PerformedSteps {
     pub(crate) snapshotted_config: bool,
     pub(crate) wrote_config: bool,
     pub(crate) replaced_runtime: bool,
-    pub(crate) config_before_rollback: Option<Vec<u8>>,
+    pub(crate) config_before_rollback: Option<zeroize::Zeroizing<Vec<u8>>>,
     pub(crate) migration_applied: bool,
     pub(crate) migration_outcome_unknown: bool,
     pub(crate) migration_result: Option<nazo_operator_protocol::ControlResult>,
@@ -310,14 +311,8 @@ pub(crate) struct HostLifecycleExecutor;
 
 impl LifecycleExecutor for HostLifecycleExecutor {
     fn execute_update(&self, job: &UpdateJob<'_>) -> Result<UpdateExecution, Failure> {
-        let migration = job
-            .store
-            .load_existing(job.deployment_id)?
-            .applied_migration;
-        if migration
-            .as_ref()
-            .is_some_and(|migration| migration.operation_id != job.operation_id)
-        {
+        let migration = job.applied_migration_operation_id;
+        if migration.is_some_and(|operation_id| operation_id != job.operation_id) {
             return Err(Failure::new(
                 super::deployment_state::ROLLBACK_RECOVERY_REQUIRED,
                 "another operation has already applied a migration; resume that operation or recover a verified backup",
@@ -408,6 +403,15 @@ impl HostLifecycleExecutor {
         let backend = runtime_backend::backend(kind);
         privilege_gate(kind)?;
 
+        if let Some(staged) = job.config
+            && sha256_hex(staged.content.as_bytes()) != staged.sha256
+        {
+            return Err(Failure::new(
+                super::install_exec::CONFIG_INVALID,
+                "staged config content does not match its declared digest",
+            ));
+        }
+
         // 0. The live object's deployment ownership is the authority.
         // Container artifact drift can be reconciled from its immutable live
         // reference; a systemd executable cannot serve as its own rollback
@@ -421,7 +425,7 @@ impl HostLifecycleExecutor {
             )
         })?;
         let recorded_current_was_live =
-            require_host_artifact_continuity(kind, &live_digest, job.current_artifact)?;
+            require_host_artifact_continuity(kind, live_digest, job.current_artifact)?;
 
         // 1. Verify + pull the selected official artifact (download-on-target;
         // re-running verify/pull is idempotent for interrupted resumes).
@@ -433,7 +437,7 @@ impl HostLifecycleExecutor {
             version_floor_for_update(job.artifact, job.current_version),
             job.runtime_root,
         )?;
-        let new_digest = verified.digest.clone();
+        let new_digest = verified.digest.as_str();
 
         // Verification is the target's authority. Once it proves that the
         // selected digest is already current and no config was staged, the
@@ -441,9 +445,9 @@ impl HostLifecycleExecutor {
         // rollback generation, or advance the config revision.
         if !performed.migration_applied
             && update_is_noop(
-                &live_digest,
+                live_digest,
                 job.current_artifact,
-                &new_digest,
+                new_digest,
                 job.config.is_some(),
             )
         {
@@ -451,45 +455,46 @@ impl HostLifecycleExecutor {
                 revision: job.expected_revision,
             });
         }
-        let config_bytes = match job.config {
-            Some(config) => zeroize::Zeroizing::new(config.content.as_bytes().to_vec()),
-            None => filesystem::read_secure_regular_file(
-                Path::new(job.config_reference),
-                "deployment configuration",
-                false,
-                super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
-            )
-            .map_err(|error| {
-                Failure::new(
-                    super::install_exec::CONFIG_INVALID,
-                    sanitize(error.to_string()),
+        let config_bytes;
+        let (config_text, current_config) = match job.config {
+            Some(config) => (config.content.as_str(), None),
+            None => {
+                config_bytes = filesystem::read_secure_regular_file(
+                    Path::new(job.config_reference),
+                    "deployment configuration",
+                    false,
+                    super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
                 )
-            })?,
+                .map_err(|error| {
+                    Failure::new(
+                        super::install_exec::CONFIG_INVALID,
+                        sanitize(error.to_string()),
+                    )
+                })?;
+                let text = std::str::from_utf8(&config_bytes).map_err(|_| {
+                    Failure::new(
+                        super::install_exec::CONFIG_INVALID,
+                        "deployment configuration must be UTF-8",
+                    )
+                })?;
+                (text, Some(config_bytes.as_slice()))
+            }
         };
-        let config_text = std::str::from_utf8(&config_bytes).map_err(|_| {
-            Failure::new(
-                super::install_exec::CONFIG_INVALID,
-                "deployment configuration must be UTF-8",
-            )
-        })?;
         require_shared_signing_key_root(job.secrets_root, config_text, kind, &observation.mounts)?;
         // Build and validate the executable replacement before any migration
         // can mutate external state. Activation consumes this exact plan.
-        let replacement = runtime_replacement_required(
-            Some(live_digest.as_str()),
-            &new_digest,
-            job.config.is_some(),
-        )
-        .then(|| {
-            let mut replacement = replacement_from_observation(
-                &observation,
-                job.runtime_object,
-                &verified.runtime_artifact,
-            )?;
-            replacement.local_artifact_id = None;
-            Ok::<_, Failure>(replacement)
-        })
-        .transpose()?;
+        let replacement =
+            runtime_replacement_required(Some(live_digest), new_digest, job.config.is_some())
+                .then(|| {
+                    let mut replacement = replacement_from_observation(
+                        &observation,
+                        job.runtime_object,
+                        &verified.runtime_artifact,
+                    )?;
+                    replacement.local_artifact_id = None;
+                    Ok::<_, Failure>(replacement)
+                })
+                .transpose()?;
 
         if replacement.is_some() && kind.is_container() {
             performed.runtime_before_update = Some(exact_replacement_from_observation(
@@ -508,6 +513,7 @@ impl HostLifecycleExecutor {
                 job.config_reference,
                 job.config_schema,
                 job.config.map(|staged| staged.schema.as_str()),
+                current_config,
             )
             .map_err(|error| {
                 Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
@@ -518,12 +524,6 @@ impl HostLifecycleExecutor {
         // 3. Stage the new config when present (atomic replace, digest-gated).
         if let Some(staged) = job.config {
             let content_bytes = staged.content.as_bytes();
-            if sha256_hex(content_bytes) != staged.sha256 {
-                return Err(Failure::new(
-                    super::install_exec::CONFIG_INVALID,
-                    "staged config content does not match its declared digest",
-                ));
-            }
             filesystem::atomic_write(Path::new(job.config_reference), content_bytes, 0o600)
                 .map_err(|error| {
                     Failure::new(
@@ -540,7 +540,6 @@ impl HostLifecycleExecutor {
         }
 
         // 3.5. Application migration: run one-shot task using the VERIFIED target artifact.
-        let mut migration_result = None;
         if let Some(migration_jws) = job.migration_jws {
             let request_hash = job.migration_request_hash.ok_or_else(|| {
                 Failure::new(
@@ -557,7 +556,7 @@ impl HostLifecycleExecutor {
             let transient_credentials = BTreeMap::new();
             let mounts = observation
                 .mounts
-                .iter()
+                .into_iter()
                 .filter(|mount| {
                     matches!(
                         mount.destination.to_str(),
@@ -575,7 +574,6 @@ impl HostLifecycleExecutor {
                                     .any(|purpose| name == *purpose)
                         })
                 })
-                .cloned()
                 .collect();
             let runtime_role = runtime_database_role(job.secrets_root)?;
             let lifecycle_url = lifecycle_database_url(job.secrets_root)?;
@@ -617,12 +615,12 @@ impl HostLifecycleExecutor {
                 );
             }
             let task = runtime_backend::OneShotTask {
-                artifact: verified.runtime_artifact.clone(),
+                artifact: verified.runtime_artifact,
                 command: vec!["nazoauth".to_owned(), "operator-task".to_owned()],
                 network: if host {
                     Some("host".to_owned())
                 } else {
-                    observation.networks.first().cloned()
+                    observation.networks.into_iter().next()
                 },
                 mounts,
                 environment,
@@ -650,7 +648,7 @@ impl HostLifecycleExecutor {
             validate_migration_result(job.operation_id, request_hash, &control_result)?;
             match control_result.outcome {
                 nazo_operator_protocol::ControlOutcome::Succeeded => {
-                    performed.migration_result = Some(control_result.clone());
+                    performed.migration_result = Some(control_result);
                     performed.migration_applied = true;
                     performed.migration_outcome_unknown = false;
                     job.store.record_migration_applied(
@@ -659,7 +657,6 @@ impl HostLifecycleExecutor {
                         job.operation_id,
                         &format!("sha256:{new_digest}"),
                     )?;
-                    migration_result = Some(control_result);
                 }
                 nazo_operator_protocol::ControlOutcome::Failed => {
                     performed.migration_outcome_unknown = false;
@@ -697,9 +694,7 @@ impl HostLifecycleExecutor {
         // 5. Embedded identity check: the running object must now report the
         // verified digest and be running.
         let activated = live_observation(backend.as_ref(), job.runtime_object)?;
-        if !activated.running
-            || observation_digest(&activated).as_deref() != Some(new_digest.as_str())
-        {
+        if !activated.running || observation_digest(&activated) != Some(new_digest) {
             return Err(Failure::new(
                 TARGET_IDENTITY_MISMATCH,
                 "the started runtime does not serve the verified artifact",
@@ -717,7 +712,7 @@ impl HostLifecycleExecutor {
             job.expected_revision,
             super::deployment_state::UpdateCommit {
                 artifact: format!("sha256:{new_digest}"),
-                release: Some(verified.release.clone()),
+                release: Some(verified.release),
                 config: staged_config_change(job.config_reference, job.config),
                 operation_id: job.operation_id.to_owned(),
             },
@@ -725,8 +720,8 @@ impl HostLifecycleExecutor {
         )?;
         Ok(UpdateExecution::Activated(LifecycleFacts {
             revision: state.config.revision,
-            release: Some(verified.release),
-            migration_result,
+            release: state.current_release,
+            migration_result: performed.migration_result.take(),
         }))
     }
 
@@ -827,8 +822,7 @@ impl HostLifecycleExecutor {
                         super::install_exec::CONFIG_INVALID,
                         sanitize(error.to_string()),
                     )
-                })?
-                .to_vec(),
+                })?,
             );
             filesystem::atomic_write(Path::new(job.config_reference), bytes, 0o600).map_err(
                 |error| {
@@ -862,9 +856,7 @@ impl HostLifecycleExecutor {
 
         // 4. Identity + local health gates.
         let activated = live_observation(backend.as_ref(), job.runtime_object)?;
-        if !activated.running
-            || observation_digest(&activated).as_deref() != Some(previous_digest.as_str())
-        {
+        if !activated.running || observation_digest(&activated) != Some(previous_digest.as_str()) {
             return Err(Failure::new(
                 TARGET_IDENTITY_MISMATCH,
                 "the rolled-back runtime does not serve the previous verified artifact",
@@ -983,6 +975,77 @@ mod tests {
     use nazo_operator_protocol::{ControlOutcome, ControlResult, ControlResultData};
 
     const OPERATION_ID: &str = "01900000-0000-7000-8000-000000000001";
+
+    #[test]
+    fn host_artifact_copy_rejects_changed_bytes_without_replacing_cached_binary()
+    -> anyhow::Result<()> {
+        let temp = filesystem::PrivateTempDir::new("host-artifact-copy")?;
+        let source = temp.path().join("candidate");
+        let runtime_root = temp.path().join("runtime");
+        filesystem::atomic_write(&source, b"verified", 0o600)?;
+        let digest = sha256_hex(b"verified");
+        let cached = cache_systemd_artifact(&source, &runtime_root, &digest)?;
+        filesystem::atomic_write(&source, b"changed", 0o600)?;
+        assert!(cache_systemd_artifact(&source, &runtime_root, &digest).is_err());
+        assert_eq!(std::fs::read(cached)?, b"verified");
+        Ok(())
+    }
+
+    #[test]
+    fn config_snapshot_reuses_current_bytes_and_preserves_resumed_generation() -> anyhow::Result<()>
+    {
+        let temp = filesystem::PrivateTempDir::new("update-config-snapshot")?;
+        let config = temp.path().join("config.yaml");
+        let reference = config.to_str().unwrap();
+        snapshot_config(
+            temp.path(),
+            OPERATION_ID,
+            reference,
+            "v1",
+            Some("v2"),
+            Some(b"original"),
+        )?;
+        assert_eq!(
+            read_restorable_snapshot(temp.path(), "v2")?
+                .unwrap()
+                .0
+                .as_slice(),
+            b"original"
+        );
+
+        // A resumed update can already see the staged configuration. Its saved
+        // rollback generation must survive even when the live file is absent.
+        snapshot_config(
+            temp.path(),
+            OPERATION_ID,
+            reference,
+            "v1",
+            Some("v2"),
+            Some(b"staged"),
+        )?;
+        snapshot_config(temp.path(), OPERATION_ID, reference, "v1", Some("v2"), None)?;
+        assert_eq!(
+            read_restorable_snapshot(temp.path(), "v2")?
+                .unwrap()
+                .0
+                .as_slice(),
+            b"original"
+        );
+
+        filesystem::atomic_write(&temp.path().join(SNAPSHOT_BYTES_FILE), b"tampered", 0o600)?;
+        assert!(
+            snapshot_config(
+                temp.path(),
+                OPERATION_ID,
+                reference,
+                "v1",
+                Some("v2"),
+                Some(b"original")
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn migration_runtime_role_comes_from_the_existing_runtime_database_url() -> anyhow::Result<()> {
@@ -1520,12 +1583,12 @@ fn live_observation(
 /// The digest half of an Oci observation reference (`sha256:` stripped).
 pub(crate) fn observation_digest(
     observation: &runtime_backend::RuntimeObservation,
-) -> Option<String> {
+) -> Option<&str> {
     match &observation.artifact {
         runtime_backend::ArtifactReference::Oci { digest, .. } => {
-            Some(digest.trim_start_matches("sha256:").to_owned())
+            Some(digest.trim_start_matches("sha256:"))
         }
-        runtime_backend::ArtifactReference::HostBinary { sha256, .. } => Some(sha256.clone()),
+        runtime_backend::ArtifactReference::HostBinary { sha256, .. } => Some(sha256),
         runtime_backend::ArtifactReference::Unknown => None,
     }
 }
@@ -1602,7 +1665,7 @@ fn require_observation_serves(
             format!(
                 "runtime object serves {} while the deployment state records {}",
                 sanitize(digest),
-                sanitize(expected.to_owned())
+                sanitize(expected)
             ),
         ));
     }
@@ -1682,28 +1745,19 @@ pub(crate) fn verify_pinned_artifact_facts(
                         )
                     })?;
                 let source = Path::new(host_binary_path);
-                let observed_digest = filesystem::sha256(source).map_err(|error| {
-                    Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        sanitize(error.to_string()),
-                    )
-                })?;
-                if observed_digest != host_binary_sha256 {
-                    return Err(Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        "local pre-release host binary does not match its content digest",
-                    ));
-                }
                 let cached =
-                    cache_systemd_artifact(source, Path::new(runtime_root), &observed_digest)
+                    cache_systemd_artifact(source, Path::new(runtime_root), host_binary_sha256)
                         .map_err(|error| {
-                            Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
+                            Failure::new(
+                                super::install_exec::ARTIFACT_UNVERIFIED,
+                                sanitize(format!("{error:#}")),
+                            )
                         })?;
                 (
-                    observed_digest.clone(),
+                    host_binary_sha256.to_owned(),
                     runtime_backend::ArtifactReference::HostBinary {
                         path: cached,
-                        sha256: observed_digest,
+                        sha256: host_binary_sha256.to_owned(),
                     },
                 )
             }
@@ -1762,29 +1816,15 @@ pub(crate) fn verify_pinned_artifact_facts(
                     "systemd deployment state has no app-binary directory resource",
                 )
             })?;
-            let source = release
-                .artifact("binary", &artifact.repository)
-                .map_err(|error| {
-                    Failure::new(
-                        super::install_exec::ARTIFACT_UNVERIFIED,
-                        sanitize(error.to_string()),
-                    )
-                })?;
-            let digest = filesystem::sha256(&source).map_err(|error| {
-                Failure::new(
-                    super::install_exec::ARTIFACT_UNVERIFIED,
-                    sanitize(error.to_string()),
-                )
-            })?;
-            let cached = cache_systemd_artifact(&source, Path::new(runtime_root), &digest)
-                .map_err(|error| {
-                    Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
-                })?;
+            let (source, digest) = release.binary_artifact();
+            let cached = cache_systemd_artifact(&source, Path::new(runtime_root), digest).map_err(
+                |error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())),
+            )?;
             (
-                digest.clone(),
+                digest.to_owned(),
                 runtime_backend::ArtifactReference::HostBinary {
                     path: cached,
-                    sha256: digest,
+                    sha256: digest.to_owned(),
                 },
             )
         }
@@ -1983,6 +2023,7 @@ fn snapshot_config(
     config_reference: &str,
     current_schema: &str,
     replacing_schema: Option<&str>,
+    current_config: Option<&[u8]>,
 ) -> anyhow::Result<()> {
     let meta_path = scope_dir.join(SNAPSHOT_META_FILE);
     let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
@@ -2013,17 +2054,24 @@ fn snapshot_config(
             return Ok(());
         }
     }
-    let bytes = filesystem::read_secure_regular_file(
-        Path::new(config_reference),
-        "deployment configuration",
-        false,
-        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
-    )?;
-    filesystem::atomic_write(&bytes_path, &bytes, 0o600)?;
+    let current_bytes;
+    let bytes = match current_config {
+        Some(bytes) => bytes,
+        None => {
+            current_bytes = filesystem::read_secure_regular_file(
+                Path::new(config_reference),
+                "deployment configuration",
+                false,
+                super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
+            )?;
+            &current_bytes
+        }
+    };
+    filesystem::atomic_write(&bytes_path, bytes, 0o600)?;
     let meta = ConfigSnapshotMeta {
         schema: SNAPSHOT_META_SCHEMA,
         operation_id: operation_id.to_owned(),
-        content_sha256: sha256_hex(&bytes),
+        content_sha256: sha256_hex(bytes),
         config_schema: current_schema.to_owned(),
         replaced_by_schema: replacing_schema.map(str::to_owned),
     };
@@ -2037,7 +2085,7 @@ fn snapshot_config(
 fn read_restorable_snapshot(
     scope_dir: &Path,
     live_schema: &str,
-) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+) -> anyhow::Result<Option<(zeroize::Zeroizing<Vec<u8>>, String)>> {
     let meta_path = scope_dir.join(SNAPSHOT_META_FILE);
     let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
     if !meta_path.exists() || !bytes_path.exists() {
@@ -2072,7 +2120,7 @@ fn read_restorable_snapshot(
     if sha256_hex(&bytes) != meta.content_sha256 {
         anyhow::bail!("config snapshot bytes no longer match their recorded digest");
     }
-    Ok(Some((bytes.to_vec(), meta.config_schema)))
+    Ok(Some((bytes, meta.config_schema)))
 }
 
 fn staged_config_change(
@@ -2283,7 +2331,7 @@ fn grant_runtime_config_read(
             )),
         )
     })?;
-    super::install_exec::set_runtime_identity(path, false, preserve_owner)
+    super::install_exec::set_runtime_identity(path, preserve_owner)
 }
 
 fn rollback_result(errors: Vec<String>) -> Result<(), Failure> {
@@ -2343,8 +2391,5 @@ fn redeploy_digest(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }

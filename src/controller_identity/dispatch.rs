@@ -24,8 +24,7 @@ use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nazo_operator_protocol::{
     ControlOperationPayload, ControlOutcome, ControlResult, ControlResultData,
-    canonical_control_operation_bytes, constant_time_eq, control_operation_request_hash,
-    validate_control_result,
+    canonical_control_operation_bytes, control_operation_request_hash, validate_control_result,
 };
 
 use crate::controller_identity::journal::{OperationJournal, OperationJournalEntry};
@@ -62,13 +61,10 @@ impl PreparedOperation {
         &self,
         change_set: Option<SecretMaterial>,
     ) -> anyhow::Result<ControlOperationRequest> {
-        validate_control_change_set(
-            &self.signed.operation.operation,
-            change_set.as_ref().map(SecretMaterial::as_bytes),
-        )?;
+        validate_control_change_set(&self.signed.operation.operation, change_set.as_ref())?;
         Ok(ControlOperationRequest {
-            operation_id: self.signed.operation_id.clone(),
-            deployment_id: self.signed.deployment_id.clone(),
+            operation_id: self.signed.operation.operation_id.clone(),
+            deployment_id: self.signed.operation.deployment_id.clone(),
             compact_jws: self.signed.compact_jws.clone(),
             change_set,
         })
@@ -76,9 +72,9 @@ impl PreparedOperation {
 
     pub fn journal_entry(&self) -> OperationJournalEntry {
         OperationJournalEntry::new(
-            self.signed.operation_id.clone(),
+            self.signed.operation.operation_id.clone(),
             self.signed.request_hash.clone(),
-            self.signed.kid.clone(),
+            self.signed.operation.kid.clone(),
             self.signed.compact_jws.clone(),
         )
     }
@@ -87,7 +83,7 @@ impl PreparedOperation {
 /// Enforce the single material-consumer rule before journaling or transport.
 pub fn validate_control_change_set(
     operation: &ControlOperationPayload,
-    change_set: Option<&[u8]>,
+    change_set: Option<&SecretMaterial>,
 ) -> anyhow::Result<()> {
     let apply = matches!(
         operation,
@@ -96,11 +92,6 @@ pub fn validate_control_change_set(
     match (apply, change_set) {
         (true, None) => bail!("tenant-resource Apply requires change-set material"),
         (false, Some(_)) => bail!("only tenant-resource Apply accepts change-set material"),
-        (true, Some([])) => bail!("change-set material must not be empty"),
-        (true, Some(bytes)) if bytes.len() > crate::target::MAX_CONTROL_CHANGE_SET_BYTES => bail!(
-            "change-set material exceeds the {}-byte limit",
-            crate::target::MAX_CONTROL_CHANGE_SET_BYTES
-        ),
         _ => Ok(()),
     }
 }
@@ -126,17 +117,6 @@ pub enum DispatchVerdict {
     Terminal(ControlResult),
 }
 
-/// Resolve a selector exactly like the signing helper does.
-fn resolve_instance(registry: &RegistryStore, selector: &str) -> anyhow::Result<InstanceRecord> {
-    if let Some(record) = registry.instance_by_deployment(selector)? {
-        return Ok(record);
-    }
-    if let Some(record) = registry.instance_by_alias(selector)? {
-        return Ok(record);
-    }
-    bail!("unknown instance selector '{selector}' (no registered deployment id or alias matches)")
-}
-
 /// Prepare one control operation for `instance_selector`, resuming the
 /// journaled operation when the current command maps to its exact hash.
 ///
@@ -149,7 +129,7 @@ pub fn prepare_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<PreparedOperation> {
-    let record = resolve_instance(registry, instance_selector)?;
+    let record = registry.resolve_instance(instance_selector)?;
 
     let journaled = journal.load()?;
     if let Some(entry) = &journaled {
@@ -193,7 +173,7 @@ pub fn prepare_pending_control_operation(
     instance_selector: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
-    let record = resolve_instance(registry, instance_selector)?;
+    let record = registry.resolve_instance(instance_selector)?;
     let Some(entry) = journal.load()? else {
         return Ok(None);
     };
@@ -214,22 +194,24 @@ fn prepare_entry_resume(
     record: &InstanceRecord,
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
-    let operation =
-        build_control_operation_with_id_and_kid(record, input, &entry.operation_id, &entry.kid);
-    let request_hash = control_operation_request_hash(&operation)?;
+    let operation = build_control_operation_with_id_and_kid(
+        &record.deployment_id,
+        input,
+        entry.operation_id.clone(),
+        entry.kid.clone(),
+    );
+    let canonical = canonical_control_operation_bytes(&operation)?;
+    let request_hash = control_operation_request_hash(&canonical);
     if request_hash != entry.request_hash {
         return Ok(None);
     }
-    if !journaled_payload_matches(entry, &operation)? {
+    if !journaled_payload_matches(entry, &canonical)? {
         bail!(
             "journaled compact JWS payload does not match the stored operation identity; refusing to replay it"
         );
     }
     Ok(Some(PreparedOperation {
         signed: SignedControlOperation {
-            operation_id: entry.operation_id.clone(),
-            kid: entry.kid.clone(),
-            deployment_id: record.deployment_id.clone(),
             request_hash,
             compact_jws: entry.compact_jws.clone(),
             operation,
@@ -245,7 +227,7 @@ fn prepare_entry_resume(
 /// valid after a successful server-side acceptance and local key retirement.
 fn journaled_payload_matches(
     entry: &OperationJournalEntry,
-    operation: &nazo_operator_protocol::ControlOperation,
+    canonical: &[u8],
 ) -> anyhow::Result<bool> {
     let payload = entry
         .compact_jws
@@ -255,9 +237,7 @@ fn journaled_payload_matches(
     let payload = URL_SAFE_NO_PAD
         .decode(payload.as_bytes())
         .map_err(|_| anyhow::anyhow!("journaled compact JWS has an invalid payload encoding"))?;
-    let canonical = canonical_control_operation_bytes(operation)
-        .map_err(|error| anyhow::anyhow!("could not canonicalize recovery operation: {error}"))?;
-    Ok(constant_time_eq(&payload, &canonical))
+    Ok(payload == canonical)
 }
 
 /// Send one prepared operation through an execution target and classify the
@@ -283,11 +263,11 @@ fn classify_receipt(
     prepared: &PreparedOperation,
     receipt: ControlOperationReceipt,
 ) -> anyhow::Result<DispatchVerdict> {
-    if receipt.operation_id != prepared.signed.operation_id {
+    if receipt.operation_id != prepared.signed.operation.operation_id {
         bail!(
             "target echoed operation id '{}' for request '{}'; refusing to interpret the result",
             receipt.operation_id,
-            prepared.signed.operation_id
+            prepared.signed.operation.operation_id
         );
     }
 
@@ -316,7 +296,7 @@ fn validate_result_binding(
     result: &ControlResult,
 ) -> anyhow::Result<()> {
     validate_control_result_binding(
-        &prepared.signed.operation_id,
+        &prepared.signed.operation.operation_id,
         &prepared.signed.request_hash,
         &prepared.signed.operation.operation,
         result,
@@ -341,10 +321,7 @@ pub fn validate_control_result_binding(
             expected_operation_id
         );
     }
-    if !constant_time_eq(
-        result.request_hash.as_bytes(),
-        expected_request_hash.as_bytes(),
-    ) {
+    if result.request_hash != expected_request_hash {
         bail!(
             "ControlResult request hash does not match prepared operation '{}'",
             expected_operation_id
@@ -439,7 +416,7 @@ pub fn settle_journal(
             persist_terminal(result).with_context(|| {
                 format!(
                     "failed to persist terminal result for operation '{}'",
-                    prepared.signed.operation_id
+                    prepared.signed.operation.operation_id
                 )
             })?;
             journal.clear_if_matches(&expected)
@@ -450,8 +427,6 @@ pub fn settle_journal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller_identity::admin_api::SlotsSnapshot;
-    use crate::controller_identity::expiry;
     use crate::controller_identity::journal::JournalState;
     use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
     use crate::filesystem;
@@ -600,7 +575,10 @@ mod tests {
         ControlResult {
             schema: CONTROL_RESULT_SCHEMA,
             operation_id: operation.operation_id.clone(),
-            request_hash: control_operation_request_hash(operation).expect("valid operation"),
+            request_hash: control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(operation)
+                    .expect("valid operation"),
+            ),
             outcome,
             error: (outcome == ControlOutcome::Failed).then_some(ControlErrorCode::ExecutionFailed),
             accepted_at: 100,
@@ -656,7 +634,7 @@ mod tests {
         outcome: ControlOutcome,
     ) -> ControlOperationReceipt {
         ControlOperationReceipt {
-            operation_id: prepared.signed.operation_id.clone(),
+            operation_id: prepared.signed.operation.operation_id.clone(),
             accepted: true,
             result: Some(valid_result(&prepared.signed.operation, outcome)),
             rejection_code: None,
@@ -691,7 +669,7 @@ mod tests {
         )?;
         assert_eq!(prepared.kind, AttemptKind::Fresh);
         let entry = journal.load()?.expect("write-ahead entry");
-        assert_eq!(entry.operation_id, prepared.signed.operation_id);
+        assert_eq!(entry.operation_id, prepared.signed.operation.operation_id);
         assert_eq!(entry.state, JournalState::Dispatched);
 
         let target = RecordingTarget::default();
@@ -800,7 +778,7 @@ mod tests {
         assert!(classify_receipt(&prepared, receipt).is_err());
 
         let accepted_without_result = ControlOperationReceipt {
-            operation_id: prepared.signed.operation_id.clone(),
+            operation_id: prepared.signed.operation.operation_id.clone(),
             accepted: true,
             result: None,
             rejection_code: None,
@@ -808,7 +786,7 @@ mod tests {
         assert!(classify_receipt(&prepared, accepted_without_result).is_err());
 
         let rejected_with_result = ControlOperationReceipt {
-            operation_id: prepared.signed.operation_id.clone(),
+            operation_id: prepared.signed.operation.operation_id.clone(),
             accepted: false,
             result: Some(valid_result(
                 &prepared.signed.operation,
@@ -834,14 +812,8 @@ mod tests {
         )?;
         assert!(prepared.request(None).is_err());
         assert!(SecretMaterial::try_new(Vec::new()).is_err());
-        assert!(
-            validate_control_change_set(&prepared.signed.operation.operation, Some(&[])).is_err()
-        );
         let oversized = vec![0; crate::target::MAX_CONTROL_CHANGE_SET_BYTES + 1];
-        assert!(
-            validate_control_change_set(&prepared.signed.operation.operation, Some(&oversized))
-                .is_err()
-        );
+        assert!(SecretMaterial::try_new(oversized).is_err());
         assert_eq!(
             prepared
                 .request(Some(SecretMaterial::try_new(b"material".to_vec())?))?
@@ -884,7 +856,7 @@ mod tests {
                 input("rev-1"),
             )?;
             if expected_state == JournalState::Accepted {
-                journal.mark_accepted(&first.signed.operation_id)?;
+                journal.mark_accepted_if_matches(&journal.load()?.context("write-ahead entry")?)?;
             }
             let journaled = journal.load()?.context("write-ahead entry")?;
             assert_eq!(journaled.state, expected_state);
@@ -913,9 +885,12 @@ mod tests {
                 input("rev-1"),
             )?;
             assert_eq!(resumed.kind, AttemptKind::Resumed);
-            assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+            assert_eq!(
+                resumed.signed.operation.operation_id,
+                first.signed.operation.operation_id
+            );
             assert_eq!(resumed.signed.request_hash, first.signed.request_hash);
-            assert_eq!(resumed.signed.kid, old_kid);
+            assert_eq!(resumed.signed.operation.kid, old_kid);
             assert_eq!(resumed.signed.compact_jws, first.signed.compact_jws);
             assert!(resumed.journal_entry().has_same_identity(&journaled));
             assert_eq!(journal.load()?.context("retained journal")?, journaled);
@@ -994,7 +969,10 @@ mod tests {
             input("rev-1"),
         )?;
         assert_eq!(second.kind, AttemptKind::Resumed);
-        assert_eq!(second.signed.operation_id, first.signed.operation_id);
+        assert_eq!(
+            second.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         assert_eq!(second.signed.compact_jws, first.signed.compact_jws);
         assert_eq!(second.signed.request_hash, first.signed.request_hash);
 
@@ -1056,7 +1034,10 @@ mod tests {
             input("rev-2"),
         )?;
         assert_eq!(second.kind, AttemptKind::Fresh);
-        assert_ne!(second.signed.operation_id, first.signed.operation_id);
+        assert_ne!(
+            second.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         Ok(())
     }
 
@@ -1086,7 +1067,10 @@ mod tests {
             input("rev-1"),
         )?;
         assert_eq!(resumed.kind, AttemptKind::Resumed);
-        assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+        assert_eq!(
+            resumed.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         drop(key);
         Ok(())
     }
@@ -1115,7 +1099,7 @@ mod tests {
         let verdict = classify_receipt(
             &prepared,
             ControlOperationReceipt {
-                operation_id: prepared.signed.operation_id.clone(),
+                operation_id: prepared.signed.operation.operation_id.clone(),
                 accepted: false,
                 result: None,
                 rejection_code: Some(crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED.to_owned()),
@@ -1165,7 +1149,7 @@ mod tests {
         );
         assert_eq!(
             journal.load()?.unwrap().operation_id,
-            first.signed.operation_id
+            first.signed.operation.operation_id
         );
         Ok(())
     }
@@ -1217,7 +1201,7 @@ mod tests {
         );
         assert_eq!(
             journal.load()?.unwrap().operation_id,
-            first.signed.operation_id
+            first.signed.operation.operation_id
         );
 
         let resumed = prepare_pending_control_operation(
@@ -1229,9 +1213,12 @@ mod tests {
         )?
         .context("exact pending operation must be recoverable")?;
         assert_eq!(resumed.kind, AttemptKind::Resumed);
-        assert_eq!(resumed.signed.operation_id, first.signed.operation_id);
+        assert_eq!(
+            resumed.signed.operation.operation_id,
+            first.signed.operation.operation_id
+        );
         assert_eq!(resumed.signed.request_hash, first.signed.request_hash);
-        assert_eq!(resumed.signed.kid, first.signed.kid);
+        assert_eq!(resumed.signed.operation.kid, first.signed.operation.kid);
         assert_eq!(resumed.signed.compact_jws, first.signed.compact_jws);
         Ok(())
     }
@@ -1261,16 +1248,8 @@ mod tests {
             store_key.kid(),
             &store_key.verifying_key(),
         )?;
-        assert_eq!(decoded.operation_id, first.signed.operation_id);
+        assert_eq!(decoded.operation_id, first.signed.operation.operation_id);
 
-        // Slots snapshot helpers stay importable for command layers.
-        let empty: SlotsSnapshot = SlotsSnapshot {
-            deployment_id: "d".to_owned(),
-            total: 0,
-            max_active_slots: 3,
-            items: vec![],
-        };
-        assert!(!expiry::has_active_slot(&empty));
         Ok(())
     }
 }

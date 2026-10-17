@@ -23,6 +23,7 @@
 //! * `next_command` is always a runnable command or absent — never prose.
 
 use serde_json::json;
+use std::fmt::Write as _;
 
 use crate::error_codes;
 
@@ -191,14 +192,15 @@ pub(crate) fn render_failure(
         .expect("serde_json::Value always serializes");
     }
 
-    let mut pairs: Vec<(&str, String)> = vec![("action", action.to_owned())];
+    let chinese = crate::chinese_output();
+    let mut pairs: Vec<(&str, &str)> = vec![("action", action)];
     if let Some(host) = context.host.as_ref() {
-        pairs.push(("host", host.clone()));
+        pairs.push(("host", host));
     }
     if let Some(instance) = context.instance.as_ref() {
-        pairs.push(("instance", instance.clone()));
+        pairs.push(("instance", instance));
     }
-    let side_effects = if crate::chinese_output() {
+    let side_effects = if chinese {
         match side_effects_hint(&code) {
             "none" => "无",
             "unknown" => "未知",
@@ -210,49 +212,50 @@ pub(crate) fn render_failure(
     } else {
         side_effects_hint(&code)
     };
-    pairs.push(("side_effects", side_effects.to_owned()));
-    if crate::chinese_output() {
-        pairs.push(("reason", chinese_reason(&code).to_owned()));
+    pairs.push(("side_effects", side_effects));
+    if chinese {
+        pairs.push(("reason", chinese_reason(&code)));
     }
-    let next = if crate::chinese_output() {
+    let next = if chinese {
         chinese_next(&code)
     } else {
         next_command(&code)
     };
-    pairs.push(("code", code));
-    pairs.push(("detail", rendered));
+    pairs.push(("code", &code));
+    pairs.push(("detail", &rendered));
     if let Some(next) = next {
-        pairs.push(("next_command", next.to_owned()));
+        pairs.push(("next_command", next));
     }
-    pairs
-        .into_iter()
-        .map(|(label, value)| {
-            let label = if crate::chinese_output() {
-                match label {
-                    "action" => "操作",
-                    "host" => "主机",
-                    "instance" => "实例",
-                    "operation_id" => "操作 ID",
-                    "checkpoint" => "检查点",
-                    "side_effects" => "副作用",
-                    "code" => "错误码",
-                    "reason" => "原因",
-                    "detail" => "诊断详情（原文）",
-                    "next_command" => "下一步",
-                    _ => label,
-                }
-            } else {
-                label
-            };
-            let value = if crate::chinese_output() && value == "none" {
-                "无".to_owned()
-            } else {
-                value
-            };
-            format!("{label}: {value}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut output = String::new();
+    for (label, value) in pairs {
+        let label = if chinese {
+            match label {
+                "action" => "操作",
+                "host" => "主机",
+                "instance" => "实例",
+                "operation_id" => "操作 ID",
+                "checkpoint" => "检查点",
+                "side_effects" => "副作用",
+                "code" => "错误码",
+                "reason" => "原因",
+                "detail" => "诊断详情（原文）",
+                "next_command" => "下一步",
+                _ => label,
+            }
+        } else {
+            label
+        };
+        let value = if chinese && value == "none" {
+            "无"
+        } else {
+            value
+        };
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        write!(output, "{label}: {value}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 #[cfg(test)]

@@ -1,12 +1,17 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use nazo_operator_protocol::{ControlOperationPayload, ControlOutcome, ControlResult};
+use nazo_operator_protocol::{
+    ControlOperationPayload, ControlOutcome, ControlResult, canonical_control_operation_bytes,
+    control_operation_request_hash,
+};
 
 use crate::{
     controller_identity::{
-        OperationJournal, PreparedOperation, operation::ControlOperationInput,
-        prepare_control_operation, prepare_pending_control_operation, store::ControllerKeyStore,
+        OperationJournal, PreparedOperation,
+        operation::{ControlOperationInput, build_control_operation_with_id_and_kid},
+        prepare_control_operation, prepare_pending_control_operation,
+        store::ControllerKeyStore,
         validate_control_change_set, validate_control_result_binding,
     },
     filesystem::ensure_private_directory,
@@ -34,10 +39,8 @@ pub enum ConformanceRuntimeEvidence {
 
 /// Holds the deployment/capability observation used by one ordinary provider run.
 pub struct ConformanceSession {
-    pub deployment_id: String,
-    pub target_issuer: String,
-    pub evidence: ConformanceDeploymentEvidence,
-    pub recovery_dir: PathBuf,
+    evidence: ConformanceDeploymentEvidence,
+    recovery_dir: PathBuf,
     oidf_tenant_domain: String,
     oidf_suite_origin: String,
     secrets_dir: PathBuf,
@@ -45,20 +48,6 @@ pub struct ConformanceSession {
     target: Box<dyn ExecutionTarget>,
     controller_keys: ControllerKeyStore,
     config_revision: String,
-    openid4vp_evidence_verifier_inputs: OpenId4VpEvidenceVerifierInputs,
-}
-
-/// Target-inspected runtime identity used to verify OpenID4VP evidence. The
-/// public key is sourced from the managed runtime identity directory and is
-/// cryptographically bound to this deployment and issuer by NazoAuth's signed
-/// deployment statement. It is never a controller key.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OpenId4VpEvidenceVerifierInputs {
-    pub target_issuer: String,
-    pub deployment_id: String,
-    pub runtime_instance_id: String,
-    pub instance_key_id: String,
-    pub instance_public_key_base64: String,
 }
 
 /// Immutable controller authorization identity persisted with conformance
@@ -85,41 +74,17 @@ pub enum ConformanceControlOutcome {
     Failed(ConformanceControlCompletion),
 }
 
-fn openid4vp_verifier_inputs(
-    target_issuer: &str,
-    deployment_id: &str,
-    identity: Option<&crate::target::RuntimeInstanceIdentity>,
-) -> anyhow::Result<OpenId4VpEvidenceVerifierInputs> {
-    let identity =
-        identity.context("conformance requires the target's current runtime instance identity")?;
-    let instance_public_key =
-        nazo_operator_protocol::decode_instance_public_key(&identity.instance_public_key_base64)
-            .context("target returned an invalid runtime instance public key")?;
-    if nazo_operator_protocol::instance_key_id(&instance_public_key) != identity.instance_key_id {
-        bail!("target runtime instance key id does not match its public key");
-    }
-    Ok(OpenId4VpEvidenceVerifierInputs {
-        target_issuer: target_issuer.to_owned(),
-        deployment_id: deployment_id.to_owned(),
-        runtime_instance_id: identity.runtime_instance_id.clone(),
-        instance_key_id: identity.instance_key_id.clone(),
-        instance_public_key_base64: nazo_operator_protocol::encode_instance_public_key(
-            &instance_public_key,
-        ),
-    })
-}
-
 impl ConformanceSession {
     pub fn open(selector: Option<&str>) -> anyhow::Result<Self> {
         let registry = RegistryStore::open_default()?;
         let record = crate::fleet::resolve_instance(&registry, selector, "conformance")?;
-        let oidf_tenant_domain = record.oidf_tenant_domain.clone().with_context(|| {
+        let oidf_tenant_domain = record.oidf_tenant_domain.with_context(|| {
             format!(
                 "OIDF tenant domain is not configured for instance '{}'; run `nazoauthctl --instance {} oidf configure --tenant-domain <domain> --suite <https-origin>` once",
                 record.alias, record.alias
             )
         })?;
-        let oidf_suite_origin = record.oidf_suite_origin.clone().with_context(|| {
+        let oidf_suite_origin = record.oidf_suite_origin.with_context(|| {
             format!(
                 "OIDF Suite origin is not configured for instance '{}'; run `nazoauthctl --instance {} oidf configure --tenant-domain <domain> --suite <https-origin>` once",
                 record.alias, record.alias
@@ -141,18 +106,12 @@ impl ConformanceSession {
                 inspection.issuer
             );
         }
-        let openid4vp_evidence_verifier_inputs = openid4vp_verifier_inputs(
-            &inspection.issuer,
-            &inspection.deployment_id,
-            inspection.current_instance_identity.as_ref(),
-        )?;
 
-        let artifact = inspection.artifact.current.clone().context(
+        let artifact = inspection.artifact.current.context(
             "conformance requires a verified current artifact in target DeploymentState",
         )?;
         let identity = inspection
             .current_release
-            .as_ref()
             .context("conformance requires verified release version in target DeploymentState")?;
         let runtime = match inspection.runtime.kind {
             RuntimeBackendKind::Podman | RuntimeBackendKind::Docker => {
@@ -166,14 +125,7 @@ impl ConformanceSession {
                 ConformanceRuntimeEvidence::HostBinary { sha256 }
             }
         };
-        let release = identity.version.clone();
-
-        let evidence = ConformanceDeploymentEvidence {
-            deployment_id: record.deployment_id.clone(),
-            target_issuer: inspection.issuer.clone(),
-            release,
-            runtime,
-        };
+        let release = identity.version;
 
         let recovery_dir = registry
             .root()
@@ -182,14 +134,19 @@ impl ConformanceSession {
         ensure_private_directory(&recovery_dir, "conformance recovery directory")?;
 
         let secrets_dir = registry.root().join("secrets").join(&record.deployment_id);
+        let evidence = ConformanceDeploymentEvidence {
+            deployment_id: record.deployment_id,
+            target_issuer: inspection.issuer,
+            release,
+            runtime,
+        };
+
         let config_revision = inspection
             .config_revision_marker
             .context("conformance requires the target's current config-revision marker")?;
         let controller_keys = ControllerKeyStore::open_default()?;
 
         Ok(Self {
-            deployment_id: record.deployment_id,
-            target_issuer: inspection.issuer,
             evidence,
             recovery_dir,
             oidf_tenant_domain,
@@ -199,12 +156,11 @@ impl ConformanceSession {
             target,
             controller_keys,
             config_revision,
-            openid4vp_evidence_verifier_inputs,
         })
     }
 
     pub fn target_issuer(&self) -> &str {
-        &self.target_issuer
+        &self.evidence.target_issuer
     }
 
     pub fn oidf_tenant_domain(&self) -> &str {
@@ -215,81 +171,68 @@ impl ConformanceSession {
         &self.oidf_suite_origin
     }
 
-    pub fn openid4vp_evidence_verifier_inputs(&self) -> &OpenId4VpEvidenceVerifierInputs {
-        &self.openid4vp_evidence_verifier_inputs
+    pub fn deployment_evidence(&self) -> &ConformanceDeploymentEvidence {
+        &self.evidence
     }
 
-    pub fn deployment_evidence(&self) -> ConformanceDeploymentEvidence {
-        ConformanceDeploymentEvidence {
-            deployment_id: self.evidence.deployment_id.clone(),
-            target_issuer: self.evidence.target_issuer.clone(),
-            release: self.evidence.release.clone(),
-            runtime: match &self.evidence.runtime {
-                ConformanceRuntimeEvidence::OciImage { digest } => {
-                    ConformanceRuntimeEvidence::OciImage {
-                        digest: digest.clone(),
-                    }
-                }
-                ConformanceRuntimeEvidence::HostBinary { sha256 } => {
-                    ConformanceRuntimeEvidence::HostBinary {
-                        sha256: sha256.clone(),
-                    }
-                }
-            },
-        }
-    }
-
-    pub fn recovery_directory(&self) -> anyhow::Result<PathBuf> {
-        Ok(self.recovery_dir.clone())
+    pub fn recovery_directory(&self) -> &Path {
+        &self.recovery_dir
     }
 
     pub fn pending_control_operation(
         &self,
     ) -> anyhow::Result<Option<crate::controller_identity::OperationJournalEntry>> {
-        let journal =
-            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
+        let journal = OperationJournal::open(
+            self.controller_keys
+                .instance_dir(&self.evidence.deployment_id)?,
+        )?;
         journal.load()
     }
 
-    pub fn pending_control_operation_matches(
+    /// Compare candidates against the one loaded journal snapshot. Dispatch
+    /// reopens the journal and checks that identity before resuming anything.
+    /// Return the matching payload so recovery can dispatch it without cloning.
+    pub fn match_pending_control_operation(
         &self,
         expected: &crate::controller_identity::OperationJournalEntry,
         operation: ControlOperationPayload,
-    ) -> anyhow::Result<bool> {
-        let journal =
-            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
-        Ok(prepare_pending_control_operation(
-            &self.registry,
-            &journal,
-            expected,
-            &self.deployment_id,
+    ) -> anyhow::Result<Option<ControlOperationPayload>> {
+        let operation = build_control_operation_with_id_and_kid(
+            &self.evidence.deployment_id,
             ControlOperationInput {
                 operation,
                 config_revision: self.config_revision.clone(),
             },
-        )?
-        .is_some())
+            expected.operation_id.clone(),
+            expected.kid.clone(),
+        );
+        let canonical = canonical_control_operation_bytes(&operation)?;
+        Ok(
+            (control_operation_request_hash(&canonical) == expected.request_hash)
+                .then_some(operation.operation),
+        )
     }
 
     pub fn resume_pending_control_operation<F>(
         &self,
         expected: &crate::controller_identity::OperationJournalEntry,
         operation: ControlOperationPayload,
-        change_set: Option<Vec<u8>>,
+        change_set: Option<SecretMaterial>,
         persist: F,
     ) -> anyhow::Result<Option<ConformanceControlOutcome>>
     where
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
-        validate_control_change_set(&operation, change_set.as_deref())?;
-        let expected_operation = operation.clone();
-        let journal =
-            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
+        validate_control_change_set(&operation, change_set.as_ref())?;
+        let journal = OperationJournal::open(
+            self.controller_keys
+                .instance_dir(&self.evidence.deployment_id)?,
+        )?;
         let Some(prepared) = prepare_pending_control_operation(
             &self.registry,
             &journal,
             expected,
-            &self.deployment_id,
+            &self.evidence.deployment_id,
             ControlOperationInput {
                 operation,
                 config_revision: self.config_revision.clone(),
@@ -298,7 +241,7 @@ impl ConformanceSession {
         else {
             return Ok(None);
         };
-        self.complete_control_operation(&journal, prepared, expected_operation, change_set, persist)
+        self.complete_control_operation(&journal, prepared, change_set, persist)
             .map(Some)
     }
 
@@ -310,54 +253,50 @@ impl ConformanceSession {
     pub fn execute_control_operation<F>(
         &self,
         operation: ControlOperationPayload,
-        change_set: Option<Vec<u8>>,
+        change_set: Option<SecretMaterial>,
         persist: F,
     ) -> anyhow::Result<ConformanceControlOutcome>
     where
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
-        validate_control_change_set(&operation, change_set.as_deref())?;
-        let expected_operation = operation.clone();
+        validate_control_change_set(&operation, change_set.as_ref())?;
 
-        let journal =
-            OperationJournal::open(self.controller_keys.instance_dir(&self.deployment_id)?)?;
+        let journal = OperationJournal::open(
+            self.controller_keys
+                .instance_dir(&self.evidence.deployment_id)?,
+        )?;
         let prepared = prepare_control_operation(
             &self.registry,
             &self.controller_keys,
             &journal,
-            &self.deployment_id,
+            &self.evidence.deployment_id,
             ControlOperationInput {
                 operation,
                 config_revision: self.config_revision.clone(),
             },
         )?;
-        self.complete_control_operation(&journal, prepared, expected_operation, change_set, persist)
+        self.complete_control_operation(&journal, prepared, change_set, persist)
     }
 
     fn complete_control_operation<F>(
         &self,
         journal: &OperationJournal,
         prepared: PreparedOperation,
-        expected_operation: ControlOperationPayload,
-        change_set: Option<Vec<u8>>,
+        change_set: Option<SecretMaterial>,
         persist: F,
     ) -> anyhow::Result<ConformanceControlOutcome>
     where
         F: FnOnce(&ConformanceControlCompletion) -> anyhow::Result<()>,
     {
         let expected_journal = prepared.journal_entry();
-        let secret_material = change_set
-            .map(SecretMaterial::try_new)
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("invalid Apply material: {}", error.detail))?;
         let receipt: ControlOperationReceipt = self
             .target
-            .execute_control_operation(prepared.request(secret_material)?)?;
-        if receipt.operation_id != prepared.signed.operation_id {
+            .execute_control_operation(prepared.request(change_set)?)?;
+        if receipt.operation_id != prepared.signed.operation.operation_id {
             bail!(
                 "target returned operation '{}' for controller operation '{}'",
                 receipt.operation_id,
-                prepared.signed.operation_id
+                prepared.signed.operation.operation_id
             );
         }
         if !receipt.accepted {
@@ -375,22 +314,22 @@ impl ConformanceSession {
             "the target accepted the ControlOperation without returning its durable result",
         )?;
         validate_control_result_binding(
-            &prepared.signed.operation_id,
+            &prepared.signed.operation.operation_id,
             &prepared.signed.request_hash,
-            &expected_operation,
+            &prepared.signed.operation.operation,
             &result,
         )?;
         let completion = ConformanceControlCompletion {
             identity: ControlOperationIdentity {
-                operation_id: prepared.signed.operation_id,
+                operation_id: prepared.signed.operation.operation_id,
                 request_hash: prepared.signed.request_hash,
-                kid: prepared.signed.kid,
+                kid: prepared.signed.operation.kid,
             },
             result,
         };
-        let outcome = match completion.result.outcome {
-            ControlOutcome::Succeeded => ConformanceControlOutcome::Succeeded(completion.clone()),
-            ControlOutcome::Failed => ConformanceControlOutcome::Failed(completion.clone()),
+        let succeeded = match completion.result.outcome {
+            ControlOutcome::Succeeded => true,
+            ControlOutcome::Failed => false,
             ControlOutcome::InProgress => {
                 bail!(
                     "the ControlOperation is durably in progress; its accepted journal entry was preserved for replay"
@@ -399,7 +338,11 @@ impl ConformanceSession {
         };
         persist(&completion)?;
         journal.clear_if_matches(&expected_journal)?;
-        Ok(outcome)
+        Ok(if succeeded {
+            ConformanceControlOutcome::Succeeded(completion)
+        } else {
+            ConformanceControlOutcome::Failed(completion)
+        })
     }
 
     pub fn openid4vp_management_token(
@@ -442,20 +385,19 @@ impl ConformanceSession {
         &self,
         name: &str,
         label: &str,
-    ) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
         let path = self.secrets_dir.join(name);
         let bytes =
             crate::filesystem::read_secure_secret_file(&path, label, MAX_PROFILE_TOKEN_BYTES)?;
         let value = std::str::from_utf8(&bytes).with_context(|| format!("{label} is not UTF-8"))?;
         if value.len() < 32
-            || value.len() > MAX_PROFILE_TOKEN_BYTES as usize
             || value
                 .chars()
                 .any(|character| character.is_control() || character.is_whitespace())
         {
             bail!("{label} is invalid");
         }
-        Ok(zeroize::Zeroizing::new(value.to_owned()))
+        Ok(bytes)
     }
 
     fn derive_tenant_token(
@@ -470,12 +412,8 @@ impl ConformanceSession {
         let root = self.read_profile_secret(name, label)?;
         let tenant_id = uuid::Uuid::parse_str(tenant_id)
             .with_context(|| format!("{label} tenant ID is invalid"))?;
-        let token = nazo_operator_protocol::hkdf_sha256_v1(
-            root.as_bytes(),
-            tenant_id.as_bytes(),
-            purpose,
-            32,
-        );
+        let token =
+            nazo_operator_protocol::hkdf_sha256_v1::<32>(&root, tenant_id.as_bytes(), purpose);
         Ok(zeroize::Zeroizing::new(
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token),
         ))
@@ -563,7 +501,9 @@ mod tests {
                 serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
             let outcome = *self.outcome.borrow();
             let accepted = *self.accepted.borrow();
-            let request_hash = nazo_operator_protocol::control_operation_request_hash(&operation)?;
+            let request_hash = nazo_operator_protocol::control_operation_request_hash(
+                &nazo_operator_protocol::canonical_control_operation_bytes(&operation)?,
+            );
             Ok(ControlOperationReceipt {
                 operation_id: request.operation_id.clone(),
                 accepted,
@@ -590,34 +530,6 @@ mod tests {
                 observed_at: Utc::now(),
             })
         }
-    }
-
-    #[test]
-    fn openid4vp_verifier_inputs_require_the_exact_runtime_public_key_binding() {
-        let key = nazo_crypto::ed25519::SigningKey::from_bytes(&[41; 32]).verifying_key();
-        let encoded = nazo_operator_protocol::encode_instance_public_key(&key);
-        let key_id = nazo_operator_protocol::instance_key_id(&key);
-        assert!(
-            openid4vp_verifier_inputs("https://auth.example.com", "deploy-alpha", None).is_err()
-        );
-        let mut identity = crate::target::RuntimeInstanceIdentity {
-            runtime_instance_id: "runtime-alpha".to_owned(),
-            instance_key_id: "wrong-key-id".to_owned(),
-            instance_public_key_base64: encoded.clone(),
-        };
-        assert!(
-            openid4vp_verifier_inputs("https://auth.example.com", "deploy-alpha", Some(&identity))
-                .is_err()
-        );
-        identity.instance_key_id = key_id.clone();
-        let inputs =
-            openid4vp_verifier_inputs("https://auth.example.com", "deploy-alpha", Some(&identity))
-                .expect("valid runtime identity");
-        assert_eq!(inputs.target_issuer, "https://auth.example.com");
-        assert_eq!(inputs.deployment_id, "deploy-alpha");
-        assert_eq!(inputs.runtime_instance_id, "runtime-alpha");
-        assert_eq!(inputs.instance_key_id, key_id);
-        assert_eq!(inputs.instance_public_key_base64, encoded);
     }
 
     #[test]
@@ -652,8 +564,6 @@ mod tests {
         let target_outcome = Rc::new(RefCell::new(ControlOutcome::Succeeded));
         let result_data = Rc::new(RefCell::new(None));
         let session = ConformanceSession {
-            deployment_id: deployment_id.to_owned(),
-            target_issuer: "https://auth.example.com".to_owned(),
             evidence: ConformanceDeploymentEvidence {
                 deployment_id: deployment_id.to_owned(),
                 target_issuer: "https://auth.example.com".to_owned(),
@@ -676,31 +586,54 @@ mod tests {
             }),
             controller_keys,
             config_revision: "revision-1".to_owned(),
-            openid4vp_evidence_verifier_inputs: OpenId4VpEvidenceVerifierInputs {
-                target_issuer: "https://auth.example.com".to_owned(),
-                deployment_id: deployment_id.to_owned(),
-                runtime_instance_id: "runtime-1".to_owned(),
-                instance_key_id: "instance-key-1".to_owned(),
-                instance_public_key_base64: "unused-in-this-test".to_owned(),
-            },
         };
 
         let journal = OperationJournal::open(
             session
                 .controller_keys
-                .instance_dir(&session.deployment_id)?,
+                .instance_dir(&session.evidence.deployment_id)?,
         )?;
         let pending = prepare_control_operation(
             &session.registry,
             &session.controller_keys,
             &journal,
-            &session.deployment_id,
+            &session.evidence.deployment_id,
             ControlOperationInput {
                 operation: ControlOperationPayload::KeysValidate,
                 config_revision: session.config_revision.clone(),
             },
         )?;
         let expected = journal.load()?.context("journaled operation")?;
+        // Candidate selection uses the loaded snapshot even if the backing
+        // journal changes. Only dispatch may consume the live journal.
+        let journal_bytes = std::fs::read(journal.path())?;
+        std::fs::write(journal.path(), b"invalid journal")?;
+        assert_eq!(
+            session.match_pending_control_operation(
+                &expected,
+                ControlOperationPayload::KeysValidate,
+            )?,
+            Some(ControlOperationPayload::KeysValidate),
+        );
+        assert_eq!(
+            session.match_pending_control_operation(
+                &expected,
+                ControlOperationPayload::MigrateApply,
+            )?,
+            None,
+        );
+        assert!(
+            session
+                .resume_pending_control_operation(
+                    &expected,
+                    ControlOperationPayload::KeysValidate,
+                    None,
+                    |_| Ok(()),
+                )
+                .is_err()
+        );
+        assert!(requests.borrow().is_empty());
+        std::fs::write(journal.path(), journal_bytes)?;
         assert!(
             session
                 .resume_pending_control_operation(
@@ -718,7 +651,7 @@ mod tests {
         );
         assert_eq!(
             journal.load()?.context("journal must remain")?.operation_id,
-            pending.signed.operation_id
+            pending.signed.operation.operation_id
         );
         assert!(
             session
@@ -740,7 +673,7 @@ mod tests {
         assert_eq!(requests.borrow().len(), 1);
         assert_eq!(
             requests.borrow()[0].operation_id,
-            pending.signed.operation_id
+            pending.signed.operation.operation_id
         );
         assert_eq!(requests.borrow()[0].compact_jws, pending.signed.compact_jws);
         assert!(journal.load()?.is_none());
@@ -749,7 +682,7 @@ mod tests {
             session
                 .execute_control_operation(
                     ControlOperationPayload::KeysValidate,
-                    Some(b"unused".to_vec()),
+                    Some(SecretMaterial::try_new(b"unused".to_vec())?),
                     |_| Ok(())
                 )
                 .is_err()

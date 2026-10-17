@@ -29,15 +29,7 @@ impl Origin {
             return Err(OriginError::NotHttpsOrigin);
         }
 
-        let host = parsed.host_str().ok_or(OriginError::InvalidSyntax)?;
-        let mut canonical = format!("https://{}", canonical_host(host));
-        if let Some(port) = parsed.port()
-            && port != 443
-        {
-            canonical.push(':');
-            canonical.push_str(&port.to_string());
-        }
-        Ok(Self(canonical))
+        Ok(Self(parsed.origin().ascii_serialization()))
     }
 
     /// Parse a Suite origin supplied by the operator. Private/loopback hosts
@@ -79,19 +71,7 @@ impl Origin {
         if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
             return false;
         }
-        let Some(host) = url.host_str() else {
-            return false;
-        };
-        let authority = if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.to_ascii_lowercase()
-        };
-        let authority = match url.port() {
-            Some(port) if port != 443 => format!("{authority}:{port}"),
-            _ => authority,
-        };
-        self.0 == format!("https://{authority}")
+        self.0 == url.origin().ascii_serialization()
     }
 }
 
@@ -129,14 +109,6 @@ impl fmt::Display for OriginError {
 }
 
 impl std::error::Error for OriginError {}
-
-fn canonical_host(host: &str) -> String {
-    if host.contains(':') {
-        format!("[{}]", host.to_ascii_lowercase())
-    } else {
-        host.to_ascii_lowercase()
-    }
-}
 
 fn is_private_or_local_host(host: &str) -> bool {
     let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
@@ -183,6 +155,30 @@ mod tests {
         assert_eq!(origin.as_str(), "https://example.test");
         assert!(Origin::parse("https://example.test/path").is_err());
         assert!(Origin::parse("http://example.test").is_err());
+    }
+
+    #[test]
+    fn ipv6_origin_roundtrips_and_compares_without_duplicate_brackets() {
+        for (input, expected) in [
+            ("https://[::1]:443/", "https://[::1]"),
+            ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
+        ] {
+            let origin = Origin::parse_suite(input).unwrap();
+            assert_eq!(origin.as_str(), expected);
+            assert_eq!(Origin::parse(origin.as_str()).unwrap(), origin);
+            let endpoint = origin.url("/api/test").unwrap();
+            assert!(origin.same_origin_url(&endpoint));
+            let mut wrong_port = endpoint.clone();
+            wrong_port.set_port(Some(9443)).unwrap();
+            assert!(!origin.same_origin_url(&wrong_port));
+            let mut credentials = endpoint;
+            credentials.set_username("user").unwrap();
+            assert!(!origin.same_origin_url(&credentials));
+        }
+        assert_eq!(
+            Origin::parse_public_suite("https://[::1]").unwrap_err(),
+            OriginError::PrivateAddress
+        );
     }
 
     #[test]

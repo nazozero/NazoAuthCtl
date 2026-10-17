@@ -25,7 +25,7 @@ pub(super) struct ValidatedMaterial {
     pub(super) leaf_sha256: String,
     pub(super) material_sha256: String,
     pub(super) not_after: i64,
-    pub(super) root_store: RootCertStore,
+    pub(super) root_store: Arc<RootCertStore>,
 }
 
 pub(super) fn load_and_validate_material(
@@ -51,7 +51,7 @@ pub(super) fn load_valid_material(
     hostname: &str,
     provider: &LoadedProvider,
 ) -> anyhow::Result<ValidatedMaterial> {
-    let certificate_pem = read_secure_regular_file(
+    let mut certificate_pem = read_secure_regular_file(
         certificate_path,
         "TLS certificate chain",
         false,
@@ -97,14 +97,16 @@ pub(super) fn load_valid_material(
         .key_provider
         .load_private_key(private_key)
         .context("TLS private key algorithm is unsupported")?;
-    CertifiedKey::new(certificates.clone(), signing_key)
+    let certified_key = CertifiedKey::new(certificates, signing_key);
+    certified_key
         .keys_match()
         .context("TLS certificate and private key do not match")?;
 
-    let root_store = root_store_from_pem(&provider.trust_anchors)?;
+    let certificates = &certified_key.cert;
+    let root_store = Arc::new(root_store_from_pem(&provider.trust_anchors)?);
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(root_store.clone()),
-        Arc::new(crypto.clone()),
+        Arc::clone(&root_store),
+        Arc::new(crypto),
     )
     .build()
     .context("TLS trust anchor set is invalid")?;
@@ -129,7 +131,7 @@ pub(super) fn load_valid_material(
     let private_key_sha256 = sha256(&private_key_pem);
     let material_sha256 = sha256(format!("{leaf_sha256}:{certificate_sha256}").as_bytes());
     Ok(ValidatedMaterial {
-        certificate_pem: certificate_pem.to_vec(),
+        certificate_pem: std::mem::take(&mut *certificate_pem),
         private_key_pem,
         certificate_sha256,
         private_key_sha256,

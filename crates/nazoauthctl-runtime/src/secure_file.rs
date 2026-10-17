@@ -3,8 +3,8 @@
 //! private; the path and descriptor checks are shared so a new persistence
 //! call cannot accidentally reintroduce a weaker implementation.
 
-use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::{borrow::Cow, fs};
 
 #[cfg(unix)]
 use rand::{TryRng as _, rngs::SysRng};
@@ -34,11 +34,13 @@ pub enum SecureFileError {
 /// than normalized through an attacker-controlled symlink.
 pub fn normalize_absolute(path: &Path) -> Result<PathBuf, SecureFileError> {
     let source = if path.is_absolute() {
-        path.to_owned()
+        Cow::Borrowed(path)
     } else {
-        std::env::current_dir()
-            .map_err(|_| SecureFileError::Io)?
-            .join(path)
+        Cow::Owned(
+            std::env::current_dir()
+                .map_err(|_| SecureFileError::Io)?
+                .join(path),
+        )
     };
     let mut result = PathBuf::new();
     for component in source.components() {
@@ -49,9 +51,6 @@ pub fn normalize_absolute(path: &Path) -> Result<PathBuf, SecureFileError> {
             Component::Normal(value) => result.push(value),
             Component::ParentDir => return Err(SecureFileError::UnsafePath),
         }
-    }
-    if result.as_os_str().is_empty() {
-        return Err(SecureFileError::UnsafePath);
     }
     Ok(result)
 }
@@ -109,7 +108,6 @@ pub fn validate_directory(path: &Path, private: bool) -> Result<PathBuf, SecureF
 pub fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
-    validate_directory(parent, private)?;
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (private, parent);
@@ -117,6 +115,7 @@ pub fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, SecureFile
     }
     #[cfg(windows)]
     {
+        validate_directory(parent, private)?;
         crate::filesystem::open_lock_file(&absolute, false, "lock file").map_err(map_runtime_error)
     }
     #[cfg(unix)]
@@ -141,7 +140,6 @@ pub fn open_lock_file(path: &Path, private: bool) -> Result<fs::File, SecureFile
 pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
-    ensure_directory(parent, private)?;
     #[cfg(all(not(unix), not(windows)))]
     {
         let _ = (bytes, private);
@@ -149,17 +147,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), Secu
     }
     #[cfg(windows)]
     {
+        ensure_directory(parent, private)?;
         crate::filesystem::atomic_write(&absolute, bytes, if private { 0o600 } else { 0o644 })
             .map_err(map_runtime_error)
     }
     #[cfg(unix)]
     {
-        let parent_file = open_directory_chain(parent, private, false)?;
-        let target_name = absolute
-            .file_name()
-            .ok_or(SecureFileError::UnsafePath)?
-            .to_owned();
-        match openat_file(&parent_file, &target_name, OFlags::RDONLY) {
+        let parent_file = open_directory_chain(parent, private, true)?;
+        let target_name = absolute.file_name().ok_or(SecureFileError::UnsafePath)?;
+        match openat_file(&parent_file, target_name, OFlags::RDONLY) {
             Ok(target) => validate_file_metadata(
                 &target.metadata().map_err(|_| SecureFileError::Io)?,
                 private,
@@ -173,11 +169,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), Secu
         for _ in 0..16 {
             rng.try_fill_bytes(&mut random)
                 .map_err(|_| SecureFileError::Io)?;
-            let temporary = parent.join(format!(".{file_name}.tmp-{}", hex_suffix(&random)));
-            let temp_name = temporary
-                .file_name()
-                .ok_or(SecureFileError::UnsafePath)?
-                .to_owned();
+            let temp_name = format!(".{file_name}.tmp-{}", hex::encode(random));
             let owned = match rustix::fs::openat(
                 &parent_file,
                 &temp_name,
@@ -192,7 +184,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<(), Secu
             let result = (|| {
                 handle.write_all(bytes).map_err(|_| SecureFileError::Io)?;
                 rustix::fs::fsync(&handle).map_err(|_| SecureFileError::Io)?;
-                rustix::fs::renameat(&parent_file, &temp_name, &parent_file, &target_name)
+                rustix::fs::renameat(&parent_file, &temp_name, &parent_file, target_name)
                     .map_err(|_| SecureFileError::Io)?;
                 rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
             })();
@@ -229,7 +221,6 @@ pub fn write_new_or_exact_with_outcome(
 ) -> Result<NewOrExactOutcome, SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
-    ensure_directory(parent, private)?;
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (bytes, private);
@@ -237,6 +228,7 @@ pub fn write_new_or_exact_with_outcome(
     }
     #[cfg(windows)]
     {
+        ensure_directory(parent, private)?;
         match read_bounded(&absolute, bytes.len(), private) {
             Ok(existing) if existing == bytes => return Ok(NewOrExactOutcome::Existing),
             Ok(_) => return Err(SecureFileError::Io),
@@ -259,18 +251,15 @@ pub fn write_new_or_exact_with_outcome(
     }
     #[cfg(unix)]
     {
-        let parent_file = open_directory_chain(parent, private, false)?;
-        let target_name = absolute
-            .file_name()
-            .ok_or(SecureFileError::UnsafePath)?
-            .to_owned();
+        let parent_file = open_directory_chain(parent, private, true)?;
+        let target_name = absolute.file_name().ok_or(SecureFileError::UnsafePath)?;
         let file_name = target_name.to_string_lossy();
         let mut random = [0u8; 16];
         let mut rng = SysRng;
         for _ in 0..16 {
             rng.try_fill_bytes(&mut random)
                 .map_err(|_| SecureFileError::Io)?;
-            let temp_name = format!(".{file_name}.new-{}", hex_suffix(&random));
+            let temp_name = format!(".{file_name}.new-{}", hex::encode(random));
             let owned = match rustix::fs::openat(
                 &parent_file,
                 &temp_name,
@@ -296,7 +285,7 @@ pub fn write_new_or_exact_with_outcome(
                 &parent_file,
                 &temp_name,
                 &parent_file,
-                &target_name,
+                target_name,
                 rustix::fs::AtFlags::empty(),
             ) {
                 Ok(()) => {
@@ -328,7 +317,11 @@ pub fn write_new_or_exact_with_outcome(
                         &temp_name,
                         rustix::fs::AtFlags::empty(),
                     );
-                    let existing = read_bounded(&absolute, bytes.len(), private)?;
+                    let existing = read_bounded_file(
+                        openat_file(&parent_file, target_name, OFlags::RDONLY)?,
+                        bytes.len(),
+                        private,
+                    )?;
                     return if existing == bytes {
                         Ok(NewOrExactOutcome::Existing)
                     } else {
@@ -371,10 +364,15 @@ pub fn remove_private_file_if_exact(path: &Path, bytes: &[u8]) -> Result<(), Sec
     #[cfg(unix)]
     {
         let parent_file = open_directory_chain(parent, true, false)?;
-        if read_bounded(&absolute, bytes.len(), true)? != bytes {
+        let name = absolute.file_name().ok_or(SecureFileError::UnsafePath)?;
+        if read_bounded_file(
+            openat_file(&parent_file, name, OFlags::RDONLY)?,
+            bytes.len(),
+            true,
+        )? != bytes
+        {
             return Err(SecureFileError::Io);
         }
-        let name = absolute.file_name().ok_or(SecureFileError::UnsafePath)?;
         rustix::fs::unlinkat(&parent_file, name, rustix::fs::AtFlags::empty())
             .map_err(|_| SecureFileError::Io)?;
         rustix::fs::fsync(&parent_file).map_err(|_| SecureFileError::Io)
@@ -447,9 +445,8 @@ pub fn promote_private_file(from: &Path, to: &Path) -> Result<(), SecureFileErro
     }
 }
 
-/// Open and read a bounded regular file with O_NOFOLLOW.  Metadata is checked
-/// both before and after reading, preventing replacement races from being
-/// mistaken for a successful read.
+/// Read a bounded regular file through the descriptor whose ownership and
+/// permissions were checked. Unix path traversal uses O_NOFOLLOW throughout.
 pub fn read_bounded(
     path: &Path,
     max_bytes: usize,
@@ -457,23 +454,19 @@ pub fn read_bounded(
 ) -> Result<Vec<u8>, SecureFileError> {
     let absolute = normalize_absolute(path)?;
     let parent = absolute.parent().ok_or(SecureFileError::UnsafePath)?;
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = max_bytes;
-        return Err(SecureFileError::UnsupportedPlatform);
-    }
     #[cfg(unix)]
-    let mut file = {
+    {
         let parent_file = open_directory_chain(parent, private, false)?;
         let name = absolute.file_name().ok_or(SecureFileError::UnsafePath)?;
-        openat_file(&parent_file, name, OFlags::RDONLY)?
-            .try_clone()
-            .map_err(|_| SecureFileError::Io)?
-    };
+        read_bounded_file(
+            openat_file(&parent_file, name, OFlags::RDONLY)?,
+            max_bytes,
+            private,
+        )
+    }
     #[cfg(windows)]
     {
         use std::io::Read as _;
-        fs::symlink_metadata(&absolute).map_err(map_io_error)?;
         validate_directory(parent, private)?;
         let file = crate::filesystem::open_secure_regular_file(&absolute, "bounded file", private)
             .map_err(map_runtime_error)?;
@@ -486,25 +479,28 @@ pub fn read_bounded(
         }
         Ok(bytes)
     }
-    #[cfg(unix)]
-    {
-        let opened = file.metadata().map_err(|_| SecureFileError::Io)?;
-        validate_file_metadata(&opened, private)?;
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(max_bytes.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| SecureFileError::Io)?;
-        if bytes.len() > max_bytes {
-            return Err(SecureFileError::Oversize);
-        }
-        Ok(bytes)
-    }
     #[cfg(all(not(unix), not(windows)))]
     {
         let _ = (&absolute, parent, max_bytes, private);
         Err(SecureFileError::UnsupportedPlatform)
     }
+}
+
+#[cfg(unix)]
+fn read_bounded_file(
+    file: File,
+    max_bytes: usize,
+    private: bool,
+) -> Result<Vec<u8>, SecureFileError> {
+    validate_file_metadata(&file.metadata().map_err(|_| SecureFileError::Io)?, private)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SecureFileError::Io)?;
+    if bytes.len() > max_bytes {
+        return Err(SecureFileError::Oversize);
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]
@@ -531,7 +527,7 @@ pub fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
 
 #[cfg(unix)]
 fn open_directory_chain(path: &Path, private: bool, create: bool) -> Result<File, SecureFileError> {
-    let absolute = normalize_absolute(path)?;
+    // All callers pass the absolute path normalized at the public boundary.
     let mut directory = File::from(
         rustix::fs::openat(
             CWD,
@@ -541,12 +537,21 @@ fn open_directory_chain(path: &Path, private: bool, create: bool) -> Result<File
         )
         .map_err(map_errno)?,
     );
-    let components = absolute.components().collect::<Vec<_>>();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            continue;
-        };
-        let final_component = index + 1 == components.len();
+    let mut components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .peekable();
+    if components.peek().is_none() {
+        validate_directory_metadata(
+            &directory.metadata().map_err(|_| SecureFileError::Io)?,
+            private,
+        )?;
+    }
+    while let Some(name) = components.next() {
+        let final_component = components.peek().is_none();
         let next = match rustix::fs::openat(
             &directory,
             Path::new(name),
@@ -586,8 +591,6 @@ fn open_directory_chain(path: &Path, private: bool, create: bool) -> Result<File
         validate_directory_metadata(&metadata, private && final_component)?;
         directory = next;
     }
-    let metadata = directory.metadata().map_err(|_| SecureFileError::Io)?;
-    validate_directory_metadata(&metadata, private && components.len() <= 1)?;
     Ok(directory)
 }
 
@@ -622,10 +625,8 @@ fn validate_directory_metadata(
     private: bool,
 ) -> Result<(), SecureFileError> {
     use std::os::unix::fs::MetadataExt;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || !owner_is_current_or_root(metadata.uid())
-    {
+    // O_DIRECTORY | O_NOFOLLOW already establishes the descriptor's type.
+    if !owner_is_current_or_root(metadata.uid()) {
         return Err(SecureFileError::UnsafePath);
     }
     let mode = metadata.mode();
@@ -642,11 +643,7 @@ fn validate_directory_metadata(
 #[cfg(unix)]
 fn validate_file_metadata(metadata: &fs::Metadata, private: bool) -> Result<(), SecureFileError> {
     use std::os::unix::fs::MetadataExt;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.nlink() != 1
-        || !owner_is_current_or_root(metadata.uid())
-    {
+    if !metadata.is_file() || metadata.nlink() != 1 || !owner_is_current_or_root(metadata.uid()) {
         return Err(SecureFileError::UnsafePath);
     }
     let mode = metadata.mode();
@@ -665,15 +662,9 @@ fn owner_is_current_or_root(uid: u32) -> bool {
     uid == 0 || rustix::process::geteuid().as_raw() == uid
 }
 
-#[cfg(unix)]
-fn hex_suffix(bytes: &[u8; 16]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[cfg(windows)]
 pub fn remove_file(path: &Path, private: bool) -> Result<(), SecureFileError> {
     let absolute = normalize_absolute(path)?;
-    fs::symlink_metadata(&absolute).map_err(map_io_error)?;
     validate_directory(
         absolute.parent().ok_or(SecureFileError::UnsafePath)?,
         private,
@@ -707,6 +698,78 @@ fn map_runtime_error(error: anyhow::Error) -> SecureFileError {
 #[cfg(test)]
 mod tests {
     use std::thread;
+
+    #[test]
+    fn writes_create_nested_parents_and_exact_removal_preserves_other_bytes() {
+        let root = crate::filesystem::PrivateTempDir::new("secure-parent").unwrap();
+        for (directory, create_once) in [("atomic/nested", false), ("new/nested", true)] {
+            let path = root.path().join(directory).join("evidence");
+            if create_once {
+                super::write_new_or_exact(&path, b"verified", true).unwrap();
+            } else {
+                super::write_atomic(&path, b"verified", true).unwrap();
+            }
+            super::open_lock_file(&path.with_extension("lock"), true).unwrap();
+            assert_eq!(super::read_bounded(&path, 8, true).unwrap(), b"verified");
+            assert_eq!(
+                super::read_bounded(&path, 7, true),
+                Err(super::SecureFileError::Oversize)
+            );
+            assert!(super::remove_private_file_if_exact(&path, b"different").is_err());
+            assert_eq!(super::read_bounded(&path, 8, true).unwrap(), b"verified");
+            super::remove_private_file_if_exact(&path, b"verified").unwrap();
+            assert!(!path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_operations_reject_unsafe_parents_and_linked_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = crate::filesystem::PrivateTempDir::new("secure-descriptor").unwrap();
+        let parent = root.path().join("private");
+        super::ensure_directory(&parent, true).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&parent, &alias).unwrap();
+        let unsafe_mode = root.path().join("shared");
+        std::fs::create_dir(&unsafe_mode).unwrap();
+        std::fs::set_permissions(&unsafe_mode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for directory in [&alias, &unsafe_mode] {
+            let path = directory.join("secret");
+            assert_eq!(
+                super::write_atomic(&path, b"secret", true),
+                Err(super::SecureFileError::UnsafePath)
+            );
+            assert_eq!(
+                super::write_new_or_exact(&path, b"secret", true),
+                Err(super::SecureFileError::UnsafePath)
+            );
+            assert!(matches!(
+                super::open_lock_file(&path, true),
+                Err(super::SecureFileError::UnsafePath)
+            ));
+            assert!(!path.exists());
+        }
+        let path = parent.join("secret");
+        super::write_atomic(&path, b"secret", true).unwrap();
+        let hard_link = parent.join("hard-link");
+        std::fs::hard_link(&path, &hard_link).unwrap();
+        for linked in [&path, &hard_link] {
+            assert_eq!(
+                super::read_bounded(linked, 6, true),
+                Err(super::SecureFileError::UnsafePath)
+            );
+            assert_eq!(
+                super::write_new_or_exact(linked, b"secret", true),
+                Err(super::SecureFileError::UnsafePath)
+            );
+            assert_eq!(
+                super::remove_private_file_if_exact(linked, b"secret"),
+                Err(super::SecureFileError::UnsafePath)
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+    }
 
     #[cfg(unix)]
     #[test]

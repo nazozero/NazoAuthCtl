@@ -38,8 +38,8 @@ pub(crate) fn read_admin_credentials(
     input: AdminCredentialsInput<'_>,
     command: &str,
 ) -> anyhow::Result<AdminCredentials> {
-    let credentials = match input {
-        AdminCredentialsInput::Interactive => read_interactive(command)?,
+    match input {
+        AdminCredentialsInput::Interactive => read_interactive(command),
         AdminCredentialsInput::Stdin => {
             let mut bytes = Vec::new();
             std::io::stdin()
@@ -49,7 +49,7 @@ pub(crate) fn read_admin_credentials(
             if bytes.len() as u64 > MAX_CREDENTIALS_BYTES {
                 bail!("{INPUT_INVALID}: administrator credentials input is too large");
             }
-            parse_credentials(&bytes, "stdin credentials")?
+            parse_credentials(&bytes, "stdin credentials")
         }
         AdminCredentialsInput::File(path) => {
             let bytes = crate::filesystem::read_secure_regular_file(
@@ -58,20 +58,21 @@ pub(crate) fn read_admin_credentials(
                 true,
                 MAX_CREDENTIALS_BYTES,
             )?;
-            parse_credentials(&bytes, &path.display().to_string())?
+            parse_credentials(&bytes, &path.display().to_string())
         }
-    };
-    validate_admin_credentials(&credentials)?;
-    Ok(credentials)
+    }
 }
 
 fn parse_credentials(bytes: &[u8], source: &str) -> anyhow::Result<AdminCredentials> {
     let raw: RawAdminCredentials = serde_json::from_slice(bytes)
         .with_context(|| format!("{source} must be strict JSON with email and password"))?;
-    Ok(AdminCredentials {
+    let credentials = AdminCredentials {
         email: raw.email,
         password: Zeroizing::new(raw.password),
-    })
+    };
+    validate_admin_email(&credentials.email)?;
+    validate_admin_password(&credentials.password)?;
+    Ok(credentials)
 }
 
 fn read_interactive(command: &str) -> anyhow::Result<AdminCredentials> {
@@ -103,11 +104,6 @@ fn read_interactive(command: &str) -> anyhow::Result<AdminCredentials> {
         email: email.trim().to_owned(),
         password: Zeroizing::new(password),
     })
-}
-
-pub(crate) fn validate_admin_credentials(credentials: &AdminCredentials) -> anyhow::Result<()> {
-    validate_admin_email(&credentials.email)?;
-    validate_admin_password(&credentials.password)
 }
 
 fn validate_admin_email(email: &str) -> anyhow::Result<()> {
@@ -158,5 +154,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parsed_credentials_enforce_email_and_utf8_password_limits() {
+        for (email, password) in [
+            ("no-at", "long-enough-password".to_owned()),
+            ("admin@example.com", "short".to_owned()),
+            ("admin@example.com", "密".repeat(342)),
+        ] {
+            let json = serde_json::json!({"email": email, "password": password});
+            assert!(parse_credentials(&serde_json::to_vec(&json).unwrap(), "test").is_err());
+        }
     }
 }

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use regex::Regex;
@@ -57,16 +57,14 @@ struct StoredCookie {
 
 impl CookieJar {
     fn capture(&mut self, response: &HttpResponse) -> Result<(), OpenId4VciError> {
-        for (header, value) in response
+        for (_, value) in response
             .headers
             .iter()
             .filter(|(header, _)| header.eq_ignore_ascii_case("set-cookie"))
         {
-            let _ = header;
             let pair = value
-                .split(';')
-                .next()
-                .ok_or(OpenId4VciError::InvalidCookie)?;
+                .split_once(';')
+                .map_or(value.as_str(), |(pair, _)| pair);
             let (name, value) = pair.split_once('=').ok_or(OpenId4VciError::InvalidCookie)?;
             validate_cookie_name(name)?;
             validate_cookie_value(value)?;
@@ -93,13 +91,16 @@ impl CookieJar {
         if self.cookies.is_empty() {
             return None;
         }
-        Some(
-            self.cookies
-                .iter()
-                .map(|cookie| format!("{}={}", cookie.name, cookie.value.as_str()))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
+        let mut header = String::new();
+        for cookie in &self.cookies {
+            if !header.is_empty() {
+                header.push_str("; ");
+            }
+            header.push_str(&cookie.name);
+            header.push('=');
+            header.push_str(&cookie.value);
+        }
+        Some(header)
     }
 }
 
@@ -150,16 +151,10 @@ fn validate_cookie_value(value: &str) -> Result<(), OpenId4VciError> {
 pub enum OpenId4VciError {
     #[error("OpenID4VCI input is invalid")]
     InvalidInput,
-    #[error("OpenID4VCI target origin is invalid")]
-    InvalidTargetOrigin,
     #[error("OpenID4VCI Suite callback is invalid")]
     InvalidSuiteCallback,
-    #[error("OpenID4VCI runner data is unavailable")]
-    MissingRunnerData,
     #[error("OpenID4VCI runner is waiting for browser data")]
     Pending,
-    #[error("OpenID4VCI credential offer endpoint is unavailable")]
-    MissingOfferEndpoint,
     #[error("OpenID4VCI credential configuration is unavailable")]
     MissingCredentialConfiguration,
     #[error("OpenID4VCI pre-authorized transaction code is unavailable")]
@@ -168,8 +163,6 @@ pub enum OpenId4VciError {
     TransactionCodeMismatch,
     #[error("OpenID4VCI credential offer response is invalid")]
     InvalidOfferResponse,
-    #[error("OpenID4VCI browser task configuration is unavailable")]
-    MissingBrowserTasks,
     #[error("OpenID4VCI browser authorization URL is invalid or ambiguous")]
     InvalidAuthorizationUrl,
     #[error("OpenID4VCI hosted authorization response is invalid")]
@@ -319,7 +312,7 @@ pub struct OpenId4VciIssuerClient {
     hosted_password: Zeroizing<String>,
     transport: Arc<dyn Transport>,
     max_response_bytes: usize,
-    triggered: HashSet<(String, bool)>,
+    triggered: HashMap<String, bool>,
     completed_browser_urls: HashMap<String, HashSet<String>>,
     anonymous_browser_urls: HashSet<String>,
 }
@@ -370,9 +363,6 @@ impl OpenId4VciIssuerClient {
         transport: Arc<dyn Transport>,
     ) -> Result<Self, OpenId4VciError> {
         validate_secret(&issuer_management_token)?;
-        if suite_token.is_empty() {
-            return Err(OpenId4VciError::InvalidInput);
-        }
         Ok(Self {
             target_origin: config.target_origin,
             suite_origin: config.suite_origin,
@@ -384,7 +374,7 @@ impl OpenId4VciIssuerClient {
             hosted_password: config.hosted_password,
             transport,
             max_response_bytes: MAX_RESPONSE_BYTES,
-            triggered: HashSet::new(),
+            triggered: HashMap::new(),
             completed_browser_urls: HashMap::new(),
             anonymous_browser_urls: HashSet::new(),
         })
@@ -403,33 +393,17 @@ impl OpenId4VciIssuerClient {
         {
             headers.push(("Cookie".to_owned(), value));
         }
-        let response = self
-            .transport
+        self.transport
             .send(
                 HttpRequest {
                     method,
                     url,
                     headers,
-                    body,
+                    body: body.map(Into::into),
                 },
                 self.max_response_bytes,
             )
-            .map_err(OpenId4VciError::Transport)?;
-        let header_bytes = response
-            .headers
-            .iter()
-            .try_fold(0usize, |total, (name, value)| {
-                total
-                    .checked_add(name.len())
-                    .and_then(|total| total.checked_add(value.len()))
-                    .ok_or(())
-            });
-        if header_bytes.map_or(true, |total| total > self.max_response_bytes)
-            || response.body.len() > self.max_response_bytes
-        {
-            return Err(OpenId4VciError::Transport(TransportError::Oversize));
-        }
-        Ok(response)
+            .map_err(OpenId4VciError::Transport)
     }
 
     fn send_session(
@@ -445,15 +419,12 @@ impl OpenId4VciIssuerClient {
         Ok(response)
     }
 
-    fn target_url(&self, path: &str) -> Result<Url, OpenId4VciError> {
-        if !path.starts_with('/') || path.contains("//") || path.contains("..") {
-            return Err(OpenId4VciError::InvalidInput);
-        }
+    fn target_url(&self, path: &str) -> Url {
         let mut url = self.target_origin.as_url().clone();
         url.set_path(path);
         url.set_query(None);
         url.set_fragment(None);
-        Ok(url)
+        url
     }
 
     fn validate_target_url(&self, url: &Url) -> Result<(), OpenId4VciError> {
@@ -477,12 +448,7 @@ impl OpenId4VciIssuerClient {
         {
             return Err(OpenId4VciError::InvalidHostedResponse);
         }
-        let value: Value = serde_json::from_slice(&response.body)
-            .map_err(|_| OpenId4VciError::InvalidHostedResponse)?;
-        value
-            .as_object()
-            .cloned()
-            .ok_or(OpenId4VciError::InvalidHostedResponse)
+        serde_json::from_slice(&response.body).map_err(|_| OpenId4VciError::InvalidHostedResponse)
     }
 
     fn location(&self, request_url: &Url, response: &HttpResponse) -> Result<Url, OpenId4VciError> {
@@ -511,7 +477,7 @@ impl OpenId4VciIssuerClient {
         let response = self.send_session(
             &mut session,
             HttpMethod::Post,
-            self.target_url("/auth/login")?,
+            self.target_url("/auth/login"),
             vec![
                 ("Accept".to_owned(), "application/json".to_owned()),
                 ("Content-Type".to_owned(), "application/json".to_owned()),
@@ -532,17 +498,6 @@ impl OpenId4VciIssuerClient {
         validate_secret(csrf)?;
         session.csrf_token = Zeroizing::new(csrf.to_owned());
         Ok(session)
-    }
-
-    fn target_endpoint(&self) -> Result<Url, OpenId4VciError> {
-        let mut endpoint = self.target_origin.as_url().clone();
-        endpoint.set_path("/openid4vci/offers");
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
-        if !self.target_origin.allows(&endpoint) {
-            return Err(OpenId4VciError::InvalidTargetOrigin);
-        }
-        Ok(endpoint)
     }
 
     fn create_offer(
@@ -580,7 +535,7 @@ impl OpenId4VciIssuerClient {
             .send(
                 HttpRequest {
                     method: HttpMethod::Post,
-                    url: self.target_endpoint()?,
+                    url: self.target_url("/openid4vci/offers"),
                     headers: vec![
                         ("Accept".to_owned(), "application/json".to_owned()),
                         ("Content-Type".to_owned(), "application/json".to_owned()),
@@ -591,7 +546,8 @@ impl OpenId4VciIssuerClient {
                     ],
                     body: Some(
                         serde_json::to_vec(&Value::Object(body))
-                            .map_err(|_| OpenId4VciError::InvalidInput)?,
+                            .map_err(|_| OpenId4VciError::InvalidInput)?
+                            .into(),
                     ),
                 },
                 self.max_response_bytes,
@@ -707,12 +663,11 @@ impl OpenId4VciIssuerClient {
     fn drive_offer(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
         // The Suite owns the offer phase. A registered browser worker can
         // complete authorization without populating this HTTP driver's cache.
-        let first_phase = (module.module_id.clone(), false);
-        let second_phase = (module.module_id.clone(), true);
-        if self.triggered.contains(&second_phase) {
+        let completed_phase = self.triggered.get(&module.module_id).copied();
+        if completed_phase == Some(true) {
             return Ok(());
         }
-        let second_client = if self.triggered.contains(&first_phase) {
+        let second_client = if completed_phase == Some(false) {
             if module.test_name != MULTIPLE_CLIENTS_MODULE
                 || module.variant.get("vci_grant_type").map(String::as_str)
                     != Some("authorization_code")
@@ -764,7 +719,6 @@ impl OpenId4VciIssuerClient {
         } else {
             false
         };
-        let offer_phase = (module.module_id.clone(), second_client);
         let exposed = module
             .runner
             .get("exposed")
@@ -824,7 +778,8 @@ impl OpenId4VciIssuerClient {
             let offer = self.create_offer(configuration_id, grant_type, tx_code)?;
             self.deliver_offer(&endpoint, &offer, delivery)?;
         }
-        self.triggered.insert(offer_phase);
+        self.triggered
+            .insert(module.module_id.clone(), second_client);
         Ok(())
     }
 
@@ -850,55 +805,37 @@ impl OpenId4VciIssuerClient {
                 continue;
             }
             let Ok(url) = Url::parse(value) else { continue };
-            if url.path() == "/authorize"
-                && (!self.target_origin.allows(&url)
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                    || url.fragment().is_some())
-            {
+            if url.path() != "/authorize" {
+                continue;
+            }
+            if self.validate_target_url(&url).is_err() {
                 invalid_authorization_url = true;
                 continue;
             }
-            if url.username().is_empty()
-                && url.password().is_none()
-                && url.fragment().is_none()
-                && url.path() == "/authorize"
-                && url.query().is_some_and(|query| !query.is_empty())
-                && self.target_origin.allows(&url)
-            {
+            if url.query().is_some_and(|query| !query.is_empty()) {
                 candidates.push(url);
             }
         }
         candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         candidates.dedup_by(|left, right| left == right);
-        let completed = self
-            .completed_browser_urls
-            .get(&module.module_id)
-            .cloned()
-            .unwrap_or_default();
-        let pending = if module.test_name == REPEATED_AUTHORIZATION_MODULE {
-            candidates.clone()
-        } else {
-            candidates
-                .iter()
-                .filter(|url| !completed.contains(url.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        if pending.is_empty() {
+        if module.test_name != REPEATED_AUTHORIZATION_MODULE
+            && let Some(completed) = self.completed_browser_urls.get(&module.module_id)
+        {
+            candidates.retain(|url| !completed.contains(url.as_str()));
+        }
+        if candidates.is_empty() {
             if invalid_authorization_url {
                 return Err(OpenId4VciError::InvalidAuthorizationUrl);
             }
             return Err(OpenId4VciError::Pending);
         }
-        if pending.len() != 1 {
+        if candidates.len() != 1 {
             return Err(OpenId4VciError::InvalidAuthorizationUrl);
         }
-        let authorization_url = pending.into_iter().next().expect("one pending URL");
-        let visited = browser_visited(browser, authorization_url.as_str());
-        let anonymous_key = format!("{}\0{}", module.module_id, authorization_url);
+        let authorization_url = candidates.pop().expect("one pending URL");
         if module.test_name == INITIAL_ANONYMOUS_MODULE
-            && !visited
+            && !browser_visited(browser, authorization_url.as_str())
+            && let anonymous_key = format!("{}\0{}", module.module_id, authorization_url)
             && !self.anonymous_browser_urls.contains(&anonymous_key)
         {
             let response = self.send(
@@ -932,11 +869,10 @@ impl OpenId4VciIssuerClient {
         )?;
         let location = self.location(&authorization_url, &response)?;
         let callback = if self.suite_origin.same_origin_url(&location) {
-            self.validate_suite_callback_url(&location)?;
             location
         } else {
             let request_id = self.consent_request_id(&location)?;
-            let mut consent_url = self.target_url("/authorize/consent")?;
+            let mut consent_url = self.target_url("/authorize/consent");
             consent_url
                 .query_pairs_mut()
                 .append_pair("request_id", &request_id);
@@ -970,7 +906,7 @@ impl OpenId4VciIssuerClient {
             form.append_pair("request_id", &request_id)
                 .append_pair("decision", decision)
                 .append_pair("csrf_token", session.csrf_token.as_str());
-            let decision_url = self.target_url("/authorize/decision")?;
+            let decision_url = self.target_url("/authorize/decision");
             let csrf_header = session.csrf_token.as_str().to_owned();
             let decision_response = self.send_session(
                 &mut session,
@@ -993,9 +929,7 @@ impl OpenId4VciIssuerClient {
                 ],
                 Some(form.finish().into_bytes()),
             )?;
-            let callback = self.location(&decision_url, &decision_response)?;
-            self.validate_suite_callback_url(&callback)?;
-            callback
+            self.location(&decision_url, &decision_response)?
         };
         self.complete_suite_callback(&callback)?;
         self.completed_browser_urls
@@ -1007,13 +941,12 @@ impl OpenId4VciIssuerClient {
 
     fn initial_anonymous_location(&self, location: &Url) -> Result<(), OpenId4VciError> {
         self.validate_target_url(location)?;
+        let mut pairs = location.query_pairs();
         if location.path() != "/ui/auth"
-            || location.fragment().is_some()
-            || location.query_pairs().count() != 1
-            || location
-                .query_pairs()
+            || pairs
                 .next()
                 .is_none_or(|(key, value)| key != "next" || value.is_empty())
+            || pairs.next().is_some()
         {
             return Err(OpenId4VciError::InvalidHostedResponse);
         }
@@ -1022,16 +955,18 @@ impl OpenId4VciIssuerClient {
 
     fn consent_request_id(&self, location: &Url) -> Result<String, OpenId4VciError> {
         self.validate_target_url(location)?;
-        if location.path() != "/ui/consent" || location.fragment().is_some() {
+        if location.path() != "/ui/consent" {
             return Err(OpenId4VciError::InvalidHostedResponse);
         }
-        let pairs = location.query_pairs().collect::<Vec<_>>();
-        if pairs.len() != 1 || pairs[0].0 != "request_id" || pairs[0].1.is_empty() {
+        let mut pairs = location.query_pairs();
+        let Some((key, request_id)) = pairs.next() else {
+            return Err(OpenId4VciError::InvalidHostedResponse);
+        };
+        if key != "request_id" || request_id.is_empty() || pairs.next().is_some() {
             return Err(OpenId4VciError::InvalidHostedResponse);
         }
-        let request_id = pairs[0].1.to_string();
         validate_field(&request_id)?;
-        Ok(request_id)
+        Ok(request_id.into_owned())
     }
 
     fn validate_suite_callback_url(&self, url: &Url) -> Result<(), OpenId4VciError> {
@@ -1067,9 +1002,11 @@ impl OpenId4VciIssuerClient {
         {
             return Err(OpenId4VciError::InvalidHostedResponse);
         }
-        let pattern = Regex::new(r#"xhr\.open\('POST',\s*("(?:\\.|[^"\\])*")\s*,\s*true\);"#)
-            .map_err(|_| OpenId4VciError::InvalidHostedResponse)?;
-        let mut matches = pattern.captures_iter(
+        static CALLBACK_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"xhr\.open\('POST',\s*("(?:\\.|[^"\\])*")\s*,\s*true\);"#)
+                .expect("static Suite callback pattern")
+        });
+        let mut matches = CALLBACK_PATTERN.captures_iter(
             std::str::from_utf8(&response.body)
                 .map_err(|_| OpenId4VciError::InvalidHostedResponse)?,
         );
@@ -1164,22 +1101,22 @@ enum OfferDelivery {
 }
 
 fn parse_offer(body: &[u8]) -> Result<Offer, OpenId4VciError> {
-    let value: Value =
+    let mut object: serde_json::Map<String, Value> =
         serde_json::from_slice(body).map_err(|_| OpenId4VciError::InvalidOfferResponse)?;
-    let object = value
-        .as_object()
-        .ok_or(OpenId4VciError::InvalidOfferResponse)?;
-    let credential_offer = object.get("credential_offer").cloned();
+    let credential_offer = object.remove("credential_offer");
     if credential_offer
         .as_ref()
         .is_some_and(|value| !value.is_object())
     {
         return Err(OpenId4VciError::InvalidOfferResponse);
     }
-    let credential_offer_uri = object
-        .get("credential_offer_uri")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    let credential_offer_uri =
+        object
+            .remove("credential_offer_uri")
+            .and_then(|value| match value {
+                Value::String(uri) => Some(uri),
+                _ => None,
+            });
     if credential_offer.is_none() && credential_offer_uri.is_none() {
         return Err(OpenId4VciError::InvalidOfferResponse);
     }
@@ -1204,11 +1141,8 @@ fn offer_delivery(config: &Value) -> Result<OfferDelivery, OpenId4VciError> {
 }
 
 fn validate_secret(value: &str) -> Result<(), OpenId4VciError> {
-    if value.trim().is_empty()
+    if value.is_empty()
         || value.len() > MAX_FIELD_BYTES * 16
-        || value
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
         || !value.bytes().all(|byte| byte.is_ascii_graphic())
     {
         Err(OpenId4VciError::InvalidInput)
@@ -1698,17 +1632,6 @@ mod tests {
         assert_eq!(
             client.drive(&module("wallet_initiated", "authorization_code")),
             Err(OpenId4VciError::MissingCsrfToken)
-        );
-    }
-
-    #[test]
-    fn hosted_callback_response_is_bounded() {
-        let mut responses = hosted_responses();
-        responses[1].body = vec![b'x'; MAX_RESPONSE_BYTES + 1];
-        let (_, mut client) = client_with_responses(responses);
-        assert_eq!(
-            client.drive(&module("wallet_initiated", "authorization_code")),
-            Err(OpenId4VciError::Transport(TransportError::Oversize))
         );
     }
 

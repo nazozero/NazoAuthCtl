@@ -10,8 +10,7 @@ use anyhow::{Context as _, bail};
 
 use crate::admin_credentials::{AdminCredentialsInput, read_admin_credentials};
 use crate::clean_install::{
-    CleanInstallContext, CleanInstallRequest, CurlPublicProber, admin_provision_password_material,
-    verify_public,
+    CleanInstallContext, CleanInstallRequest, CurlPublicProber, verify_public,
 };
 use crate::cli::{
     AdminCommand, AdminCreateArgs, BackupArgs, BackupCommand, Cli, Command, InstallArgs,
@@ -39,8 +38,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     ) {
         super::self_update::repair_interrupted_update()?;
     }
-    // Copied out before the command is moved; selector helpers close over these.
-    let global_instance = cli.instance.clone();
+    // Move the independent global selector before consuming the command.
+    let global_instance = cli.instance;
     let json_mode = cli.json;
     let instance_flag = global_instance.as_deref();
     match cli.command {
@@ -49,10 +48,11 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Instance(mut command) => {
             // P1-2: fold the global --instance into the command-level selector,
             // strictly rejecting collisions where both channels are present.
-            let apply_merge = |sel: &mut InstanceSelector, label: &str| -> anyhow::Result<()> {
-                if let Some(merged) = sel.merge_global(instance_flag, label)? {
-                    sel.positional = Some(merged);
-                    sel.named = None;
+            let mut global_instance = global_instance;
+            let mut apply_merge = |sel: &mut InstanceSelector, label: &str| -> anyhow::Result<()> {
+                sel.merge_global(global_instance.as_deref(), label)?;
+                if let Some(global) = global_instance.take() {
+                    sel.named = Some(global);
                 }
                 Ok(())
             };
@@ -79,74 +79,51 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Version { selector, all } => {
-            let merged = merge(&selector, instance_flag, "version")?;
-            crate::fleet::fleet_read::run_version(merged.as_deref(), all, json_mode)
+            let merged = selector.merge_global(instance_flag, "version")?;
+            crate::fleet::fleet_read::run_version(merged, all, json_mode)
         }
         Command::Status { selector, all } => {
-            selector_scoped(&selector, instance_flag, "status", |merged| {
-                let store = RegistryStore::open_default()?;
-                crate::fleet::fleet_read::run_status_like(
-                    &store,
-                    merged.as_deref(),
-                    all,
-                    json_mode,
-                    "status",
-                    false,
-                )
-            })
+            let merged = selector.merge_global(instance_flag, "status")?;
+            let store = RegistryStore::open_default()?;
+            crate::fleet::fleet_read::run_status_like(
+                &store, merged, all, json_mode, "status", false,
+            )
         }
         Command::Doctor { selector, all } => {
-            selector_scoped(&selector, instance_flag, "doctor", |merged| {
-                let store = RegistryStore::open_default()?;
-                crate::fleet::fleet_read::run_status_like(
-                    &store,
-                    merged.as_deref(),
-                    all,
-                    json_mode,
-                    "doctor",
-                    true,
-                )
-            })
+            let merged = selector.merge_global(instance_flag, "doctor")?;
+            let store = RegistryStore::open_default()?;
+            crate::fleet::fleet_read::run_status_like(
+                &store, merged, all, json_mode, "doctor", true,
+            )
         }
         Command::Logs { selector, limit } => {
-            selector_scoped(&selector, instance_flag, "logs", |merged| {
-                let store = RegistryStore::open_default()?;
-                crate::fleet::fleet_read::run_logs_view(&store, merged.as_deref(), limit, json_mode)
-            })
+            let merged = selector.merge_global(instance_flag, "logs")?;
+            let store = RegistryStore::open_default()?;
+            crate::fleet::fleet_read::run_logs_view(&store, merged, limit, json_mode)
         }
-        Command::Verify { selector } => {
-            selector_scoped(&selector, instance_flag, "verify", run_verify)
-        }
+        Command::Verify { selector } => run_verify(selector.merge_global(instance_flag, "verify")?),
         Command::Update(args) => run_update(args, instance_flag),
         Command::Rollback { selector } => {
-            let merged = merge(&selector, instance_flag, "rollback")?;
+            let merged = selector.merge_global(instance_flag, "rollback")?;
             let context = LifecycleContext::production()?;
-            let report = crate::instance_lifecycle::run_rollback(&context, merged.as_deref())?;
+            let report = crate::instance_lifecycle::run_rollback(&context, merged)?;
             crate::ui::print_report(&report);
             Ok(())
         }
         Command::Operation { selector, limit } => {
-            selector_scoped(&selector, instance_flag, "operation", |merged| {
-                let store = RegistryStore::open_default()?;
-                let keys = ControllerKeyStore::open_default()?;
-                crate::fleet::fleet_read::run_operation_view(
-                    &store,
-                    &keys,
-                    merged.as_deref(),
-                    limit,
-                    json_mode,
-                )
-            })
+            let merged = selector.merge_global(instance_flag, "operation")?;
+            let store = RegistryStore::open_default()?;
+            let keys = ControllerKeyStore::open_default()?;
+            crate::fleet::fleet_read::run_operation_view(&store, &keys, merged, limit, json_mode)
         }
         Command::Backup(args) => run_backup(args, instance_flag, json_mode),
         Command::Policy(args) => run_policy(args, instance_flag),
         Command::Recover(args) => run_recover(args, instance_flag),
         Command::Uninstall { selector, yes } => {
-            let merged = merge(&selector, instance_flag, "uninstall")?;
+            let merged = selector.merge_global(instance_flag, "uninstall")?;
             let context = LifecycleContext::production()?;
             let keys = ControllerKeyStore::open_default()?;
-            let report =
-                crate::instance_lifecycle::run_uninstall(&context, &keys, merged.as_deref(), yes)?;
+            let report = crate::instance_lifecycle::run_uninstall(&context, &keys, merged, yes)?;
             crate::ui::print_report(&report);
             Ok(())
         }
@@ -170,34 +147,15 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
 
 // ------------------------------------------------------------------ helpers
 
-/// Apply the I02 exactly-one rule between the global `--instance` and any
-/// command-level channel.
-fn merge(
-    selector: &InstanceSelector,
-    global: Option<&str>,
-    action: &str,
-) -> anyhow::Result<Option<String>> {
-    selector.merge_global(global, action)
-}
-
-fn selector_scoped<T>(
-    selector: &InstanceSelector,
-    global: Option<&str>,
-    action: &str,
-    body: impl FnOnce(Option<String>) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    body(merge(selector, global, action)?)
-}
-
 fn run_backup(args: BackupArgs, global: Option<&str>, json_mode: bool) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "backup")?;
+    let merged = args.selector.merge_global(global, "backup")?;
     if args.command == BackupCommand::Show {
         let store = RegistryStore::open_default()?;
-        return crate::fleet::fleet_read::run_backup_view(&store, merged.as_deref(), json_mode);
+        return crate::fleet::fleet_read::run_backup_view(&store, merged, json_mode);
     }
     let context = LifecycleContext::production()?;
     let (record, source_host, target, inspection) =
-        crate::instance_lifecycle::resolve_live_instance(&context, merged.as_deref(), "backup")?;
+        crate::instance_lifecycle::resolve_live_instance(&context, merged, "backup")?;
     if let BackupCommand::Copy { to_host } = args.command {
         return run_backup_copy(
             &context.registry,
@@ -264,13 +222,6 @@ fn run_backup_copy(
     let keys = ControllerKeyStore::open_default()?;
     let journal = TransferJournal::open(&keys.instance_dir(deployment_id)?)?;
     let existing = journal.load()?;
-    if let Some(existing) = &existing
-        && (existing.deployment_id != deployment_id
-            || existing.source_host_id != source_host.host_id.to_string()
-            || existing.destination_alias != destination_alias)
-    {
-        return transfer_binding_error(existing, &record.alias);
-    }
     let destination_host = registry.host_by_alias(destination_alias)?.with_context(|| {
         if let Some(existing) = &existing {
             format!(
@@ -376,7 +327,6 @@ fn resume_backup_transfer(
                     )?,
                     "source export preparation",
                 )?;
-                validate_source_plan(transfer, &plan)?;
                 transfer.source_plan = Some(plan);
                 transfer.phase = TransferPhase::DestinationPrepare;
                 journal.store(transfer)?;
@@ -463,33 +413,13 @@ fn resume_backup_transfer(
                 )?;
                 let receipt = transfer
                     .receipt
-                    .clone()
+                    .take()
                     .context("backup copy: durable destination receipt is missing")?;
                 journal.clear()?;
                 return Ok(receipt);
             }
         }
     }
-}
-
-fn validate_source_plan(
-    transfer: &TransferRecord,
-    plan: &crate::target::backup_exec::BackupTransferPlan,
-) -> anyhow::Result<()> {
-    if plan.operation_id != transfer.transfer_operation_id
-        || plan.deployment_id != transfer.deployment_id
-        || plan.manifest_sha256.len() != 64
-        || !plan
-            .manifest_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || plan.files.is_empty()
-    {
-        bail!(
-            "backup copy: source returned a transfer plan with mismatched immutable bindings; the durable transfer was retained for exact retry"
-        );
-    }
-    Ok(())
 }
 
 fn validate_receipt(
@@ -685,9 +615,9 @@ fn expect_transfer_written(result: crate::target::HostResult) -> anyhow::Result<
 }
 
 fn run_policy(args: PolicyArgs, global: Option<&str>) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "policy")?;
+    let merged = args.selector.merge_global(global, "policy")?;
     let store = RegistryStore::open_default()?;
-    let record = crate::fleet::resolve_instance(&store, merged.as_deref(), "policy")?;
+    let record = crate::fleet::resolve_instance(&store, merged, "policy")?;
     let updated = store.set_backup_before_update(&record.deployment_id, args.mode)?;
     let policy = match updated.backup_before_update {
         crate::registry::BackupBeforeUpdatePolicy::Off => crate::ui::text("Off", "关闭").to_owned(),
@@ -714,16 +644,10 @@ fn run_policy(args: PolicyArgs, global: Option<&str>) -> anyhow::Result<()> {
 fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
     use nazo_operator_protocol::{ControlOutcome, ControlResultData};
 
-    let merged = merge(&args.selector, global, "recover")?;
+    let merged = args.selector.merge_global(global, "recover")?;
     let context = LifecycleContext::production()?;
     let (record, host, target, inspection) =
-        crate::instance_lifecycle::resolve_live_instance(&context, merged.as_deref(), "recover")?;
-    let snapshot = inspection
-        .backup
-        .snapshot
-        .as_ref()
-        .context("recover requires an existing immutable snapshot")?;
-    validate_recovery_snapshot(snapshot)?;
+        crate::instance_lifecycle::resolve_live_instance(&context, merged, "recover")?;
     let keys = ControllerKeyStore::open_default()?;
     let journal = RecoveryJournal::open(&keys.instance_dir(&record.deployment_id)?)?;
     let mut plan = match journal.load()? {
@@ -734,6 +658,12 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             plan
         }
         None => {
+            let snapshot = inspection
+                .backup
+                .snapshot
+                .as_ref()
+                .context("recover requires an existing immutable snapshot")?;
+            validate_recovery_snapshot(snapshot)?;
             let plan = recovery_journal::new_plan(
                 record.deployment_id.clone(),
                 inspection.revision,
@@ -889,7 +819,6 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         }
         let config_revision = restored
             .config_revision_marker
-            .clone()
             .context("recover: restored target has no config-revision marker")?;
         let control_journal = crate::controller_identity::journal::OperationJournal::open(
             keys.instance_dir(&record.deployment_id)?,
@@ -920,12 +849,13 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             &plan.invalidation_request_hash,
         ) {
             (None, None) => {
-                plan.invalidation_operation_id = Some(prepared.signed.operation_id.clone());
+                plan.invalidation_operation_id =
+                    Some(prepared.signed.operation.operation_id.clone());
                 plan.invalidation_request_hash = Some(prepared.signed.request_hash.clone());
                 journal.store(&plan)?;
             }
             (Some(operation_id), Some(request_hash))
-                if operation_id == &prepared.signed.operation_id
+                if operation_id == &prepared.signed.operation.operation_id
                     && request_hash == &prepared.signed.request_hash => {}
             _ => bail!(
                 "recover: control-operation journal does not match the recorded recovery invalidation"
@@ -933,7 +863,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         }
         let candidate = plan
             .candidate
-            .clone()
+            .as_ref()
             .context("recover: recovery journal has no candidate pointer")?;
         let wrapper_operation_id = plan
             .candidate_control_operation_id
@@ -954,12 +884,12 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     https: candidate.https,
                 },
                 plan.state_epoch.clone(),
-                prepared.signed.operation_id.clone(),
+                prepared.signed.operation.operation_id.clone(),
                 prepared.signed.compact_jws.clone(),
             ),
         )?;
         let receipt = crate::target::control_operation_receipt(
-            prepared.signed.operation_id.clone(),
+            prepared.signed.operation.operation_id.clone(),
             host_result.outcome,
         )?;
         let verdict = crate::controller_identity::classify_control_receipt(&prepared, receipt)?;
@@ -1021,7 +951,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     &context.registry,
                     &keys,
                     &api,
-                    Some(&record.deployment_id),
+                    &record.deployment_id,
                     &secret,
                     "recovered-controller",
                     &delivery,
@@ -1242,7 +1172,7 @@ fn read_password_file_inner(
     flag: &str,
 ) -> anyhow::Result<crate::target::SecretMaterial> {
     const MAX_PASSWORD_FILE_BYTES: u64 = 4096;
-    let raw =
+    let mut raw =
         crate::filesystem::read_secure_regular_file(path, flag, true, MAX_PASSWORD_FILE_BYTES)
             .with_context(|| format!("{flag}: failed to read {}", path.display()))?;
     let mut end = raw.len();
@@ -1252,7 +1182,8 @@ fn read_password_file_inner(
     if end == 0 {
         bail!("{flag}: {} is empty", path.display());
     }
-    crate::target::SecretMaterial::try_new(raw[..end].to_vec())
+    raw.truncate(end);
+    crate::target::SecretMaterial::try_new(std::mem::take(&mut *raw))
         .map_err(|error| anyhow::anyhow!(error.detail))
 }
 
@@ -1261,24 +1192,28 @@ fn read_password_file_inner(
 /// is unusable.  It never enters argv, a target operation, or either journal.
 fn read_recovery_secret_file(path: &Path) -> anyhow::Result<zeroize::Zeroizing<String>> {
     const MAX_SECRET_FILE_BYTES: u64 = 4096;
-    let bytes = crate::filesystem::read_secure_regular_file(
+    let mut bytes = crate::filesystem::read_secure_regular_file(
         path,
         "recovery secret",
         true,
         MAX_SECRET_FILE_BYTES,
     )
     .with_context(|| format!("--recovery-secret-file: failed to read {}", path.display()))?;
-    let value = String::from_utf8(bytes.to_vec()).with_context(|| {
-        format!(
-            "--recovery-secret-file: {} is not valid UTF-8",
+    let value = String::from_utf8(std::mem::take(&mut *bytes)).map_err(|error| {
+        let cause = error.utf8_error();
+        let _invalid = zeroize::Zeroizing::new(error.into_bytes());
+        anyhow::anyhow!(
+            "--recovery-secret-file: {} is not valid UTF-8: {cause}",
             path.display()
         )
     })?;
-    let value = value.trim_end_matches(['\r', '\n']);
-    if value.is_empty() {
+    let mut value = zeroize::Zeroizing::new(value);
+    let length = value.trim_end_matches(['\r', '\n']).len();
+    if length == 0 {
         bail!("--recovery-secret-file: {} is empty", path.display());
     }
-    Ok(zeroize::Zeroizing::new(value.to_owned()))
+    value.truncate(length);
+    Ok(value)
 }
 
 fn run_install(args: InstallArgs) -> anyhow::Result<()> {
@@ -1302,14 +1237,13 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         direct_tls_config: args
             .direct_tls_config
             .map(|path| {
-                let bytes = crate::filesystem::read_secure_regular_file(
+                let mut bytes = crate::filesystem::read_secure_regular_file(
                     &path,
                     "Direct TLS configuration",
                     false,
                     crate::target::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
                 )?;
-                std::str::from_utf8(&bytes)
-                    .map(str::to_owned)
+                String::from_utf8(std::mem::take(&mut *bytes))
                     .context("Direct TLS configuration is not UTF-8")
             })
             .transpose()?,
@@ -1341,9 +1275,9 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_verify(merged: Option<String>) -> anyhow::Result<()> {
+fn run_verify(merged: Option<&str>) -> anyhow::Result<()> {
     let store = RegistryStore::open_default()?;
-    let record = crate::fleet::resolve_instance(&store, merged.as_deref(), "verify")?;
+    let record = crate::fleet::resolve_instance(&store, merged, "verify")?;
     let prober = CurlPublicProber;
     let report = verify_public(&prober, &record.issuer);
     crate::ui::print_report(&report.render());
@@ -1360,14 +1294,11 @@ fn run_admin(command: AdminCommand, global: Option<&str>) -> anyhow::Result<()> 
 /// The target resolves runtime/config paths from its live DeploymentState and
 /// invokes only the fixed `nazoauth admin-provision` entry point.
 fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "admin create")?;
+    let merged = args.selector.merge_global(global, "admin create")?;
     let context = LifecycleContext::production()?;
-    let (record, _host, target, inspection) = crate::instance_lifecycle::resolve_live_instance(
-        &context,
-        merged.as_deref(),
-        "admin create",
-    )?;
-    let credentials = read_admin_credentials(
+    let (record, _host, target, inspection) =
+        crate::instance_lifecycle::resolve_live_instance(&context, merged, "admin create")?;
+    let mut credentials = read_admin_credentials(
         if args.credentials_stdin {
             AdminCredentialsInput::Stdin
         } else {
@@ -1375,12 +1306,14 @@ fn run_admin_create(args: AdminCreateArgs, global: Option<&str>) -> anyhow::Resu
         },
         "admin create",
     )?;
-    let password = admin_provision_password_material(&credentials)?;
+    let password = crate::target::SecretMaterial::try_new(
+        std::mem::take(&mut *credentials.password).into_bytes(),
+    )?;
     let operation_id = admin_operation_id();
     let operation = crate::target::HostOperation::admin_create(
         operation_id,
-        inspection.deployment_id.clone(),
-        credentials.email.clone(),
+        inspection.deployment_id,
+        credentials.email,
         password,
     );
     let result = target.execute_host_operation(&operation)?;
@@ -1415,13 +1348,13 @@ fn admin_operation_id() -> uuid::Uuid {
 }
 
 fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
-    let merged = merge(&args.selector, global, "update")?;
+    let merged = args.selector.merge_global(global, "update")?;
     let config_content = match &args.config_file {
         Some(path) => Some(read_config_file(path)?),
         None => None,
     };
     let request = UpdateRequest {
-        instance: merged,
+        instance: merged.map(str::to_owned),
         version: args.version,
         config_content,
         config_schema: args.config_schema,
@@ -1433,7 +1366,7 @@ fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
             "Verifying release and updating the instance…",
             "正在验证发行版并更新实例……",
         ),
-        || crate::instance_lifecycle::run_update(&context, &keys, &request),
+        || crate::instance_lifecycle::run_update(&context, &keys, request),
     )?;
     crate::ui::print_report(&report);
     Ok(())
@@ -1441,14 +1374,14 @@ fn run_update(args: UpdateArgs, global: Option<&str>) -> anyhow::Result<()> {
 
 fn read_config_file(path: &std::path::Path) -> anyhow::Result<String> {
     const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-    let bytes = crate::filesystem::read_secure_regular_file(
+    let mut bytes = crate::filesystem::read_secure_regular_file(
         path,
         "staged configuration",
         false,
         MAX_CONFIG_BYTES,
     )
     .with_context(|| format!("failed to read {}", path.display()))?;
-    String::from_utf8(bytes.to_vec())
+    String::from_utf8(std::mem::take(&mut *bytes))
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
@@ -1469,6 +1402,24 @@ mod admin_create_tests {
 #[cfg(test)]
 mod install_input_tests {
     use super::read_password_file;
+
+    #[test]
+    fn password_file_preserves_bytes_and_removes_only_trailing_line_endings() -> anyhow::Result<()>
+    {
+        let work = crate::filesystem::PrivateTempDir::new("password-input")?;
+        let path = work.path().join("password");
+        for (bytes, expected) in [
+            (b" secret \r\n\n".as_slice(), b" secret ".as_slice()),
+            (b"\xff\x80\r\n".as_slice(), b"\xff\x80".as_slice()),
+        ] {
+            crate::filesystem::atomic_write(&path, bytes, 0o600)?;
+            let secret = read_password_file(&path, "--database-runtime-password-file")?;
+            assert_eq!(secret.as_bytes(), expected);
+        }
+        crate::filesystem::atomic_write(&path, b"\r\n", 0o600)?;
+        assert!(read_password_file(&path, "--database-runtime-password-file").is_err());
+        Ok(())
+    }
 
     #[test]
     fn local_password_file_failures_are_typed_as_invalid_input() {

@@ -35,3 +35,20 @@ fn maximum_archive_manifest_rejects_duplicate_paths_and_excess_entries() -> anyh
     );
     Ok(())
 }
+
+#[test]
+fn manifest_hash_stream_preserves_serialized_bytes() -> anyhow::Result<()> {
+    let mut manifest: SnapshotManifest = serde_json::from_slice(include_bytes!(
+        "../../fixtures/persistence/v0.2.28/snapshot-manifest.json"
+    ))?;
+    manifest.manifest_sha256.clear();
+    assert_eq!(
+        manifest.computed_sha256()?,
+        hex_digest(&serde_json::to_vec(&manifest)?)
+    );
+    for hash in ["", "invalid", &"A".repeat(64)] {
+        manifest.manifest_sha256 = hash.to_owned();
+        assert!(manifest.validate().is_err());
+    }
+    Ok(())
+}

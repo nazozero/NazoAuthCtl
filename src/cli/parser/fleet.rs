@@ -13,25 +13,25 @@ use anyhow::Context as _;
 use super::super::types::{HostCommand, InstanceCommand, InstanceSelector};
 use crate::registry::HostPrivilege;
 
-pub(super) fn parse_host(values: Vec<String>) -> anyhow::Result<HostCommand> {
-    let (subcommand, rest) = split_subcommand(&values, "host add|list|show|check|forget")?;
-    match subcommand {
+pub(super) fn parse_host(values: impl IntoIterator<Item = String>) -> anyhow::Result<HostCommand> {
+    let (subcommand, rest) = split_subcommand(values, "host add|list|show|check|forget")?;
+    match subcommand.as_str() {
         "add" => parse_host_add(rest),
         "list" => {
-            let parsed = parse_options(rest.to_vec(), &[], &["--refresh"], "host list")?;
+            let parsed = parse_options(rest, &[], &["--refresh"], "host list")?;
             require_no_positionals(&parsed.positionals, "host list")?;
             Ok(HostCommand::List {
                 refresh: parsed.flags.contains("--refresh"),
             })
         }
         "show" => Ok(HostCommand::Show {
-            alias: exactly_one(rest.to_vec(), "host show <alias>")?,
+            alias: exactly_one(rest, "host show <alias>")?,
         }),
         "check" => Ok(HostCommand::Check {
-            alias: exactly_one(rest.to_vec(), "host check <alias>")?,
+            alias: exactly_one(rest, "host check <alias>")?,
         }),
         "forget" => {
-            let parsed = parse_options(rest.to_vec(), &[], &["--cascade"], "host forget")?;
+            let parsed = parse_options(rest, &[], &["--cascade"], "host forget")?;
             Ok(HostCommand::Forget {
                 alias: exactly_one(parsed.positionals, "host forget <alias>")?,
                 cascade: parsed.flags.contains("--cascade"),
@@ -44,20 +44,15 @@ pub(super) fn parse_host(values: Vec<String>) -> anyhow::Result<HostCommand> {
     }
 }
 
-fn parse_host_add(values: &[String]) -> anyhow::Result<HostCommand> {
-    let parsed = parse_options(
-        values.to_owned(),
-        &["--ssh", "--privilege"],
-        &[],
-        "host add",
-    )?;
+fn parse_host_add(values: impl IntoIterator<Item = String>) -> anyhow::Result<HostCommand> {
+    let mut parsed = parse_options(values, &["--ssh", "--privilege"], &[], "host add")?;
     let alias = exactly_one(parsed.positionals, "host add <alias> --ssh PROFILE")?;
     checked_name("alias", &alias)?;
-    let ssh_profile = parsed.values.get("--ssh").context(crate::ui::text(
+    let ssh_profile = parsed.values.remove("--ssh").context(crate::ui::text(
         "host add requires --ssh PROFILE",
         "host add 需要 --ssh PROFILE",
     ))?;
-    checked_name("--ssh", ssh_profile)?;
+    checked_name("--ssh", &ssh_profile)?;
     let privilege = match parsed.values.get("--privilege").map(String::as_str) {
         None => HostPrivilege::Direct,
         Some("direct") => HostPrivilege::Direct,
@@ -69,19 +64,19 @@ fn parse_host_add(values: &[String]) -> anyhow::Result<HostCommand> {
     };
     Ok(HostCommand::Add {
         alias,
-        ssh_profile: ssh_profile.clone(),
+        ssh_profile,
         privilege,
     })
 }
 
-pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceCommand> {
-    let (subcommand, rest) = split_subcommand(
-        &values,
-        "instance list|show|register|rename|forget|relocate",
-    )?;
-    match subcommand {
+pub(super) fn parse_instance(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<InstanceCommand> {
+    let (subcommand, rest) =
+        split_subcommand(values, "instance list|show|register|rename|forget|relocate")?;
+    match subcommand.as_str() {
         "list" => {
-            let parsed = parse_options(rest.to_vec(), &[], &["--refresh"], "instance list")?;
+            let parsed = parse_options(rest, &[], &["--refresh"], "instance list")?;
             require_no_positionals(&parsed.positionals, "instance list")?;
             Ok(InstanceCommand::List {
                 refresh: parsed.flags.contains("--refresh"),
@@ -97,71 +92,78 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
         "register" => {
             // Controlled takeover (G05): the deployment binding comes from the
             // target's own DeploymentState over a verified handshake.
-            let parsed = parse_options(
-                rest.to_vec(),
+            let mut parsed = parse_options(
+                rest,
                 &["--host", "--deployment-id", "--alias"],
                 &[],
                 "instance register",
             )?;
             require_no_positionals(&parsed.positionals, "instance register")?;
-            for flag in ["--host", "--deployment-id"] {
-                parsed.values.get(flag).with_context(|| {
+            let mut required_name = |flag: &str| -> anyhow::Result<String> {
+                let value = parsed.values.remove(flag).with_context(|| {
                     crate::ui::message!(
                         "instance register requires {flag}",
                         "instance register 需要 {flag}"
                     )
                 })?;
-            }
-            checked_name("--host", &parsed.values["--host"])?;
-            checked_name("--deployment-id", &parsed.values["--deployment-id"])?;
-            let alias = match parsed.values.get("--alias") {
+                checked_name(flag, &value)?;
+                Ok(value)
+            };
+            let host = required_name("--host")?;
+            let deployment_id = required_name("--deployment-id")?;
+            let alias = match parsed.values.remove("--alias") {
                 Some(alias) => {
-                    checked_name("--alias", alias)?;
-                    Some(alias.clone())
+                    checked_name("--alias", &alias)?;
+                    Some(alias)
                 }
                 None => None,
             };
             Ok(InstanceCommand::Register {
-                host: parsed.values["--host"].clone(),
-                deployment_id: parsed.values["--deployment-id"].clone(),
+                host,
+                deployment_id,
                 alias,
             })
         }
         "rename" => {
             // Grammar: `[OLD] NEW`, or `--instance OLD NEW`.
-            let parsed = parse_options(rest.to_vec(), &["--instance"], &[], "instance rename")?;
-            let named = match parsed.values.get("--instance") {
+            let mut parsed = parse_options(rest, &["--instance"], &[], "instance rename")?;
+            let named = match parsed.values.remove("--instance") {
                 Some(instance) => {
-                    checked_name("--instance", instance)?;
-                    Some(instance.clone())
+                    checked_name("--instance", &instance)?;
+                    Some(instance)
                 }
                 None => None,
             };
-            let (source, new_alias) = match parsed.positionals.as_slice() {
-                [new_alias] => (
+            let mut positionals = parsed.positionals.into_iter();
+            let (source, new_alias) = match (
+                positionals.next(),
+                positionals.next(),
+                positionals.next(),
+            ) {
+                (Some(new_alias), None, None) => (
                     InstanceSelector {
                         positional: None,
                         named,
                     },
-                    new_alias.clone(),
+                    new_alias,
                 ),
-                [old, new_alias] => {
+                (Some(old), Some(new_alias), None) => {
                     if named.is_some() {
                         crate::ui::fail!(
                             "instance rename takes either --instance OLD or the positional OLD, not both",
                             "旧实例名称只能通过 --instance OLD 或位置参数 OLD 指定一次"
                         );
                     }
-                    checked_name("old selector", old)?;
+                    checked_name("old selector", &old)?;
                     (
                         InstanceSelector {
-                            positional: Some(old.clone()),
+                            positional: Some(old),
                             named: None,
                         },
-                        new_alias.clone(),
+                        new_alias,
                     )
                 }
-                [] => crate::ui::fail!(
+                (None, _, _) => crate::ui::fail!(
                     "instance rename requires the new alias",
                     "instance rename 需要新名称"
                 ),
@@ -181,15 +183,11 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
             }))
         }
         "relocate" => {
-            let parts = selector_parts(rest, &["--to-host"], &[], "instance relocate")?;
-            let to_host = parts
-                .values
-                .get("--to-host")
-                .context(crate::ui::text(
-                    "instance relocate requires --to-host HOST_ALIAS",
-                    "instance relocate 需要 --to-host HOST_ALIAS",
-                ))?
-                .clone();
+            let mut parts = selector_parts(rest, &["--to-host"], &[], "instance relocate")?;
+            let to_host = parts.values.remove("--to-host").context(crate::ui::text(
+                "instance relocate requires --to-host HOST_ALIAS",
+                "instance relocate 需要 --to-host HOST_ALIAS",
+            ))?;
             checked_name("--to-host", &to_host)?;
             Ok(InstanceCommand::Relocate {
                 selector: InstanceSelector {
@@ -209,24 +207,24 @@ pub(super) fn parse_instance(values: Vec<String>) -> anyhow::Result<InstanceComm
 /// Merge the positional selector argument with the explicit `--instance`
 /// channel. Extra named flags ride along in `values`.
 pub(super) fn selector_parts(
-    values: &[String],
+    values: impl IntoIterator<Item = String>,
     extra_value_flags: &[&str],
     bool_flags: &[&str],
     command: &str,
 ) -> anyhow::Result<SelectorParts> {
     let mut value_flags = extra_value_flags.to_vec();
     value_flags.push("--instance");
-    let parsed = parse_options(values.to_vec(), &value_flags, bool_flags, command)?;
+    let mut parsed = parse_options(values, &value_flags, bool_flags, command)?;
     if parsed.positionals.len() > 1 {
         crate::ui::fail!(
             "{command} accepts at most one selector argument",
             "{command} 最多接受一个实例选择参数"
         );
     }
-    let named = match parsed.values.get("--instance") {
+    let named = match parsed.values.remove("--instance") {
         Some(instance) => {
-            checked_name("--instance", instance)?;
-            Some(instance.clone())
+            checked_name("--instance", &instance)?;
+            Some(instance)
         }
         None => None,
     };
@@ -245,14 +243,13 @@ pub(super) struct SelectorParts {
     pub(super) flags: BTreeSet<String>,
 }
 
-fn split_subcommand<'a>(
-    values: &'a [String],
+fn split_subcommand(
+    values: impl IntoIterator<Item = String>,
     usage: &str,
-) -> anyhow::Result<(&'a str, &'a [String])> {
-    let (subcommand, rest) = values
-        .split_first()
-        .with_context(|| format!("expected {usage}"))?;
-    Ok((subcommand.as_str(), rest))
+) -> anyhow::Result<(String, impl Iterator<Item = String>)> {
+    let mut rest = values.into_iter();
+    let subcommand = rest.next().with_context(|| format!("expected {usage}"))?;
+    Ok((subcommand, rest))
 }
 
 pub(super) struct ParsedOptions {
@@ -262,7 +259,7 @@ pub(super) struct ParsedOptions {
 }
 
 pub(super) fn parse_options(
-    values: Vec<String>,
+    values: impl IntoIterator<Item = String>,
     value_flags: &[&str],
     bool_flags: &[&str],
     command: &str,
@@ -278,12 +275,18 @@ pub(super) fn parse_options(
             let value = iter.next().with_context(|| {
                 crate::ui::message!("{token} requires a value", "{token} 需要一个值")
             })?;
-            if parsed.values.insert(token.clone(), value).is_some() {
-                crate::ui::fail!("{token} may be specified only once", "{token} 只能指定一次");
+            match parsed.values.entry(token) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    let token = entry.key();
+                    crate::ui::fail!("{token} may be specified only once", "{token} 只能指定一次");
+                }
             }
-        } else if bool_flags.contains(&token.as_str()) {
-            if !parsed.flags.insert(token.clone()) {
-                crate::ui::fail!("{token} may be specified only once", "{token} 只能指定一次");
+        } else if let Some(&flag) = bool_flags.iter().find(|flag| **flag == token) {
+            if !parsed.flags.insert(token) {
+                crate::ui::fail!("{flag} may be specified only once", "{flag} 只能指定一次");
             }
         } else if token.starts_with('-') && token.len() > 1 {
             crate::ui::fail!(
@@ -297,7 +300,7 @@ pub(super) fn parse_options(
     Ok(parsed)
 }
 
-fn exactly_one(values: Vec<String>, usage: &str) -> anyhow::Result<String> {
+fn exactly_one(values: impl IntoIterator<Item = String>, usage: &str) -> anyhow::Result<String> {
     let mut iter = values.into_iter();
     let first = iter
         .next()

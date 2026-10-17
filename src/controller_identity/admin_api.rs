@@ -38,7 +38,9 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use http_body_util::BodyExt as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -86,10 +88,51 @@ impl fmt::Debug for AdminHttpRequest {
 #[derive(Clone)]
 pub struct AdminHttpResponse {
     pub status: u16,
-    pub body: Vec<u8>,
+    pub body: AdminResponseBody,
     /// Exact Set-Cookie values. Only the administrator-session client reads
     /// them; Debug intentionally reports only the count.
     pub set_cookie_headers: Vec<String>,
+}
+
+/// Retains HTTP data frames until their JSON consumer reads them.
+#[derive(Clone, Default)]
+pub struct AdminResponseBody {
+    first: Bytes,
+    rest: Vec<Bytes>,
+}
+
+impl From<Bytes> for AdminResponseBody {
+    fn from(first: Bytes) -> Self {
+        Self {
+            first,
+            rest: Vec::new(),
+        }
+    }
+}
+
+impl From<Vec<u8>> for AdminResponseBody {
+    fn from(bytes: Vec<u8>) -> Self {
+        Bytes::from(bytes).into()
+    }
+}
+
+impl AdminResponseBody {
+    fn len(&self) -> usize {
+        self.first.len() + self.rest.iter().map(Bytes::len).sum::<usize>()
+    }
+
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> serde_json::Result<T> {
+        if self.rest.is_empty() {
+            serde_json::from_slice(&self.first)
+        } else {
+            let chunks =
+                std::iter::once(self.first.as_ref()).chain(self.rest.iter().map(Bytes::as_ref));
+            let mut deserializer = serde_json::Deserializer::from_chunks(chunks);
+            let value = T::deserialize(&mut deserializer)?;
+            deserializer.end()?;
+            Ok(value)
+        }
+    }
 }
 
 impl fmt::Debug for AdminHttpResponse {
@@ -155,9 +198,9 @@ impl AdminApiTransport for HttpsAdminTransport {
     fn send(&self, request: AdminHttpRequest) -> anyhow::Result<AdminHttpResponse> {
         let mut builder = http::Request::builder()
             .method(request.method)
-            .uri(request.url.as_str());
-        for (name, value) in &request.headers {
-            builder = builder.header(*name, value);
+            .uri(request.url);
+        for (name, value) in request.headers {
+            builder = builder.header(name, value);
         }
         let outgoing = builder
             .body(http_body_util::Full::new(bytes::Bytes::from(
@@ -202,17 +245,23 @@ where
                     .context("admin API returned a non-text Set-Cookie header")
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (_, mut body) = response.into_parts();
-        let mut bytes = Vec::new();
+        let mut body = http_body_util::Limited::new(response.into_body(), MAX_RESPONSE_BYTES);
+        let mut collected = AdminResponseBody::default();
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(anyhow::Error::from)?;
-            if let Ok(data) = frame.into_data() {
-                append_response_frame(&mut bytes, &data)?;
+            if let Ok(data) = frame.map_err(anyhow::Error::from_boxed)?.into_data()
+                && !data.is_empty()
+            {
+                if collected.first.is_empty() {
+                    collected.first = data;
+                } else {
+                    collected.rest.push(data);
+                }
             }
         }
+        let body = collected;
         Ok::<_, anyhow::Error>(AdminHttpResponse {
             status,
-            body: bytes,
+            body,
             set_cookie_headers,
         })
     };
@@ -224,19 +273,6 @@ where
                 REQUEST_TIMEOUT.as_secs()
             )
         })?
-}
-
-/// The cap is enforced as each frame arrives so a malicious peer cannot make
-/// ctl collect an oversized response before it notices the limit.
-fn append_response_frame(output: &mut Vec<u8>, frame: &[u8]) -> anyhow::Result<()> {
-    if frame.len() > MAX_RESPONSE_BYTES.saturating_sub(output.len()) {
-        bail!(
-            "admin API response exceeds the {} byte limit",
-            MAX_RESPONSE_BYTES
-        );
-    }
-    output.extend_from_slice(frame);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -361,11 +397,10 @@ pub struct SlotsSnapshot {
 }
 
 impl SlotsSnapshot {
-    pub fn active_slots(&self) -> Vec<&ControllerSlotView> {
+    pub fn active_slots(&self) -> impl Iterator<Item = &ControllerSlotView> {
         self.items
             .iter()
             .filter(|slot| slot.status == SlotStatus::Active)
-            .collect()
     }
 }
 
@@ -662,17 +697,13 @@ pub struct TotpConfirmation {
 struct AdminCookieJar {
     values: BTreeMap<String, String>,
     csrf_cookie_name: Option<String>,
-    csrf_token: Option<String>,
 }
 
 impl AdminCookieJar {
     fn absorb(&mut self, headers: &[String]) -> anyhow::Result<()> {
         for header in headers {
-            let pair = header
-                .split(';')
-                .next()
-                .context("Set-Cookie header has no cookie pair")?
-                .trim();
+            let (pair, attributes) = header.split_once(';').unwrap_or((header, ""));
+            let pair = pair.trim();
             let (name, value) = pair
                 .split_once('=')
                 .context("Set-Cookie header has no name/value separator")?;
@@ -684,9 +715,8 @@ impl AdminCookieJar {
             {
                 bail!("admin API returned an invalid cookie name");
             }
-            let expires = header
+            let expires = attributes
                 .split(';')
-                .skip(1)
                 .any(|attribute| attribute.trim().eq_ignore_ascii_case("max-age=0"));
             if expires {
                 self.values.remove(name);
@@ -697,37 +727,30 @@ impl AdminCookieJar {
         Ok(())
     }
 
-    fn set_login_csrf(&mut self, token: String) -> anyhow::Result<()> {
+    fn set_login_csrf(&mut self, token: &str) -> anyhow::Result<()> {
         let name = self
             .values
             .iter()
-            .find_map(|(name, value)| (value == &token).then(|| name.clone()))
+            .find_map(|(name, value)| (value == token).then(|| name.clone()))
             .context("login response did not set the matching CSRF cookie")?;
         self.csrf_cookie_name = Some(name);
-        self.csrf_token = Some(token);
         Ok(())
     }
 
-    fn refresh_rotated_csrf(&mut self) -> anyhow::Result<()> {
+    fn csrf_token(&self) -> anyhow::Result<&str> {
         let name = self
             .csrf_cookie_name
             .as_ref()
             .context("administrator session has no CSRF cookie name")?;
-        let token = self
-            .values
+        self.values
             .get(name)
-            .cloned()
-            .context("administrator session rotation omitted the CSRF cookie")?;
-        self.csrf_token = Some(token);
-        Ok(())
+            .map(String::as_str)
+            .context("administrator session has no CSRF cookie")
     }
 
     fn request_headers(&self) -> anyhow::Result<Vec<(&'static str, String)>> {
         let cookie = self.cookie_header()?;
-        let csrf = self
-            .csrf_token
-            .clone()
-            .context("administrator session has no CSRF token")?;
+        let csrf = self.csrf_token()?.to_owned();
         Ok(vec![("Cookie", cookie), ("x-csrf-token", csrf)])
     }
 
@@ -735,19 +758,27 @@ impl AdminCookieJar {
         if self.values.is_empty() {
             bail!("administrator login did not establish a cookie session");
         }
-        Ok(self
-            .values
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; "))
+        let mut cookie = String::new();
+        for (name, value) in &self.values {
+            if !cookie.is_empty() {
+                cookie.push_str("; ");
+            }
+            cookie.push_str(name);
+            cookie.push('=');
+            cookie.push_str(value);
+        }
+        Ok(cookie)
     }
 
-    fn into_access(self) -> anyhow::Result<AdminAccess> {
+    fn into_access(mut self) -> anyhow::Result<AdminAccess> {
         let cookie = self.cookie_header()?;
+        let name = self
+            .csrf_cookie_name
+            .context("administrator session has no CSRF cookie name")?;
         let csrf = self
-            .csrf_token
-            .context("administrator session has no CSRF token")?;
+            .values
+            .remove(&name)
+            .context("administrator session has no CSRF cookie")?;
         Ok(AdminAccess::new(Some(cookie), Some(csrf)))
     }
 }
@@ -822,10 +853,11 @@ impl HttpAdminSessionApi {
             Some(serialize_body(&LoginBody { email, password })?),
             false,
         )?;
-        let wire: LoginWire = serde_json::from_slice(&raw)
+        let wire: LoginWire = raw
+            .json()
             .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
         self.cookies
-            .set_login_csrf(wire.csrf_token)
+            .set_login_csrf(&wire.csrf_token)
             .map_err(AdminApiError::MalformedResponse)?;
         Ok(AdminLogin {
             mfa_required: wire.mfa_required,
@@ -834,7 +866,8 @@ impl HttpAdminSessionApi {
 
     pub fn begin_totp(&mut self) -> Result<TotpEnrollment, AdminApiError> {
         let raw = self.send_json("/auth/me/mfa/totp/begin", Some(b"{}".to_vec()), true)?;
-        let wire: TotpEnrollmentWire = serde_json::from_slice(&raw)
+        let wire: TotpEnrollmentWire = raw
+            .json()
             .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
         Ok(TotpEnrollment {
             secret_base32: zeroize::Zeroizing::new(wire.secret_base32),
@@ -856,16 +889,15 @@ impl HttpAdminSessionApi {
             })?),
             true,
         )?;
-        let wire: MfaSuccessWire = serde_json::from_slice(&raw)
+        let wire: MfaSuccessWire = raw
+            .json()
             .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
         if !wire.success {
             return Err(AdminApiError::MalformedResponse(anyhow::anyhow!(
                 "MFA verification returned success=false"
             )));
         }
-        self.cookies
-            .refresh_rotated_csrf()
-            .map_err(AdminApiError::MalformedResponse)
+        Ok(())
     }
 
     pub fn confirm_totp(&mut self, code: &str) -> Result<TotpConfirmation, AdminApiError> {
@@ -878,16 +910,14 @@ impl HttpAdminSessionApi {
             Some(serialize_body(&ConfirmBody { code })?),
             true,
         )?;
-        let wire: TotpConfirmationWire = serde_json::from_slice(&raw)
+        let wire: TotpConfirmationWire = raw
+            .json()
             .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
         if !wire.mfa_enabled {
             return Err(AdminApiError::MalformedResponse(anyhow::anyhow!(
                 "TOTP confirmation returned mfa_enabled=false"
             )));
         }
-        self.cookies
-            .refresh_rotated_csrf()
-            .map_err(AdminApiError::MalformedResponse)?;
         Ok(TotpConfirmation {
             backup_codes: wire
                 .backup_codes
@@ -910,7 +940,7 @@ impl HttpAdminSessionApi {
         path: &str,
         body: Option<Vec<u8>>,
         authenticated: bool,
-    ) -> Result<Vec<u8>, AdminApiError> {
+    ) -> Result<AdminResponseBody, AdminApiError> {
         let mut headers = if authenticated {
             self.cookies
                 .request_headers()
@@ -1049,7 +1079,7 @@ impl HttpControllerRegistryApi {
         path: &str,
         query: Option<(&str, &str)>,
         body: Option<Vec<u8>>,
-    ) -> Result<Vec<u8>, AdminApiError> {
+    ) -> Result<AdminResponseBody, AdminApiError> {
         // A Recovery Secret is its own authority and must never share an
         // administrator session. This is structural: even the
         // normal `controller recover` command cannot send Cookie/CSRF there.
@@ -1082,11 +1112,11 @@ impl HttpControllerRegistryApi {
 
 /// Shared response decoding: 2xx returns the body, everything else maps onto
 /// the typed taxonomy. Malformed success bodies fail closed.
-fn decode_response(response: AdminHttpResponse) -> Result<Vec<u8>, AdminApiError> {
+fn decode_response(response: AdminHttpResponse) -> Result<AdminResponseBody, AdminApiError> {
     if (200..300).contains(&response.status) {
         return Ok(response.body);
     }
-    let parsed: ErrorBodyWire = serde_json::from_slice(&response.body).unwrap_or_default();
+    let parsed: ErrorBodyWire = response.body.json().unwrap_or_default();
     if response.status == 409 && parsed.error.as_deref() == Some("controller_slot_limit") {
         let mut summaries = Vec::new();
         for wire in parsed.active_slots.unwrap_or_default() {
@@ -1123,7 +1153,8 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             Some(("deployment_id", deployment_id)),
             None,
         )?;
-        let wire: SlotsSnapshotWire = serde_json::from_slice(&raw)
+        let wire: SlotsSnapshotWire = raw
+            .json()
             .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
         let items = wire
             .items
@@ -1146,7 +1177,8 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        let wire: IssuedApprovalWire = serde_json::from_slice(&raw)
+        let wire: IssuedApprovalWire = raw
+            .json()
             .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
         Ok(IssuedApproval {
             approval_token: wire.approval_token,
@@ -1165,7 +1197,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_slot_envelope(raw)
+        decode_slot_envelope(&raw)
     }
 
     fn rotate_slot(&self, body: &RotateCommitBody) -> Result<ControllerSlotView, AdminApiError> {
@@ -1175,7 +1207,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_slot_envelope(raw)
+        decode_slot_envelope(&raw)
     }
 
     fn revoke_slot(&self, body: &RevokeCommitBody) -> Result<ControllerSlotView, AdminApiError> {
@@ -1185,7 +1217,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_slot_envelope(raw)
+        decode_slot_envelope(&raw)
     }
 
     fn recovery_root_view(&self, deployment_id: &str) -> Result<RecoveryRootView, AdminApiError> {
@@ -1195,7 +1227,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             Some(("deployment_id", deployment_id)),
             None,
         )?;
-        decode_recovery_root_view(raw)
+        decode_recovery_root_view(raw.json().map_err(malformed_response)?)
     }
 
     fn issue_recovery_root_approval(
@@ -1208,7 +1240,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        let wire: IssuedApprovalWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        let wire: IssuedApprovalWire = raw.json().map_err(malformed_response)?;
         Ok(IssuedApproval {
             approval_token: wire.approval_token,
             action: wire.action,
@@ -1229,23 +1261,24 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        let value: serde_json::Value = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        let mut value: serde_json::Map<String, serde_json::Value> =
+            raw.json().map_err(malformed_response)?;
         // The commit response wraps the root object without the `present`
         // discriminant (it is implicitly present); normalize before decoding.
-        let mut inner = value
-            .get("recovery_root")
-            .cloned()
-            .and_then(|inner| inner.as_object().cloned())
-            .ok_or_else(|| malformed_response(anyhow::anyhow!("missing 'recovery_root'")))?;
-        if inner.contains_key("present") {
+        let Some(serde_json::Value::Object(mut inner)) = value.remove("recovery_root") else {
+            return Err(malformed_response(anyhow::anyhow!(
+                "missing 'recovery_root'"
+            )));
+        };
+        if inner
+            .insert("present".to_owned(), serde_json::Value::Bool(true))
+            .is_some()
+        {
             return Err(malformed_response(anyhow::anyhow!(
                 "recovery_root must not carry 'present'"
             )));
         }
-        inner.insert("present".to_owned(), serde_json::Value::Bool(true));
-        decode_recovery_root_view(
-            serde_json::to_vec(&serde_json::Value::Object(inner)).map_err(malformed_response)?,
-        )
+        decode_recovery_root_view(inner)
     }
 
     fn issue_recovery_challenge(
@@ -1270,7 +1303,7 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        let wire: ChallengeWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+        let wire: ChallengeWire = raw.json().map_err(malformed_response)?;
         if wire.deployment_id != body.deployment_id {
             return Err(malformed_response(anyhow::anyhow!(
                 "server challenge echoed a different deployment id"
@@ -1286,12 +1319,15 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
                 "server issued a non-single-use challenge"
             )));
         }
-        let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(wire.nonce.as_bytes())
+        let mut nonce = [0_u8; 32];
+        let length = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode_slice(wire.nonce.as_bytes(), &mut nonce)
             .map_err(malformed_response)?;
-        let nonce: [u8; 32] = nonce_bytes
-            .try_into()
-            .map_err(|_| malformed_response(anyhow::anyhow!("challenge nonce is not 32 bytes")))?;
+        if length != nonce.len() {
+            return Err(malformed_response(anyhow::anyhow!(
+                "challenge nonce is not 32 bytes"
+            )));
+        }
         Ok(IssuedRecoveryChallenge {
             challenge_id: wire.challenge_id,
             nonce,
@@ -1310,12 +1346,13 @@ impl ControllerRegistryApi for HttpControllerRegistryApi {
             None,
             Some(serialize_body(body)?),
         )?;
-        decode_recovery_commit(raw)
+        decode_recovery_commit(&raw)
     }
 }
 
-fn decode_slot_envelope(raw: Vec<u8>) -> Result<ControllerSlotView, AdminApiError> {
-    let wire: SlotEnvelopeWire = serde_json::from_slice(&raw)
+fn decode_slot_envelope(raw: &AdminResponseBody) -> Result<ControllerSlotView, AdminApiError> {
+    let wire: SlotEnvelopeWire = raw
+        .json()
         .map_err(|error| AdminApiError::MalformedResponse(anyhow::Error::new(error)))?;
     wire.slot
         .into_view()
@@ -1403,18 +1440,14 @@ fn malformed_response(error: impl Into<anyhow::Error>) -> AdminApiError {
     AdminApiError::MalformedResponse(error.into())
 }
 
-fn decode_recovery_root_view(raw: Vec<u8>) -> Result<RecoveryRootView, AdminApiError> {
-    let mut object =
-        match serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&raw) {
-            Ok(object) => object,
-            Err(error) => return Err(malformed_response(error)),
-        };
+fn decode_recovery_root_view(
+    mut object: serde_json::Map<String, serde_json::Value>,
+) -> Result<RecoveryRootView, AdminApiError> {
     let present = object
-        .get("present")
-        .and_then(serde_json::Value::as_bool)
+        .remove("present")
+        .and_then(|value| value.as_bool())
         .ok_or_else(|| malformed_response(anyhow::anyhow!("missing boolean 'present'")))?;
     // Strip the discriminant so each branch can stay deny_unknown_fields.
-    object.remove("present");
     let value = serde_json::Value::Object(object);
     if !present {
         #[derive(Deserialize)]
@@ -1460,8 +1493,8 @@ struct RecoveryCommitWire {
     old_recovery_secret_invalid: Option<bool>,
 }
 
-fn decode_recovery_commit(raw: Vec<u8>) -> Result<RecoveryCommitView, AdminApiError> {
-    let wire: RecoveryCommitWire = serde_json::from_slice(&raw).map_err(malformed_response)?;
+fn decode_recovery_commit(raw: &AdminResponseBody) -> Result<RecoveryCommitView, AdminApiError> {
+    let wire: RecoveryCommitWire = raw.json().map_err(malformed_response)?;
     if wire.old_recovery_secret_invalid != Some(true) {
         return Err(malformed_response(anyhow::anyhow!(
             "recovery commit did not confirm previous-generation invalidation"
@@ -1513,7 +1546,7 @@ mod tests {
                 .unwrap()
                 .push(Ok(AdminHttpResponse {
                     status,
-                    body: body.as_bytes().to_vec(),
+                    body: Bytes::copy_from_slice(body.as_bytes()).into(),
                     set_cookie_headers,
                 }));
             self
@@ -1543,6 +1576,36 @@ mod tests {
             Box::new(transport),
         )
         .expect("valid issuer")
+    }
+
+    #[test]
+    fn rotated_and_removed_csrf_cookies_control_subsequent_requests() {
+        let mut cookies = AdminCookieJar::default();
+        cookies
+            .absorb(&[
+                "session=login-session; Secure".to_owned(),
+                "csrf=login-csrf; Secure".to_owned(),
+            ])
+            .unwrap();
+        cookies.set_login_csrf("login-csrf").unwrap();
+        cookies
+            .absorb(&["csrf=rotated-csrf; Secure".to_owned()])
+            .unwrap();
+        assert_eq!(
+            cookies.request_headers().unwrap(),
+            vec![
+                (
+                    "Cookie",
+                    "csrf=rotated-csrf; session=login-session".to_owned()
+                ),
+                ("x-csrf-token", "rotated-csrf".to_owned()),
+            ]
+        );
+        cookies
+            .absorb(&["csrf=; Max-Age=0; Secure".to_owned()])
+            .unwrap();
+        assert!(cookies.request_headers().is_err());
+        assert!(cookies.into_access().is_err());
     }
 
     #[test]
@@ -1691,7 +1754,7 @@ mod tests {
         let snapshot = client.list_slots("deploy alpha?x").expect("snapshot");
         assert_eq!(snapshot.deployment_id, "deploy-alpha");
         assert_eq!(snapshot.max_active_slots, 3);
-        assert_eq!(snapshot.active_slots().len(), 1);
+        assert_eq!(snapshot.active_slots().count(), 1);
         let slot = snapshot.items[0].clone();
         assert_eq!(slot.status, SlotStatus::Active);
         assert_eq!(slot.warning, None);
@@ -1800,6 +1863,49 @@ mod tests {
     }
 
     #[test]
+    fn recovery_root_rotation_decodes_the_owned_object_and_rejects_contract_drift() {
+        let root = serde_json::json!({
+            "deployment_id": "deploy-alpha", "recovery_kid": "key-2",
+            "kdf": "argon2id", "generation": 2
+        });
+        let transport = CannedTransport::default();
+        let client = HttpControllerRegistryApi::with_transport(
+            "https://auth.example.com",
+            AdminAccess::new(None, None),
+            Box::new(transport.clone()),
+        )
+        .unwrap();
+        let body = RecoveryRootRotateBody {
+            approval_token: "approval".to_owned(),
+            deployment_id: "deploy-alpha".to_owned(),
+            recovery_public_key: "public-key".to_owned(),
+            kid: "key-2".to_owned(),
+        };
+        transport.push(200, &serde_json::json!({"recovery_root": root}).to_string());
+        let view = client.rotate_recovery_root(&body).unwrap();
+        assert!(view.present);
+        assert_eq!(view.recovery_kid.as_deref(), Some("key-2"));
+        assert_eq!(view.generation, Some(2));
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"recovery_root": []}),
+            serde_json::json!({"recovery_root": {"present": true}}),
+            {
+                let mut invalid = root.clone();
+                invalid["unexpected"] = serde_json::json!(true);
+                serde_json::json!({"recovery_root": invalid})
+            },
+        ] {
+            transport.push(200, &invalid.to_string());
+            assert!(matches!(
+                client.rotate_recovery_root(&body),
+                Err(AdminApiError::MalformedResponse(_))
+            ));
+        }
+    }
+
+    #[test]
     fn recovery_ceremony_never_attaches_admin_access_headers() -> anyhow::Result<()> {
         let transport = CannedTransport::default();
         transport.push(200, "{}");
@@ -1826,12 +1932,158 @@ mod tests {
     }
 
     #[test]
-    fn response_cap_is_enforced_before_oversized_frame_is_appended() {
-        let mut collected = vec![0; MAX_RESPONSE_BYTES - 1];
-        assert!(append_response_frame(&mut collected, &[1]).is_ok());
-        assert_eq!(collected.len(), MAX_RESPONSE_BYTES);
-        assert!(append_response_frame(&mut collected, &[2]).is_err());
-        assert_eq!(collected.len(), MAX_RESPONSE_BYTES);
+    fn response_collection_preserves_single_frame_and_bounds_multiple_frames() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let bytes = Bytes::from(vec![7; MAX_RESPONSE_BYTES]);
+            let pointer = bytes.as_ptr();
+            let response = complete_admin_request(
+                std::future::ready(Ok::<_, std::io::Error>(http::Response::new(
+                    http_body_util::Full::new(bytes),
+                ))),
+                tokio::time::Instant::now() + REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.body.first.as_ptr(), pointer);
+            assert_eq!(response.body.len(), MAX_RESPONSE_BYTES);
+
+            for (sizes, oversized) in [
+                (vec![], false),
+                (vec![0, 32, 0], false),
+                (vec![MAX_RESPONSE_BYTES - 2, 1, 1], false),
+                (vec![MAX_RESPONSE_BYTES + 1], true),
+                (vec![MAX_RESPONSE_BYTES - 1, 1], false),
+                (vec![MAX_RESPONSE_BYTES, 1], true),
+            ] {
+                let expected: Vec<u8> = sizes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, size)| std::iter::repeat_n(index as u8, *size))
+                    .collect();
+                let frames = sizes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, size)| Bytes::from(vec![index as u8; size]))
+                    .collect();
+                let result = complete_admin_request(
+                    std::future::ready(Ok::<_, std::io::Error>(http::Response::new(TestBody {
+                        frames,
+                        pending: false,
+                    }))),
+                    tokio::time::Instant::now() + REQUEST_TIMEOUT,
+                )
+                .await;
+                if oversized {
+                    assert_eq!(result.unwrap_err().to_string(), "length limit exceeded");
+                } else {
+                    let body = result.unwrap().body;
+                    let actual: Vec<_> = std::iter::once(&body.first)
+                        .chain(&body.rest)
+                        .flat_map(|frame| frame.iter().copied())
+                        .collect();
+                    assert_eq!(actual, expected);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn segmented_json_preserves_frames_and_decodes_every_split() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let json =
+            r#"{"text":"utf8: 中, escape: \"","number":-1.25e3,"array":[true,null]}"#.as_bytes();
+        let expected: serde_json::Value = serde_json::from_slice(json).unwrap();
+        runtime.block_on(async {
+            for split in 1..json.len() {
+                let frames = [
+                    Bytes::copy_from_slice(&json[..split]),
+                    Bytes::copy_from_slice(&json[split..]),
+                ];
+                let pointers = frames.each_ref().map(|frame| frame.as_ptr());
+                let response = complete_admin_request(
+                    std::future::ready(Ok::<_, std::io::Error>(http::Response::new(TestBody {
+                        frames: frames.into(),
+                        pending: false,
+                    }))),
+                    tokio::time::Instant::now() + REQUEST_TIMEOUT,
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.body.first.as_ptr(), pointers[0]);
+                assert_eq!(response.body.rest[0].as_ptr(), pointers[1]);
+                assert_eq!(response.body.json::<serde_json::Value>().unwrap(), expected);
+            }
+        });
+        for trailing in [b" true".as_slice(), b"{", b"\xff"] {
+            let body = AdminResponseBody {
+                first: Bytes::from_static(json),
+                rest: vec![Bytes::copy_from_slice(trailing)],
+            };
+            assert!(body.json::<serde_json::Value>().is_err());
+        }
+    }
+
+    struct TestBody {
+        frames: std::collections::VecDeque<Bytes>,
+        pending: bool,
+    }
+
+    impl http_body::Body for TestBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            if let Some(data) = self.frames.pop_front() {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
+            } else if self.pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(None)
+            }
+        }
+    }
+
+    #[test]
+    fn response_deadline_covers_stalled_headers_and_body() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let deadline = || tokio::time::Instant::now() + Duration::from_millis(5);
+            let headers = std::future::pending::<
+                Result<http::Response<http_body_util::Full<Bytes>>, std::io::Error>,
+            >();
+            assert!(
+                complete_admin_request(headers, deadline())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("timed out")
+            );
+            let body = TestBody {
+                frames: [Bytes::from_static(b"partial")].into(),
+                pending: true,
+            };
+            let request = std::future::ready(Ok::<_, std::io::Error>(http::Response::new(body)));
+            assert!(
+                complete_admin_request(request, deadline())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("timed out")
+            );
+        });
     }
 
     #[test]

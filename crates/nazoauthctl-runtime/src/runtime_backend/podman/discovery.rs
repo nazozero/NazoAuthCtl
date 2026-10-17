@@ -47,22 +47,21 @@ fn is_server_document(value: &serde_json::Value) -> bool {
     let Some(config) = value.get("Config") else {
         return false;
     };
-    let command_values = config
-        .get("Command")
-        .or_else(|| config.get("Cmd"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let mut complete_command = config
-        .get("Entrypoint")
-        .and_then(serde_json::Value::as_str)
-        .map(|value| vec![value.to_owned()])
-        .unwrap_or_default();
-    complete_command.extend(command_values);
-    server_command_verified(&complete_command)
+    server_command_verified(
+        config
+            .get("Entrypoint")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .chain(
+                config
+                    .get("Command")
+                    .or_else(|| config.get("Cmd"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            ),
+    )
 }
 
 pub(super) fn inspect(
@@ -77,7 +76,7 @@ pub(super) fn inspect(
     observation_from_document(command, &value)
 }
 
-pub(super) fn observation_from_document(
+fn observation_from_document(
     command: &OsStr,
     value: &serde_json::Value,
 ) -> anyhow::Result<RuntimeObservation> {
@@ -219,7 +218,9 @@ fn parse_ports(value: &serde_json::Value) -> anyhow::Result<Vec<String>> {
     Ok(observed)
 }
 
-fn parse_mounts(value: &serde_json::Value) -> anyhow::Result<Vec<super::super::NeutralMount>> {
+pub(super) fn parse_mounts(
+    value: &serde_json::Value,
+) -> anyhow::Result<Vec<super::super::NeutralMount>> {
     let Some(raw_mounts) = value.get("Mounts") else {
         return Ok(Vec::new());
     };
@@ -335,12 +336,15 @@ pub(super) fn resolve_image_digest(
     image_reference: &str,
     local_image_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let repo_digests = image_inspect_output(
+    let observed = image_inspect_output(
         command,
         image_reference,
         local_image_id,
-        "{{json .RepoDigests}}",
+        "{{json .RepoDigests}}\n{{.Digest}}",
     )?;
+    let (repo_digests, digest) = observed
+        .split_once('\n')
+        .context("Podman image inspect omitted digest fields")?;
     if let Ok(values) = serde_json::from_str::<Vec<String>>(repo_digests.trim())
         && let Some(digest) = values
             .iter()
@@ -352,7 +356,6 @@ pub(super) fn resolve_image_digest(
     {
         return Ok(digest.to_ascii_lowercase());
     }
-    let digest = image_inspect_output(command, image_reference, local_image_id, "{{.Digest}}")?;
     let digest = digest.trim();
     if !container_shared::valid_digest(digest)
         || !container_shared::requested_digest_matches(image_reference, digest)
@@ -405,6 +408,71 @@ pub(super) fn resolve_local_image_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn image_digest_fields_share_one_inspect_and_keep_reference_binding() {
+        use crate::{filesystem::PrivateTempDir, test_support::write_shell_executable};
+        let work = PrivateTempDir::new("podman-digest-fields").unwrap();
+        let engine = work.path().join("fake-podman");
+        let calls = work.path().join("calls");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let other = format!("sha256:{}", "b".repeat(64));
+        let reference = format!("registry.example/image@{digest}");
+        let local_id = format!("sha256:{}", "c".repeat(64));
+        for (repos, fallback, reference_missing, accepted, expected_calls) in [
+            (
+                vec![format!("image@{digest}")],
+                other.as_str(),
+                false,
+                true,
+                1,
+            ),
+            (Vec::new(), digest.as_str(), false, true, 1),
+            (
+                vec![format!("image@{digest}")],
+                other.as_str(),
+                true,
+                true,
+                2,
+            ),
+            (
+                vec![format!("image@{other}")],
+                other.as_str(),
+                false,
+                false,
+                1,
+            ),
+        ] {
+            std::fs::write(&calls, "").unwrap();
+            let fail_reference = if reference_missing {
+                format!("[ \"$3\" != '{reference}' ] || exit 1\n")
+            } else {
+                String::new()
+            };
+            write_shell_executable(
+                &engine,
+                &format!(
+                    "printf '%s\\n' \"$3\" >> '{}'\n[ \"$1 $2 $4\" = 'image inspect --format' ] || exit 3\n[ \"$5\" = '{{{{json .RepoDigests}}}}\n{{{{.Digest}}}}' ] || exit 4\n{fail_reference}printf '%s\\n%s\\n' '{}' '{fallback}'",
+                    calls.display(),
+                    serde_json::to_string(&repos).unwrap(),
+                ),
+            );
+            let result = resolve_image_digest(engine.as_os_str(), &reference, Some(&local_id));
+            if accepted {
+                assert_eq!(result.unwrap(), digest);
+            } else {
+                assert!(result.is_err());
+            }
+            let recorded = std::fs::read_to_string(&calls).unwrap();
+            let targets = recorded.lines().collect::<Vec<_>>();
+            assert_eq!(targets.len(), expected_calls);
+            assert_eq!(targets[0], reference);
+            if reference_missing {
+                assert_eq!(targets[1], local_id);
+            }
+        }
+    }
 
     #[test]
     fn podman_mount_uses_the_inspect_rw_field_for_read_only_state() {

@@ -244,7 +244,7 @@ impl InstanceSelector {
     /// Merge the positional and per-command channels. Both set — even to the
     /// same value — is rejected: one action carries at most one explicit
     /// selection channel.
-    pub(crate) fn explicit(&self) -> anyhow::Result<Option<String>> {
+    pub(crate) fn explicit(&self) -> anyhow::Result<Option<&str>> {
         match (&self.positional, &self.named) {
             (Some(_), Some(_)) => {
                 crate::ui::fail!(
@@ -252,7 +252,7 @@ impl InstanceSelector {
                     "请通过 --instance 或位置参数选择实例，不能同时使用"
                 )
             }
-            (Some(value), None) | (None, Some(value)) => Ok(Some(value.clone())),
+            (Some(value), None) | (None, Some(value)) => Ok(Some(value.as_str())),
             (None, None) => Ok(None),
         }
     }
@@ -260,11 +260,11 @@ impl InstanceSelector {
     /// Fold the global `--instance` into this selector under the I02
     /// exactly-one rule: the global channel and any command-level channel are
     /// mutually exclusive, whatever their values.
-    pub(crate) fn merge_global(
-        &self,
-        global: Option<&str>,
+    pub(crate) fn merge_global<'a>(
+        &'a self,
+        global: Option<&'a str>,
         action: &str,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<Option<&'a str>> {
         let local = self.explicit().with_context(|| {
             crate::ui::message!(
                 "{action}: conflicting selectors",
@@ -278,7 +278,7 @@ impl InstanceSelector {
                  '{local_value}', not both",
                 "{action}：全局 --instance {global_value} 与命令内的实例选择参数“{local_value}”不能同时使用"
             ),
-            (Some(global_value), None) => Ok(Some(global_value.to_owned())),
+            (Some(global_value), None) => Ok(Some(global_value)),
             (None, local) => Ok(local),
         }
     }

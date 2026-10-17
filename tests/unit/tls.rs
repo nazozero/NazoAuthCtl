@@ -9,6 +9,10 @@ use rustls_pki_types::{PrivateKeyDer, pem::PemObject};
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
+fn tls_config(pem: &[u8]) -> Arc<rustls::ClientConfig> {
+    public_endpoint::client_config(Arc::new(root_store_from_pem(pem).unwrap())).unwrap()
+}
+
 fn write_fixture(path: &std::path::Path, bytes: impl AsRef<[u8]>) {
     crate::filesystem::atomic_write(path, bytes.as_ref(), 0o600).unwrap();
 }
@@ -346,7 +350,7 @@ fn certificate_source_binding_is_persistently_verifiable() {
         leaf_sha256,
         material_sha256,
         not_after: 1_900_000_000,
-        root_store: RootCertStore::empty(),
+        root_store: Arc::new(RootCertStore::empty()),
     };
     let binding = bind_certificate_source(
         &ResolvedCertificateSource::AcmeReceipt(Box::new(source.clone())),
@@ -406,7 +410,7 @@ fn readiness_revalidates_active_material_and_renewal_window() {
         leaf_sha256: receipt.leaf_certificate_sha256.clone(),
         material_sha256: receipt.material_sha256.clone(),
         not_after: receipt.certificate_not_after,
-        root_store: RootCertStore::empty(),
+        root_store: Arc::new(RootCertStore::empty()),
     };
     assert!(validate_installed_material(&receipt, &material).is_ok());
     material.private_key_sha256 = "0".repeat(64);
@@ -700,7 +704,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         "auth.example",
         address,
         &sha256(leaf_der.as_ref()),
-        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        tls_config(ca_pem.as_bytes()),
         &provider,
         None,
     )
@@ -710,7 +714,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         "auth.example",
         address,
         &"0".repeat(64),
-        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        tls_config(ca_pem.as_bytes()),
         &provider,
     )
     .unwrap();
@@ -719,7 +723,7 @@ fn public_verification_observes_real_tls_leaf_and_http_health() {
         "auth.example",
         address,
         &sha256(leaf_der.as_ref()),
-        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        tls_config(ca_pem.as_bytes()),
         &provider,
     )
     .unwrap_err();
@@ -782,7 +786,7 @@ fn public_verification_waits_for_new_identity_and_can_verify_rollback() {
             "auth.example",
             address,
             &digest,
-            root_store_from_pem(issuer.pem().as_bytes()).unwrap(),
+            tls_config(issuer.pem().as_bytes()),
             &provider,
             None,
         )
@@ -850,7 +854,7 @@ fn public_verification_stops_when_a_healthy_identity_never_switches() {
         "auth.example",
         address,
         &"0".repeat(64),
-        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        tls_config(ca_pem.as_bytes()),
         &provider,
         None,
     )
@@ -891,7 +895,7 @@ fn public_verification_uses_an_absolute_request_deadline() {
         "auth.example",
         address,
         &sha256(leaf_der.as_ref()),
-        root_store_from_pem(ca_pem.as_bytes()).unwrap(),
+        tls_config(ca_pem.as_bytes()),
         &provider,
         None,
     )
@@ -949,7 +953,7 @@ fn unchanged_certificate_waits_for_the_live_proxy_configuration() -> anyhow::Res
         "auth.example",
         address,
         &sha256(leaf.as_ref()),
-        root_store_from_pem(ca_pem.as_bytes())?,
+        tls_config(ca_pem.as_bytes()),
         &provider,
         Some(&"b".repeat(64)),
     )?;
@@ -1030,7 +1034,7 @@ fn activated_generation_is_deactivated_before_rollback_public_proof() {
         leaf_sha256: "b".repeat(64),
         material_sha256: transaction.material_sha256.clone(),
         not_after: transaction.certificate_not_after,
-        root_store: RootCertStore::empty(),
+        root_store: Arc::new(RootCertStore::empty()),
     };
     stage_generation(&transaction, &material).unwrap();
     transaction.phase = TransactionPhase::Staged;
@@ -1052,8 +1056,12 @@ fn proxy_configuration_is_digest_bound_and_removed_with_its_generation() -> anyh
     let mut transaction = test_transaction(work.path().join("material"));
     let template = b"ssl_certificate \"@NAZOAUTH_TLS_CERTIFICATE_FILE@\"; ssl_certificate_key \"@NAZOAUTH_TLS_PRIVATE_KEY_FILE@\"; add_header X-NazoAuth-TLS-Configuration \"@NAZOAUTH_TLS_CONFIGURATION_SHA256@\" always;";
     transaction.proxy_configuration_sha256 = Some(sha256(template));
+    let template = proxy_config::Template {
+        bytes: template.to_vec().into(),
+        sha256: sha256(template),
+    };
     ensure_private_directory(&transaction.generation, "test generation")?;
-    proxy_config::stage(&transaction, Some(template))?;
+    proxy_config::stage(&transaction.generation, Some(&template))?;
     proxy_config::validate_generation(
         &transaction.generation,
         transaction.proxy_configuration_sha256.as_deref(),
@@ -1070,7 +1078,7 @@ fn proxy_configuration_is_digest_bound_and_removed_with_its_generation() -> anyh
         )
         .is_err()
     );
-    proxy_config::stage(&transaction, Some(template))?;
+    proxy_config::stage(&transaction.generation, Some(&template))?;
     atomic_write(
         &transaction.generation.join("proxy.conf.template"),
         b"changed",

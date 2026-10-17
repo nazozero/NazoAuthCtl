@@ -581,9 +581,25 @@ fn merge_terminal_and_deferred_review_workers(
     runner.config.suite_resource_observer = Some(Arc::new(RetainSuiteObserver));
 
     let mut prepared = runner.prepare_run(&mut ());
-    let work = plan_work(&mut prepared);
-    let terminal = runner.run_prepared(&mut (), worker_prepared(&work[0]));
-    let mut deferred = runner.run_prepared(&mut (), worker_prepared(&work[1]));
+    let (work, mut queue) = plan_work(&mut prepared);
+    let terminal = runner.run_prepared(
+        &mut (),
+        worker_prepared(
+            queue.pop_front().unwrap().1,
+            &prepared.groups,
+            &prepared.plans,
+        ),
+        None,
+    );
+    let mut deferred = runner.run_prepared(
+        &mut (),
+        worker_prepared(
+            queue.pop_front().unwrap().1,
+            &prepared.groups,
+            &prepared.plans,
+        ),
+        None,
+    );
     let module = deferred
         .report
         .modules

@@ -8,6 +8,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -517,7 +518,7 @@ fn check(
         &provider.public_url,
         &hostname,
         &receipt.leaf_certificate_sha256,
-        material.root_store.clone(),
+        material.root_store,
         &provider.config,
         receipt.proxy_configuration_sha256.as_deref(),
     )?;
@@ -626,7 +627,9 @@ fn apply(
     let source = bind_certificate_source(&resolved_source, &material)?;
     let previous = load_receipt(store, &record, &tenant, &hostname)?;
     let proxy_template = proxy_config::load_template(input, &provider.config)?;
-    let proxy_configuration_sha256 = proxy_template.as_deref().map(sha256);
+    let proxy_configuration_sha256 = proxy_template
+        .as_ref()
+        .map(|template| template.sha256.clone());
     validate_active_receipt(&provider.config, previous.as_ref())?;
     if let Some(previous) = previous.as_ref() {
         validate_receipt_provider_authority(previous, &provider)?;
@@ -663,8 +666,8 @@ fn apply(
         hostname: hostname.clone(),
         expected_revision,
         target_revision,
-        source: source.clone(),
-        proxy_configuration_sha256: proxy_configuration_sha256.clone(),
+        source,
+        proxy_configuration_sha256,
         material_sha256: material.material_sha256.clone(),
         leaf_certificate_sha256: material.leaf_sha256.clone(),
         certificate_not_after: material.not_after,
@@ -691,7 +694,7 @@ fn apply(
     let result = (|| -> anyhow::Result<CertificateReceipt> {
         ensure_transaction_fresh(&transaction)?;
         stage_generation(&transaction, &material)?;
-        proxy_config::stage(&transaction, proxy_template.as_deref())?;
+        proxy_config::stage(&transaction.generation, proxy_template.as_ref())?;
         transaction.phase = TransactionPhase::Staged;
         persist_pending(store, &transaction)?;
         ensure_transaction_fresh(&transaction)?;
@@ -712,7 +715,7 @@ fn apply(
             &provider.public_url,
             &hostname,
             &material.leaf_sha256,
-            material.root_store.clone(),
+            material.root_store,
             &provider.config,
             transaction.proxy_configuration_sha256.as_deref(),
         )?;
@@ -967,7 +970,7 @@ fn build_plan(
         validate_receipt_provider_authority(current, provider)?;
     }
     let proxy_template = proxy_config::load_template(input, &provider.config)?;
-    let proxy_configuration_sha256 = proxy_template.as_deref().map(sha256);
+    let proxy_configuration_sha256 = proxy_template.map(|template| template.sha256);
     ensure_source_not_current(current, source, proxy_configuration_sha256.as_deref())?;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
     Ok(CertificatePlan {
@@ -1030,15 +1033,14 @@ fn load_provider(
     )?;
     let config: ProviderConfig =
         serde_json::from_slice(&bytes).context("TLS provider configuration is invalid")?;
-    validate_provider_config(store, &config, requested_tenant, requested_hostname)?;
+    let public_url =
+        validate_provider_config(store, &config, requested_tenant, requested_hostname)?;
     let trust_anchors = read_secure_regular_file(
         &config.trust_anchors,
         "TLS trust anchors",
         false,
         MAX_TRUST_ANCHOR_BYTES,
     )?;
-    let public_url =
-        Url::parse(&config.public_url).context("TLS provider public_url is invalid")?;
     Ok(LoadedProvider {
         config,
         config_sha256: sha256(&bytes),
@@ -1052,7 +1054,7 @@ fn loaded_provider_from_transaction(
     store: &TlsStore,
     transaction: &CertificateTransaction,
 ) -> anyhow::Result<LoadedProvider> {
-    validate_provider_config(
+    let public_url = validate_provider_config(
         store,
         &transaction.provider,
         &transaction.tenant,
@@ -1065,8 +1067,6 @@ fn loaded_provider_from_transaction(
         bail!("TLS transaction trust anchors do not match their bound digest");
     }
     root_store_from_pem(&trust_anchors)?;
-    let public_url =
-        Url::parse(&transaction.provider.public_url).context("TLS public URL is invalid")?;
     Ok(LoadedProvider {
         config: transaction.provider.clone(),
         config_sha256: transaction.provider_config_sha256.clone(),
@@ -1081,7 +1081,7 @@ fn validate_provider_config(
     config: &ProviderConfig,
     requested_tenant: &str,
     requested_hostname: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Url> {
     ensure_provider_platform_support()?;
     if config.schema != PROVIDER_SCHEMA || config.protocol != PROVIDER_PROTOCOL {
         bail!("unsupported TLS provider schema or protocol");
@@ -1150,7 +1150,7 @@ fn validate_provider_config(
             "native proxy",
         )?;
     }
-    Ok(())
+    Ok(url)
 }
 
 #[cfg(unix)]
@@ -1279,7 +1279,7 @@ fn rollback_transaction(
                 &provider.public_url,
                 &transaction.hostname,
                 &transaction.leaf_certificate_sha256,
-                root_store_from_pem(&provider.trust_anchors)?,
+                Arc::new(root_store_from_pem(&provider.trust_anchors)?),
                 &transaction.provider,
                 transaction.provider.native_proxy_program.is_some(),
             )?,
@@ -1308,7 +1308,7 @@ fn restore_previous_activation(transaction: &CertificateTransaction) -> anyhow::
 fn validate_rollback_material(
     receipt: &CertificateReceipt,
     provider: &LoadedProvider,
-) -> anyhow::Result<RootCertStore> {
+) -> anyhow::Result<Arc<RootCertStore>> {
     validate_receipt_provider_authority(receipt, provider)?;
     let material = material::load_valid_material(
         &receipt.generation.join("fullchain.pem"),
@@ -1663,9 +1663,7 @@ fn ensure_provider_not_pending(
     let mut inspected_bindings = 0_u32;
     for deployment in deployments {
         let deployment = deployment?;
-        inspected_deployments = inspected_deployments
-            .checked_add(1)
-            .context("too many deployment state entries")?;
+        inspected_deployments += 1;
         if inspected_deployments > 1024 {
             bail!("too many deployment state entries while fencing TLS provider");
         }
@@ -1682,9 +1680,7 @@ fn ensure_provider_not_pending(
         };
         for entry in entries {
             let entry = entry?;
-            inspected_bindings = inspected_bindings
-                .checked_add(1)
-                .context("too many TLS transaction bindings")?;
+            inspected_bindings += 1;
             if inspected_bindings > 4096 {
                 bail!("too many TLS transaction bindings");
             }
@@ -2171,13 +2167,7 @@ fn validate_absolute_normalized(path: &Path, label: &str) -> anyhow::Result<()> 
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    output
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn valid_sha256(value: &str) -> bool {

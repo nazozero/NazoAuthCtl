@@ -1,4 +1,4 @@
-//! Public verification as an independent, explicit report (task G08).
+//! Public verification as an independent, explicit report.
 //!
 //! Install/update lifecycle commits depend on exactly one health domain: the
 //! target-local runtime. Public DNS propagation, TLS termination, OIDC
@@ -10,7 +10,7 @@
 //! Rules pinned here:
 //!
 //! * a loopback issuer is always reported as a trial endpoint and can never
-//!   produce a public pass (goal plan 07 G8 禁止事项);
+//!   produce a public pass;
 //! * failures are reported with reasons and a `checked_at` timestamp; they
 //!   never touch local lifecycle state;
 //! * only an explicitly user-configured policy may block on this report — the
@@ -21,9 +21,7 @@ use url::Url;
 
 /// Probe seam so tests classify outcomes without a network.
 pub(crate) trait PublicProber {
-    fn tls_handshake(&self, issuer: &Url) -> Result<(), String>;
-    /// Returns the `issuer` value from the discovery document for
-    /// exact-match comparison against the expected origin (P1-5).
+    /// Fetches discovery over verified TLS and returns its issuer.
     fn oidc_discovery(&self, issuer: &Url) -> Result<String, String>;
 }
 
@@ -48,7 +46,7 @@ pub(crate) struct PublicVerificationReport {
 }
 
 impl PublicVerificationReport {
-    /// Human rendering for the future `verify` CLI surface.
+    /// Human rendering for the `verify` CLI surface.
     pub(crate) fn render(&self) -> String {
         let mut lines = vec![crate::ui::message!(
             "public verification of {} at {}",
@@ -89,19 +87,16 @@ impl PublicVerificationReport {
 }
 
 fn is_loopback(issuer: &Url) -> bool {
-    issuer.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    })
+    match issuer.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// Run the independent public checks. This function has no parameter through
-/// which any local lifecycle state could be reached — that is the G08 design
-/// guarantee, enforced by the type system rather than by discipline.
-///
-/// Delivery boundary: wired into the CLI by the I wave (`verify`).
+/// which any local lifecycle state could be reached.
 pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVerificationReport {
     let checked_at = Utc::now();
     let mut failures = Vec::new();
@@ -129,9 +124,6 @@ pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVe
     if loopback_trial {
         // Never a pass, by definition (G8 禁止事项).
         failures.push("issuer resolves to a loopback origin".to_owned());
-    }
-    if let Err(reason) = prober.tls_handshake(&parsed) {
-        failures.push(format!("TLS handshake failed: {reason}"));
     }
     match prober.oidc_discovery(&parsed) {
         Err(reason) => failures.push(format!("OIDC discovery failed: {reason}")),
@@ -161,30 +153,11 @@ pub(crate) fn verify_public(prober: &dyn PublicProber, issuer: &str) -> PublicVe
     }
 }
 
-/// Production prober: bounded curl for both checks, matching the transport
-/// precedent of administrator provisioning. A TLS/transport failure surfaces as a
-/// nonzero curl exit; any HTTP answer counts for the handshake half because
-/// this check owns reachability, not application semantics.
+/// One bounded HTTPS discovery request proves TLS reachability and the served
+/// issuer together. curl verifies the certificate before reading the document.
 pub(crate) struct CurlPublicProber;
 
 impl PublicProber for CurlPublicProber {
-    fn tls_handshake(&self, issuer: &Url) -> Result<(), String> {
-        crate::process::Process::new("curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--head",
-                "--connect-timeout",
-                "10",
-                "--max-time",
-                "20",
-            ])
-            .arg(issuer.as_str())
-            .stdout()
-            .map(|_| ())
-            .map_err(|error| format!("{error:#}"))
-    }
-
     fn oidc_discovery(&self, issuer: &Url) -> Result<String, String> {
         let mut discovery = issuer.clone();
         discovery.set_path(".well-known/openid-configuration");
@@ -201,11 +174,13 @@ impl PublicProber for CurlPublicProber {
             .arg(discovery.as_str())
             .stdout()
             .map_err(|error| format!("{error:#}"))?;
-        // P1-5: extract the discovery issuer for exact-match comparison.
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(doc) => Ok(doc["issuer"].as_str().unwrap_or_default().to_owned()),
-            Err(_) => Err("discovery document is not valid JSON".to_owned()),
+        #[derive(serde::Deserialize)]
+        struct DiscoveryDocument {
+            issuer: String,
         }
+        serde_json::from_str::<DiscoveryDocument>(&body)
+            .map(|document| document.issuer)
+            .map_err(|_| "discovery document must be valid JSON with a string issuer".to_owned())
     }
 }
 
@@ -214,15 +189,11 @@ mod tests {
     use super::*;
 
     struct Prober {
-        tls: Result<(), String>,
         /// Some(discovered_issuer) on success.
         discovery: Result<String, String>,
     }
 
     impl PublicProber for Prober {
-        fn tls_handshake(&self, _issuer: &Url) -> Result<(), String> {
-            self.tls.clone()
-        }
         fn oidc_discovery(&self, _issuer: &Url) -> Result<String, String> {
             self.discovery.clone()
         }
@@ -232,7 +203,6 @@ mod tests {
     fn a_healthy_public_origin_passes() {
         let report = verify_public(
             &Prober {
-                tls: Ok(()),
                 discovery: Ok("https://auth.example.com".to_owned()),
             },
             "https://auth.example.com",
@@ -246,15 +216,14 @@ mod tests {
     fn every_failure_is_reported_with_reasons_and_a_timestamp() {
         let report = verify_public(
             &Prober {
-                tls: Err("certificate expired".to_owned()),
-                discovery: Err("404 at /.well-known/openid-configuration".to_owned()),
+                discovery: Err("certificate expired".to_owned()),
             },
             "https://auth.example.com",
         );
         let PublicVerdict::Failed { failures } = &report.verdict else {
             panic!("expected failure");
         };
-        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures.iter().any(|f| f.contains("certificate expired")));
         let age = (Utc::now() - report.checked_at).num_milliseconds();
         assert!((0..60_000).contains(&age), "checked_at must be fresh");
@@ -268,7 +237,6 @@ mod tests {
         // 禁止事项 (G8): loopback is never reported as a formal public pass.
         let report = verify_public(
             &Prober {
-                tls: Ok(()),
                 discovery: Ok("https://127.0.0.1:8000".to_owned()),
             },
             "https://127.0.0.1:8000",
@@ -283,18 +251,24 @@ mod tests {
 
         let localhost = verify_public(
             &Prober {
-                tls: Ok(()),
                 discovery: Ok("https://localhost:8000".to_owned()),
             },
             "https://localhost:8000",
         );
         assert!(localhost.loopback_trial);
+        let ipv6 = verify_public(
+            &Prober {
+                discovery: Ok("https://[::1]:8000".to_owned()),
+            },
+            "https://[::1]:8000",
+        );
+        assert!(ipv6.loopback_trial);
+        assert!(matches!(ipv6.verdict, PublicVerdict::Failed { .. }));
 
         // P1-5: plain-HTTP issuers are rejected before any probe runs, so an
         // HTTP loopback URL is not even classified as a loopback trial.
         let plaintext = verify_public(
             &Prober {
-                tls: Ok(()),
                 discovery: Ok("http://127.0.0.1:8000".to_owned()),
             },
             "http://127.0.0.1:8000",
@@ -308,7 +282,6 @@ mod tests {
         for issuer in ["not-a-url", "ftp://x", "https://u:p@host"] {
             let report = verify_public(
                 &Prober {
-                    tls: Ok(()),
                     discovery: Ok("https://auth.example.com".to_owned()),
                 },
                 issuer,

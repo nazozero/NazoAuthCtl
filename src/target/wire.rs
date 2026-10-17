@@ -23,7 +23,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use nazo_operator_protocol::ControlResult;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::deployment_state::{ArtifactRefs, RuntimeSurface, StateMutationPayload};
@@ -823,7 +822,7 @@ impl HostOperation {
                     ));
                 }
             }
-            HostOperationBody::AdminCreate { email, password } => {
+            HostOperationBody::AdminCreate { email, .. } => {
                 // Administrator provisioning is an instance-bound target
                 // mutation. It deliberately has no DeploymentState CAS: the
                 // server's own database transaction is the authority for
@@ -835,12 +834,7 @@ impl HostOperation {
                         "admin-create requires deployment_id and must not carry expected_revision",
                     ));
                 }
-                if email.is_empty()
-                    || email.len() > 254
-                    || email.chars().any(char::is_control)
-                    || password.as_bytes().is_empty()
-                    || password.as_bytes().len() > MAX_CONTROL_CHANGE_SET_BYTES
-                {
+                if email.is_empty() || email.len() > 254 || email.chars().any(char::is_control) {
                     return Err(MessageRejection::new(
                         RejectionCode::OperationMalformed,
                         "admin-create email/password is malformed",
@@ -998,7 +992,6 @@ impl HostOperation {
                     || *total_bytes == 0
                     || *total_bytes > MAX_BACKUP_TRANSFER_FILE_BYTES
                     || !valid_lower_hex_sha256(file_sha256)
-                    || bytes.as_bytes().is_empty()
                     || end.is_none_or(|end| end > *total_bytes)
                 {
                     return Err(MessageRejection::new(
@@ -1129,7 +1122,7 @@ impl HostOperation {
             HostOperationBody::ControlOperation {
                 compact_jws,
                 expected_deployment_id,
-                change_set,
+                ..
             } => {
                 // Instance binding required; revision expectations are
                 // meaningless for a pass-through delivery.
@@ -1151,15 +1144,6 @@ impl HostOperation {
                         RejectionCode::OperationMalformed,
                         "control-operation expected_deployment_id must equal the operation \
                          binding",
-                    ));
-                }
-                if change_set.as_ref().is_some_and(|material| {
-                    material.as_bytes().is_empty()
-                        || material.as_bytes().len() > MAX_CONTROL_CHANGE_SET_BYTES
-                }) {
-                    return Err(MessageRejection::new(
-                        RejectionCode::OperationMalformed,
-                        "control-operation change_set must be 1 byte to 4 MiB",
                     ));
                 }
             }
@@ -1243,7 +1227,7 @@ impl Serialize for BackupTransferBytes {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&STANDARD.encode(&self.0))
+        serializer.collect_str(&base64::display::Base64Display::new(&self.0, &STANDARD))
     }
 }
 
@@ -1281,10 +1265,13 @@ pub struct BackupTransferChunk {
 /// secret carrier for this protocol: never Debug or Clone it. Construction
 /// and deserialization enforce the fixed 4 MiB ceiling.
 #[derive(Eq, PartialEq)]
-pub struct SecretMaterial(Vec<u8>);
+pub struct SecretMaterial(zeroize::Zeroizing<Vec<u8>>);
 
 impl SecretMaterial {
-    pub fn try_new(bytes: Vec<u8>) -> Result<Self, MessageRejection> {
+    pub fn try_new(
+        bytes: impl Into<zeroize::Zeroizing<Vec<u8>>>,
+    ) -> Result<Self, MessageRejection> {
+        let bytes = bytes.into();
         if bytes.is_empty() || bytes.len() > MAX_CONTROL_CHANGE_SET_BYTES {
             return Err(MessageRejection::new(
                 RejectionCode::OperationMalformed,
@@ -1309,23 +1296,12 @@ impl std::fmt::Debug for SecretMaterial {
     }
 }
 
-impl Drop for SecretMaterial {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.0);
-    }
-}
-
 impl Serialize for SecretMaterial {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        if self.0.len() > MAX_CONTROL_CHANGE_SET_BYTES {
-            return Err(serde::ser::Error::custom(
-                "secret material exceeds the 4 MiB limit",
-            ));
-        }
-        serializer.serialize_str(&STANDARD.encode(&self.0))
+        serializer.collect_str(&base64::display::Base64Display::new(&self.0, &STANDARD))
     }
 }
 
@@ -1342,11 +1318,6 @@ impl<'de> Deserialize<'de> for SecretMaterial {
             ));
         }
         let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
-        if bytes.len() > MAX_CONTROL_CHANGE_SET_BYTES {
-            return Err(serde::de::Error::custom(
-                "secret material exceeds the 4 MiB limit",
-            ));
-        }
         Self::try_new(bytes).map_err(|error| serde::de::Error::custom(error.detail))
     }
 }
@@ -1389,13 +1360,13 @@ impl HostResult {
     /// Build a failed result. `detail` must be target-generated diagnostic
     /// text (static strings or validated identifiers); transports never echo
     /// raw input into this field, and [`sanitize`] bounds whatever is passed.
-    pub fn failed(operation_id: impl Into<String>, code: &str, detail: impl Into<String>) -> Self {
+    pub fn failed(operation_id: impl Into<String>, code: &str, detail: impl AsRef<str>) -> Self {
         Self {
             schema: HOST_PROTOCOL_SCHEMA,
             operation_id: operation_id.into(),
             outcome: HostOutcome::Failed {
                 code: code.to_owned(),
-                detail: sanitize(detail.into()),
+                detail: sanitize(detail),
             },
         }
     }
@@ -1659,13 +1630,14 @@ pub(crate) fn local_hello_for_target(
 /// Task C08 handshake check: the announced helper identity must equal this
 /// binary's constants exactly. Any difference is a mismatch — there is no
 /// compatibility range and no fallback.
-pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
+pub fn verify_remote_hello(hello: &RemoteHello) -> Result<Uuid, String> {
     if !valid_token(&hello.product, 64) {
         return Err("hello product is not a valid token".to_owned());
     }
-    if !matches!(Uuid::parse_str(&hello.target_id), Ok(id) if id.get_version_num() == 7) {
-        return Err("hello target_id is not a UUIDv7".to_owned());
-    }
+    let target_id = match Uuid::parse_str(&hello.target_id) {
+        Ok(id) if id.get_version_num() == 7 => id,
+        _ => return Err("hello target_id is not a UUIDv7".to_owned()),
+    };
     if !valid_token(&hello.version, 64) {
         return Err("hello version is not a valid token".to_owned());
     }
@@ -1685,7 +1657,7 @@ pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
     if hello.product != HELLO_PRODUCT {
         return Err(format!(
             "target answered as product '{}' instead of '{HELLO_PRODUCT}'",
-            sanitize(hello.product.clone())
+            sanitize(&hello.product)
         ));
     }
     if hello.remote_exec_schema != HOST_PROTOCOL_SCHEMA {
@@ -1694,7 +1666,7 @@ pub fn verify_remote_hello(hello: &RemoteHello) -> Result<(), String> {
             hello.remote_exec_schema
         ));
     }
-    Ok(())
+    Ok(target_id)
 }
 
 /// Serialize a HostOperation for a target's stdin, enforcing the size cap.
@@ -1714,26 +1686,23 @@ pub fn parse_host_operation(raw: &[u8]) -> Result<HostOperation, MessageRejectio
             format!("exceeds the {}-byte limit", MAX_HOST_OPERATION_BYTES),
         ));
     }
-    let value: serde_json::Value = serde_json::from_slice(raw)
-        .map_err(|error| malformed(RejectionCode::OperationMalformed, &error))?;
-    let Some(kind) = value
-        .get("operation")
-        .and_then(|operation| operation.get("kind"))
-        .and_then(serde_json::Value::as_str)
-    else {
-        return Err(MessageRejection::new(
-            RejectionCode::OperationMalformed,
-            "missing string 'kind' discriminator",
-        ));
-    };
-    if !HOST_OPERATION_KINDS.contains(&kind) {
-        return Err(MessageRejection::new(
-            RejectionCode::OperationKindUnknown,
-            format!("unsupported operation kind '{}'", sanitize(kind)),
-        ));
-    }
-    let operation: HostOperation = serde_json::from_value(value)
-        .map_err(|error| malformed(RejectionCode::OperationMalformed, &error))?;
+    let operation: HostOperation = serde_json::from_slice(raw).map_err(|error| {
+        // Preserve the wire's unknown-kind code without materializing a second
+        // copy of every valid message (including its base64 payload).
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw)
+            && let Some(kind) = value
+                .get("operation")
+                .and_then(|operation| operation.get("kind"))
+                .and_then(serde_json::Value::as_str)
+            && !HOST_OPERATION_KINDS.contains(&kind)
+        {
+            return MessageRejection::new(
+                RejectionCode::OperationKindUnknown,
+                format!("unsupported operation kind '{}'", sanitize(kind)),
+            );
+        }
+        malformed(RejectionCode::OperationMalformed, &error)
+    })?;
     operation.validate()?;
     Ok(operation)
 }
@@ -1751,22 +1720,7 @@ pub fn parse_host_result(raw: &[u8]) -> Result<HostResult, MessageRejection> {
             format!("exceeds the {}-byte limit", MAX_HOST_RESULT_BYTES),
         ));
     }
-    let value: serde_json::Value = serde_json::from_slice(raw)
-        .map_err(|error| malformed(RejectionCode::ResultMalformed, &error))?;
-    match value
-        .get("outcome")
-        .and_then(|outcome| outcome.get("status"))
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("completed" | "failed") => {}
-        _ => {
-            return Err(MessageRejection::new(
-                RejectionCode::ResultMalformed,
-                "missing string 'status' discriminator",
-            ));
-        }
-    }
-    let result: HostResult = serde_json::from_value(value)
+    let result: HostResult = serde_json::from_slice(raw)
         .map_err(|error| malformed(RejectionCode::ResultMalformed, &error))?;
     result.validate()?;
     Ok(result)
@@ -1794,21 +1748,22 @@ fn malformed(code: RejectionCode, error: &serde_json::Error) -> MessageRejection
 const ADMIN_CREATE_CREDENTIALS_REDACTED: &str = "<redacted>";
 
 fn canonical_operation_value(operation: &HostOperation) -> anyhow::Result<serde_json::Value> {
-    let mut value = serde_json::to_value(operation)?;
-    if matches!(&operation.operation, HostOperationBody::AdminCreate { .. }) {
-        let payload = value
-            .get_mut("operation")
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or_else(|| {
-                anyhow::anyhow!("host operation payload did not serialize as an object")
-            })?;
-        // The password is intentionally not part of the target journal's
-        // replay hash: hashing it would create an offline verifier. The email
-        // remains in this view as the non-secret operation identity.
-        payload.insert(
-            "password".to_owned(),
-            serde_json::Value::String(ADMIN_CREATE_CREDENTIALS_REDACTED.to_owned()),
-        );
+    let HostOperationBody::AdminCreate { email, .. } = &operation.operation else {
+        return Ok(serde_json::to_value(operation)?);
+    };
+    // Build the redacted projection directly: the password never needs to be
+    // encoded or copied into a temporary JSON value for the replay identity.
+    let mut value = serde_json::json!({
+        "schema": operation.schema,
+        "operation_id": operation.operation_id,
+        "operation": {"kind": "admin-create", "email": email,
+            "password": ADMIN_CREATE_CREDENTIALS_REDACTED}
+    });
+    if let Some(deployment_id) = &operation.deployment_id {
+        value["deployment_id"] = serde_json::to_value(deployment_id)?;
+    }
+    if let Some(revision) = operation.expected_revision {
+        value["expected_revision"] = revision.into();
     }
     Ok(value)
 }
@@ -1820,18 +1775,9 @@ fn canonical_operation_value(operation: &HostOperation) -> anyhow::Result<serde_
 /// conflicts.
 pub fn canonical_operation_hash(operation: &HostOperation) -> anyhow::Result<String> {
     // The projection already has sorted map keys (no `preserve_order` feature).
-    Ok(hex_sha256(&serde_json::to_vec(
-        &canonical_operation_value(operation)?,
-    )?))
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
+    let mut writer = crate::digest::Sha256Writer::default();
+    serde_json::to_writer(&mut writer, &canonical_operation_value(operation)?)?;
+    Ok(writer.finish())
 }
 
 fn is_uuid_v7(value: &str) -> bool {
@@ -1840,14 +1786,13 @@ fn is_uuid_v7(value: &str) -> bool {
 
 fn valid_token(value: &str, max_chars: usize) -> bool {
     !value.is_empty()
-        && value.chars().count() <= max_chars
-        && value.chars().all(|character| character.is_ascii_graphic())
+        && value.len() <= max_chars
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 /// Bound diagnostic text without destroying printable Unicode.
-pub(super) fn sanitize(value: impl Into<String>) -> String {
-    let value: String = value.into();
-    let mut characters = value.chars();
+pub(super) fn sanitize(value: impl AsRef<str>) -> String {
+    let mut characters = value.as_ref().chars();
     let mut bounded: String = characters
         .by_ref()
         .take(200)
@@ -1868,6 +1813,7 @@ pub(super) fn sanitize(value: impl Into<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest as _, Sha256};
 
     fn ping_operation(nonce: &str) -> HostOperation {
         HostOperation::ping(Uuid::now_v7().to_string(), nonce)
@@ -2305,6 +2251,17 @@ mod tests {
         assert!(std::mem::needs_drop::<SecretMaterial>());
 
         assert!(SecretMaterial::try_new(vec![0; MAX_CONTROL_CHANGE_SET_BYTES + 1]).is_err());
+        assert!(serde_json::from_str::<SecretMaterial>("\"\"").is_err());
+        // One extra raw byte still fits the encoded-length ceiling. The
+        // constructor must enforce the decoded limit on this path as well.
+        let oversized = STANDARD.encode(vec![0; MAX_CONTROL_CHANGE_SET_BYTES + 1]);
+        assert_eq!(
+            oversized.len(),
+            MAX_CONTROL_CHANGE_SET_BYTES.div_ceil(3) * 4
+        );
+        assert!(
+            serde_json::from_value::<SecretMaterial>(serde_json::Value::String(oversized)).is_err()
+        );
         Ok(())
     }
 
@@ -2738,6 +2695,30 @@ mod tests {
     }
 
     #[test]
+    fn wire_rejects_duplicate_fields_before_typed_admission() -> anyhow::Result<()> {
+        let operation = ping_operation("nonce");
+        let raw = String::from_utf8(encode_host_operation(&operation)?)?;
+        let duplicate = raw.replacen("{", "{\"schema\":11,", 1);
+        assert_eq!(
+            parse_host_operation(duplicate.as_bytes()).unwrap_err().code,
+            RejectionCode::OperationMalformed
+        );
+        let result = HostResult::completed(
+            &operation.operation_id,
+            HostCompletionBody::Ping {
+                nonce: "nonce".into(),
+            },
+        );
+        let raw = String::from_utf8(encode_host_result(&result)?)?;
+        let duplicate = raw.replacen("{", "{\"schema\":11,", 1);
+        assert_eq!(
+            parse_host_result(duplicate.as_bytes()).unwrap_err().code,
+            RejectionCode::ResultMalformed
+        );
+        Ok(())
+    }
+
+    #[test]
     fn canonical_hash_is_deterministic_across_key_order() -> anyhow::Result<()> {
         let operation = ping_operation("same-nonce");
         let direct = canonical_operation_hash(&operation)?;
@@ -2752,7 +2733,7 @@ mod tests {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         *object = rotated.into_iter().collect();
-        let reordered_hash = hex_sha256(&serde_json::to_vec(&reordered)?);
+        let reordered_hash = hex::encode(Sha256::digest(serde_json::to_vec(&reordered)?));
         assert_eq!(reordered_hash, direct, "hash must ignore key order");
 
         let other = ping_operation("other-nonce");
@@ -2780,6 +2761,13 @@ mod tests {
             canonical_operation_hash(&first)?,
             canonical_operation_hash(&second)?,
             "password changes must not change the admin-create journal hash"
+        );
+        let mut previous = serde_json::to_value(&first)?;
+        previous["operation"]["password"] = ADMIN_CREATE_CREDENTIALS_REDACTED.into();
+        assert_eq!(canonical_operation_value(&first)?, previous);
+        assert_eq!(
+            canonical_operation_hash(&first)?,
+            hex::encode(Sha256::digest(serde_json::to_vec(&previous)?))
         );
         let canonical =
             String::from_utf8(serde_json::to_vec(&canonical_operation_value(&first)?)?)?;

@@ -30,14 +30,13 @@ use std::{
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 use uuid::Uuid;
 
-use crate::filesystem;
 use crate::target::wire::{RemoteHello, verify_remote_hello};
 use crate::target::{ExecutionTarget, HostCompletionBody, HostOperation, HostOutcome, LocalTarget};
+use crate::{file_lock::FileLock, filesystem};
 
 /// Schema discriminator carried by every persisted registry record.
 pub const REGISTRY_RECORD_SCHEMA: u32 = 3;
@@ -57,10 +56,8 @@ use crate::error_codes::{STATE_RESET_REQUIRED, TARGET_IDENTITY_MISMATCH};
 pub(crate) fn verify_registered_target_identity(
     host_id: Uuid,
     host_alias: &str,
-    hello: &RemoteHello,
+    observed: Uuid,
 ) -> anyhow::Result<()> {
-    let observed = Uuid::parse_str(&hello.target_id)
-        .context("the verified target hello carries an invalid target identity")?;
     if observed != host_id {
         bail!(
             "{TARGET_IDENTITY_MISMATCH}: registered host alias '{host_alias}' names target {host_id}, but the live helper owns target {observed}; refusing to read or change that target"
@@ -441,11 +438,9 @@ impl DiscoveryEvidence {
             );
         }
         validate_key(&self.host_alias, "evidence host alias")?;
-        verify_remote_hello(&self.hello).map_err(|reason| {
+        let target_id = verify_remote_hello(&self.hello).map_err(|reason| {
             anyhow::anyhow!("evidence helper identity is not verifiable: {reason}")
         })?;
-        let target_id = Uuid::parse_str(&self.hello.target_id)
-            .context("evidence target identity is not a UUID")?;
         if target_id != self.host_id {
             bail!(
                 "evidence target identity {target_id} does not match evidence host {}",
@@ -476,8 +471,7 @@ fn local_target_id(_registry_root: &Path) -> anyhow::Result<Uuid> {
         bail!("local target did not complete its identity hello")
     };
     verify_remote_hello(&hello)
-        .map_err(|reason| anyhow::anyhow!("local target hello is not verifiable: {reason}"))?;
-    Uuid::parse_str(&hello.target_id).context("local target hello has an invalid target identity")
+        .map_err(|reason| anyhow::anyhow!("local target hello is not verifiable: {reason}"))
 }
 
 fn validate_key(value: &str, label: &str) -> anyhow::Result<()> {
@@ -540,26 +534,6 @@ pub(crate) fn validate_issuer(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Exclusive registry lock held across a store operation.
-struct StoreLock {
-    file: fs::File,
-}
-
-impl StoreLock {
-    fn acquire(path: &Path) -> anyhow::Result<Self> {
-        let file = filesystem::open_lock_file(path, false, "registry lock")?;
-        file.try_lock_exclusive()
-            .with_context(|| format!("another operation holds {}", path.display()))?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
 /// Handle to the user-scoped registry store.
 #[derive(Clone, Debug)]
 pub struct RegistryStore {
@@ -610,8 +584,8 @@ impl RegistryStore {
         self.root.join("registry.lock")
     }
 
-    fn lock(&self) -> anyhow::Result<StoreLock> {
-        StoreLock::acquire(&self.lock_path())
+    fn lock(&self) -> anyhow::Result<FileLock> {
+        FileLock::acquire(&self.lock_path())
     }
 
     /// Create the reserved built-in `local` host exactly once.
@@ -629,10 +603,11 @@ impl RegistryStore {
     pub fn add_host(&self, record: HostRecord) -> anyhow::Result<HostRecord> {
         record.validate()?;
         let _lock = self.lock()?;
-        if self.find_host_by_alias_locked(&record.alias)?.is_some() {
+        let hosts = self.load_all_locked::<HostRecord>(Directory::Hosts)?;
+        if hosts.iter().any(|host| host.alias == record.alias) {
             bail!("duplicate host alias '{}'", record.alias);
         }
-        if self.find_host_by_id_locked(record.host_id)?.is_some() {
+        if hosts.iter().any(|host| host.host_id == record.host_id) {
             bail!("duplicate host id {}", record.host_id);
         }
         self.write_host_locked(&record)?;
@@ -646,10 +621,7 @@ impl RegistryStore {
 
     pub fn list_hosts(&self) -> anyhow::Result<Vec<HostRecord>> {
         let _lock = self.lock()?;
-        let mut hosts = Vec::new();
-        for (_, record) in self.load_all_locked::<HostRecord>(Directory::Hosts)? {
-            hosts.push(record);
-        }
+        let mut hosts = self.load_all_locked::<HostRecord>(Directory::Hosts)?;
         hosts.sort_by(|left, right| left.alias.cmp(&right.alias));
         Ok(hosts)
     }
@@ -693,13 +665,16 @@ impl RegistryStore {
         new_alias: impl Into<String>,
     ) -> anyhow::Result<InstanceRecord> {
         let _lock = self.lock()?;
-        let record = self
-            .find_instance_by_alias_locked(old_alias)?
+        let mut instances = self.load_all_locked::<InstanceRecord>(Directory::Instances)?;
+        let index = instances
+            .iter()
+            .position(|record| record.alias == old_alias)
             .with_context(|| format!("unknown instance alias '{old_alias}'"))?;
         let new_alias = new_alias.into();
-        if new_alias != record.alias && self.find_instance_by_alias_locked(&new_alias)?.is_some() {
+        if new_alias != old_alias && instances.iter().any(|record| record.alias == new_alias) {
             bail!("duplicate instance alias '{new_alias}'");
         }
+        let record = instances.swap_remove(index);
         let renamed = record.renamed(new_alias)?;
         let path = self.instance_path(&renamed.deployment_id);
         write_record(&path, "instance record", &renamed)?;
@@ -720,7 +695,6 @@ impl RegistryStore {
             .with_context(|| format!("unknown deployment id '{deployment_id}'"))?;
         record.oidf_tenant_domain = Some(tenant_domain.to_owned());
         record.oidf_suite_origin = Some(suite_origin.trim_end_matches('/').to_owned());
-        record.validate()?;
         let path = self.instance_path(&record.deployment_id);
         write_record(&path, "instance record", &record)?;
         Ok(record)
@@ -729,6 +703,24 @@ impl RegistryStore {
     pub fn instance_by_alias(&self, alias: &str) -> anyhow::Result<Option<InstanceRecord>> {
         let _lock = self.lock()?;
         self.find_instance_by_alias_locked(alias)
+    }
+
+    /// Resolve an explicit instance selector under one registry lock: an exact
+    /// deployment id takes precedence over an alias with the same spelling.
+    pub(crate) fn resolve_instance(&self, selector: &str) -> anyhow::Result<InstanceRecord> {
+        validate_identifier(selector, 128, "instance selector").with_context(|| {
+            format!(
+                "{}: invalid instance selector '{selector}'",
+                crate::error_codes::INSTANCE_NOT_REGISTERED
+            )
+        })?;
+        let _lock = self.lock()?;
+        if let Some(record) = read_optional_record(&self.instance_path(selector), selector)? {
+            return Ok(record);
+        }
+        self.find_instance_by_alias_locked(selector)?.with_context(|| {
+            format!("{}: unknown instance selector '{selector}' (no registered deployment id or alias matches)", crate::error_codes::INSTANCE_NOT_REGISTERED)
+        })
     }
 
     pub fn instance_by_deployment(
@@ -741,10 +733,7 @@ impl RegistryStore {
 
     pub fn list_instances(&self) -> anyhow::Result<Vec<InstanceRecord>> {
         let _lock = self.lock()?;
-        let mut instances = Vec::new();
-        for (_, record) in self.load_all_locked::<InstanceRecord>(Directory::Instances)? {
-            instances.push(record);
-        }
+        let mut instances = self.load_all_locked::<InstanceRecord>(Directory::Instances)?;
         instances.sort_by(|left, right| left.alias.cmp(&right.alias));
         Ok(instances)
     }
@@ -827,7 +816,7 @@ impl RegistryStore {
             );
         }
         let mut referencing = Vec::new();
-        for (_, record) in self.load_all_locked::<InstanceRecord>(Directory::Instances)? {
+        for record in self.load_all_locked::<InstanceRecord>(Directory::Instances)? {
             if record.host_id == host.host_id {
                 referencing.push(record);
             }
@@ -883,7 +872,6 @@ impl RegistryStore {
             .find_host_by_id_locked(host_id)?
             .with_context(|| format!("unknown host {host_id}"))?;
         host.last_observation = Some(observation);
-        host.validate()?;
         self.write_host_locked(&host)
     }
 
@@ -899,7 +887,6 @@ impl RegistryStore {
             .find_instance_by_deployment_locked(deployment_id)?
             .with_context(|| format!("unknown instance '{deployment_id}'"))?;
         record.last_observation = Some(observation);
-        record.validate()?;
         write_record(
             &self.instance_path(deployment_id),
             "instance record",
@@ -946,7 +933,6 @@ impl RegistryStore {
             .find_instance_by_deployment_locked(deployment_id)?
             .with_context(|| format!("unknown instance '{deployment_id}'"))?;
         record.backup_before_update = policy;
-        record.validate()?;
         write_record(
             &self.instance_path(deployment_id),
             "instance record",
@@ -1001,8 +987,7 @@ impl RegistryStore {
         Ok(self
             .load_all_locked::<HostRecord>(Directory::Hosts)?
             .into_iter()
-            .find(|(_, record)| record.alias == alias)
-            .map(|(_, record)| record))
+            .find(|record| record.alias == alias))
     }
 
     fn find_host_by_id_locked(&self, host_id: Uuid) -> anyhow::Result<Option<HostRecord>> {
@@ -1021,8 +1006,7 @@ impl RegistryStore {
         Ok(self
             .load_all_locked::<InstanceRecord>(Directory::Instances)?
             .into_iter()
-            .find(|(_, record)| record.alias == alias)
-            .map(|(_, record)| record))
+            .find(|record| record.alias == alias))
     }
 
     /// Load every record of one directory. Filenames other than `*.json`
@@ -1034,7 +1018,7 @@ impl RegistryStore {
     fn load_all_locked<T: ConformingRecord>(
         &self,
         _directory: Directory,
-    ) -> anyhow::Result<Vec<(String, T)>> {
+    ) -> anyhow::Result<Vec<T>> {
         let dir = match _directory {
             Directory::Hosts => self.hosts_dir(),
             Directory::Instances => self.instances_dir(),
@@ -1053,9 +1037,8 @@ impl RegistryStore {
             let stem = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .with_context(|| format!("unreadable record name {}", path.display()))?
-                .to_owned();
-            records.push((stem.clone(), read_record::<T>(&path, &stem)?));
+                .with_context(|| format!("unreadable record name {}", path.display()))?;
+            records.push(read_record::<T>(&path, stem)?);
         }
         Ok(records)
     }
@@ -1112,10 +1095,16 @@ impl ConformingRecord for InstanceRecord {
 }
 
 fn read_optional_record<T: ConformingRecord>(path: &Path, stem: &str) -> anyhow::Result<Option<T>> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => read_record(path, stem).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    match read_record(path, stem) {
+        Ok(record) => Ok(Some(record)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1234,11 +1223,34 @@ mod tests {
         assert_eq!(store.host_by_id(host.host_id)?, Some(host));
         assert_eq!(
             store.instance_by_deployment("deploy-healthy")?,
-            Some(instance)
+            Some(instance.clone())
+        );
+        assert_eq!(store.resolve_instance("deploy-healthy")?, instance);
+        assert_eq!(
+            crate::fleet::resolve_instance(&store, Some("deploy-healthy"), "test")?,
+            instance
         );
         assert!(store.instance_by_deployment("deploy-broken").is_err());
         assert!(store.instance_by_deployment("../outside").is_err());
         assert!(store.list_hosts().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn control_selector_prefers_deployment_id_then_resolves_alias() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        let first = register_fixture(&store, &host, "deploy-first", "first")?;
+        let second = register_fixture(&store, &host, "deploy-second", "deploy-first")?;
+        assert_eq!(store.resolve_instance("deploy-first")?, first);
+        assert_eq!(
+            crate::fleet::resolve_instance(&store, Some("deploy-first"), "test")?,
+            first
+        );
+        assert_eq!(store.resolve_instance("first")?, first);
+        assert_eq!(store.resolve_instance("deploy-second")?, second);
+        assert!(store.resolve_instance("missing").is_err());
+        assert!(store.resolve_instance("../outside").is_err());
         Ok(())
     }
 
@@ -1788,6 +1800,41 @@ mod tests {
                 .set_instance_observation("missing", ObservationCache::now(true, "x"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn backup_policy_updates_validate_new_values_and_preserve_the_record() -> anyhow::Result<()> {
+        let (_temp, store) = test_store()?;
+        let host = store.ensure_local_host()?;
+        let original = register_fixture(&store, &host, "deploy-alpha", "production")?;
+        for max_age_seconds in [0, 31_536_001] {
+            assert!(
+                store
+                    .set_backup_before_update(
+                        "deploy-alpha",
+                        BackupBeforeUpdatePolicy::Require { max_age_seconds },
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                store.instance_by_deployment("deploy-alpha")?,
+                Some(original.clone())
+            );
+        }
+        let policy = BackupBeforeUpdatePolicy::Require {
+            max_age_seconds: 3600,
+        };
+        let mut expected = original;
+        expected.backup_before_update = policy.clone();
+        assert_eq!(
+            store.set_backup_before_update("deploy-alpha", policy)?,
+            expected
+        );
+        assert_eq!(
+            store.instance_by_deployment("deploy-alpha")?,
+            Some(expected)
+        );
+        Ok(())
     }
 
     #[test]

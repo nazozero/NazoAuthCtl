@@ -82,8 +82,7 @@ impl RuntimeBackend for PodmanBackend {
     }
 
     fn read_logs(&self, object_reference: &str, limit: usize) -> anyhow::Result<Vec<String>> {
-        discovery::inspect(&self.command, object_reference)?;
-        let output = crate::process::Process::new(self.command.clone())
+        let output = crate::process::Process::new(&self.command)
             .args(["logs", "--tail"])
             .arg(limit.to_string())
             .arg(object_reference)
@@ -99,8 +98,8 @@ impl RuntimeBackend for PodmanBackend {
         operations::stop(&self.command, object_reference)
     }
 
-    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()> {
-        operations::quiesce_for_recovery(&self.command, object_reference)
+    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<bool> {
+        super::container_shared::quiesce_for_recovery(&self.command, object_reference, "Podman")
     }
 
     fn restart(&self, object_reference: &str) -> anyhow::Result<()> {
@@ -127,7 +126,7 @@ impl RuntimeBackend for PodmanBackend {
         super::container_shared::stage_recovery_candidate(
             &self.command,
             "Podman",
-            &discovery::observation_from_document(&self.command, &document)?,
+            &discovery::parse_mounts(&document)?,
             &document,
             request,
             false,

@@ -1,7 +1,5 @@
 //! Controller surface orchestration and self-update.
 
-#[cfg(unix)]
-use crate::process::Process;
 use anyhow::bail;
 
 use crate::error_codes::PRIVILEGE_REQUIRED;
@@ -25,7 +23,7 @@ pub(crate) fn require_root() -> anyhow::Result<()> {
     }
     #[cfg(unix)]
     {
-        if Process::new("id").arg("-u").stdout()?.trim() != "0" {
+        if !crate::process::is_effective_root() {
             bail!("{PRIVILEGE_REQUIRED}: this command requires root");
         }
         Ok(())

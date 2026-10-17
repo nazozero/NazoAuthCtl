@@ -1,7 +1,7 @@
 //! Token parser for the final command façade (goal plan 09 §1, I01).
 //!
 //! Command families own their option state and boundary checks in sibling modules.  This module
-//! only consumes global options and routes the remaining tokens to the family parser.
+//! consumes the already parsed global prefix and routes tokens to the family parser.
 
 mod common;
 mod controller;
@@ -22,23 +22,18 @@ use surface::{
 use tls::parse_tls;
 
 impl Cli {
-    pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Self>> {
-        let mut args = args.into_iter();
-        let _program = args.next();
-        let mut values = args.collect::<Vec<_>>();
-        if values.is_empty() {
+    pub(crate) fn parse(
+        args: Vec<String>,
+        globals: super::GlobalOptions,
+    ) -> anyhow::Result<Option<Self>> {
+        let mut values = args.into_iter();
+        let _program = values.next();
+        if values.as_slice().is_empty() {
             return Ok(None);
         }
-        let globals = super::parse_global_options(&values)?;
-        values.drain(..globals.consumed);
-        if values
-            .iter()
-            .any(|value| matches!(value.as_str(), "-h" | "--help"))
-        {
-            return Ok(None);
-        }
-        let command = values.first().cloned().context("a command is required")?;
-        values.remove(0);
+        let command = values
+            .nth(globals.consumed)
+            .context("a command is required")?;
         let command = match command.as_str() {
             // ---- primary 18-command surface --------------------------------
             "host" => Command::Host(parse_host(values)?),
@@ -46,10 +41,10 @@ impl Cli {
             "controller" => Command::Controller(parse_controller(values)?),
             "install" => Command::Install(parse_install_args(values)?),
             "discover" => {
-                let parsed = fleet::parse_options(values.to_vec(), &["--host"], &[], "discover")?;
+                let mut parsed = fleet::parse_options(values, &["--host"], &[], "discover")?;
                 no_arguments(&parsed.positionals, "discover")?;
                 Command::Discover {
-                    host: parsed.values.get("--host").cloned(),
+                    host: parsed.values.remove("--host"),
                 }
             }
             "bind" => Command::Bind(parse_bind(values)?),
@@ -109,29 +104,54 @@ impl Cli {
             "admin" => Command::Admin(parse_admin(values)?),
             "tls" => Command::Tls(parse_tls(values)?),
             "remote" if values.as_slice() == ["transfer-stream"] => Command::RemoteTransferStream,
-            "remote" if values.first().is_some_and(|value| value == "exec") => {
-                values.remove(0);
-                no_arguments(&values, "remote exec")?;
+            "remote"
+                if values
+                    .as_slice()
+                    .first()
+                    .is_some_and(|value| value == "exec") =>
+            {
+                values.next();
+                no_arguments(values.as_slice(), "remote exec")?;
                 Command::RemoteExec
             }
-            "self" if values.first().is_some_and(|value| value == "check") => {
-                values.remove(0);
+            "self"
+                if values
+                    .as_slice()
+                    .first()
+                    .is_some_and(|value| value == "check") =>
+            {
+                values.next();
                 Command::SelfCheck(parse_version_option(values)?)
             }
-            "self" if values.first().is_some_and(|value| value == "verify-state") => {
-                values.remove(0);
-                no_arguments(&values, "self verify-state")?;
+            "self"
+                if values
+                    .as_slice()
+                    .first()
+                    .is_some_and(|value| value == "verify-state") =>
+            {
+                values.next();
+                no_arguments(values.as_slice(), "self verify-state")?;
                 Command::SelfVerifyState
             }
-            "self" if values.first().is_some_and(|value| value == "update") => {
-                values.remove(0);
+            "self"
+                if values
+                    .as_slice()
+                    .first()
+                    .is_some_and(|value| value == "update") =>
+            {
+                values.next();
                 Command::SelfUpdate {
                     version: parse_version_option(values)?,
                 }
             }
-            "self" if values.first().is_some_and(|value| value == "rollback") => {
-                values.remove(0);
-                no_arguments(&values, "self rollback")?;
+            "self"
+                if values
+                    .as_slice()
+                    .first()
+                    .is_some_and(|value| value == "rollback") =>
+            {
+                values.next();
+                no_arguments(values.as_slice(), "self rollback")?;
                 Command::SelfRollback
             }
             other => crate::ui::fail!(
@@ -148,7 +168,7 @@ impl Cli {
 }
 
 fn parse_limited_selector(
-    values: Vec<String>,
+    values: impl IntoIterator<Item = String>,
     command: &str,
     default: usize,
     maximum: usize,
@@ -160,7 +180,6 @@ fn parse_limited_selector(
             "{command} 最多接受一个实例选择参数"
         );
     }
-    let selector = surface::selector_from_parsed(&parsed);
     let limit = match parsed.values.get("--limit") {
         Some(raw) => raw.parse::<usize>().with_context(|| {
             crate::ui::message!(
@@ -176,7 +195,20 @@ fn parse_limited_selector(
             "{command} 的 --limit 必须在 1 到 {maximum} 之间"
         );
     }
-    Ok((selector, limit))
+    Ok((
+        InstanceSelector {
+            positional: parsed.positionals.into_iter().next(),
+            named: None,
+        },
+        limit,
+    ))
+}
+
+#[cfg(test)]
+fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Cli>> {
+    let args: Vec<_> = args.into_iter().collect();
+    let globals = super::parse_global_options(args.get(1..).unwrap_or_default())?;
+    Cli::parse(args, globals)
 }
 
 #[cfg(test)]
@@ -186,14 +218,14 @@ mod tests {
 
     #[test]
     fn verify_rejects_all_instead_of_ignoring_it() {
-        let error = Cli::parse(["nazoauthctl", "verify", "--all"].map(str::to_owned))
+        let error = parse(["nazoauthctl", "verify", "--all"].map(str::to_owned))
             .expect_err("verify --all must not be silently narrowed");
         assert!(error.to_string().contains("does not accept --all"));
     }
 
     #[test]
     fn admin_create_accepts_only_the_fixed_credentials_input_shape() {
-        let parsed = Cli::parse(
+        let parsed = parse(
             [
                 "nazoauthctl",
                 "admin",
@@ -214,7 +246,7 @@ mod tests {
                     && args.credentials_stdin
         ));
         assert!(
-            Cli::parse(
+            parse(
                 ["nazoauthctl", "admin", "delete"]
                     .into_iter()
                     .map(str::to_owned)
@@ -234,7 +266,7 @@ mod tests {
             vec!["nazoauthctl", "controller", "revoke", "controller-a"],
         ] {
             assert!(
-                Cli::parse(command.into_iter().map(str::to_owned)).is_ok(),
+                parse(command.into_iter().map(str::to_owned)).is_ok(),
                 "the command itself is the operator intent"
             );
         }
@@ -258,13 +290,13 @@ mod tests {
             ],
         ] {
             assert!(
-                Cli::parse(command.into_iter().map(str::to_owned)).is_err(),
+                parse(command.into_iter().map(str::to_owned)).is_err(),
                 "the removed compatibility flag must not remain accepted"
             );
         }
 
         assert!(
-            Cli::parse(
+            parse(
                 ["nazoauthctl", "uninstall", "--yes"]
                     .into_iter()
                     .map(str::to_owned)
@@ -281,7 +313,7 @@ mod version_tests {
     #[test]
     fn version_aliases_accept_instance_and_json_without_changing_other_commands() {
         for alias in ["version", "V", "--version", "-V"] {
-            let cli = Cli::parse(
+            let cli = parse(
                 ["nazoauthctl", "--json", "--instance", "production", alias].map(str::to_owned),
             )
             .unwrap()
@@ -290,8 +322,6 @@ mod version_tests {
             assert_eq!(cli.instance.as_deref(), Some("production"));
             assert!(matches!(cli.command, Command::Version { all: false, .. }));
         }
-        assert!(
-            Cli::parse(["nazoauthctl", "version", "--to", "v9.0.0"].map(str::to_owned)).is_err()
-        );
+        assert!(parse(["nazoauthctl", "version", "--to", "v9.0.0"].map(str::to_owned)).is_err());
     }
 }

@@ -1,24 +1,6 @@
-//! Instance lifecycle use cases over the ExecutionTarget seam (goal plan 07,
-//! tasks G03/G04/G06/G07).
-//!
-//! Module map:
-//!
-//! * [`update`] — G03: minimal crash-safe update. One pre-signed
-//!   ControlOperation drives the application migration; one journaled
-//!   HostOperation stages, activates, health-gates, and commits the new
-//!   artifact/config references on the target.
-//! * [`rollback`] — G04: explicit restore of the previous verified artifact
-//!   reference plus an explicitly saved, schema-compatible config snapshot.
-//! * [`uninstall`] — G06: plan-first deletion of exactly the managed +
-//!   deployment-scoped resources; external/shared resources have zero-delete
-//!   paths and the host record plus sibling instances are never touched.
-//! * [`privilege`] — G07: privilege sinking. Root/sudo is required only at
-//!   genuine privileged steps; registry reads, state reads, and health probes
-//!   run with caller permissions.
-//!
-//! The use cases are transport-agnostic by construction: they speak only to
-//! an [`ExecutionTarget`], so local and SSH lifecycles share this exact code
-//! and this exact test suite. CLI wiring lands with the I wave.
+//! Instance update, rollback and uninstall over the same local/SSH target boundary.
+//! Live inspections supply planning facts; target-side journals and revision checks
+//! own mutations. Registry observations are display-only.
 
 pub(crate) mod privilege;
 mod rollback;
@@ -28,7 +10,6 @@ mod update;
 #[cfg(test)]
 mod tests;
 
-// CLI-surface re-exports (I wave).
 pub(crate) use rollback::run_rollback;
 pub(crate) use uninstall::run_uninstall;
 pub(crate) use update::{UpdateRequest, run_update};
@@ -86,8 +67,7 @@ pub(crate) fn resolve_live_instance(
         .host_by_id(record.host_id)?
         .with_context(|| format!("instance '{}' references a missing host", record.alias))?;
     let target = context.target_for(&host)?;
-    // C08 gate upstream of every mutation kind: no lifecycle action talks to
-    // an unverified helper.
+    // Verify the helper before reading or mutating target state.
     live_probe(target.as_ref(), &host).with_context(|| {
         format!(
             "host '{}' failed its live verification; {} changed nothing",

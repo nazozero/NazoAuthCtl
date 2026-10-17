@@ -154,14 +154,14 @@ fn probe_target(
             bail!("the target helper answered failure {code}: {detail}")
         }
     };
-    verify_remote_hello(&hello).map_err(|reason| {
+    let observed = verify_remote_hello(&hello).map_err(|reason| {
         anyhow::anyhow!(
             "{REMOTE_HELPER_MISMATCH}: {reason}. Upgrade the target helper first \
              (`nazoauthctl self update` on the host), then retry; no fallback exists."
         )
     })?;
     if let Some(host) = expected_host {
-        verify_registered_target_identity(host.host_id, &host.alias, &hello)?;
+        verify_registered_target_identity(host.host_id, &host.alias, observed)?;
     }
 
     Ok(hello)
@@ -199,8 +199,8 @@ pub(crate) fn summarize_inspection(inspection: &InstanceInspection) -> String {
     let artifacts = match (&inspection.artifact.current, &inspection.artifact.previous) {
         (None, None) => "-".to_owned(),
         (current, previous) => {
-            let current = current.clone().unwrap_or_else(|| "-".to_owned());
-            let previous = previous.clone().unwrap_or_else(|| "-".to_owned());
+            let current = current.as_deref().unwrap_or("-");
+            let previous = previous.as_deref().unwrap_or("-");
             format!("{current}<-{previous}")
         }
     };
@@ -597,26 +597,16 @@ pub(crate) fn resolve_instance(
     explicit: Option<&str>,
     action: &str,
 ) -> anyhow::Result<InstanceRecord> {
-    let instances = store.list_instances()?;
     if let Some(selector) = explicit {
-        return instances
-            .iter()
-            .find(|record| record.alias == selector || record.deployment_id == selector)
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "{INSTANCE_NOT_REGISTERED}: no registered instance matches '{selector}' \
-                     exactly. Selectors accept an exact alias or an exact deployment id only — \
-                     substring, fuzzy, and discovery-order selection are never attempted"
-                )
-            });
+        return store.resolve_instance(selector);
     }
+    let mut instances = store.list_instances()?;
     match instances.as_slice() {
         [] => crate::ui::fail!(
             "{INSTANCE_NOT_REGISTERED}: no instances are registered yet",
             "{INSTANCE_NOT_REGISTERED}：尚未注册实例，请先安装或注册部署"
         ),
-        [single] => Ok(single.clone()),
+        [_] => Ok(instances.pop().expect("one registered instance")),
         many => {
             let candidates = many
                 .iter()
@@ -632,7 +622,10 @@ pub(crate) fn resolve_instance(
     }
 }
 
-fn merged_selector(selector: &InstanceSelector, action: &str) -> anyhow::Result<Option<String>> {
+fn merged_selector<'a>(
+    selector: &'a InstanceSelector,
+    action: &str,
+) -> anyhow::Result<Option<&'a str>> {
     selector
         .explicit()
         .with_context(|| format!("{action}: conflicting selectors"))
@@ -656,10 +649,9 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
             match live_probe(target.as_ref(), &host) {
                 Ok(hello) => {
                     let summary = summarize_hello(&hello);
-                    context.store.set_host_observation(
-                        host.host_id,
-                        ObservationCache::now(true, summary.clone()),
-                    )?;
+                    context
+                        .store
+                        .set_host_observation(host.host_id, ObservationCache::now(true, summary))?;
                     for bound in instances
                         .iter()
                         .filter(|other| other.host_id == host.host_id)
@@ -745,7 +737,7 @@ fn instance_list(context: &FleetContext, refresh: bool) -> anyhow::Result<String
 
 fn instance_show(context: &FleetContext, selector: &InstanceSelector) -> anyhow::Result<String> {
     let explicit = merged_selector(selector, "instance show")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance show")?;
+    let record = resolve_instance(&context.store, explicit, "instance show")?;
     let host = context.store.host_by_id(record.host_id)?.with_context(|| {
         format!(
             "instance '{}' references missing host {}",
@@ -781,7 +773,7 @@ fn instance_rename(
     new_alias: &str,
 ) -> anyhow::Result<String> {
     let explicit = merged_selector(source, "instance rename")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance rename")?;
+    let record = resolve_instance(&context.store, explicit, "instance rename")?;
     let renamed = context.store.rename_instance(&record.alias, new_alias)?;
     Ok(crate::ui::message!(
         "renamed instance '{}' -> '{}' (deployment {}; key/issuer/host bindings unchanged)\n",
@@ -794,7 +786,7 @@ fn instance_rename(
 
 fn instance_forget(context: &FleetContext, selector: &InstanceSelector) -> anyhow::Result<String> {
     let explicit = merged_selector(selector, "instance forget")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance forget")?;
+    let record = resolve_instance(&context.store, explicit, "instance forget")?;
     let mut report = String::new();
     if record.controller_id.is_some() || record.controller_key_ref.is_some() {
         report.push_str(&crate::ui::message!(
@@ -820,7 +812,7 @@ fn instance_relocate(
     to_host: &str,
 ) -> anyhow::Result<String> {
     let explicit = merged_selector(selector, "instance relocate")?;
-    let record = resolve_instance(&context.store, explicit.as_deref(), "instance relocate")?;
+    let record = resolve_instance(&context.store, explicit, "instance relocate")?;
     let current = context.store.host_by_id(record.host_id)?.with_context(|| {
         format!(
             "instance '{}' references missing host {}",

@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_DRIVER_BYTES, MAX_ARTIFACT_MATRIX_BYTES,
-    MAX_SIGNED_DRIVER_BYTES, OidfDriverInspectionPlan, OidfPlanError, OidfPlanSelection,
-    VerifiedOidfArtifact, artifact::verify_oidf_matrix_with_driver,
-    artifact_plan::compile_oidf_driver_inspection_plan, verify_oidf_artifact,
+    MAX_SIGNED_DRIVER_BYTES, OidfArtifactMatrix, OidfDriverInspectionPlan, OidfDriverProgram,
+    OidfPlanError, OidfPlanSelection, VerifiedOidfArtifact,
+    artifact::verify_oidf_matrix_with_driver, artifact_plan::compile_oidf_driver_inspection_plan,
     verify_oidf_driver_manifest,
 };
 
@@ -129,8 +129,8 @@ pub fn open_cached_oidf_driver_plan(
     )?;
     Ok(compile_oidf_driver_inspection_plan(
         cached,
-        &driver,
-        &matrix,
+        driver,
+        matrix,
         available_capabilities,
         selection,
         now,
@@ -143,7 +143,7 @@ fn open_cached_entry(
     trust: &ArtifactTrustPolicy,
     available_capabilities: &BTreeSet<String>,
     now: i64,
-) -> Result<(CachedOidfArtifact, Vec<u8>, Vec<u8>), ArtifactDiscoveryError> {
+) -> Result<(CachedOidfArtifact, OidfDriverProgram, OidfArtifactMatrix), ArtifactDiscoveryError> {
     if !cache_root.is_absolute() || cache_root.file_name().is_none() {
         return Err(ArtifactDiscoveryError::UnsafeCache);
     }
@@ -160,7 +160,7 @@ fn open_cached_entry(
     let compact_manifest = read_cache(&cache_entry.join("manifest.jws"), MAX_SIGNED_DRIVER_BYTES)?;
     let driver = read_cache(&cache_entry.join("driver.json"), MAX_ARTIFACT_DRIVER_BYTES)?;
     let matrix = read_cache(&cache_entry.join("matrix.json"), MAX_ARTIFACT_MATRIX_BYTES)?;
-    let record = verify_cached_entry(
+    let (record, driver, matrix) = verify_cached_entry(
         CachedVerificationInput {
             record: &record_bytes,
             compact_manifest: &compact_manifest,
@@ -284,17 +284,10 @@ fn fetch_verified_artifact(
     let compact_manifest = compact_manifest(&manifest_bytes)?;
     let driver =
         verify_oidf_driver_manifest(&compact_manifest, trust, available_capabilities, now)?;
-    let driver_url = driver.driver_url().to_owned();
-    let driver_size = driver.driver_size();
-    let matrix_url = driver.matrix_url().to_owned();
-    let matrix_size = driver.matrix_size();
-    if matrix_size == 0 || matrix_size > MAX_ARTIFACT_MATRIX_BYTES as u64 {
-        return Err(ArtifactDiscoveryError::Oversize);
-    }
-    let driver_payload = transport.get(&driver_url, driver_size)?;
+    let driver_payload = transport.get(driver.driver_url(), driver.driver_size())?;
     let driver_program = driver.verify_driver_payload(&driver_payload)?;
-    let matrix = transport.get(&matrix_url, matrix_size)?;
-    let artifact = verify_oidf_matrix_with_driver(driver, driver_program, &matrix)?;
+    let matrix = transport.get(driver.matrix_url(), driver.matrix_size())?;
+    let (artifact, _, _) = verify_oidf_matrix_with_driver(driver, driver_program, &matrix)?;
     Ok(FetchedArtifact {
         compact_manifest,
         driver: driver_payload,
@@ -328,7 +321,7 @@ fn verify_cached_entry(
     trust: &ArtifactTrustPolicy,
     available_capabilities: &BTreeSet<String>,
     now: i64,
-) -> Result<CacheRecord, ArtifactDiscoveryError> {
+) -> Result<(CacheRecord, OidfDriverProgram, OidfArtifactMatrix), ArtifactDiscoveryError> {
     if !is_lowercase_sha256(input.manifest_digest) {
         return Err(ArtifactDiscoveryError::InvalidManifestDigest);
     }
@@ -339,18 +332,15 @@ fn verify_cached_entry(
     }
 
     let compact_manifest = compact_manifest(input.compact_manifest)?;
-    let artifact = verify_oidf_artifact(
-        &compact_manifest,
-        input.driver,
-        input.matrix,
-        trust,
-        available_capabilities,
-        now,
-    )?;
+    let manifest =
+        verify_oidf_driver_manifest(&compact_manifest, trust, available_capabilities, now)?;
+    let driver = manifest.verify_driver_payload(input.driver)?;
+    let (artifact, driver, matrix) =
+        verify_oidf_matrix_with_driver(manifest, driver, input.matrix)?;
     if artifact.driver_manifest_sha256 != input.manifest_digest || artifact != record.artifact {
         return Err(ArtifactDiscoveryError::CacheIdentity);
     }
-    Ok(record)
+    Ok((record, driver, matrix))
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -672,6 +662,7 @@ mod tests {
             available_capabilities,
             now,
         )
+        .map(|(record, _, _)| record)
     }
 
     fn manifest(matrix: &[u8], expires_at: i64) -> OidfDriverManifest {
@@ -1048,6 +1039,27 @@ mod tests {
                 .expect("record modified time"),
             before
         );
+
+        for (name, original) in [
+            ("driver.json", &fetched.driver),
+            ("matrix.json", &fetched.matrix),
+        ] {
+            let mut changed = original.clone();
+            changed.push(b' ');
+            write_cache(&entry.join(name), &changed).expect("change cached bytes");
+            assert!(matches!(
+                open_cached_oidf_driver_plan(
+                    &root,
+                    &opened.artifact.driver_manifest_sha256,
+                    &trust(),
+                    &capabilities(),
+                    OidfPlanSelection::default(),
+                    NOW + 2,
+                ),
+                Err(ArtifactDiscoveryError::Artifact(_))
+            ));
+            write_cache(&entry.join(name), original).expect("restore cached bytes");
+        }
 
         std::fs::remove_file(opened.cache_entry.join("verified.json")).expect("remove marker");
         assert!(matches!(

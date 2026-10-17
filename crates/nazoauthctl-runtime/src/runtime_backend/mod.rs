@@ -326,9 +326,9 @@ impl OneShotTask {
         process: crate::process::Process,
     ) -> anyhow::Result<String> {
         if self.command != ["nazoauth", "operator-task"] {
-            return process.stdin_stdout(&self.stdin);
+            return process.stdin_stdout(self.stdin.as_slice());
         }
-        let output = process.stdin_output(&self.stdin)?;
+        let output = process.stdin_output(self.stdin.as_slice())?;
         if !output.status.success() && output.stdout.is_empty() {
             anyhow::bail!(
                 "operator task exited without a control receipt: {}",
@@ -382,7 +382,8 @@ pub trait RuntimeBackend {
     fn read_logs(&self, object_reference: &str, limit: usize) -> anyhow::Result<Vec<String>>;
     fn start(&self, object_reference: &str) -> anyhow::Result<()>;
     fn stop(&self, object_reference: &str) -> anyhow::Result<()>;
-    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()>;
+    /// Stop or prove absence, returning whether the runtime was initially running.
+    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<bool>;
     fn restart(&self, object_reference: &str) -> anyhow::Result<()>;
     fn remove(&self, object_reference: &str) -> anyhow::Result<()>;
     /// Replace the runtime object without starting it. The caller restores the desired running state.
@@ -447,11 +448,19 @@ pub fn safe_environment(values: &[serde_json::Value]) -> BTreeMap<String, String
         .collect()
 }
 
-pub fn server_command_verified(values: &[String]) -> bool {
-    values.windows(2).any(|pair| pair == ["nazoauth", "server"])
-        || values.first().is_some_and(|value| {
-            value.ends_with("nazoauth") && values.get(1).is_some_and(|value| value == "server")
-        })
+pub fn server_command_verified<'a>(values: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut previous: Option<&str> = None;
+    for (index, value) in values.into_iter().enumerate() {
+        if value == "server"
+            && previous.is_some_and(|previous| {
+                previous == "nazoauth" || (index == 1 && previous.ends_with("nazoauth"))
+            })
+        {
+            return true;
+        }
+        previous = Some(value);
+    }
+    false
 }
 
 pub fn labels(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
@@ -483,6 +492,24 @@ pub const RUNTIME_SECRET_NAMES: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn server_command_recognition_borrows_arguments_and_preserves_position_rules() {
+        for values in [
+            vec!["/usr/bin/nazoauth", "server"],
+            vec!["wrapper", "nazoauth", "server"],
+        ] {
+            assert!(super::server_command_verified(values));
+        }
+        for values in [
+            vec![],
+            vec!["nazoauth"],
+            vec!["nazoauth", "migrate"],
+            vec!["wrapper", "/usr/bin/nazoauth", "server"],
+        ] {
+            assert!(!super::server_command_verified(values));
+        }
+    }
+
     use super::{RuntimeBackendKind, safe_environment};
 
     #[test]

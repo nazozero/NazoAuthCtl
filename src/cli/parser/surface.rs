@@ -24,10 +24,10 @@ use super::fleet::{checked_name, parse_options, selector_parts};
 
 /// Selector plus bool flags for read-only views (`status`, `doctor`, ...).
 pub(super) fn parse_read_view_selector(
-    values: Vec<String>,
+    values: impl IntoIterator<Item = String>,
     command: &str,
 ) -> anyhow::Result<(InstanceSelector, bool)> {
-    let parts = selector_parts(&values, &[], &["--all"], command)?;
+    let parts = selector_parts(values, &[], &["--all"], command)?;
     Ok((
         InstanceSelector {
             positional: parts.positional,
@@ -40,11 +40,11 @@ pub(super) fn parse_read_view_selector(
 /// Selector plus confirmation flags for mutating commands
 /// (`rollback`, `uninstall`).
 pub(super) fn parse_confirm_scoped(
-    values: Vec<String>,
+    values: impl IntoIterator<Item = String>,
     bool_flags: &[&str],
     command: &str,
 ) -> anyhow::Result<(InstanceSelector, bool)> {
-    let parts = selector_parts(&values, &[], bool_flags, command)?;
+    let parts = selector_parts(values, &[], bool_flags, command)?;
     Ok((
         InstanceSelector {
             positional: parts.positional,
@@ -54,17 +54,10 @@ pub(super) fn parse_confirm_scoped(
     ))
 }
 
-pub(super) fn selector_from_parsed(parsed: &super::fleet::ParsedOptions) -> InstanceSelector {
-    InstanceSelector {
-        positional: parsed.positionals.first().cloned(),
-        named: parsed.values.get("--instance").cloned(),
-    }
-}
-
 /// `nazoauthctl bind [--instance SELECTOR] --label NAME [--approval-token T]
 /// [--credentials-file PATH] [--output-secret-file PATH]`
-pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
-    let parsed = parse_options(
+pub(super) fn parse_bind(values: impl IntoIterator<Item = String>) -> anyhow::Result<BindOptions> {
+    let mut parsed = parse_options(
         values,
         &[
             "--instance",
@@ -82,24 +75,24 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
             "bind 最多接受一个实例选择参数"
         );
     }
-    let named = match parsed.values.get("--instance") {
+    let named = match parsed.values.remove("--instance") {
         Some(instance) => {
-            checked_name("--instance", instance)?;
-            Some(instance.clone())
+            checked_name("--instance", &instance)?;
+            Some(instance)
         }
         None => None,
     };
-    let label = match parsed.values.get("--label") {
+    let label = match parsed.values.remove("--label") {
         Some(label) => {
-            checked_name("--label", label)?;
-            label.clone()
+            checked_name("--label", &label)?;
+            label
         }
         None => crate::ui::fail!(
             "--label NAME is required so administrators can recognize this key",
             "必须提供 --label NAME，便于管理员识别此密钥"
         ),
     };
-    let approval_token = match parsed.values.get("--approval-token") {
+    let approval_token = match parsed.values.remove("--approval-token") {
         Some(token) => {
             if token.trim().is_empty() || token.chars().any(char::is_control) || token.len() > 512 {
                 crate::ui::fail!(
@@ -107,11 +100,11 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
                     "--approval-token 必须是长度符合限制的单行令牌"
                 );
             }
-            Some(token.clone())
+            Some(token)
         }
         None => None,
     };
-    let credentials_file = match parsed.values.get("--credentials-file") {
+    let credentials_file = match parsed.values.remove("--credentials-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
         Some(_) => crate::ui::fail!(
             "--credentials-file requires a file path",
@@ -125,7 +118,7 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
             "--approval-token 和 --credentials-file 只能选择一种"
         );
     }
-    let output_secret_file = match parsed.values.get("--output-secret-file") {
+    let output_secret_file = match parsed.values.remove("--output-secret-file") {
         Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
         Some(_) => crate::ui::fail!(
             "--output-secret-file requires a file path",
@@ -149,8 +142,10 @@ pub(super) fn parse_bind(values: Vec<String>) -> anyhow::Result<BindOptions> {
 /// [--to VERSION] [--runtime CLASS] [--install-root PATH]`
 ///
 /// This is the G01 clean install; the retired per-deployment installer is gone.
-pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallArgs> {
-    let parsed = parse_options(
+pub(super) fn parse_install_args(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<InstallArgs> {
+    let mut parsed = parse_options(
         values,
         &[
             "--host",
@@ -183,22 +178,21 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
     }
     let public_url = parsed
         .values
-        .get("--public-url")
+        .remove("--public-url")
         .context(crate::ui::text(
             "install requires --public-url URL (the public issuer origin)",
             "安装需要 --public-url URL（公开服务地址）",
-        ))?
-        .clone();
+        ))?;
     if let Some(host) = parsed.values.get("--host") {
         checked_name("--host", host)?;
     }
     if let Some(name) = parsed.values.get("--name") {
         checked_name("--name", name)?;
     }
-    let version = match parsed.values.get("--to") {
+    let version = match parsed.values.remove("--to") {
         Some(version) => {
-            validate_version(version)?;
-            Some(version.clone())
+            validate_version(&version)?;
+            Some(version)
         }
         None => None,
     };
@@ -211,15 +205,14 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "--runtime must be podman, docker, or host",
             "--runtime 必须为 podman、docker 或 host",
         ))?;
-    let install_root = parsed.values.get("--install-root").map(PathBuf::from);
+    let install_root = parsed.values.remove("--install-root").map(PathBuf::from);
     let database_host = parsed
         .values
-        .get("--database-host")
+        .remove("--database-host")
         .context(crate::ui::text(
             "install requires --database-host HOST (external PostgreSQL endpoint)",
             "安装需要 --database-host HOST（已有 PostgreSQL 地址）",
-        ))?
-        .clone();
+        ))?;
     let database_port = match parsed.values.get("--database-port") {
         Some(port) => port.parse::<u16>().context(crate::ui::text(
             "--database-port must be 1-65535",
@@ -232,28 +225,27 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
     };
     let database_name = parsed
         .values
-        .get("--database-name")
+        .remove("--database-name")
         .context(crate::ui::text(
             "install requires --database-name DATABASE",
             "安装需要 --database-name DATABASE",
-        ))?
-        .clone();
-    let database_runtime_user = parsed
-        .values
-        .get("--database-runtime-user")
-        .context(crate::ui::text(
-            "install requires --database-runtime-user ROLE",
-            "安装需要 --database-runtime-user ROLE",
-        ))?
-        .clone();
-    let database_lifecycle_user = parsed
-        .values
-        .get("--database-lifecycle-user")
-        .context(crate::ui::text(
-            "install requires --database-lifecycle-user ROLE",
-            "安装需要 --database-lifecycle-user ROLE",
-        ))?
-        .clone();
+        ))?;
+    let database_runtime_user =
+        parsed
+            .values
+            .remove("--database-runtime-user")
+            .context(crate::ui::text(
+                "install requires --database-runtime-user ROLE",
+                "安装需要 --database-runtime-user ROLE",
+            ))?;
+    let database_lifecycle_user =
+        parsed
+            .values
+            .remove("--database-lifecycle-user")
+            .context(crate::ui::text(
+                "install requires --database-lifecycle-user ROLE",
+                "安装需要 --database-lifecycle-user ROLE",
+            ))?;
     if database_runtime_user == database_lifecycle_user {
         crate::ui::fail!(
             "runtime and lifecycle PostgreSQL roles must be distinct",
@@ -262,12 +254,11 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
     }
     let valkey_host = parsed
         .values
-        .get("--valkey-host")
+        .remove("--valkey-host")
         .context(crate::ui::text(
             "install requires --valkey-host HOST (external Valkey endpoint)",
             "安装需要 --valkey-host HOST（已有 Valkey 地址）",
-        ))?
-        .clone();
+        ))?;
     let valkey_port = match parsed.values.get("--valkey-port") {
         Some(port) => port.parse::<u16>().context(crate::ui::text(
             "--valkey-port must be 1-65535",
@@ -278,7 +269,9 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "安装需要 --valkey-port PORT"
         ),
     };
-    let database_runtime_password_file = match parsed.values.get("--database-runtime-password-file")
+    let database_runtime_password_file = match parsed
+        .values
+        .remove("--database-runtime-password-file")
     {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         Some(_) => crate::ui::fail!(
@@ -293,7 +286,7 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
     };
     let database_lifecycle_password_file = match parsed
         .values
-        .get("--database-lifecycle-password-file")
+        .remove("--database-lifecycle-password-file")
     {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         Some(_) => crate::ui::fail!(
@@ -305,7 +298,7 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "安装需要 --database-lifecycle-password-file PATH，文件中应为已有 PostgreSQL 迁移角色的密码"
         ),
     };
-    let valkey_password_file = match parsed.values.get("--valkey-password-file") {
+    let valkey_password_file = match parsed.values.remove("--valkey-password-file") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
         Some(_) => crate::ui::fail!(
             "--valkey-password-file requires a file path",
@@ -317,8 +310,8 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
             "安装需要 --valkey-password-file PATH，文件中应为已有 Valkey 的密码"
         ),
     };
-    let target_path = |flag: &str| -> anyhow::Result<Option<PathBuf>> {
-        let Some(value) = parsed.values.get(flag) else {
+    let mut target_path = |flag: &str| -> anyhow::Result<Option<PathBuf>> {
+        let Some(value) = parsed.values.remove(flag) else {
             return Ok(None);
         };
         let windows_absolute = value.len() >= 3
@@ -340,8 +333,11 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         }
         Ok(Some(PathBuf::from(value)))
     };
-    let direct_tls_config = parsed.values.get("--direct-tls-config").map(PathBuf::from);
     let tls_material_root = target_path("--tls-material-root")?;
+    let direct_tls_config = parsed
+        .values
+        .remove("--direct-tls-config")
+        .map(PathBuf::from);
     if direct_tls_config.is_some() != tls_material_root.is_some() {
         crate::ui::fail!(
             "--direct-tls-config and --tls-material-root must be supplied together",
@@ -349,8 +345,8 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
         );
     }
     Ok(InstallArgs {
-        host: parsed.values.get("--host").cloned(),
-        name: parsed.values.get("--name").cloned(),
+        host: parsed.values.remove("--host"),
+        name: parsed.values.remove("--name"),
         public_url,
         version,
         runtime,
@@ -372,8 +368,10 @@ pub(super) fn parse_install_args(values: Vec<String>) -> anyhow::Result<InstallA
 
 /// `nazoauthctl update [--instance SELECTOR] [--to VERSION]
 /// [--config-file PATH --config-schema TOKEN]`
-pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArgs> {
-    let parsed = parse_options(
+pub(super) fn parse_update_args(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<UpdateArgs> {
+    let mut parsed = parse_options(
         values,
         &["--instance", "--to", "--config-file", "--config-schema"],
         &[],
@@ -385,22 +383,22 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
             "update 最多接受一个实例选择参数"
         );
     }
-    let named = match parsed.values.get("--instance") {
+    let named = match parsed.values.remove("--instance") {
         Some(instance) => {
-            checked_name("--instance", instance)?;
-            Some(instance.clone())
+            checked_name("--instance", &instance)?;
+            Some(instance)
         }
         None => None,
     };
-    let version = match parsed.values.get("--to") {
+    let version = match parsed.values.remove("--to") {
         Some(version) => {
-            validate_version(version)?;
-            Some(version.clone())
+            validate_version(&version)?;
+            Some(version)
         }
         None => None,
     };
-    let config_file = parsed.values.get("--config-file").map(PathBuf::from);
-    let config_schema = parsed.values.get("--config-schema").cloned();
+    let config_file = parsed.values.remove("--config-file").map(PathBuf::from);
+    let config_schema = parsed.values.remove("--config-schema");
     match (&config_file, &config_schema) {
         (Some(_), Some(_)) | (None, None) => {}
         _ => crate::ui::fail!(
@@ -421,29 +419,26 @@ pub(super) fn parse_update_args(values: Vec<String>) -> anyhow::Result<UpdateArg
 }
 
 /// `nazoauthctl backup show|snapshot|restore-test|copy [--instance SELECTOR]`.
-pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
-    let (command, rest) = match values.split_first() {
-        None => (BackupCommand::Show, values.as_slice()),
-        Some((first, rest)) => match first.as_str() {
-            "show" => (BackupCommand::Show, rest),
-            "snapshot" => (BackupCommand::Snapshot, rest),
-            "restore-test" => (BackupCommand::RestoreTest, rest),
+pub(super) fn parse_backup(values: impl IntoIterator<Item = String>) -> anyhow::Result<BackupArgs> {
+    let mut rest = values.into_iter();
+    let command = match rest.next() {
+        None => BackupCommand::Show,
+        Some(first) => match first.as_str() {
+            "show" => BackupCommand::Show,
+            "snapshot" => BackupCommand::Snapshot,
+            "restore-test" => BackupCommand::RestoreTest,
             "copy" => {
-                let parts = selector_parts(rest, &["--to-host"], &[], "backup copy")?;
+                let mut parts = selector_parts(rest, &["--to-host"], &[], "backup copy")?;
                 if parts.positional.is_some() {
                     crate::ui::fail!(
                         "backup copy does not accept a positional selector; use --instance",
                         "backup copy 请使用 --instance 选择实例，不接受位置参数"
                     );
                 }
-                let to_host = parts
-                    .values
-                    .get("--to-host")
-                    .cloned()
-                    .context(crate::ui::text(
-                        "backup copy requires --to-host HOST",
-                        "backup copy 需要 --to-host HOST",
-                    ))?;
+                let to_host = parts.values.remove("--to-host").context(crate::ui::text(
+                    "backup copy requires --to-host HOST",
+                    "backup copy 需要 --to-host HOST",
+                ))?;
                 return Ok(BackupArgs {
                     selector: InstanceSelector {
                         positional: None,
@@ -475,8 +470,9 @@ pub(super) fn parse_backup(values: Vec<String>) -> anyhow::Result<BackupArgs> {
 }
 
 /// `nazoauthctl policy backup-before-update off|warn|require --max-age-seconds N`.
-pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
-    let Some((subject, rest)) = values.split_first() else {
+pub(super) fn parse_policy(values: impl IntoIterator<Item = String>) -> anyhow::Result<PolicyArgs> {
+    let mut rest = values.into_iter();
+    let Some(subject) = rest.next() else {
         crate::ui::fail!(
             "policy requires backup-before-update",
             "policy 需要 backup-before-update 子命令"
@@ -488,7 +484,7 @@ pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
             "policy 仅支持 backup-before-update"
         );
     }
-    let Some((mode, rest)) = rest.split_first() else {
+    let Some(mode) = rest.next() else {
         crate::ui::fail!(
             "backup-before-update requires off, warn, or require",
             "备份策略必须为 off、warn 或 require"
@@ -548,15 +544,17 @@ pub(super) fn parse_policy(values: Vec<String>) -> anyhow::Result<PolicyArgs> {
     })
 }
 
-pub(super) fn parse_recover(values: Vec<String>) -> anyhow::Result<RecoverArgs> {
-    let parts = selector_parts(&values, &["--to", "--recovery-secret-file"], &[], "recover")?;
-    let version = parts.values.get("--to").cloned();
+pub(super) fn parse_recover(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<RecoverArgs> {
+    let mut parts = selector_parts(values, &["--to", "--recovery-secret-file"], &[], "recover")?;
+    let version = parts.values.remove("--to");
     if let Some(version) = &version {
         validate_version(version)?;
     }
     let recovery_secret_file = parts
         .values
-        .get("--recovery-secret-file")
+        .remove("--recovery-secret-file")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
     Ok(RecoverArgs {
@@ -570,11 +568,12 @@ pub(super) fn parse_recover(values: Vec<String>) -> anyhow::Result<RecoverArgs> 
 }
 
 /// `nazoauthctl admin create [--instance SELECTOR] [--credentials-stdin]`
-pub(super) fn parse_admin(values: Vec<String>) -> anyhow::Result<AdminCommand> {
-    let (subcommand, rest) = values
-        .split_first()
-        .with_context(|| "expected admin create")?;
-    if *subcommand != "create" {
+pub(super) fn parse_admin(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<AdminCommand> {
+    let mut rest = values.into_iter();
+    let subcommand = rest.next().context("expected admin create")?;
+    if subcommand != "create" {
         crate::ui::fail!(
             "unknown admin subcommand '{subcommand}'",
             "未知的 admin 子命令：{subcommand}"
@@ -678,8 +677,7 @@ mod boundary_tests {
         let error = parse_backup(
             ["copy", "unexpected", "--to-host", "other"]
                 .into_iter()
-                .map(str::to_owned)
-                .collect(),
+                .map(str::to_owned),
         )
         .expect_err("a positional selector must not be ignored");
         assert!(error.to_string().contains("does not accept a positional"));

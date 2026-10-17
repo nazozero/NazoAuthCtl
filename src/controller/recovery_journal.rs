@@ -81,28 +81,46 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn load(&self) -> anyhow::Result<Option<RecoveryPlan>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let bytes = filesystem::read_secure_regular_file(
+        let bytes = match filesystem::read_secure_regular_file(
             &self.path,
             "controller recovery journal",
             true,
             MAX_BYTES,
-        )?;
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
-        if value.get("schema").and_then(serde_json::Value::as_u64) == Some(1) {
-            // Schema 1 explicitly defaulted absent transport flags to HTTP.
-            if let Some(candidate) = value
-                .get_mut("candidate")
-                .and_then(serde_json::Value::as_object_mut)
+        ) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
-                candidate.entry("https").or_insert(false.into());
+                return Ok(None);
             }
-            value["schema"] = SCHEMA.into();
+            Err(error) => return Err(error),
+        };
+        let mut plan = match serde_json::from_slice::<RecoveryPlan>(&bytes) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+                    return Err(error).with_context(|| {
+                        format!("{} is not a valid recovery plan", self.path.display())
+                    });
+                }
+                // Schema 1 explicitly defaulted absent transport flags to HTTP.
+                if let Some(candidate) = value
+                    .get_mut("candidate")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    candidate.entry("https").or_insert(false.into());
+                }
+                serde_json::from_value(value).with_context(|| {
+                    format!("{} is not a valid recovery plan", self.path.display())
+                })?
+            }
+        };
+        if plan.schema == 1 {
+            plan.schema = SCHEMA;
         }
-        let plan: RecoveryPlan = serde_json::from_value(value)
-            .with_context(|| format!("{} is not a valid recovery plan", self.path.display()))?;
         validate(&plan)?;
         Ok(Some(plan))
     }
@@ -114,10 +132,7 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn clear(&self) -> anyhow::Result<()> {
-        if self.path.exists() {
-            filesystem::remove_file_durable(&self.path)?;
-        }
-        Ok(())
+        filesystem::remove_file_durable(&self.path)
     }
 }
 

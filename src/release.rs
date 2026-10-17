@@ -8,26 +8,11 @@
 //! workflow identity — and hand out an immutable handle; callers never see
 //! unverified bytes and never repeat a proof already covered by the handle.
 //!
-//! H03 digest-semantics ledger: every remaining digest expresses exactly one
-//! distinct fact.
-//! 1. Attestation subject digest: a signed in-toto statement binds the exact
-//!    downloaded bytes. Supply-chain binding, established once here.
-//! 2. Signed manifest digests (`ReleaseManifest.artifacts[*].sha256`, OCI
-//!    index/platform digests): the signed policy binds the artifact set (J3);
-//!    its coherence with fact 1 is checked once during verification.
-//! 3. Cache entry address (`official|local/<subject>` directory name): which
-//!    signed subject the cached bytes claim to be.
-//! 4. Cache `blob_sha256` (OCI archives only): integrity of the exported
-//!    archive transport encoding, which has no other local identity.
-//! 5. `ArtifactHandle::verify_integrity`: one re-hash of cached bytes against
-//!    fact 3/4 detects in-place mutation before consumption. It is never a
-//!    second supply-chain proof.
-//! 6. `active-release.json`, update journals, rollback states, and the
-//!    controller self-update journal pin deployed/candidate identities for
-//!    crash-safe lifecycle state; they are durable pointers, not repeated
-//!    proofs over the same bytes.
-//! 7. Attestation bundles persisted under `evidence/` are archival evidence;
-//!    no trust decision consumes them.
+//! A persistent cache saves downloads only: cached bytes enter a private
+//! workspace and pass the complete attestation and signed-manifest checks.
+//! The verified handle then exposes that workspace's binary and its signed
+//! digest. Deployment copies bind their written bytes to this digest before
+//! atomic publication; they do not repeat the supply-chain proof.
 
 use std::{
     collections::BTreeMap,
@@ -42,7 +27,7 @@ use serde::Deserialize;
 use crate::{
     error_codes::{RELEASE_DOWNLOAD_FAILED, RELEASE_NOT_FOUND},
     filesystem::{PrivateTempDir, atomic_write, read_secure_regular_file, sha256},
-    model::{Artifact, ReleaseManifest, release_target, semantic_tag},
+    model::{ReleaseManifest, release_target, semantic_tag},
     process::{Process, command_exists},
     runtime_backend::RuntimeBackendKind,
     runtime_backend::{BlobAttestationVerification, backend},
@@ -58,7 +43,7 @@ const SIGSTORE_BUNDLE_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0
 const MAX_ATTESTATIONS: usize = 20;
 const ATTESTATION_PAGE_SIZE: usize = MAX_ATTESTATIONS + 1;
 const MAX_GITHUB_JSON_BYTES: u64 = 1024 * 1024;
-const MAX_UNATTESTED_UPDATER_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RELEASE_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const GITHUB_REQUEST_SECONDS: u64 = 30;
 const RELEASE_DOWNLOAD_SECONDS: u64 = 300;
 const IN_TOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
@@ -160,35 +145,10 @@ impl VerifiedRelease {
         Ok(Self { work, manifest })
     }
 
-    /// Materialize one declared artifact inside the private handle workspace.
-    ///
-    /// Each artifact's digest is checked exactly once, when its bytes first
-    /// enter the workspace: attested subjects were digest-bound during
-    /// [`Self::verify`], and artifacts fetched on demand are bound here
-    /// against their signed manifest entry.
-    /// The workspace is private to this handle, so existence implies coverage;
-    /// re-hashing on every access would only duplicate the same fact (H03).
-    pub(crate) fn artifact(&self, key: &str, repository: &str) -> anyhow::Result<PathBuf> {
-        let artifact = self
-            .manifest
-            .artifacts
-            .get(key)
-            .with_context(|| format!("release manifest does not contain {key}"))?;
-        if artifact.repository != repository {
-            bail!("release artifact repository does not match controller policy");
-        }
-        let path = self.work.path().join(&artifact.name);
-        if !path.exists() {
-            download(
-                &artifact.repository,
-                &self.manifest.version,
-                &artifact.name,
-                self.work.path(),
-                artifact.size,
-            )?;
-            verify_artifact(&path, artifact)?;
-        }
-        Ok(path)
+    /// The binary already bound to the signed manifest in this private workspace.
+    pub(crate) fn binary_artifact(&self) -> (PathBuf, &str) {
+        let artifact = &self.manifest.artifacts["binary"];
+        (self.work.path().join(&artifact.name), &artifact.sha256)
     }
 }
 
@@ -210,13 +170,7 @@ impl VerifiedControllerRelease {
         };
         let artifact_name = format!("nazoauthctl-{target}{suffix}");
         let work = PrivateTempDir::new("nazoauthctl-release")?;
-        download(
-            CONTROLLER_REPOSITORY,
-            &version,
-            &artifact_name,
-            work.path(),
-            MAX_UNATTESTED_UPDATER_BYTES,
-        )?;
+        download(CONTROLLER_REPOSITORY, &version, &artifact_name, work.path())?;
         let digest = sha256(&work.path().join(&artifact_name))?;
         let response = fetch_github_attestation_response(
             CONTROLLER_REPOSITORY,
@@ -354,18 +308,12 @@ fn verified_release_candidate(
     identity: &str,
     cache: Option<&Path>,
 ) -> anyhow::Result<ReleaseManifest> {
-    let cached = cache.and_then(|root| {
+    let mut cached = cache.and_then(|root| {
         let source = root.join(repository).join(version).join(blob);
         fs::copy(&source, work.join(blob)).ok().map(|_| source)
     });
     if cached.is_none() {
-        download(
-            repository,
-            version,
-            blob,
-            work,
-            MAX_UNATTESTED_UPDATER_BYTES,
-        )?;
+        download(repository, version, blob, work)?;
     }
     // P1-11: the cache is a TRANSPORT optimization only. The digest is
     // recomputed from the bytes actually in the workspace and the full
@@ -391,13 +339,8 @@ fn verified_release_candidate(
         (Err(error), None) => return Err(error),
         (Err(cached_error), Some(cached_source)) => {
             remove_failed_cached_release(cached_source)?;
-            download(
-                repository,
-                version,
-                blob,
-                work,
-                MAX_UNATTESTED_UPDATER_BYTES,
-            )
+            cached = None;
+            download(repository, version, blob, work)
             .with_context(|| {
                 format!(
                     "cached Release artifact failed verification ({cached_error:#}); its single fresh download failed"
@@ -430,7 +373,9 @@ fn verified_release_candidate(
             })?
         }
     };
-    if let Some(root) = cache {
+    if let Some(root) = cache
+        && cached.is_none()
+    {
         let destination = root.join(repository).join(version).join(blob);
         // Only fully verified bytes reach the persistent store; the
         // recomputed digest above already proved what we are storing.  The
@@ -461,14 +406,15 @@ pub(crate) fn enforce_release_trust_floor(
     Ok(())
 }
 
+pub(crate) fn parse_release_version(value: &str) -> anyhow::Result<semver::Version> {
+    let value = value
+        .strip_prefix('v')
+        .context("Release version has no v prefix")?;
+    semver::Version::parse(value).context("Release version is not semantic")
+}
+
 pub(crate) fn compare_versions(left: &str, right: &str) -> anyhow::Result<std::cmp::Ordering> {
-    fn parse(value: &str) -> anyhow::Result<semver::Version> {
-        let value = value
-            .strip_prefix('v')
-            .context("Release version has no v prefix")?;
-        semver::Version::parse(value).context("Release version is not semantic")
-    }
-    Ok(parse(left)?.cmp_precedence(&parse(right)?))
+    Ok(parse_release_version(left)?.cmp_precedence(&parse_release_version(right)?))
 }
 
 fn bounded_https_curl_arguments(max_time: u64, max_filesize: u64) -> Vec<String> {
@@ -716,20 +662,11 @@ fn resolve_version(repository: &str, requested: Option<&str>) -> anyhow::Result<
     Ok(version.to_owned())
 }
 
-fn download(
-    repository: &str,
-    version: &str,
-    name: &str,
-    destination: &Path,
-    maximum_size: u64,
-) -> anyhow::Result<()> {
-    if maximum_size == 0 {
-        bail!("release artifact has no bounded download size");
-    }
+fn download(repository: &str, version: &str, name: &str, destination: &Path) -> anyhow::Result<()> {
     Process::new("curl")
         .args(bounded_https_curl_arguments(
             RELEASE_DOWNLOAD_SECONDS,
-            maximum_size,
+            MAX_RELEASE_BINARY_BYTES,
         ))
         .arg("--output")
         .arg(destination.join(name))
@@ -776,27 +713,24 @@ fn verify_blob_attestation(
     })
 }
 
-fn verify_artifact(path: &Path, artifact: &Artifact) -> anyhow::Result<()> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    if metadata.len() != artifact.size {
-        bail!(
-            "{ARTIFACT_UNVERIFIED}: artifact size mismatch: {}",
-            artifact.name
-        );
-    }
-    if sha256(path)? != artifact.sha256 {
-        bail!(
-            "{ARTIFACT_UNVERIFIED}: artifact digest mismatch: {}",
-            artifact.name
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn release_version_parsing_preserves_tag_and_precedence_rules() {
+        for invalid in ["1.2.3", "v", "v1.2", "v01.2.3"] {
+            assert!(parse_release_version(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            compare_versions("v1.2.3+build-a", "v1.2.3+build-b").unwrap(),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("v1.2.3-rc.1", "v1.2.3").unwrap(),
+            std::cmp::Ordering::Less
+        );
+    }
 
     #[test]
     fn release_fetch_failures_distinguish_missing_from_transport() {

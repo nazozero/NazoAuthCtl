@@ -40,39 +40,12 @@
 //!   attempt after fixing the cause mints a fresh operation_id.
 //! * Any drift in the journal file fails closed instead of being repaired.
 
-use std::fs;
-
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error_codes::STATE_RESET_REQUIRED;
-use crate::filesystem;
-
-/// Exclusive per-instance lock shared with the Controller Key store, so
-/// journal writes serialize against key-store mutations of the same
-/// deployment. Locking is fail-fast (`try_lock`): contention surfaces as an
-/// error instead of corrupting state.
-struct InstanceJournalLock {
-    file: fs::File,
-}
-
-impl InstanceJournalLock {
-    fn acquire(instance_dir: &std::path::Path) -> anyhow::Result<Self> {
-        let path = instance_dir.join("keys.lock");
-        let file = filesystem::open_lock_file(&path, false, "control operation journal lock")?;
-        file.try_lock_exclusive()
-            .with_context(|| format!("another operation holds {}", path.display()))?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for InstanceJournalLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
+use crate::{file_lock::FileLock, filesystem};
 
 /// Schema discriminator for the operation journal file.
 pub const OPERATION_JOURNAL_SCHEMA: u32 = 2;
@@ -196,27 +169,20 @@ impl OperationJournal {
 
     /// Load the current entry, or `None` when no operation was ever prepared.
     pub fn load(&self) -> anyhow::Result<Option<OperationJournalEntry>> {
-        match fs::symlink_metadata(&self.path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect {}", self.path.display()));
-            }
-        }
-        let bytes = filesystem::read_secure_regular_file(
+        let bytes = match filesystem::read_secure_regular_file(
             &self.path,
             "control operation journal",
             true,
             MAX_JOURNAL_BYTES,
-        )
-        .map_err(|error| {
-            error.context(format!(
-                "{STATE_RESET_REQUIRED}: operation journal is unreadable, unsafe, or exceeds \
-                 the size limit ({})",
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) if error.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => return Ok(None),
+            Err(error) => return Err(error.context(format!(
+                "{STATE_RESET_REQUIRED}: operation journal is unreadable, unsafe, or exceeds the size limit ({})",
                 self.path.display()
-            ))
-        })?;
+            ))),
+        };
         let entry: OperationJournalEntry = serde_json::from_slice(&bytes).map_err(|error| {
             anyhow::Error::new(error).context(format!(
                 "{STATE_RESET_REQUIRED}: operation journal does not parse as the current \
@@ -239,11 +205,7 @@ impl OperationJournal {
         if entry.state != JournalState::Dispatched {
             bail!("a fresh journal entry must start in the dispatched state");
         }
-        let _lock = InstanceJournalLock::acquire(
-            self.path
-                .parent()
-                .context("journal path has no parent directory")?,
-        )?;
+        let _lock = FileLock::acquire(&self.path.with_file_name("keys.lock"))?;
         if let Some(existing) = self.load()? {
             if existing.operation_id == entry.operation_id {
                 if !existing.has_same_identity(entry) {
@@ -280,38 +242,11 @@ impl OperationJournal {
             .with_context(|| format!("failed to persist {}", self.path.display()))
     }
 
-    /// Transition the entry to accepted after the target acknowledged it.
-    pub fn mark_accepted(&self, operation_id: &str) -> anyhow::Result<()> {
-        let _lock = InstanceJournalLock::acquire(
-            self.path
-                .parent()
-                .context("journal path has no parent directory")?,
-        )?;
-        let Some(mut entry) = self.load()? else {
-            bail!("no journaled operation to mark accepted");
-        };
-        if entry.operation_id != operation_id {
-            bail!(
-                "journaled operation {} cannot be marked accepted for foreign id {operation_id}",
-                entry.operation_id
-            );
-        }
-        entry.state = JournalState::Accepted;
-        let bytes = serde_json::to_vec_pretty(&entry)
-            .context("failed to serialize the operation journal entry")?;
-        filesystem::atomic_write(&self.path, &bytes, 0o600)
-            .with_context(|| format!("failed to persist {}", self.path.display()))
-    }
-
     /// Transition only the exact operation observed by the caller. State and
     /// timestamp are intentionally excluded: a concurrent retry may already
     /// have moved the same operation from dispatched to accepted.
     pub fn mark_accepted_if_matches(&self, expected: &OperationJournalEntry) -> anyhow::Result<()> {
-        let _lock = InstanceJournalLock::acquire(
-            self.path
-                .parent()
-                .context("journal path has no parent directory")?,
-        )?;
+        let _lock = FileLock::acquire(&self.path.with_file_name("keys.lock"))?;
         let Some(mut entry) = self.load()? else {
             bail!("the expected journaled operation is no longer present");
         };
@@ -320,6 +255,9 @@ impl OperationJournal {
                 "the operation journal changed while operation '{}' was settling",
                 expected.operation_id
             );
+        }
+        if entry.state == JournalState::Accepted {
+            return Ok(());
         }
         entry.state = JournalState::Accepted;
         let bytes = serde_json::to_vec_pretty(&entry)
@@ -331,11 +269,7 @@ impl OperationJournal {
     /// Remove only the exact operation observed by the caller. This prevents
     /// a late completion from deleting a newer single-slot journal entry.
     pub fn clear_if_matches(&self, expected: &OperationJournalEntry) -> anyhow::Result<()> {
-        let _lock = InstanceJournalLock::acquire(
-            self.path
-                .parent()
-                .context("journal path has no parent directory")?,
-        )?;
+        let _lock = FileLock::acquire(&self.path.with_file_name("keys.lock"))?;
         let Some(entry) = self.load()? else {
             bail!("the expected journaled operation is no longer present");
         };
@@ -352,19 +286,7 @@ impl OperationJournal {
     /// Remove the entry after a definitive unaccepted rejection so the next
     /// attempt mints a fresh operation id. Absence is already fine.
     pub fn clear(&self) -> anyhow::Result<()> {
-        let _lock = InstanceJournalLock::acquire(
-            self.path
-                .parent()
-                .context("journal path has no parent directory")?,
-        )?;
-        match fs::symlink_metadata(&self.path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to inspect {}", self.path.display()));
-            }
-        }
+        let _lock = FileLock::acquire(&self.path.with_file_name("keys.lock"))?;
         filesystem::remove_file_durable(&self.path)
             .with_context(|| format!("failed to clear {}", self.path.display()))
     }
@@ -376,6 +298,7 @@ mod tests {
     use crate::controller_identity::store::{ControllerKeyStore, controller_key_ref_for};
     use crate::filesystem;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::fs;
 
     struct Fixture {
         _temp: filesystem::PrivateTempDir,
@@ -425,12 +348,17 @@ mod tests {
         assert_eq!(loaded, entry);
         assert_eq!(loaded.state, JournalState::Dispatched);
 
-        journal.mark_accepted(&entry.operation_id)?;
+        journal.mark_accepted_if_matches(&entry)?;
         let loaded = journal.load()?.expect("accepted entry");
         assert_eq!(loaded.state, JournalState::Accepted);
+        let accepted_modified = fs::metadata(journal.path())?.modified()?;
+        journal.mark_accepted_if_matches(&entry)?;
+        assert_eq!(fs::metadata(journal.path())?.modified()?, accepted_modified);
 
         // Foreign ids are refused.
-        assert!(journal.mark_accepted("other-id").is_err());
+        let mut foreign = entry;
+        foreign.operation_id = "other-id".to_owned();
+        assert!(journal.mark_accepted_if_matches(&foreign).is_err());
         Ok(())
     }
 
@@ -544,6 +472,9 @@ mod tests {
         let f = fixture()?;
         let journal = journal(&f)?;
         let mut entry = sample_entry("01900000-0000-7000-8000-000000000004");
+        if entry.state == JournalState::Accepted {
+            return Ok(());
+        }
         entry.state = JournalState::Accepted;
         assert!(journal.record_dispatched(&entry).is_err());
         Ok(())
@@ -576,7 +507,7 @@ mod tests {
         assert_eq!(fs::read(journal.path())?, original_bytes);
         assert_eq!(fs::metadata(journal.path())?.modified()?, original_modified);
 
-        journal.mark_accepted(&original.operation_id)?;
+        journal.mark_accepted_if_matches(&original)?;
         let accepted_bytes = fs::read(journal.path())?;
         assert!(journal.record_dispatched(&original).is_err());
         assert_eq!(fs::read(journal.path())?, accepted_bytes);

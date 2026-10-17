@@ -139,7 +139,7 @@ pub struct GroupProgress {
     pub remaining: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProgressSnapshot {
     pub completed: usize,
     pub total: usize,
@@ -442,21 +442,16 @@ pub fn current_matrix_label(
     profile: Option<&str>,
     variant: Option<&BTreeMap<String, String>>,
 ) -> String {
-    let profile = profile.unwrap_or("-");
-    let variant = variant
-        .map(|values| {
-            values
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    if variant.is_empty() {
-        profile.to_owned()
-    } else {
-        format!("{profile}/{variant}")
+    let mut label = profile.unwrap_or("-").to_owned();
+    if let Some(variant) = variant {
+        for (index, (key, value)) in variant.iter().enumerate() {
+            label.push(if index == 0 { '/' } else { ',' });
+            label.push_str(key);
+            label.push('=');
+            label.push_str(value);
+        }
     }
+    label
 }
 
 fn percent(completed: usize, total: usize) -> usize {

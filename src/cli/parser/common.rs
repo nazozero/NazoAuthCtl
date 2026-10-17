@@ -1,14 +1,18 @@
 use crate::model::semantic_tag;
 
-pub(super) fn parse_version_option(values: Vec<String>) -> anyhow::Result<Option<String>> {
-    if values.is_empty() {
+pub(super) fn parse_version_option(
+    values: impl IntoIterator<Item = String>,
+) -> anyhow::Result<Option<String>> {
+    let mut values = values.into_iter();
+    let Some(flag) = values.next() else {
         return Ok(None);
-    }
-    if values.len() != 2 || values[0] != "--to" {
-        crate::ui::fail!("expected only --to VERSION", "仅支持 --to VERSION");
-    }
-    validate_version(&values[1])?;
-    Ok(Some(values[1].clone()))
+    };
+    let version = match (flag.as_str(), values.next(), values.next()) {
+        ("--to", Some(version), None) => version,
+        _ => crate::ui::fail!("expected only --to VERSION", "仅支持 --to VERSION"),
+    };
+    validate_version(&version)?;
+    Ok(Some(version))
 }
 
 pub(super) fn validate_version(version: &str) -> anyhow::Result<()> {

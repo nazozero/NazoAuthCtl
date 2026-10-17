@@ -4,7 +4,6 @@ use serde_json::Value;
 use url::Url;
 
 use super::BrowserError;
-use super::parser::parse_browser_urls;
 use super::validation::{BrowserPolicy, MAX_MATCH_BYTES, MAX_STEPS};
 
 /// Suite browser work is represented as bounded URLs rather than executable
@@ -103,15 +102,61 @@ fn parse_uri_input_submit_urls(
             return Err(BrowserError::InvalidSchema);
         }
         let submit_url = Url::parse(submit_url).map_err(|_| BrowserError::InvalidSchema)?;
-        policy.validate_url(&submit_url)?;
-        if !policy.suite_origin.same_origin_url(&submit_url)
-            || !submit_url.username().is_empty()
-            || submit_url.password().is_some()
-            || submit_url.fragment().is_some()
-        {
+        if !policy.suite_origin.same_origin_url(&submit_url) {
+            return Err(BrowserError::CrossOriginNavigation);
+        }
+        if submit_url.fragment().is_some() {
             return Err(BrowserError::InvalidSchema);
         }
         submit_urls.push(submit_url);
     }
     Ok(submit_urls)
+}
+
+fn parse_browser_urls(
+    value: Option<&Value>,
+    policy: &BrowserPolicy,
+) -> Result<Vec<Url>, BrowserError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or(BrowserError::InvalidSchema)?;
+    if values.len() > MAX_STEPS {
+        return Err(BrowserError::StepLimit);
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let text = match value {
+            Value::String(text) => text.as_str(),
+            Value::Object(object) => {
+                if object
+                    .keys()
+                    .any(|key| !["url", "method"].contains(&key.as_str()))
+                    || object
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .is_some_and(|method| method != "GET")
+                {
+                    return Err(BrowserError::UnsupportedCommand);
+                }
+                object
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or(BrowserError::InvalidSchema)?
+            }
+            _ => return Err(BrowserError::InvalidSchema),
+        };
+        if text.len() > MAX_MATCH_BYTES {
+            return Err(BrowserError::InvalidSchema);
+        }
+        let url = Url::parse(text).map_err(|_| BrowserError::InvalidSchema)?;
+        policy.validate_url(&url)?;
+        if url.fragment().is_some() {
+            return Err(BrowserError::InvalidSchema);
+        }
+        if !parsed.iter().any(|candidate| candidate == &url) {
+            parsed.push(url);
+        }
+    }
+    Ok(parsed)
 }

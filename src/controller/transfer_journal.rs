@@ -113,15 +113,22 @@ impl TransferJournal {
     }
 
     pub(crate) fn load(&self) -> anyhow::Result<Option<TransferRecord>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let bytes = filesystem::read_secure_regular_file(
+        let bytes = match filesystem::read_secure_regular_file(
             &self.path,
             "controller backup transfer journal",
             true,
             MAX_BYTES,
-        )?;
+        ) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let record: TransferRecord = serde_json::from_slice(&bytes).with_context(|| {
             format!(
                 "{} is not a valid backup transfer record; preserve it and repair or remove it only after verifying both target staging areas",
@@ -142,10 +149,7 @@ impl TransferJournal {
     }
 
     pub(crate) fn clear(&self) -> anyhow::Result<()> {
-        if self.path.exists() {
-            filesystem::remove_file_durable(&self.path)?;
-        }
-        Ok(())
+        filesystem::remove_file_durable(&self.path)
     }
 
     #[cfg(test)]

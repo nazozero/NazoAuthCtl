@@ -75,7 +75,7 @@ impl DeletionExecutor for HostDeletionExecutor {
                     format!(
                         "runtime object '{}' exists without this deployment's ownership label; \
                          refusing to remove a possibly foreign object",
-                        sanitize(job.runtime_object.to_owned())
+                        sanitize(job.runtime_object)
                     ),
                 ));
             }
@@ -112,19 +112,11 @@ impl DeletionExecutor for HostDeletionExecutor {
         let config_path = Path::new(job.config_reference);
         let config_marker =
             std::path::PathBuf::from(format!("{}.nazoauth-owned", job.config_reference));
-        if config_path.exists() {
-            filesystem::remove_file_durable(config_path).map_err(|error| {
+        for path in [config_path, config_marker.as_path()] {
+            filesystem::remove_file_durable(path).map_err(|error| {
                 Failure::new(
                     HOST_ERR_OPERATION_INVALID,
-                    format!("failed to remove {}: {error}", config_path.display()),
-                )
-            })?;
-        }
-        if config_marker.exists() {
-            filesystem::remove_file_durable(&config_marker).map_err(|error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    format!("failed to remove {}: {error}", config_marker.display()),
+                    format!("failed to remove {}: {error}", path.display()),
                 )
             })?;
         }
@@ -150,7 +142,7 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
                         "refusing to delete directory '{}': not a deep absolute path",
-                        sanitize(locator.to_owned())
+                        sanitize(locator)
                     ),
                 ));
             }
@@ -158,21 +150,22 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
             // The locator was already re-confirmed against DeploymentState
             // before the first attempt. A crash after remove_dir_all must not
             // turn the now-absent ownership marker into a replay failure.
-            if !path.exists() {
-                return Ok(());
-            }
-            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-                Failure::new(
-                    HOST_ERR_OPERATION_INVALID,
-                    format!("failed to inspect managed directory: {error}"),
-                )
-            })?;
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(Failure::new(
+                        HOST_ERR_OPERATION_INVALID,
+                        format!("failed to inspect managed directory: {error}"),
+                    ));
+                }
+            };
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(Failure::new(
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
                         "refusing to delete directory '{}': locator is not a real directory",
-                        sanitize(locator.to_owned())
+                        sanitize(locator)
                     ),
                 ));
             }
@@ -192,28 +185,29 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
                     super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                     format!(
                         "refusing to delete file '{}': not a deep absolute path",
-                        sanitize(locator.to_owned())
+                        sanitize(locator)
                     ),
                 ));
             }
             let marker_path = format!("{locator}.nazoauth-owned");
             let marker = Path::new(marker_path.as_str());
-            if !path.exists() && !marker.exists() {
-                return Ok(());
-            }
-            if path.exists() {
-                let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-                    Failure::new(
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(Failure::new(
                         HOST_ERR_OPERATION_INVALID,
                         format!("failed to inspect managed file: {error}"),
-                    )
-                })?;
+                    ));
+                }
+            };
+            if let Some(metadata) = metadata {
                 if !metadata.is_file() || metadata.file_type().is_symlink() {
                     return Err(Failure::new(
                         super::deployment_state::OBJECT_IDENTITY_MISMATCH,
                         format!(
                             "refusing to delete file '{}': locator is not a real file",
-                            sanitize(locator.to_owned())
+                            sanitize(locator)
                         ),
                     ));
                 }
@@ -224,14 +218,12 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
                     )
                 })?;
             }
-            if marker.exists() {
-                filesystem::remove_file_durable(marker).map_err(|error| {
-                    Failure::new(
-                        HOST_ERR_OPERATION_INVALID,
-                        format!("failed to delete marker {}: {error}", marker.display()),
-                    )
-                })?;
-            }
+            filesystem::remove_file_durable(marker).map_err(|error| {
+                Failure::new(
+                    HOST_ERR_OPERATION_INVALID,
+                    format!("failed to delete marker {}: {error}", marker.display()),
+                )
+            })?;
             Ok(())
         }
         other => Err(Failure::new(
@@ -239,7 +231,7 @@ fn delete_managed_resource(kind: &str, locator: &str) -> Result<(), Failure> {
             format!(
                 "managed resource kind '{}' has no deletion procedure; extend the vocabulary \
                  explicitly before deleting such objects",
-                sanitize(other.to_owned())
+                sanitize(other)
             ),
         )),
     }
@@ -393,6 +385,30 @@ mod tests {
         std::fs::write(&path, b"managed by authoritative target state")?;
         delete_managed_resource("file", &locator)?;
         assert!(!path.exists());
+        Ok(())
+    }
+    #[test]
+    fn managed_file_with_missing_parent_is_already_removed() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("uninstall-missing-parent")?;
+        let path = temp.path().join("removed").join("file");
+        delete_managed_resource("file", &path.to_string_lossy())?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_managed_locator_is_not_mistaken_for_absence() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("uninstall-dangling")?;
+        let path = temp.path().join("managed-link");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &path)?;
+        for kind in ["file", "directory"] {
+            let error = delete_managed_resource(kind, &path.to_string_lossy()).unwrap_err();
+            assert_eq!(
+                error.code,
+                super::super::deployment_state::OBJECT_IDENTITY_MISMATCH
+            );
+        }
+        assert!(std::fs::symlink_metadata(path)?.file_type().is_symlink());
         Ok(())
     }
 }

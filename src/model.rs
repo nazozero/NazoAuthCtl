@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -45,23 +45,23 @@ impl ReleaseManifest {
         if self.operator_protocol != nazo_operator_protocol::PROTOCOL_VERSION {
             bail!("signed release manifest has an invalid operator protocol contract");
         }
-        let expected = BTreeSet::from(["binary".to_owned()]);
-        if self.artifacts.keys().cloned().collect::<BTreeSet<_>>() != expected {
+        let Some(artifact) = self
+            .artifacts
+            .get("binary")
+            .filter(|_| self.artifacts.len() == 1)
+        else {
             bail!("signed release manifest has an unexpected artifact set");
-        }
+        };
         let executable_suffix = executable_suffix(&self.target);
         let expected_binary = format!("nazoauth-{}{executable_suffix}", self.target);
-        if self.artifacts["binary"].name != expected_binary {
+        if artifact.name != expected_binary {
             bail!("signed release manifest artifact does not match its target");
         }
-        for artifact in self.artifacts.values() {
-            if artifact.size == 0
-                || artifact.repository != "nazozero/NazoAuth"
-                || !safe_artifact_name(&artifact.name)
-                || !is_lower_hex(&artifact.sha256, 64)
-            {
-                bail!("signed release manifest contains an invalid artifact");
-            }
+        if artifact.size == 0
+            || artifact.repository != "nazozero/NazoAuth"
+            || !is_lower_hex(&artifact.sha256, 64)
+        {
+            bail!("signed release manifest contains an invalid artifact");
         }
         self.validate_oci()?;
         Ok(())
@@ -76,17 +76,14 @@ impl ReleaseManifest {
     }
 
     fn validate_oci(&self) -> anyhow::Result<()> {
-        let expected_platforms =
-            BTreeSet::from(["linux/amd64".to_owned(), "linux/arm64".to_owned()]);
         if self.oci.repository != "ghcr.io/nazozero/nazoauth"
             || !oci_digest(&self.oci.index_digest)
-            || self
+            || !self
                 .oci
                 .platform_manifests
                 .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                != expected_platforms
+                .map(String::as_str)
+                .eq(["linux/amd64", "linux/arm64"])
             || self
                 .oci
                 .platform_manifests
@@ -154,14 +151,6 @@ pub(crate) fn semantic_tag(value: &str) -> bool {
         return false;
     };
     semver::Version::parse(rest).is_ok_and(|parsed| parsed.to_string() == rest)
-}
-
-fn safe_artifact_name(value: &str) -> bool {
-    !value.is_empty()
-        && !value.starts_with('.')
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
 }
 
 fn is_lower_hex(value: &str, length: usize) -> bool {

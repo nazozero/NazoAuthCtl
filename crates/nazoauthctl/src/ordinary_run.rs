@@ -14,7 +14,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use cliclack::{
@@ -27,23 +27,23 @@ use nazoauthctl_conformance::{
     ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
     EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceRuntimeIdentity,
-    EvidenceSourceIdentity, GroupProgress, GroupStatus, HttpRequest, HttpTransport,
-    MatrixSelection, ModuleOutcome, OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane,
-    OidfPlanResourceBudget, OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig,
-    OpenId4VciIssuerDriver, OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage,
-    ProgressActivity, ProgressEvent, ProgressSink, ProxyTrustGuard, RunControl, StableRenderer,
-    SuiteClient, SuiteClientError, SuiteResourceObserver, SuiteRetentionDeferredReview,
-    SuiteRetentionManifest, SuiteRetentionManifestReceipt, SuiteRetentionPlan,
-    SuiteRetentionScreenshotManifest, TenantResourceApplyOutput, TenantResourceControlOperation,
-    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, activity_label,
-    bundled_oidf_matrix, current_matrix_label, open_bundled_oidf_driver_plan,
-    recover_suite_resources, write_private_control_evidence_bundle,
+    EvidenceSourceIdentity, GroupProgress, GroupStatus, HttpRequest, HttpTransport, ModuleOutcome,
+    OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
+    OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
+    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
+    ProgressEvent, ProgressSink, RunControl, StableRenderer, SuiteClient, SuiteClientError,
+    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
+    SuiteRetentionManifestReceipt, SuiteRetentionPlan, TenantResourceApplyOutput,
+    TenantResourceControlOperation, TenantResourceRecoveryBinding, TenantResourceRecoveryPhase,
+    Transport, activity_label, bundled_oidf_matrix, current_matrix_label,
+    open_bundled_oidf_driver_plan, recover_proxy_trust, recover_suite_resources,
+    write_private_control_evidence_bundle,
 };
 use serde::Serialize;
 use url::Url;
 use zeroize::Zeroizing;
 
-use super::RunInvocation;
+use super::{RunInvocation, current_unix_time};
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
@@ -494,9 +494,9 @@ fn execute_with_progress<S: ProgressSink>(
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
     let deployment = session.deployment_evidence();
-    let recovery_directory = session.recovery_directory()?;
+    let recovery_directory = session.recovery_directory();
     let recovery_store =
-        ConformanceRecoveryStore::open(&recovery_directory, &deployment.deployment_id)?;
+        ConformanceRecoveryStore::open(recovery_directory, &deployment.deployment_id)?;
     let _orchestration_lock = recovery_store.acquire_orchestration_lock()?;
     recover_pending_runs(&session, &recovery_store, None)?;
     let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
@@ -553,14 +553,13 @@ fn execute_with_progress<S: ProgressSink>(
         }
         return Ok(0);
     }
-    let matrix: OidfArtifactMatrix =
-        bundled_oidf_matrix().context("bundled OIDF Matrix is malformed")?;
+    let matrix = bundled_oidf_matrix().context("bundled OIDF Matrix is malformed")?;
     let selected_plan_ids = driver_plan
         .plans
         .iter()
-        .map(|plan| (plan.group_id.clone(), plan.plan_id.clone()))
+        .map(|plan| (plan.group_id.as_str(), plan.plan_id.as_str()))
         .collect::<BTreeSet<_>>();
-    let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids)?;
+    let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids);
     let plan_lanes = driver_plan
         .plans
         .iter()
@@ -574,13 +573,13 @@ fn execute_with_progress<S: ProgressSink>(
         .iter()
         .map(|plan| (plan.plan_id.clone(), plan.resource_budget.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut selected_resource_budget = driver_plan.selected_resource_budget.clone();
+    let mut selected_resource_budget = driver_plan.selected_resource_budget;
     // The official Suite owns each plan's live module list and may add tests
     // without changing the plan identity. Bound the run by the artifact-wide
     // module ceiling instead of treating an old per-plan count as immutable.
     selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
-    let request_jti = format!("request-{}", hex(rand::random::<[u8; 16]>()));
-    let evidence_directory = create_evidence_directory(&recovery_directory, &request_jti)?;
+    let request_jti = format!("request-{}", hex::encode(rand::random::<[u8; 16]>()));
+    let evidence_directory = create_evidence_directory(recovery_directory, &request_jti)?;
     let ephemeral_tenant = EphemeralTenant::new(
         &invocation.tenant_id,
         session.oidf_tenant_domain(),
@@ -714,7 +713,9 @@ fn execute_with_progress<S: ProgressSink>(
                     tenant_id: invocation.tenant_id.clone(),
                     resources: manifest.resource_identities().to_vec(),
                 },
-                Some(manifest.bytes().as_bytes().to_vec()),
+                Some(nazoauthctl_core::target::SecretMaterial::try_new(
+                    manifest.bytes().as_bytes().to_vec(),
+                )?),
                 |completion| {
                     lock_recovery(&recovery)?.record_terminal_completion(
                         TenantResourceRecoveryPhase::Applied,
@@ -774,15 +775,6 @@ fn execute_with_progress<S: ProgressSink>(
         cleanup_complete: false,
     };
 
-    // The OpenID4VP client and runner are being generalized in the adjacent
-    // slice. Keep this typed boundary ordinary-only: a lease-shaped adapter is
-    // deliberately impossible here.
-    let ciba_approver = build_ciba_user_approver(
-        requires_ciba,
-        &ephemeral_tenant.issuer,
-        &run_secrets,
-        ordinary.clients().values().cloned().collect(),
-    )?;
     let run_result = run_signed_suite(
         ordinary,
         suite_client.clone(),
@@ -796,7 +788,7 @@ fn execute_with_progress<S: ProgressSink>(
         plan_resource_budgets,
         selected_resource_budget,
         recovery.clone(),
-        ciba_approver,
+        requires_ciba,
         requires_vci,
         requires_vp,
         control,
@@ -817,7 +809,6 @@ fn execute_with_progress<S: ProgressSink>(
     } else {
         Vec::new()
     };
-    let review_screenshot_manifest = None;
     if run_result
         .as_ref()
         .is_ok_and(|report| report.orchestration_integrity.cleanup_complete)
@@ -832,7 +823,6 @@ fn execute_with_progress<S: ProgressSink>(
                     .expect("retention eligibility requires report"),
                 &artifact_digest,
                 &deployment_report.matrix_sha256,
-                review_screenshot_manifest.as_ref(),
             )?;
             let manifest_path = suite_retention_manifest_path(&evidence_directory, &manifest);
             recovery.prepare_suite_plan_retention(manifest, manifest_path)
@@ -868,16 +858,11 @@ fn execute_with_progress<S: ProgressSink>(
             None
         }
     };
-    let cleanup_complete = cleanup_evidence.is_some()
-        && !errors
-            .iter()
-            .any(|error| error.starts_with("resource-cleanup="));
-    let retention_commit_possible = retention_eligible && cleanup_evidence.is_some();
-    // Screenshot evidence, not the optional control evidence, is the durable
-    // certification-retention boundary.  The screenshot manifest was bound
-    // to the Prepared journal above and is revalidated by stage, commit,
-    // publish, recovery claim, and finish. Control-operation evidence is written only
-    // after ownership has transferred and the final report is fixed.
+    let cleanup_complete = cleanup_evidence.is_some();
+    let retention_commit_possible = retention_eligible && cleanup_complete;
+    // Transfer Suite plan ownership only after ordinary resource cleanup.
+    // Control-operation evidence is written after retention has committed and
+    // the final report is fixed.
     let mut retention_committed = if retention_commit_possible {
         match (|| -> anyhow::Result<()> {
             recovery.stage_suite_retention_manifest()?;
@@ -956,17 +941,12 @@ fn execute_with_progress<S: ProgressSink>(
         report.orchestration_integrity.cleanup_complete = !recovery.suite_retention_committed()
             && !retention_committed
             && report.orchestration_integrity.suite_resources_settled;
-        if errors
-            .iter()
-            .any(|error| error.starts_with("suite-retention"))
-        {
-            report.errors.extend(
-                errors
-                    .iter()
-                    .filter(|error| error.starts_with("suite-retention"))
-                    .cloned(),
-            );
-        }
+        report.errors.extend(
+            errors
+                .iter()
+                .filter(|error| error.starts_with("suite-retention"))
+                .cloned(),
+        );
         report.local_success = report.errors.is_empty()
             && report.orchestration_integrity.all_modules_instantiated
             && report.orchestration_integrity.all_modules_settled
@@ -978,25 +958,25 @@ fn execute_with_progress<S: ProgressSink>(
     // a successful writer and to FinalOutput; a failed writer is represented
     // only by outer diagnostics and an absent receipt.
     let mut evidence = None;
-    if let (Some(report), Some(cleanup_operations)) = (report.as_ref(), cleanup_evidence.as_ref()) {
+    if let (Some(report), Some(cleanup_operations)) = (report.as_ref(), cleanup_evidence) {
         progress.activity(&ProgressActivity::WritingEvidence);
         let runtime = evidence_runtime(&deployment.runtime);
         let identity = EvidenceBundleIdentity {
-            run_jti: request_jti.clone(),
+            run_jti: request_jti,
             deployment: EvidenceDeploymentIdentity {
                 deployment_id: deployment.deployment_id.clone(),
                 target_issuer: ephemeral_tenant.issuer.clone(),
                 release: deployment.release.clone(),
-                runtime: runtime.clone(),
+                runtime,
             },
             source: EvidenceSourceIdentity {
                 suite_origin: suite_origin.to_string(),
-                artifact: Box::new(driver_plan.artifact.clone()),
+                artifact: Box::new(driver_plan.artifact),
             },
             control: EvidenceControlIdentity {
                 deployment_id: deployment.deployment_id.clone(),
                 tenant_id: invocation.tenant_id.clone(),
-                operations: cleanup_operations.clone(),
+                operations: cleanup_operations,
                 cleanup_complete,
             },
             outer_cleanup_complete: cleanup_complete,
@@ -1018,7 +998,7 @@ fn execute_with_progress<S: ProgressSink>(
     } else {
         None
     };
-    if cleanup_evidence.is_some()
+    if cleanup_complete
         && recovery.suite_cleanup_complete()
         && let Err(error) = recovery.finish()
     {
@@ -1102,6 +1082,50 @@ mod acceptance_tests {
         completed_lifecycle_candidate, next_pending_for_run, persist_pending_recovery_completion,
         persisted_candidate_for_pending, pre_suite_requires_resource_cleanup,
     };
+
+    #[test]
+    fn run_materializes_exact_driver_selection_including_exclusions() {
+        use nazoauthctl_conformance::{
+            OidfPlanSelection, Origin, bundled_oidf_matrix, open_bundled_oidf_driver_plan,
+        };
+
+        let matrix = bundled_oidf_matrix().unwrap();
+        let group = matrix
+            .groups
+            .iter()
+            .find(|group| group.plans.len() > 1)
+            .unwrap();
+        let excluded = group.plans[0].id.clone();
+        let driver = open_bundled_oidf_driver_plan(
+            OidfPlanSelection {
+                groups: vec![group.id.clone()],
+                plans: Vec::new(),
+                excluded_plans: vec![excluded.clone()],
+            },
+            &Origin::parse_public_suite("https://www.certification.openid.net").unwrap(),
+            1_800_000_000,
+        )
+        .unwrap();
+        let expected = driver
+            .plans
+            .iter()
+            .map(|plan| (plan.group_id.as_str(), plan.plan_id.as_str()))
+            .collect();
+        let selected = super::select_artifact_matrix_for_run(matrix, &expected);
+        let actual = selected
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .plans
+                    .iter()
+                    .map(|plan| (group.id.as_str(), plan.id.as_str()))
+            })
+            .collect();
+        assert_eq!(expected, actual);
+        assert!(!expected.iter().any(|(_, id)| *id == excluded));
+        assert_eq!(expected.len(), driver.selected_plan_count as usize);
+    }
 
     #[test]
     fn temporary_tenant_uses_the_instance_owned_domain() {
@@ -1554,13 +1578,10 @@ struct EphemeralTenant {
 
 impl EphemeralTenant {
     fn new(tenant_id: &str, tenant_domain: &str, target_issuer: &str) -> anyhow::Result<Self> {
-        let tenant_id = uuid::Uuid::parse_str(tenant_id)
-            .context("generated OIDF tenant ID is invalid")?
-            .to_string();
         let realm_id = uuid::Uuid::now_v7().to_string();
         let organization_id = uuid::Uuid::now_v7().to_string();
         Self::from_ids(
-            &tenant_id,
+            tenant_id,
             &realm_id,
             &organization_id,
             tenant_domain,
@@ -2254,7 +2275,7 @@ fn run_signed_suite<S: ProgressSink>(
     plan_resource_budgets: BTreeMap<String, OidfPlanResourceBudget>,
     selected_resource_budget: OidfPlanResourceBudget,
     recovery: Arc<Mutex<nazoauthctl_conformance::ConformanceRecoveryGuard>>,
-    ciba_approver: Option<Arc<CibaUserApprovalClient>>,
+    requires_ciba: bool,
     requires_vci: bool,
     requires_vp: bool,
     control: RunControl,
@@ -2262,6 +2283,15 @@ fn run_signed_suite<S: ProgressSink>(
     interrupt_notice: &'static str,
     progress: &mut S,
 ) -> anyhow::Result<nazoauthctl_conformance::ConformanceReport> {
+    let ciba_approver = requires_ciba
+        .then(|| {
+            build_ciba_user_approver(
+                target_issuer,
+                &secrets,
+                materialized.clients().values().cloned().collect(),
+            )
+        })
+        .transpose()?;
     let binding = materialized
         .trust_policy_identity()
         .map(|identity| {
@@ -2278,14 +2308,7 @@ fn run_signed_suite<S: ProgressSink>(
         .then(|| session.openid4vp_management_token(&invocation.tenant_id))
         .transpose()
         .context("failed to derive the run tenant OpenID4VP management token")?;
-    let selected = materialized
-        .take_matrix()
-        .select(&MatrixSelection {
-            groups: invocation.groups.clone(),
-            profiles: Vec::new(),
-            plans: invocation.plans.clone(),
-        })
-        .context("requested selection is outside the signed artifact Matrix")?;
+    let selected = materialized.take_matrix();
     let interrupt = control.clone();
     ctrlc::set_handler(move || {
         if !user_interrupted.swap(true, Ordering::SeqCst) {
@@ -2352,7 +2375,7 @@ fn run_signed_suite<S: ProgressSink>(
         target_origin: Some(target_origin),
         binding,
         poll_timeout: invocation.poll_timeout,
-        control: control.clone(),
+        control,
         plan_lanes,
         plan_resource_budgets,
         selected_resource_budget,
@@ -2371,21 +2394,17 @@ fn run_signed_suite<S: ProgressSink>(
 }
 
 fn build_ciba_user_approver(
-    requires_ciba: bool,
     target_issuer: &str,
     secrets: &RunSecrets,
     allowed_clients: std::collections::HashSet<String>,
-) -> anyhow::Result<Option<Arc<CibaUserApprovalClient>>> {
-    if !requires_ciba {
-        return Ok(None);
-    }
+) -> anyhow::Result<Arc<CibaUserApprovalClient>> {
     let issuer = Url::parse(target_issuer)
         .context("deployment target issuer is not a valid CIBA approval URL")?;
     let transport = Arc::new(
         HttpTransport::new(Duration::from_secs(30))
             .context("failed to initialize normal CIBA user-approval transport")?,
     );
-    Ok(Some(Arc::new(
+    Ok(Arc::new(
         CibaUserApprovalClient::new(
             issuer,
             secrets.applicant_email.clone(),
@@ -2394,7 +2413,7 @@ fn build_ciba_user_approver(
             allowed_clients,
         )
         .context("failed to initialize normal CIBA user approval")?,
-    )))
+    ))
 }
 
 struct DurableSuiteObserver {
@@ -2568,7 +2587,6 @@ fn suite_retention_manifest(
     report: &nazoauthctl_conformance::ConformanceReport,
     artifact_digest: &str,
     matrix_sha256: &str,
-    review_screenshot_manifest: Option<&nazoauthctl_conformance::ReviewScreenshotManifestReceipt>,
 ) -> anyhow::Result<SuiteRetentionManifest> {
     let binding = recovery.ordinary_binding();
     let retained_plan_ids = report
@@ -2602,12 +2620,7 @@ fn suite_retention_manifest(
         deployment_id: binding.deployment_id.clone(),
         tenant_id: binding.tenant_id.clone(),
         run_id: binding.run_id.clone(),
-        review_screenshot_manifest: review_screenshot_manifest.map(|manifest| {
-            SuiteRetentionScreenshotManifest {
-                path: manifest.path.clone(),
-                sha256: manifest.sha256.clone(),
-            }
-        }),
+        review_screenshot_manifest: None,
         deferred_review_pending: report
             .modules
             .iter()
@@ -2987,9 +3000,7 @@ fn next_pending_for_run(
         )
         .map(Some);
     }
-    if recovery.terminal_failure().is_some()
-        || retained_recovery_stops_before_live_apply(recovery.suite_retention_committed())
-    {
+    if recovery.terminal_failure().is_some() || recovery.suite_retention_committed() {
         return Ok(None);
     }
     if recovery.baseline_enumerate_operation().is_none() {
@@ -3146,7 +3157,7 @@ fn resume_pending_candidate<F>(
     session: &nazoauthctl_core::ConformanceSession,
     expected: &nazoauthctl_core::controller_identity::OperationJournalEntry,
     operation: ControlOperationPayload,
-    change_set: Option<Vec<u8>>,
+    change_set: Option<nazoauthctl_core::target::SecretMaterial>,
     persist: F,
 ) -> anyhow::Result<nazoauthctl_core::ConformanceControlOutcome>
 where
@@ -3220,7 +3231,12 @@ fn execute_pending_recovery_candidate(
             };
             let recovery = &mut recoveries[index];
             let change_set = matches!(step, PendingRecoveryStep::Apply(_))
-                .then(|| recovery.read_private_material().map(|value| value.to_vec()))
+                .then(|| {
+                    nazoauthctl_core::target::SecretMaterial::try_new(
+                        recovery.read_private_material()?,
+                    )
+                    .map_err(anyhow::Error::from)
+                })
                 .transpose()?;
             let _ =
                 resume_pending_candidate(session, expected, operation, change_set, |completion| {
@@ -3256,8 +3272,11 @@ fn resume_pending_conformance_operation(
         }
     }
     let mut matching = Vec::new();
-    for candidate in candidates {
-        if session.pending_control_operation_matches(&expected, candidate.operation.clone())? {
+    for mut candidate in candidates {
+        if let Some(operation) =
+            session.match_pending_control_operation(&expected, candidate.operation)?
+        {
+            candidate.operation = operation;
             matching.push(candidate);
         }
     }
@@ -3279,26 +3298,29 @@ fn recover_pending_runs(
     let mut pending = store.claim_pending()?;
     resume_pending_conformance_operation(session, &mut pending)?;
     for mut recovery in pending {
-        let binding = recovery.ordinary_binding().clone();
+        let run_id = recovery.ordinary_binding().run_id.clone();
         let result = (|| -> anyhow::Result<Option<SuiteRetentionManifestReceipt>> {
             let (directory_revision, tenant_present) =
-                tenant_directory_presence(session, &binding.tenant_id)?;
-            let terminal_failure = recovery.terminal_failure().cloned();
-            if let Some(failure) = terminal_failure {
+                tenant_directory_presence(session, &recovery.ordinary_binding().tenant_id)?;
+            if let Some(failure) = recovery.terminal_failure() {
+                let failure = format!(
+                    "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}",
+                    failure.operation_id,
+                    failure.request_hash,
+                    failure
+                        .result
+                        .error
+                        .as_ref()
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| "missing".to_owned()),
+                );
                 let tenant_cleanup = if tenant_present {
                     cleanup_ephemeral_tenant(session, &mut recovery)
                 } else {
                     recovery.mark_tenant_absent(directory_revision)
                 };
                 bail!(
-                    "ordinary recovery is blocked by durable failed ControlOperation: operation_id={} request_hash={} error={}; tenant_cleanup={}",
-                    failure.operation_id,
-                    failure.request_hash,
-                    failure
-                        .result
-                        .error
-                        .map(|error| format!("{error:?}"))
-                        .unwrap_or_else(|| "missing".to_owned()),
+                    "{failure}; tenant_cleanup={}",
                     tenant_cleanup
                         .err()
                         .map_or_else(|| "ok".to_owned(), |error| format!("{error:#}")),
@@ -3307,7 +3329,7 @@ fn recover_pending_runs(
             if !tenant_present {
                 recovery.mark_tenant_absent(directory_revision)?;
             }
-            if retained_recovery_stops_before_live_apply(recovery.suite_retention_committed()) {
+            if recovery.suite_retention_committed() {
                 cleanup_ephemeral_tenant(session, &mut recovery)?;
                 if suite_client.is_none() {
                     return Ok(None);
@@ -3322,8 +3344,8 @@ fn recover_pending_runs(
             // Each local cleanup remains executable even if the other boundary fails.
             let proxy_result = (|| -> anyhow::Result<()> {
                 if !recovery.proxy_cleanup_complete() {
-                    if let Some(proxy) = binding.proxy.as_ref() {
-                        ProxyTrustGuard::recover(&proxy.bundle_path, &proxy.reload_executable)?;
+                    if let Some(proxy) = recovery.ordinary_binding().proxy.as_ref() {
+                        recover_proxy_trust(&proxy.bundle_path, &proxy.reload_executable)?;
                     }
                     recovery.mark_proxy_cleanup_complete()?;
                 }
@@ -3352,7 +3374,7 @@ fn recover_pending_runs(
         match result {
             Ok(Some(receipt)) => retained.push(receipt),
             Ok(None) => {}
-            Err(error) => failures.push(format!("{}: {error:#}", binding.run_id)),
+            Err(error) => failures.push(format!("{run_id}: {error:#}")),
         }
     }
     if failures.is_empty() {
@@ -3401,10 +3423,6 @@ where
             None
         }
     }
-}
-
-fn retained_recovery_stops_before_live_apply(retention_committed: bool) -> bool {
-    retention_committed
 }
 
 fn resolve_token<S: ProgressSink>(
@@ -3560,39 +3578,34 @@ fn create_evidence_directory(recovery_directory: &Path, run_id: &str) -> anyhow:
     }
 }
 
-fn current_unix_time() -> anyhow::Result<i64> {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_secs();
-    i64::try_from(seconds).context("system clock exceeds the supported range")
-}
-
-fn hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn select_artifact_matrix_for_run(
-    mut matrix: OidfArtifactMatrix,
-    selected_plan_ids: &BTreeSet<(String, String)>,
-) -> anyhow::Result<OidfArtifactMatrix> {
-    let mut retained = BTreeSet::new();
-    matrix.groups.retain_mut(|group| {
-        group.plans.retain(|plan| {
-            let selected = selected_plan_ids.contains(&(group.id.clone(), plan.id.clone()));
-            if selected {
-                retained.insert((group.id.clone(), plan.id.clone()));
-            }
-            selected
-        });
-        !group.plans.is_empty()
-    });
-    if retained != *selected_plan_ids {
-        bail!("selected signed Matrix plans changed before materialization");
+    matrix: &OidfArtifactMatrix,
+    selected_plan_ids: &BTreeSet<(&str, &str)>,
+) -> OidfArtifactMatrix {
+    let groups = matrix
+        .groups
+        .iter()
+        .filter_map(|group| {
+            let plans: Vec<_> = group
+                .plans
+                .iter()
+                .filter(|plan| selected_plan_ids.contains(&(group.id.as_str(), plan.id.as_str())))
+                .cloned()
+                .collect();
+            (!plans.is_empty()).then(|| nazoauthctl_conformance::OidfArtifactMatrixGroup {
+                id: group.id.clone(),
+                profile: group.profile.clone(),
+                variant: group.variant.clone(),
+                required_roles: group.required_roles.clone(),
+                plans,
+            })
+        })
+        .collect();
+    OidfArtifactMatrix {
+        schema: matrix.schema,
+        name: matrix.name.clone(),
+        openid4vc_credential_datasets: matrix.openid4vc_credential_datasets.clone(),
+        openid4vc_suite_mdoc_trust_anchor_pem: matrix.openid4vc_suite_mdoc_trust_anchor_pem.clone(),
+        groups,
     }
-    Ok(matrix)
 }

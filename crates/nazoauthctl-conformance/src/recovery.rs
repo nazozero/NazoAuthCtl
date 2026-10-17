@@ -23,6 +23,9 @@ const ORCHESTRATION_LOCK_FILE: &str = "oidf-orchestration.lock";
 const MAX_SUITE_RECOVERY_MODULES: usize = 16 * 1024;
 const SUITE_RETENTION_MANIFEST_SCHEMA: u32 = 2;
 const MAX_SUITE_RETENTION_MANIFEST_BYTES: usize = 64 * 1024;
+// Persisted screenshot manifests remain readable for runs created by older controllers.
+const MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES: usize = 1024 * 1024;
+const REVIEW_SCREENSHOT_MANIFEST_SCHEMA: u32 = 6;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -987,12 +990,9 @@ impl ConformanceRecoveryGuard {
             _ => bail!("Suite retention has not been prepared"),
         };
         let bytes = canonical_suite_retention_manifest(&record.manifest)?;
-        if sha256_hex(&bytes) != record.manifest_sha256 {
-            bail!("Suite retention manifest digest conflicts with journal");
-        }
         let pending = self.suite_retention_pending_path()?;
         match crate::secure_file::read_bounded(&pending, MAX_SUITE_RETENTION_MANIFEST_BYTES, true) {
-            Ok(existing) if sha256_hex(&existing) == record.manifest_sha256 => return Ok(pending),
+            Ok(existing) if existing == bytes => return Ok(pending),
             Ok(_) => bail!("retained Suite manifest conflicts with recovery journal"),
             Err(crate::secure_file::SecureFileError::NotFound) => {}
             Err(error) => bail!("retained Suite manifest is not secure: {error:?}"),
@@ -1012,7 +1012,7 @@ impl ConformanceRecoveryGuard {
         }
         let pending = self.suite_retention_pending_path()?;
         let record = match &self.journal.suite_retention {
-            SuiteRetentionDisposition::RetentionPrepared { record } => record.clone(),
+            SuiteRetentionDisposition::RetentionPrepared { record } => record,
             _ => bail!("Suite retention has not been prepared"),
         };
         validate_suite_retention_evidence(&record.manifest, &self.journal.binding)?;
@@ -1031,7 +1031,12 @@ impl ConformanceRecoveryGuard {
             .context("Suite retention has no persisted allocation")?;
         suite.plan_ids.clear();
         suite.module_ids.clear();
-        committed.suite_retention = SuiteRetentionDisposition::Retained { record };
+        committed.suite_retention = match committed.suite_retention {
+            SuiteRetentionDisposition::RetentionPrepared { record } => {
+                SuiteRetentionDisposition::Retained { record }
+            }
+            _ => unreachable!("prepared retention was checked before cloning"),
+        };
         // Rename can succeed before its directory sync fails. Until a later
         // claim resolves disk state, neither publication nor deletion is safe.
         self.retention_commit_resolution = SuiteRetentionCommitResolution::Ambiguous;
@@ -1378,7 +1383,7 @@ fn validate_tenant_resource_journal(
             if suite.cleanup_complete || !suite.pending_create_intents.is_empty() {
                 bail!("prepared Suite retention has unsettled allocation state");
             }
-            validate_suite_retention_record(record, &journal.binding, suite)?;
+            validate_suite_retention_record(record, &journal.binding, Some(suite))?;
         }
         SuiteRetentionDisposition::Retained { record } => {
             let suite = journal
@@ -1392,7 +1397,7 @@ fn validate_tenant_resource_journal(
             {
                 bail!("retained Suite disposition must transfer all allocation IDs");
             }
-            validate_suite_retention_record_without_inventory(record, &journal.binding)?;
+            validate_suite_retention_record(record, &journal.binding, None)?;
         }
     }
     if let Some(baseline) = &journal.baseline_enumerate {
@@ -1427,34 +1432,15 @@ fn canonical_suite_retention_manifest(
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        output.push(HEX[usize::from(byte >> 4)] as char);
-        output.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    output
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn validate_suite_retention_record(
     record: &SuiteRetentionRecord,
     binding: &TenantResourceRecoveryBinding,
-    suite: &SuiteRecoveryState,
+    suite: Option<&SuiteRecoveryState>,
 ) -> anyhow::Result<()> {
-    validate_suite_retention_manifest(&record.manifest, binding, Some(suite))?;
-    if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
-    {
-        bail!("Suite retention manifest digest is invalid");
-    }
-    validate_suite_retention_manifest_path(record, binding)?;
-    Ok(())
-}
-
-fn validate_suite_retention_record_without_inventory(
-    record: &SuiteRetentionRecord,
-    binding: &TenantResourceRecoveryBinding,
-) -> anyhow::Result<()> {
-    validate_suite_retention_manifest(&record.manifest, binding, None)?;
+    validate_suite_retention_manifest(&record.manifest, binding, suite)?;
     if sha256_hex(&canonical_suite_retention_manifest(&record.manifest)?) != record.manifest_sha256
     {
         bail!("Suite retention manifest digest is invalid");
@@ -1501,8 +1487,6 @@ fn validate_suite_retention_manifest(
     }
     let mut deferred_modules = std::collections::BTreeSet::new();
     for pending in &manifest.deferred_review_pending {
-        let canonical_variant = serde_json::to_string(&pending.variant)
-            .expect("BTreeMap<String, String> always serializes to JSON");
         validate_component(&pending.matrix_plan_id, "deferred review Matrix plan ID")?;
         validate_component(&pending.suite_plan_id, "deferred review Suite plan ID")?;
         validate_component(&pending.module_id, "deferred review Suite module ID")?;
@@ -1519,27 +1503,22 @@ fn validate_suite_retention_manifest(
             || !matrix_ids.contains(&pending.matrix_plan_id)
             || !suite_ids.contains(&pending.suite_plan_id)
             || !deferred_modules.insert((
-                pending.matrix_plan_id.clone(),
-                pending.suite_plan_id.clone(),
-                pending.module_id.clone(),
-                pending.test_name.clone(),
-                canonical_variant,
+                &pending.matrix_plan_id,
+                &pending.suite_plan_id,
+                &pending.module_id,
+                &pending.test_name,
+                &pending.variant,
             ))
         {
             bail!("deferred review retention identity is invalid");
         }
     }
     if let Some(suite) = suite {
-        let suite_ids = suite
+        let journal_ids = suite
             .plan_ids
             .iter()
             .collect::<std::collections::BTreeSet<_>>();
-        let manifest_ids = manifest
-            .plans
-            .iter()
-            .map(|plan| &plan.suite_plan_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        if suite_ids != manifest_ids {
+        if suite_ids != journal_ids {
             bail!("Suite retention manifest does not cover the journal plan IDs");
         }
         if suite.origin != manifest.suite_origin {
@@ -1555,30 +1534,16 @@ fn validate_suite_retention_evidence(
 ) -> anyhow::Result<()> {
     if let Some(screenshot) = &manifest.review_screenshot_manifest {
         validate_review_screenshot_manifest_binding(screenshot, manifest, binding)?;
-    }
-    if !manifest.deferred_review_pending.is_empty() {
-        let screenshot = manifest
-            .review_screenshot_manifest
-            .as_ref()
-            .context("deferred review retention has no screenshot manifest")?;
-        validate_deferred_review_screenshot_binding(screenshot, manifest, binding)?;
+    } else if !manifest.deferred_review_pending.is_empty() {
+        bail!("deferred review retention has no screenshot manifest");
     }
     Ok(())
 }
 
 fn validate_deferred_review_screenshot_binding(
-    screenshot: &SuiteRetentionScreenshotManifest,
+    document: &ReviewScreenshotManifestDocument,
     retention: &SuiteRetentionManifest,
-    binding: &TenantResourceRecoveryBinding,
 ) -> anyhow::Result<()> {
-    let bytes = crate::secure_file::read_bounded(
-        &screenshot.path,
-        crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
-        true,
-    )
-    .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
-    let document: ReviewScreenshotManifestDocument =
-        serde_json::from_slice(&bytes).context("review screenshot manifest is not valid JSON")?;
     for pending in &retention.deferred_review_pending {
         let module_matches = document.modules.iter().any(|module| {
             module.matrix_plan_id == pending.matrix_plan_id
@@ -1609,9 +1574,6 @@ fn validate_deferred_review_screenshot_binding(
             bail!("deferred review screenshot manifest does not bind the retained module");
         }
     }
-    if document.run_jti != binding.run_id {
-        bail!("deferred review screenshot manifest has the wrong run identity");
-    }
     Ok(())
 }
 
@@ -1636,7 +1598,7 @@ fn validate_review_screenshot_manifest_binding(
     }
     let bytes = crate::secure_file::read_bounded(
         &screenshot.path,
-        crate::evidence::MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
+        MAX_REVIEW_SCREENSHOT_MANIFEST_BYTES,
         true,
     )
     .map_err(|error| anyhow::anyhow!("review screenshot manifest is not secure: {error:?}"))?;
@@ -1645,7 +1607,7 @@ fn validate_review_screenshot_manifest_binding(
     }
     let document: ReviewScreenshotManifestDocument =
         serde_json::from_slice(&bytes).context("review screenshot manifest is not valid JSON")?;
-    if document.schema != crate::evidence::REVIEW_SCREENSHOT_MANIFEST_SCHEMA
+    if document.schema != REVIEW_SCREENSHOT_MANIFEST_SCHEMA
         || document.run_jti != binding.run_id
         || document.artifact_digest != retention.artifact_digest
         || document.matrix_sha256 != retention.matrix_sha256
@@ -1653,6 +1615,7 @@ fn validate_review_screenshot_manifest_binding(
     {
         bail!("review screenshot manifest identity conflicts with retention");
     }
+    validate_deferred_review_screenshot_binding(&document, retention)?;
     let target_issuer = document.target_issuer.as_deref();
     let vp_trust_anchor = binding.vp_evidence_trust_anchor.as_ref();
     if target_issuer.is_none() {
@@ -1663,25 +1626,58 @@ fn validate_review_screenshot_manifest_binding(
         .iter()
         .map(|plan| (&plan.matrix_plan_id, &plan.suite_plan_id))
         .collect::<std::collections::BTreeSet<_>>();
-    let mut modules = std::collections::BTreeSet::new();
+    let mut modules = std::collections::BTreeMap::new();
     for module in &document.modules {
         if !plans.contains(&(&module.matrix_plan_id, &module.suite_plan_id))
             || module.module_id.is_empty()
             || module.test_name.is_empty()
             || module.required != module.captured_required
-            || !modules.insert((
-                &module.matrix_plan_id,
-                &module.suite_plan_id,
-                &module.module_id,
-                &module.test_name,
-                &module.variant,
-            ))
+            || modules
+                .insert(
+                    (
+                        &module.matrix_plan_id,
+                        &module.suite_plan_id,
+                        &module.module_id,
+                        &module.test_name,
+                        &module.variant,
+                    ),
+                    (module, 0usize, 0usize, std::collections::BTreeSet::new()),
+                )
+                .is_some()
         {
             bail!("review screenshot manifest module graph is invalid");
         }
     }
+    for image in &document.screenshots {
+        let (_, captured, required, obligations) = modules
+            .get_mut(&(
+                &image.matrix_plan_id,
+                &image.suite_plan_id,
+                &image.module_id,
+                &image.test_name,
+                &image.variant,
+            ))
+            .context("review screenshot has no exact module tuple")?;
+        *captured += 1;
+        *required += usize::from(image.marker == crate::ReviewScreenshotMarker::Required);
+        if !obligations.insert(image.obligation_index) {
+            bail!("review screenshot manifest obligation graph is invalid");
+        }
+    }
+    for (module, captured, required, obligations) in modules.values() {
+        let total_attempts = captured
+            .checked_add(module.missing_optional)
+            .context("review screenshot attempt count overflows")?;
+        if *required != module.required
+            || total_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
+            || obligations
+                .last()
+                .is_some_and(|index| *index >= total_attempts)
+        {
+            bail!("review screenshot manifest obligation count is invalid");
+        }
+    }
     let mut images = std::collections::BTreeSet::new();
-    let mut obligations = std::collections::BTreeSet::new();
     let mut expected_files = std::collections::BTreeSet::new();
     let evidence_root = screenshot
         .path
@@ -1701,116 +1697,71 @@ fn validate_review_screenshot_manifest_binding(
                 Some(std::path::Component::Normal(_))
             )
             && path_components.next().is_none();
+        let trigger = format!("{}{}", image.trigger_origin, image.trigger_path);
         let source_valid = match image.source {
             crate::BrowserReviewScreenshotSource::SuiteVerificationEvidence => {
                 image.verification_receipt.is_none()
                     && image.trigger_origin == document.suite_origin
                     && image.trigger_path
                         == format!("/test/a/{}/verification-evidence", image.module_id)
-                    && sha256_hex(
-                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
-                    ) == image.trigger_url_sha256
             }
             crate::BrowserReviewScreenshotSource::NazoVpVerificationResultLiveWebdriver => {
-                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
-                    .is_ok_and(|url| {
-                        url.scheme() == "https"
-                            && url.host_str().is_some()
-                            && url.username().is_empty()
-                            && url.password().is_none()
-                            && url.query().is_none()
-                            && url.fragment().is_none()
+                url::Url::parse(&trigger).is_ok_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                }) && target_issuer
+                    .zip(vp_trust_anchor)
+                    .is_some_and(|(target_issuer, anchor)| {
+                        target_issuer == anchor.target_issuer
+                            && image.verification_receipt.as_ref().is_some_and(|receipt| {
+                                verify_vp_receipt_provenance(
+                                    receipt,
+                                    anchor,
+                                    binding,
+                                    &VpReceiptContext {
+                                        artifact_digest: &retention.artifact_digest,
+                                        matrix_sha256: &retention.matrix_sha256,
+                                        suite_plan_id: &image.suite_plan_id,
+                                        suite_module_id: &image.module_id,
+                                        test_name: &image.test_name,
+                                        variant: &image.variant,
+                                        trigger_origin: &image.trigger_origin,
+                                    },
+                                )
+                            })
                     })
-                    && target_issuer
-                        .zip(vp_trust_anchor)
-                        .is_some_and(|(target_issuer, anchor)| {
-                            target_issuer == anchor.target_issuer
-                                && image.verification_receipt.as_ref().is_some_and(|receipt| {
-                                    verify_vp_receipt_provenance(
-                                        receipt, anchor, binding, retention, image,
-                                    )
-                                })
-                        })
                     && image.trigger_path == "/ui/verification-result"
-                    && sha256_hex(
-                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
-                    ) == image.trigger_url_sha256
             }
             crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver => {
-                url::Url::parse(&format!("{}{}", image.trigger_origin, image.trigger_path))
-                    .is_ok_and(|url| {
-                        url.scheme() == "https"
-                            && url.host_str().is_some()
-                            && url.username().is_empty()
-                            && url.password().is_none()
-                            && url.query().is_none()
-                            && url.fragment().is_none()
-                    })
-                    && image.verification_receipt.is_none()
+                url::Url::parse(&trigger).is_ok_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                }) && image.verification_receipt.is_none()
                     && target_issuer
                         .is_some_and(|target_issuer| target_issuer == image.trigger_origin)
                     && image
                         .trigger_path
                         .strip_prefix("/openid4vp/complete/")
                         .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
-                    && sha256_hex(
-                        format!("{}{}", image.trigger_origin, image.trigger_path).as_bytes(),
-                    ) == image.trigger_url_sha256
             }
         };
-        if !plans.contains(&(&image.matrix_plan_id, &image.suite_plan_id))
-            || !modules.contains(&(
-                &image.matrix_plan_id,
-                &image.suite_plan_id,
-                &image.module_id,
-                &image.test_name,
-                &image.variant,
-            ))
-            || !valid_path
+        if !valid_path
             || image.size == 0
             || !lower_hex(&image.sha256, 64)
             || !lower_hex(&image.receipt_sha256, 64)
-            || !lower_hex(&image.trigger_url_sha256, 64)
+            || sha256_hex(trigger.as_bytes()) != image.trigger_url_sha256
             || !source_valid
             || !images.insert(&image.path)
         {
             bail!("review screenshot manifest screenshot graph is invalid");
-        }
-        let module = document
-            .modules
-            .iter()
-            .find(|module| {
-                module.matrix_plan_id == image.matrix_plan_id
-                    && module.suite_plan_id == image.suite_plan_id
-                    && module.module_id == image.module_id
-                    && module.test_name == image.test_name
-                    && module.variant == image.variant
-            })
-            .context("review screenshot has no exact module tuple")?;
-        let total_attempts = document
-            .screenshots
-            .iter()
-            .filter(|candidate| {
-                candidate.matrix_plan_id == module.matrix_plan_id
-                    && candidate.suite_plan_id == module.suite_plan_id
-                    && candidate.module_id == module.module_id
-                    && candidate.test_name == module.test_name
-                    && candidate.variant == module.variant
-            })
-            .count()
-            .checked_add(module.missing_optional)
-            .context("review screenshot attempt count overflows")?;
-        if image.obligation_index >= total_attempts
-            || !obligations.insert((
-                &image.matrix_plan_id,
-                &image.suite_plan_id,
-                &image.module_id,
-                &image.test_name,
-                &image.variant,
-                image.obligation_index,
-            ))
-        {
-            bail!("review screenshot manifest obligation graph is invalid");
         }
         let image_path = evidence_root.join(&image.path);
         expected_files.insert(image.path.clone());
@@ -1847,42 +1798,6 @@ fn validate_review_screenshot_manifest_binding(
             || audit.verification_receipt != image.verification_receipt
         {
             bail!("review screenshot receipt conflicts with the manifest");
-        }
-    }
-    for module in &document.modules {
-        let required_captured = document
-            .screenshots
-            .iter()
-            .filter(|image| {
-                image.matrix_plan_id == module.matrix_plan_id
-                    && image.suite_plan_id == module.suite_plan_id
-                    && image.module_id == module.module_id
-                    && image.test_name == module.test_name
-                    && image.variant == module.variant
-                    && matches!(image.marker, crate::ReviewScreenshotMarker::Required)
-            })
-            .count();
-        let optional_captured = document
-            .screenshots
-            .iter()
-            .filter(|image| {
-                image.matrix_plan_id == module.matrix_plan_id
-                    && image.suite_plan_id == module.suite_plan_id
-                    && image.module_id == module.module_id
-                    && image.test_name == module.test_name
-                    && image.variant == module.variant
-                    && matches!(image.marker, crate::ReviewScreenshotMarker::Optional)
-            })
-            .count();
-        let total_attempts = required_captured
-            .checked_add(optional_captured)
-            .and_then(|attempts| attempts.checked_add(module.missing_optional))
-            .context("review screenshot optional attempt count overflows")?;
-        if required_captured != module.required
-            || module.captured_required != module.required
-            || total_attempts > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_MODULE
-        {
-            bail!("review screenshot manifest optional obligation count is invalid");
         }
     }
     if expected_files.len() > crate::browser::MAX_REVIEW_SCREENSHOTS_PER_RUN * 2 {
@@ -1930,12 +1845,21 @@ fn validate_review_screenshot_manifest_binding(
     Ok(())
 }
 
-fn verify_vp_receipt_provenance(
+pub(crate) struct VpReceiptContext<'a> {
+    pub artifact_digest: &'a str,
+    pub matrix_sha256: &'a str,
+    pub suite_plan_id: &'a str,
+    pub suite_module_id: &'a str,
+    pub test_name: &'a str,
+    pub variant: &'a std::collections::BTreeMap<String, String>,
+    pub trigger_origin: &'a str,
+}
+
+pub(crate) fn verify_vp_receipt_provenance(
     receipt: &crate::OpenId4VpVerificationReceiptProvenance,
     anchor: &OpenId4VpEvidenceTrustAnchor,
     binding: &TenantResourceRecoveryBinding,
-    retention: &SuiteRetentionManifest,
-    image: &ReviewScreenshotManifestImage,
+    context: &VpReceiptContext<'_>,
 ) -> bool {
     use time::format_description::well_known::Rfc3339;
 
@@ -1945,15 +1869,10 @@ fn verify_vp_receipt_provenance(
         || receipt.runtime_instance_id != anchor.runtime_instance_id
         || receipt.instance_key_id != anchor.instance_key_id
         || receipt.instance_public_key_base64 != anchor.instance_public_key_base64
-        || image.trigger_origin != anchor.target_issuer
+        || context.trigger_origin != anchor.target_issuer
         || receipt.receipt_api_url
             != format!("{}/openid4vp/verification-receipts", anchor.target_issuer)
         || sha256_hex(receipt.receipt_jws.as_bytes()) != receipt.receipt_sha256
-        || !lower_hex(&receipt.receipt_sha256, 64)
-        || !lower_hex(&receipt.capability_sha256, 64)
-        || uuid::Uuid::parse_str(&receipt.issuance_request_jti).is_err()
-        || !lower_hex(&receipt.presentation_binding_sha256, 64)
-        || !lower_hex(&receipt.intent_sha256, 64)
     {
         return false;
     }
@@ -1965,16 +1884,16 @@ fn verify_vp_receipt_provenance(
     if nazo_operator_protocol::instance_key_id(&key) != receipt.instance_key_id {
         return false;
     }
-    let Ok(variant_bytes) = serde_json::to_vec(&image.variant) else {
+    let Ok(variant_bytes) = serde_json::to_vec(context.variant) else {
         return false;
     };
     let context = crate::oidf_protocol::Openid4vpEvidenceContext {
         run_jti: binding.run_id.clone(),
-        artifact_sha256: retention.artifact_digest.clone(),
-        matrix_sha256: retention.matrix_sha256.clone(),
-        suite_plan_id: image.suite_plan_id.clone(),
-        suite_module_id: image.module_id.clone(),
-        test_name: image.test_name.clone(),
+        artifact_sha256: context.artifact_digest.to_owned(),
+        matrix_sha256: context.matrix_sha256.to_owned(),
+        suite_plan_id: context.suite_plan_id.to_owned(),
+        suite_module_id: context.suite_module_id.to_owned(),
+        test_name: context.test_name.to_owned(),
         variant_sha256: sha256_hex(&variant_bytes),
     };
     let Ok(context_sha256) =
@@ -1982,27 +1901,17 @@ fn verify_vp_receipt_provenance(
     else {
         return false;
     };
-    let Ok(completed_at) = time::OffsetDateTime::parse(&receipt.completed_at, &Rfc3339) else {
-        return false;
-    };
-    if completed_at.format(&Rfc3339).ok().as_deref() != Some(receipt.completed_at.as_str()) {
-        return false;
-    }
     let Ok(expires_at) = time::OffsetDateTime::parse(&receipt.expires_at, &Rfc3339) else {
         return false;
     };
-    if expires_at.format(&Rfc3339).ok().as_deref() != Some(receipt.expires_at.as_str())
-        || expires_at <= completed_at
-    {
+    if expires_at.format(&Rfc3339).ok().as_deref() != Some(receipt.expires_at.as_str()) {
         return false;
     }
     // This is historical verification: the presentation completes before the
     // runtime can issue its receipt, so `completed_at` may precede the signed
-    // `iat`. Verify at the last whole second inside the signed validity window,
-    // then separately bind the verified issuance time to presentation order.
-    let Some(verification_time) = expires_at.unix_timestamp().checked_sub(1) else {
-        return false;
-    };
+    // `iat`. Verify inside the claimed validity window; the protocol verifier
+    // checks the signed lifetime and completion-before-issuance ordering.
+    let verification_time = expires_at.unix_timestamp() - 1;
     let receipt_id = receipt.receipt_id.to_string();
     let transaction_id = receipt.transaction_id.to_string();
     let expected = crate::oidf_protocol::Openid4vpVerificationReceiptExpectations {
@@ -2029,16 +1938,6 @@ fn verify_vp_receipt_provenance(
         return false;
     };
     verified.completed_at == receipt.completed_at
-        && verified.iat >= completed_at.unix_timestamp()
-        && verified.iat < verified.exp
-        && verified.iss == receipt.issuer
-        && verified.deployment_id == receipt.deployment_id
-        && verified.tenant_id == receipt.tenant_id
-        && verified.runtime_instance_id == receipt.runtime_instance_id
-        && verified.instance_key_id == receipt.instance_key_id
-        && verified.transaction_id == transaction_id
-        && verified.issuance_request_jti == receipt.issuance_request_jti
-        && verified.intent_sha256 == receipt.intent_sha256
         && verified.exp == expires_at.unix_timestamp()
         && exact_vp_trust_policy_binding(binding, &verified.presentation_binding.trust_policy)
 }
@@ -2649,6 +2548,121 @@ mod tests {
         validate_suite_retention_manifest(&retention_manifest(&binding), &binding, None).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn retained_screenshots_bind_exact_variants_obligations_and_files() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use serde_json::{Value, json};
+
+        let work =
+            nazoauthctl_runtime::filesystem::PrivateTempDir::new("oidf-retained-images").unwrap();
+        let binding = binding();
+        let mut retention = retention_manifest(&binding);
+        let target = "https://issuer.example";
+        let trigger_path = "/openid4vp/complete/550e8400-e29b-41d4-a716-446655440000";
+        let png = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        let mut modules = Vec::new();
+        let mut screenshots = Vec::new();
+        for (index, variant) in [json!({}), json!({"mode":"optional"})]
+            .into_iter()
+            .enumerate()
+        {
+            let required = usize::from(index == 0);
+            let marker = if required == 1 {
+                crate::ReviewScreenshotMarker::Required
+            } else {
+                crate::ReviewScreenshotMarker::Optional
+            };
+            let path = PathBuf::from(format!("review-screenshots/run-1/image-{index}.png"));
+            let source = work.path().join(&path);
+            crate::secure_file::write_atomic(&source, &png, true).unwrap();
+            let audit = json!({
+                "suite_plan_id":"suite-plan-1","module_id":"module-1","test_name":"test",
+                "variant":variant,"marker":marker,"obligation_index":0,"path":path,
+                "sha256":sha256_hex(&png),"size":png.len(),"trigger_origin":target,
+                "trigger_path":trigger_path,"trigger_url_sha256":sha256_hex(format!("{target}{trigger_path}").as_bytes()),
+                "source":crate::BrowserReviewScreenshotSource::NazoVpCompletionLiveWebdriver,
+                "verification_receipt":null
+            });
+            let receipt = serde_json::to_vec(&audit).unwrap();
+            crate::secure_file::write_atomic(
+                &source.with_extension("png.receipt.json"),
+                &receipt,
+                true,
+            )
+            .unwrap();
+            let mut image = audit;
+            image["matrix_plan_id"] = json!("openid4vc-vp-p038");
+            image["receipt_sha256"] = json!(sha256_hex(&receipt));
+            screenshots.push(image);
+            modules.push(json!({
+                "matrix_plan_id":"openid4vc-vp-p038","suite_plan_id":"suite-plan-1",
+                "module_id":"module-1","test_name":"test","variant":variant,
+                "required":required,"captured_required":required,"missing_optional":0
+            }));
+        }
+        retention
+            .deferred_review_pending
+            .push(SuiteRetentionDeferredReview {
+                matrix_plan_id: "openid4vc-vp-p038".into(),
+                suite_plan_id: "suite-plan-1".into(),
+                module_id: "module-1".into(),
+                test_name: "test".into(),
+                variant: Default::default(),
+                placeholder_path: "/test/a/module-1/verification-evidence".into(),
+                marker: crate::ReviewScreenshotMarker::Required,
+                obligation_index: 0,
+            });
+        let document = json!({
+            "schema":REVIEW_SCREENSHOT_MANIFEST_SCHEMA,"run_jti":binding.run_id,
+            "artifact_digest":retention.artifact_digest,"matrix_sha256":retention.matrix_sha256,
+            "suite_origin":retention.suite_origin,"target_issuer":target,
+            "modules":modules,"screenshots":screenshots
+        });
+        let path = work.path().join("review-screenshot-manifests/run-1.json");
+        let check = |document: &Value, retention: &SuiteRetentionManifest| {
+            let bytes = serde_json::to_vec(document).unwrap();
+            crate::secure_file::write_atomic(&path, &bytes, true).unwrap();
+            let mut retention = retention.clone();
+            retention.review_screenshot_manifest = Some(SuiteRetentionScreenshotManifest {
+                path: path.clone(),
+                sha256: sha256_hex(&bytes),
+            });
+            validate_suite_retention_evidence(&retention, &binding)
+        };
+        check(&document, &retention).expect("same module ID with distinct variants is valid");
+
+        let mut duplicate = document.clone();
+        duplicate["screenshots"]
+            .as_array_mut()
+            .unwrap()
+            .push(document["screenshots"][0].clone());
+        assert!(check(&duplicate, &retention).is_err());
+        let mut unknown = document.clone();
+        unknown["screenshots"][1]["variant"] = json!({"mode":"unknown"});
+        assert!(check(&unknown, &retention).is_err());
+        let mut wrong_index = document.clone();
+        wrong_index["screenshots"][1]["obligation_index"] = json!(1);
+        assert!(check(&wrong_index, &retention).is_err());
+        let mut wrong_count = document.clone();
+        wrong_count["modules"][1]["required"] = json!(1);
+        wrong_count["modules"][1]["captured_required"] = json!(1);
+        assert!(check(&wrong_count, &retention).is_err());
+        let mut overflow = document.clone();
+        overflow["modules"][1]["missing_optional"] = json!(usize::MAX);
+        assert!(check(&overflow, &retention).is_err());
+        let mut wrong_retention = retention.clone();
+        wrong_retention.deferred_review_pending[0].module_id = "different-module".into();
+        assert!(check(&document, &wrong_retention).is_err());
+        crate::secure_file::write_atomic(
+            &work.path().join("review-screenshots/run-1/image-1.png"),
+            b"substituted",
+            true,
+        )
+        .unwrap();
+        assert!(check(&document, &retention).is_err());
+    }
+
     #[test]
     fn cleanup_claim_does_not_require_deleted_apply_material() {
         let work =
@@ -2687,7 +2701,12 @@ mod tests {
         guard
             .prepare_suite_plan_retention(manifest, work.path().join("retained-suite-run-1.json"))
             .unwrap();
-        guard.stage_suite_retention_manifest().unwrap();
+        let pending = guard.stage_suite_retention_manifest().unwrap();
+        let original = fs::read(&pending).unwrap();
+        assert_eq!(guard.stage_suite_retention_manifest().unwrap(), pending);
+        crate::secure_file::write_atomic(&pending, b"substituted", true).unwrap();
+        assert!(guard.stage_suite_retention_manifest().is_err());
+        crate::secure_file::write_atomic(&pending, &original, true).unwrap();
         let journal = guard.journal_path.clone();
         let saved = journal.with_extension("saved");
         fs::rename(&journal, &saved).unwrap();

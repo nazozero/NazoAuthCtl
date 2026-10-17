@@ -69,10 +69,6 @@ case "$(uname -m)" in
 esac
 
 parent=$(dirname -- "$install_path")
-[ -d "$parent" ] && [ ! -L "$parent" ] || {
-  printf '%s\n' 'controller install parent must be an existing non-symlink directory' >&2
-  exit 1
-}
 if [ -e "$install_path" ] || [ -L "$install_path" ]; then
   [ -f "$install_path" ] && [ ! -L "$install_path" ] || {
     printf '%s\n' 'existing controller install target must be a regular non-symlink file' >&2
@@ -83,12 +79,13 @@ fi
 # Both staging and installation stay under an administrator-owned chain.
 directory=$parent
 while :; do
+  metadata=$(stat -c '%u:%a' -- "$directory")
   [ -d "$directory" ] && [ ! -L "$directory" ] &&
-    [ "$(stat -c %u -- "$directory")" -eq 0 ] || {
+    [ "${metadata%:*}" -eq 0 ] || {
       printf '%s\n' 'install directory chain must be root-owned and non-symlink' >&2
       exit 1
     }
-  mode=$(stat -c %a -- "$directory")
+  mode=${metadata#*:}
   [ "$((0$mode & 0022))" -eq 0 ] || {
     printf '%s\n' 'install directory chain must not be group/world writable' >&2
     exit 1
@@ -98,9 +95,7 @@ while :; do
 done
 umask 077
 work=$(mktemp -d "$parent/.nazoauthctl-install.XXXXXX")
-staged=""
 cleanup() {
-  [ -z "$staged" ] || rm -f -- "$staged"
   rm -rf -- "$work"
 }
 trap cleanup EXIT HUP INT TERM
@@ -112,11 +107,9 @@ gh attestation verify "$work/$artifact" \
   --signer-workflow "$repository/.github/workflows/release.yml" \
   --source-ref "refs/tags/$version" \
   --deny-self-hosted-runners
+chown root:root "$work/$artifact"
 chmod 0755 "$work/$artifact"
 "$work/$artifact" --json self verify-state >/dev/null
 
-staged=$(mktemp "$parent/.nazoauthctl.XXXXXX")
-install -o root -g root -m 0755 "$work/$artifact" "$staged"
-mv -f -- "$staged" "$install_path"
-staged=""
+mv -f -- "$work/$artifact" "$install_path"
 printf 'installed verified nazoauthctl %s at %s\n' "$version" "$install_path"

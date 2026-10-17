@@ -43,9 +43,13 @@ Captured child processes share one elapsed-time budget across stdin writing,
 process waiting and stdout/stderr collection. Input and output pipes make progress
 concurrently. A child that stops reading stdin cannot postpone timeout handling;
 expiry terminates and reaps the process tree using the platform cleanup primitive.
+`stdin_output` and `stdin_stdout` take owned byte buffers without copying them;
+borrowed inputs are copied to give the bounded writer thread independent ownership.
+The writer zeroizes its input on completion.
 
 The SSH transport preserves the local `SSH_AUTH_SOCK` value for OpenSSH agent
-authentication while retaining the cleaned child environment. This does not enable
+authentication for ordinary operations, transfer sessions, recovery forwards and
+interactive sudo while retaining the cleaned child environment. This does not enable
 remote agent forwarding or expose the socket to unrelated host commands.
 
 ## Target capabilities

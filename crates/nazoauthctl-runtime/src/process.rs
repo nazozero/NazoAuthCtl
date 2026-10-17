@@ -20,6 +20,18 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_CAPTURE_BYTES: u64 = 1024 * 1024;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Whether this process has the effective Unix root identity.
+pub fn is_effective_root() -> bool {
+    #[cfg(unix)]
+    {
+        rustix::process::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct Process {
     program: OsString,
@@ -114,7 +126,9 @@ impl Process {
         {
             command.arg("--disable");
         }
-        command.args(&self.args).envs(self.environment.clone());
+        command
+            .args(&self.args)
+            .envs(self.environment.iter().map(|(key, value)| (key, value)));
         command
     }
 
@@ -156,7 +170,7 @@ impl Process {
             .with_context(|| format!("{} produced non-UTF-8 output", self.display_name()))
     }
 
-    pub fn stdin_stdout(&self, input: &[u8]) -> anyhow::Result<String> {
+    pub fn stdin_stdout(&self, input: impl Into<Vec<u8>>) -> anyhow::Result<String> {
         let output = self.stdin_output(input)?;
         if !output.status.success() {
             // Diagnostics from secret-bearing children are not public error text.
@@ -173,7 +187,8 @@ impl Process {
     /// Feeds `input` on stdin and captures the complete bounded output,
     /// including stderr, for protocol transports that classify failures from
     /// the child's diagnostic stream (for example OpenSSH exec wrappers).
-    pub fn stdin_output(&self, input: &[u8]) -> anyhow::Result<Output> {
+    pub fn stdin_output(&self, input: impl Into<Vec<u8>>) -> anyhow::Result<Output> {
+        let input = zeroize::Zeroizing::new(input.into());
         let mut command = self.command();
         command
             .stdin(Stdio::piped())
@@ -241,7 +256,7 @@ impl Process {
             }
         });
         Ok(LineSession {
-            child,
+            child: Some(child),
             requests,
             responses,
             diagnostics,
@@ -309,7 +324,7 @@ impl Process {
     fn collect_output(
         &self,
         mut child: std::process::Child,
-        input: Option<&[u8]>,
+        input: Option<zeroize::Zeroizing<Vec<u8>>>,
     ) -> anyhow::Result<Output> {
         let deadline = Instant::now() + self.timeout;
         let stdout = child
@@ -326,7 +341,6 @@ impl Process {
         spawn_reader(stderr, stderr_sender);
         if let Some(input) = input {
             let mut stdin = child.stdin.take().context("child stdin was unavailable")?;
-            let input = zeroize::Zeroizing::new(input.to_vec());
             let (sender, receiver) = mpsc::sync_channel(1);
             thread::spawn(move || {
                 let result = stdin.write_all(&input);
@@ -360,12 +374,11 @@ impl Process {
         result
     }
 
-    fn display_name(&self) -> String {
+    fn display_name(&self) -> std::borrow::Cow<'_, str> {
         Path::new(&self.program)
             .file_name()
             .unwrap_or_else(|| OsStr::new("command"))
             .to_string_lossy()
-            .into_owned()
     }
 }
 
@@ -380,7 +393,7 @@ fn read_bounded(reader: impl std::io::Read) -> anyhow::Result<Vec<u8>> {
 
 #[derive(Debug)]
 pub struct LineSession {
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     requests: SyncSender<Vec<u8>>,
     responses: Receiver<anyhow::Result<Vec<u8>>>,
     diagnostics: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -388,6 +401,12 @@ pub struct LineSession {
 }
 
 impl LineSession {
+    fn terminate(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            terminate_and_reap(&mut child);
+        }
+    }
+
     /// An empty request reads the peer's initial greeting without writing.
     pub fn exchange(&mut self, request: Vec<u8>) -> anyhow::Result<Vec<u8>> {
         self.requests
@@ -396,12 +415,12 @@ impl LineSession {
         let result = match self.responses.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(error) => {
-                terminate_and_reap(&mut self.child);
+                self.terminate();
                 return Err(error).context("session timed out or closed waiting for a reply");
             }
         };
         if result.is_err() {
-            terminate_and_reap(&mut self.child);
+            self.terminate();
         }
         result.map_err(|error| {
             let diagnostics = self
@@ -416,7 +435,7 @@ impl LineSession {
 
 impl Drop for LineSession {
     fn drop(&mut self) {
-        terminate_and_reap(&mut self.child);
+        self.terminate();
     }
 }
 
@@ -573,7 +592,7 @@ mod process_tests {
         let started = std::time::Instant::now();
         let error = process
             .timeout(std::time::Duration::from_millis(100))
-            .stdin_output(&vec![b'x'; 4 * 1024 * 1024])
+            .stdin_output(vec![b'x'; 4 * 1024 * 1024])
             .expect_err("a full stdin pipe must obey the process deadline");
         assert!(error.to_string().contains("timed out"), "{error:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -590,7 +609,7 @@ mod process_tests {
         let process = Process::new("sh").args(["-c", "head -c 131072 /dev/zero; wc -c"]);
         let output = process
             .timeout(std::time::Duration::from_secs(10))
-            .stdin_output(&vec![b'x'; 262144])
+            .stdin_output(vec![b'x'; 262144])
             .expect("both pipes must make progress");
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout[131072..]).contains("262144"));
@@ -615,7 +634,10 @@ mod process_tests {
                 .to_string()
                 .contains("timed out")
         );
-        assert!(session.child.try_wait().unwrap().is_some());
+        assert!(
+            session.child.is_none(),
+            "timed-out session must release its child"
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 

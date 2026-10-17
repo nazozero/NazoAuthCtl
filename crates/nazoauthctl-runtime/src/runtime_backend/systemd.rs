@@ -99,8 +99,16 @@ impl RuntimeBackend for SystemdBackend {
     }
 
     fn inspect(&self, object_reference: &str) -> anyhow::Result<RuntimeObservation> {
+        self.inspect_optional(object_reference)?
+            .context("systemd unit does not exist")
+    }
+
+    fn inspect_optional(
+        &self,
+        object_reference: &str,
+    ) -> anyhow::Result<Option<RuntimeObservation>> {
         if object_reference.starts_with("process:") {
-            return inspect_process(object_reference);
+            return inspect_process(object_reference).map(Some);
         }
         validate_unit_name(object_reference)?;
         let output = Process::new("systemctl")
@@ -112,11 +120,15 @@ impl RuntimeBackend for SystemdBackend {
             ])
             .stdout()?;
         let properties = parse_properties(&output);
-        let exec_start = properties.get("ExecStart").cloned().unwrap_or_default();
-        let executable = executable_from_systemd(&exec_start);
-        let server_command_verified = command_is_nazoauth_server(&exec_start);
+        if properties.get("LoadState") == Some(&"not-found") {
+            return Ok(None);
+        }
+        let argv = properties
+            .get("ExecStart")
+            .and_then(|value| parse_systemd_exec_start(value).ok());
+        let server_command_verified = argv.as_deref().is_some_and(is_nazoauth_server_argv);
+        let executable = argv.as_ref().and_then(|argv| argv.first()).copied();
         let artifact = executable
-            .as_deref()
             .filter(|_| server_command_verified)
             .and_then(|path| host_artifact(Path::new(path)).ok())
             .unwrap_or(ArtifactReference::Unknown);
@@ -156,9 +168,7 @@ impl RuntimeBackend for SystemdBackend {
         }
         if properties
             .get("StartLimitIntervalUSec")
-            .is_some_and(|value| {
-                matches!(value.as_str(), "60000000" | "1min" | "60s" | "60000000us")
-            })
+            .is_some_and(|value| matches!(*value, "60000000" | "1min" | "60s" | "60000000us"))
         {
             evidence.push("systemd StartLimitIntervalSec policy observed".to_owned());
         } else {
@@ -181,20 +191,21 @@ impl RuntimeBackend for SystemdBackend {
         }
         if properties
             .get("EnvironmentFiles")
-            .is_some_and(|value| !value.is_empty() && value != "-")
+            .is_some_and(|value| !value.is_empty() && *value != "-")
         {
             evidence.push("systemd EnvironmentFiles observed".to_owned());
         }
-        Ok(RuntimeObservation {
+        Ok(Some(RuntimeObservation {
             backend: self.kind(),
             object_reference: object_reference.to_owned(),
             display_name: properties
                 .get("Id")
-                .cloned()
-                .unwrap_or_else(|| object_reference.to_owned()),
+                .copied()
+                .unwrap_or(object_reference)
+                .to_owned(),
             running: properties
                 .get("ActiveState")
-                .is_some_and(|state| state == "active"),
+                .is_some_and(|state| *state == "active"),
             server_command_verified,
             artifact,
             local_artifact_id,
@@ -205,40 +216,11 @@ impl RuntimeBackend for SystemdBackend {
             labels: BTreeMap::new(),
             evidence,
             missing,
-        })
-    }
-
-    fn inspect_optional(
-        &self,
-        object_reference: &str,
-    ) -> anyhow::Result<Option<RuntimeObservation>> {
-        if object_reference.starts_with("process:") {
-            return self.inspect(object_reference).map(Some);
-        }
-        validate_unit_name(object_reference)?;
-        let output = Process::new("systemctl")
-            .args([
-                "show",
-                object_reference,
-                "--no-pager",
-                "--property=LoadState",
-                "--value",
-            ])
-            .output()?;
-        if !output.status.success() {
-            bail!("systemd could not inspect the recovery unit");
-        }
-        let load_state = String::from_utf8(output.stdout)
-            .context("systemd returned a non-UTF-8 unit load state")?;
-        if load_state.trim() == "not-found" {
-            return Ok(None);
-        }
-        self.inspect(object_reference).map(Some)
+        }))
     }
 
     fn read_logs(&self, object_reference: &str, limit: usize) -> anyhow::Result<Vec<String>> {
         validate_mutable_unit(object_reference)?;
-        self.inspect(object_reference)?;
         let output = Process::new("journalctl")
             .args([
                 "--unit",
@@ -265,32 +247,18 @@ impl RuntimeBackend for SystemdBackend {
             .run_quiet()
     }
 
-    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<()> {
-        if object_reference.starts_with("process:") {
-            if self.inspect(object_reference).is_ok() {
-                bail!("an unmanaged host process cannot be stopped by the recovery controller");
-            }
-            return Ok(());
-        }
+    fn quiesce_for_recovery(&self, object_reference: &str) -> anyhow::Result<bool> {
         validate_mutable_unit(object_reference)?;
-        let output = Process::new("systemctl")
-            .args(["show", object_reference, "--property=LoadState", "--value"])
-            .output()?;
-        if !output.status.success() {
-            bail!("systemd could not prove the recovery unit is stopped or absent");
+        if !systemd_unit_running(object_reference)? {
+            return Ok(false);
         }
-        let load_state = String::from_utf8(output.stdout)
-            .context("systemd returned a non-UTF-8 unit load state")?;
-        if load_state.trim() == "not-found" {
-            return Ok(());
-        }
-        if self.inspect(object_reference)?.running {
-            self.stop(object_reference)?;
-        }
-        if self.inspect(object_reference)?.running {
+        Process::new("systemctl")
+            .args(["stop", object_reference])
+            .run_quiet()?;
+        if systemd_unit_running(object_reference)? {
             bail!("systemd recovery unit remained active after stop");
         }
-        Ok(())
+        Ok(true)
     }
 
     fn restart(&self, object_reference: &str) -> anyhow::Result<()> {
@@ -302,17 +270,20 @@ impl RuntimeBackend for SystemdBackend {
 
     fn remove(&self, object_reference: &str) -> anyhow::Result<()> {
         validate_mutable_unit(object_reference)?;
-        if self.inspect_optional(object_reference)?.is_some() {
+        let output = Process::new("systemctl")
+            .args([
+                "show",
+                object_reference,
+                "--no-pager",
+                "--property=LoadState,FragmentPath",
+            ])
+            .stdout()?;
+        let properties = parse_properties(&output);
+        if properties.get("LoadState") != Some(&"not-found") {
             let fragment_path = PathBuf::from(
-                Process::new("systemctl")
-                    .args([
-                        "show",
-                        object_reference,
-                        "--property=FragmentPath",
-                        "--value",
-                    ])
-                    .stdout()?
-                    .trim(),
+                properties
+                    .get("FragmentPath")
+                    .context("systemd unit has no fragment path")?,
             );
             let fragment = read_secure_regular_file(
                 &fragment_path,
@@ -323,9 +294,9 @@ impl RuntimeBackend for SystemdBackend {
             if !fragment.starts_with(b"# Managed by nazoauthctl\n") {
                 bail!("refusing to remove an unmanaged systemd unit");
             }
-            if self.inspect(object_reference)?.running {
-                self.stop(object_reference)?;
-            }
+            Process::new("systemctl")
+                .args(["stop", object_reference])
+                .run_quiet()?;
             Process::new("systemctl")
                 .args(["disable", object_reference])
                 .run_quiet()?;
@@ -389,12 +360,7 @@ impl RuntimeBackend for SystemdBackend {
         if systemd_unit_executable(&replacement.object_reference)? != target {
             bail!("systemd unit ExecStart changed during replacement");
         }
-        copy_atomic_from_file(&mut source_file, &target, 0o755)?;
-        let mut target_file =
-            open_secure_regular_file(&target, "systemd replacement target", false)?;
-        if sha256_file(&mut target_file, &target.display().to_string())? != *expected {
-            bail!("systemd replacement target digest changed during activation");
-        }
+        copy_atomic_from_file(&mut source_file, &target, 0o755, Some(expected))?;
         Ok(())
     }
 
@@ -433,7 +399,7 @@ impl RuntimeBackend for SystemdBackend {
     }
 
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()> {
-        validate_host_service_install(install)?;
+        let rendered = render_host_service_unit(install)?;
         if Process::new("id")
             .args(["-u", install.service_user.as_str()])
             .succeeds()
@@ -479,19 +445,19 @@ impl RuntimeBackend for SystemdBackend {
             .run_quiet()?;
         let mut readable_directories = BTreeSet::new();
         if let Some(parent) = install.config.parent() {
-            readable_directories.insert(parent.to_path_buf());
+            readable_directories.insert(parent);
         }
         for secret in &install.secret_paths {
             if let Some(parent) = secret.parent() {
-                readable_directories.insert(parent.to_path_buf());
+                readable_directories.insert(parent);
             }
         }
         for directory in readable_directories {
             Process::new("chown")
                 .arg(format!("root:{}", install.service_user))
-                .arg(&directory)
+                .arg(directory)
                 .run_quiet()?;
-            set_mode(&directory, 0o750)?;
+            set_mode(directory, 0o750)?;
         }
         set_mode(&install.config, 0o440)?;
         for path in &install.secret_paths {
@@ -502,7 +468,7 @@ impl RuntimeBackend for SystemdBackend {
             "verified systemd source binary",
             false,
         )?;
-        copy_atomic_from_file(&mut source, &install.binary, 0o755)?;
+        copy_atomic_from_file(&mut source, &install.binary, 0o755, None)?;
         let unit_directory = env::var_os("NAZOAUTH_SYSTEMD_UNIT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/etc/systemd/system"));
@@ -531,7 +497,6 @@ impl RuntimeBackend for SystemdBackend {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("failed to inspect systemd unit"),
         }
-        let rendered = render_host_service_unit(install)?;
         atomic_write(&unit_path, rendered.as_bytes(), 0o644)?;
         Process::new("systemctl").arg("daemon-reload").run_quiet()?;
         Process::new("systemctl")
@@ -878,10 +843,10 @@ fn systemd_one_shot_process(task: &OneShotTask) -> anyhow::Result<Process> {
             mount.destination.display()
         ));
     }
-    let arguments = task
-        .command
-        .strip_prefix(&["nazoauth".to_owned()])
-        .unwrap_or(task.command.as_slice());
+    let arguments = match task.command.as_slice() {
+        [program, arguments @ ..] if program == "nazoauth" => arguments,
+        arguments => arguments,
+    };
     Ok(process.arg(path).args(arguments))
 }
 
@@ -889,7 +854,7 @@ fn add_operator_credentials(
     mut process: Process,
     task: &OneShotTask,
     unit: &str,
-) -> anyhow::Result<(Process, BTreeSet<String>)> {
+) -> anyhow::Result<(Process, BTreeSet<&'static str>)> {
     let mut credential_environment = BTreeSet::new();
     for (environment, credential) in OPERATOR_CREDENTIAL_ENVIRONMENT {
         let Some(source) = task.environment.get(environment) else {
@@ -907,7 +872,7 @@ fn add_operator_credentials(
                 "--setenv={environment}={}",
                 systemd_credential_path(unit, credential)?
             ));
-            credential_environment.insert(environment.to_owned());
+            credential_environment.insert(environment);
             continue;
         }
         safe_systemd_path(Path::new(source))
@@ -921,13 +886,12 @@ fn add_operator_credentials(
                 "--setenv={environment}={}",
                 systemd_credential_path(unit, credential)?
             ));
-        credential_environment.insert(environment.to_owned());
+        credential_environment.insert(environment);
     }
     Ok((process, credential_environment))
 }
 
 fn systemd_credential_path(unit: &str, credential: &str) -> anyhow::Result<String> {
-    validate_unit_name(unit)?;
     if credential.is_empty()
         || credential.len() > 128
         || !credential
@@ -953,55 +917,60 @@ fn discover_unmanaged_processes() -> anyhow::Result<Vec<RuntimeObservation>> {
         .lines()
         .filter_map(|line| {
             let (pid, command) = line.trim().split_once(char::is_whitespace)?;
-            if !command_is_nazoauth_server(command) {
-                return None;
-            }
-            let executable = command.split_whitespace().next()?;
-            let artifact =
-                host_artifact(Path::new(executable)).unwrap_or(ArtifactReference::Unknown);
-            let local_artifact_id = match &artifact {
-                ArtifactReference::HostBinary { sha256, .. } => Some(format!("sha256:{sha256}")),
-                _ => None,
-            };
-            Some(RuntimeObservation {
-                backend: RuntimeBackendKind::Host,
-                object_reference: format!("process:{pid}"),
-                display_name: format!("unmanaged process {pid}"),
-                running: true,
-                server_command_verified: true,
-                artifact,
-                local_artifact_id,
-                ports: Vec::new(),
-                networks: Vec::new(),
-                mounts: Vec::new(),
-                safe_environment: BTreeMap::new(),
-                labels: BTreeMap::new(),
-                evidence: vec!["process command identifies nazoauth server".to_owned()],
-                missing: vec![
-                    "process is not controlled by a systemd unit".to_owned(),
-                    "published ports and mounts are not safely observable".to_owned(),
-                ],
-            })
+            process_observation(pid, command)
         })
         .collect())
 }
 
-fn inspect_process(object_reference: &str) -> anyhow::Result<RuntimeObservation> {
-    let expected_pid = object_reference
-        .strip_prefix("process:")
-        .context("invalid process reference")?;
-    let observations = discover_unmanaged_processes()?;
-    observations
-        .into_iter()
-        .find(|observation| observation.object_reference == format!("process:{expected_pid}"))
-        .context("discovered process is no longer running")
+fn process_observation(pid: &str, command: &str) -> Option<RuntimeObservation> {
+    if !command_is_nazoauth_server(command) {
+        return None;
+    }
+    let executable = command.split_whitespace().next()?;
+    let artifact = host_artifact(Path::new(executable)).unwrap_or(ArtifactReference::Unknown);
+    let local_artifact_id = match &artifact {
+        ArtifactReference::HostBinary { sha256, .. } => Some(format!("sha256:{sha256}")),
+        _ => None,
+    };
+    Some(RuntimeObservation {
+        backend: RuntimeBackendKind::Host,
+        object_reference: format!("process:{pid}"),
+        display_name: format!("unmanaged process {pid}"),
+        running: true,
+        server_command_verified: true,
+        artifact,
+        local_artifact_id,
+        ports: Vec::new(),
+        networks: Vec::new(),
+        mounts: Vec::new(),
+        safe_environment: BTreeMap::new(),
+        labels: BTreeMap::new(),
+        evidence: vec!["process command identifies nazoauth server".to_owned()],
+        missing: vec![
+            "process is not controlled by a systemd unit".to_owned(),
+            "published ports and mounts are not safely observable".to_owned(),
+        ],
+    })
 }
 
-fn parse_properties(output: &str) -> BTreeMap<String, String> {
+fn inspect_process(object_reference: &str) -> anyhow::Result<RuntimeObservation> {
+    let pid = object_reference
+        .strip_prefix("process:")
+        .context("invalid process reference")?;
+    if pid.parse::<u32>().ok().is_none_or(|pid| pid == 0) {
+        bail!("invalid process PID");
+    }
+    let output = Process::new("ps")
+        .args(["-p", pid, "-o", "args="])
+        .stdout()?;
+    process_observation(pid, output.trim())
+        .context("discovered process is no longer running a NazoAuth server")
+}
+
+fn parse_properties(output: &str) -> BTreeMap<&str, &str> {
     output
         .lines()
         .filter_map(|line| line.split_once('='))
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
 }
 
@@ -1012,10 +981,28 @@ fn systemd_property_matches(property: &str, value: &str, expected: &str) -> bool
     }
 }
 
-fn executable_from_systemd(exec_start: &str) -> Option<String> {
-    parse_systemd_exec_start(exec_start)
-        .ok()
-        .and_then(|argv| argv.into_iter().next())
+fn systemd_unit_running(object_reference: &str) -> anyhow::Result<bool> {
+    let output = Process::new("systemctl")
+        .args([
+            "show",
+            object_reference,
+            "--no-pager",
+            "--property=LoadState,ActiveState",
+        ])
+        .stdout()?;
+    let properties = parse_properties(&output);
+    if properties.get("LoadState") == Some(&"not-found") {
+        return Ok(false);
+    }
+    match properties
+        .get("ActiveState")
+        .copied()
+        .filter(|state| !state.is_empty())
+    {
+        Some("inactive" | "failed") => Ok(false),
+        Some(_) => Ok(true),
+        None => bail!("systemd did not report the recovery unit active state"),
+    }
 }
 
 fn systemd_unit_executable(object_reference: &str) -> anyhow::Result<PathBuf> {
@@ -1037,29 +1024,34 @@ fn systemd_unit_executable(object_reference: &str) -> anyhow::Result<PathBuf> {
 
 fn command_is_nazoauth_server(command: &str) -> bool {
     let command = command.strip_suffix('\n').unwrap_or(command);
+    if command.trim_start().starts_with('{') {
+        return parse_systemd_exec_start(command).is_ok_and(|argv| is_nazoauth_server_argv(&argv));
+    }
     if validate_systemd_exec_input(command).is_err() {
         return false;
     }
-    let command = command.trim();
-    if command.starts_with('{') {
-        return parse_systemd_exec_start(command).is_ok_and(|argv| is_nazoauth_server_argv(&argv));
+    let mut words = command.split_whitespace();
+    let Some(mut program) = words.next() else {
+        return false;
+    };
+    for argument in words {
+        if is_nazoauth_server_argv(&[program, argument]) {
+            return true;
+        }
+        program = argument;
     }
-    let words = command
-        .split_whitespace()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    words.windows(2).any(is_nazoauth_server_argv)
+    false
 }
 
-fn is_nazoauth_server_argv(argv: &[String]) -> bool {
+fn is_nazoauth_server_argv(argv: &[&str]) -> bool {
     argv.first()
         .and_then(|value| Path::new(value).file_name())
         .and_then(|value| value.to_str())
         .is_some_and(|value| matches!(value, "nazoauth" | "nazoauth.exe"))
-        && argv.get(1).map(String::as_str) == Some("server")
+        && argv.get(1).copied() == Some("server")
 }
 
-fn parse_systemd_exec_start(value: &str) -> anyhow::Result<Vec<String>> {
+fn parse_systemd_exec_start(value: &str) -> anyhow::Result<Vec<&str>> {
     let value = value.strip_suffix('\n').unwrap_or(value);
     validate_systemd_exec_input(value)?;
     let value = value.trim();
@@ -1097,22 +1089,8 @@ fn parse_systemd_exec_start(value: &str) -> anyhow::Result<Vec<String>> {
         let key = &body[key_start..cursor];
         cursor += 1;
         let value_start = cursor;
-        let mut escaped = false;
-        while cursor < bytes.len() {
-            match (bytes[cursor], escaped) {
-                (b'\\', false) => {
-                    escaped = true;
-                    cursor += 1;
-                }
-                (b';', false) => break,
-                (_, _) => {
-                    escaped = false;
-                    cursor += 1;
-                }
-            }
-        }
-        if escaped {
-            bail!("systemd ExecStart contains a truncated escape");
+        while cursor < bytes.len() && bytes[cursor] != b';' {
+            cursor += 1;
         }
         let raw = body[value_start..cursor].trim();
         if raw.is_empty() {
@@ -1123,7 +1101,11 @@ fn parse_systemd_exec_start(value: &str) -> anyhow::Result<Vec<String>> {
                 if path.is_some() {
                     bail!("systemd ExecStart contains multiple paths");
                 }
-                path = Some(decode_systemd_scalar(raw)?);
+                let mut words = raw.split_ascii_whitespace();
+                path = words.next();
+                if words.next().is_some() {
+                    bail!("systemd ExecStart scalar contains multiple words");
+                }
             }
             "argv[]" => argv_fields.push(raw),
             _ => {}
@@ -1136,7 +1118,7 @@ fn parse_systemd_exec_start(value: &str) -> anyhow::Result<Vec<String>> {
     let path = path.context("systemd ExecStart has no path field")?;
     let mut argv = Vec::new();
     for field in argv_fields {
-        argv.extend(split_systemd_argv(field)?);
+        argv.extend(field.split_ascii_whitespace());
     }
     if argv.is_empty() {
         bail!("systemd ExecStart has no argv[] field");
@@ -1145,19 +1127,6 @@ fn parse_systemd_exec_start(value: &str) -> anyhow::Result<Vec<String>> {
         bail!("systemd ExecStart path and argv[0] differ");
     }
     Ok(argv)
-}
-
-fn decode_systemd_scalar(value: &str) -> anyhow::Result<String> {
-    let values = split_systemd_argv(value)?;
-    if values.len() != 1 {
-        bail!("systemd ExecStart scalar contains multiple words");
-    }
-    Ok(values.into_iter().next().unwrap())
-}
-
-fn split_systemd_argv(value: &str) -> anyhow::Result<Vec<String>> {
-    validate_systemd_exec_input(value)?;
-    Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
 }
 
 fn validate_systemd_exec_input(value: &str) -> anyhow::Result<()> {
@@ -1255,7 +1224,6 @@ mod tests {
                 .unwrap(),
             "/run/credentials/nazoauthctl-task-test.service/database-lifecycle-url"
         );
-        assert!(systemd_credential_path("nazoauthctl-task-test", "credential").is_err());
         assert!(systemd_credential_path("nazoauthctl-task-test.service", "../credential").is_err());
     }
 

@@ -8,6 +8,12 @@ must be reviewed before advancing it. Raising a
 manifest's version floor does not mean the locked executable previously used
 that older version.
 
+The workspace pins a `serde_json` fork in `[patch.crates-io]` for immutable chunk
+input. Admin responses retain HTTP frames; strings contained in one frame borrow
+it, and strings spanning frames or requiring unescaping use parser storage.
+Owned string consumers take that storage directly. Keep chunk-boundary, UTF-8,
+escape, raw-value and upstream parser tests when advancing this revision.
+
 Use Rust 1.99.0 from `rust-toolchain.toml`, including rustfmt and Clippy. The Linux
 release build uses the same version in the digest-pinned official
 `rust:1.99.0-bookworm` image, retaining the Debian 12 compatibility baseline.

@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::matrix::{
     MatrixDocument, MatrixGroup, MatrixPlan, MatrixVariant, SelectedMatrix, zeroize_json_value,
@@ -34,9 +34,6 @@ const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TENANT_RESOURCE_PAYLOAD_BYTES: usize = 512 * 1024;
 const MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TENANT_RESOURCE_ID_BYTES: usize = 128;
-const MAX_TENANT_RESOURCE_USERNAME_BYTES: usize = 150;
-const MAX_TENANT_RESOURCE_EMAIL_BYTES: usize = 254;
-const MAX_TENANT_RESOURCE_PASSWORD_BYTES: usize = 512;
 const MAX_TENANT_RESOURCE_CERTIFICATE_BYTES: usize = 256 * 1024;
 const MAX_TENANT_RESOURCE_CONFIGURATION_ID_BYTES: usize = 255;
 
@@ -57,10 +54,9 @@ pub use descriptor::{
     DescriptorVariant, MAX_DESCRIPTOR_BYTES, MatrixDescriptor, RoleRequirement,
 };
 use descriptor::{
-    collect_client_policies, collect_registrations, descriptor_requires_reference,
-    extract_single_mdoc_trust_anchor_from_bundle, is_placeholder, parse_placeholder,
-    referenced_openid4vc_credential_dataset_ids, validate_binding_reference, validate_descriptor,
-    validate_digest, validate_single_mdoc_trust_anchor,
+    descriptor_requires_reference, extract_single_mdoc_trust_anchor_from_bundle, parse_placeholder,
+    referenced_openid4vc_credential_dataset_ids, validate_descriptor, validate_digest,
+    validate_single_mdoc_trust_anchor,
 };
 use template::{
     materialize_registration_template, materialize_value, materialize_vci_config,
@@ -75,8 +71,8 @@ struct MaterializationBindings {
 }
 
 /// Preparation state is deliberately neither serializable nor printable.
-/// Its `Zeroize`/`ZeroizeOnDrop` implementation clears every private field;
-/// descriptor/public metadata is retained only for the duration of finalize.
+/// Private fields own their zeroizing buffers; each client clears its private
+/// request JSON on drop. Public metadata is retained until finalize completes.
 pub struct PreparedMaterialization {
     descriptor: MatrixDescriptor,
     target_issuer: String,
@@ -89,27 +85,6 @@ pub struct PreparedMaterialization {
     attestation: Option<GeneratedAttestationMaterial>,
     dynamic_registration_initial_access_token: Option<Zeroizing<String>>,
     clients: BTreeMap<String, PreparedClient>,
-}
-
-impl Zeroize for PreparedMaterialization {
-    fn zeroize(&mut self) {
-        self.applicant_password.zeroize();
-        self.applicant_email.zeroize();
-        self.tx_code.zeroize();
-        self.attestation.zeroize();
-        self.dynamic_registration_initial_access_token.zeroize();
-        for client in self.clients.values_mut() {
-            client.zeroize();
-        }
-    }
-}
-
-impl ZeroizeOnDrop for PreparedMaterialization {}
-
-impl Drop for PreparedMaterialization {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
 }
 
 impl PreparedMaterialization {
@@ -172,45 +147,24 @@ impl PreparedMaterialization {
         &self,
         run_namespace: &str,
     ) -> Result<TenantResourceManifest, MaterializerError> {
-        validate_request_jti(run_namespace)?;
         if run_namespace != self.request_jti {
             return Err(MaterializerError::RequestMismatch);
         }
         let run_suffix = run_namespace_suffix(run_namespace);
-        let user_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix)?;
+        let user_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix);
         let trust_policy_resource_id = self
             .attestation
             .as_ref()
-            .map(|_| run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix))
-            .transpose()?;
+            .map(|_| run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix));
         let username = self
             .applicant_email
             .split_once('@')
             .map(|(local, _)| local)
             .ok_or(MaterializerError::InvalidField("generated.applicant_email"))?;
-        validate_bounded_text(
-            username,
-            MAX_TENANT_RESOURCE_USERNAME_BYTES,
-            "generated.applicant_email",
-        )?;
-        validate_bounded_text(
-            self.applicant_email.as_str(),
-            MAX_TENANT_RESOURCE_EMAIL_BYTES,
-            "generated.applicant_email",
-        )?;
-        validate_bounded_text(
-            self.applicant_password.as_str(),
-            MAX_TENANT_RESOURCE_PASSWORD_BYTES,
-            "generated.applicant_password",
-        )?;
         let applicant_profile_origin = self.target_issuer.trim_end_matches('/');
 
         let mut resources = Vec::with_capacity(
-            1usize
-                .saturating_add(self.clients.len())
-                .saturating_add(self.clients.len())
-                .saturating_add(self.descriptor.openid4vc_credential_datasets.len())
-                .saturating_add(1),
+            2 + 2 * self.clients.len() + self.descriptor.openid4vc_credential_datasets.len(),
         );
         let mut payload_total = 0usize;
 
@@ -251,19 +205,18 @@ impl PreparedMaterialization {
 
         for (logical_client_id, client) in &self.clients {
             let client_resource_id =
-                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix)?;
-            validate_manifest_client_request(&client.request)?;
+                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix);
             let supplied_secret =
-                (!client.client_secret.is_empty()).then(|| client.client_secret.to_string());
+                (!client.client_secret.is_empty()).then_some(client.client_secret.as_str());
             push_manifest_resource(
                 &mut resources,
                 &mut payload_total,
                 TenantResourceKind::OauthClient,
                 client_resource_id.clone(),
                 serde_json::json!({
-                    "request": client.request.clone(),
+                    "request": client.request,
                     "supplied_secret": supplied_secret,
-                    "trust_policy_resource_id": trust_policy_resource_id.clone(),
+                    "trust_policy_resource_id": trust_policy_resource_id,
                 }),
             )?;
 
@@ -276,7 +229,7 @@ impl PreparedMaterialization {
                     &mut resources,
                     &mut payload_total,
                     TenantResourceKind::MtlsTrustAnchor,
-                    run_scoped_resource_id("mtls-trust-anchor", logical_client_id, &run_suffix)?,
+                    run_scoped_resource_id("mtls-trust-anchor", logical_client_id, &run_suffix),
                     serde_json::json!({
                         "client_resource_id": client_resource_id,
                         "certificate_pem": client.mtls_ca_certificate.as_str(),
@@ -295,7 +248,7 @@ impl PreparedMaterialization {
                 &mut resources,
                 &mut payload_total,
                 TenantResourceKind::Openid4vcDataset,
-                run_scoped_resource_id("openid4vc-dataset", configuration_id, &run_suffix)?,
+                run_scoped_resource_id("openid4vc-dataset", configuration_id, &run_suffix),
                 serde_json::json!({
                     "user_resource_id": user_resource_id,
                     "configuration_id": configuration_id,
@@ -313,12 +266,8 @@ impl PreparedMaterialization {
                     "{}/",
                     self.suite_base_url.trim_end_matches('/')
                 ),
-                client_attestation_jwks: strict_openid4vc_trust_jwks(
-                    attestation.attester_public_jwks.as_str(),
-                )?,
-                key_attestation_jwks: strict_openid4vc_trust_jwks(
-                    attestation.key_attestation_public_jwks.as_str(),
-                )?,
+                client_attestation_jwks: attestation.attester_public_jwks.clone(),
+                key_attestation_jwks: attestation.key_attestation_public_jwks.clone(),
                 wallet_authorization_origins: vec![self.suite_base_url.clone()],
                 credential_trust_anchor_pem: combine_openid4vc_credential_trust_anchors(
                     attestation.trust_anchor_pem.as_str(),
@@ -362,78 +311,21 @@ fn materialize_openid4vc_dataset_claims(configuration_id: &str, claims: &Value) 
     claims
 }
 
-fn strict_openid4vc_trust_jwks(encoded: &str) -> Result<Value, MaterializerError> {
-    const PUBLIC_MEMBERS: [&str; 6] = ["alg", "crv", "kid", "kty", "x", "y"];
-    const PROVIDER_METADATA_MEMBERS: [&str; 2] = ["use", "x5c"];
-    const PRIVATE_MEMBERS: [&str; 8] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
-
-    let source: Value = serde_json::from_str(encoded).map_err(|_| MaterializerError::Encoding)?;
-    let object = source.as_object().ok_or(MaterializerError::InvalidField(
-        "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-    ))?;
-    if object.keys().any(|name| name != "keys") {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-        ));
-    }
-    let keys = object
-        .get("keys")
-        .and_then(Value::as_array)
-        .filter(|keys| !keys.is_empty())
-        .ok_or(MaterializerError::InvalidField(
-            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-        ))?;
-    let mut public_keys = Vec::with_capacity(keys.len());
-    for key in keys {
-        let source_key = key.as_object().ok_or(MaterializerError::InvalidField(
-            "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-        ))?;
-        if source_key
-            .keys()
-            .any(|name| PRIVATE_MEMBERS.contains(&name.as_str()))
-            || source_key.keys().any(|name| {
-                !PUBLIC_MEMBERS.contains(&name.as_str())
-                    && !PROVIDER_METADATA_MEMBERS.contains(&name.as_str())
-            })
-        {
-            return Err(MaterializerError::InvalidField(
-                "tenant_resource_manifest.openid4vc_trust_policy_jwks",
-            ));
-        }
-        let mut public_key = serde_json::Map::new();
-        for name in PUBLIC_MEMBERS {
-            if let Some(value) = source_key.get(name) {
-                public_key.insert(name.to_owned(), value.clone());
-            }
-        }
-        public_keys.push(Value::Object(public_key));
-    }
-    Ok(serde_json::json!({ "keys": public_keys }))
-}
-
 struct PreparedClient {
     client_secret: Zeroizing<String>,
     rsa_private_jwks: Zeroizing<String>,
-    rsa_public_jwks: Zeroizing<String>,
+    rsa_public_jwks: String,
     ec_private_jwks: Zeroizing<String>,
-    ec_public_jwks: Zeroizing<String>,
-    mtls_ca_certificate: Zeroizing<String>,
-    mtls_client_certificate: Zeroizing<String>,
+    ec_public_jwks: String,
+    mtls_ca_certificate: String,
+    mtls_client_certificate: String,
     mtls_client_key: Zeroizing<String>,
     mtls_client_certificate_sha256: String,
     request: Value,
 }
 
-impl Zeroize for PreparedClient {
-    fn zeroize(&mut self) {
-        self.client_secret.zeroize();
-        self.rsa_private_jwks.zeroize();
-        self.rsa_public_jwks.zeroize();
-        self.ec_private_jwks.zeroize();
-        self.ec_public_jwks.zeroize();
-        self.mtls_ca_certificate.zeroize();
-        self.mtls_client_certificate.zeroize();
-        self.mtls_client_key.zeroize();
+impl Drop for PreparedClient {
+    fn drop(&mut self) {
         zeroize_json_value(&mut self.request);
     }
 }
@@ -441,7 +333,6 @@ impl Zeroize for PreparedClient {
 /// Private bytes are zeroized and can only be written using the owner-only
 /// atomic writer.  The bundle record below intentionally excludes private JWK
 /// values and the mTLS private key.
-#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecureBytes(Zeroizing<Vec<u8>>);
 
 impl SecureBytes {
@@ -499,12 +390,6 @@ impl TenantResourceManifestResource {
     }
 }
 
-impl Drop for TenantResourceManifestResource {
-    fn drop(&mut self) {
-        self.payload_base64url.zeroize();
-    }
-}
-
 /// NazoAuth TenantResourceManifest v1.
 ///
 /// The serialized form is exactly the server's `ApplyManifest` wire shape:
@@ -558,22 +443,14 @@ impl TenantResourceManifest {
         resources.sort_by(|left, right| {
             (left.kind, &left.resource_id).cmp(&(right.kind, &right.resource_id))
         });
-        let mut seen = BTreeSet::new();
         let identities = resources
             .iter()
-            .map(|resource| {
-                if !seen.insert((resource.kind, resource.resource_id.clone())) {
-                    return Err(MaterializerError::InvalidField(
-                        "tenant_resource_manifest.resources",
-                    ));
-                }
-                Ok(TenantResourceIdentity {
-                    kind: resource.kind,
-                    resource_id: resource.resource_id.clone(),
-                    digest: resource.digest.clone(),
-                })
+            .map(|resource| TenantResourceIdentity {
+                kind: resource.kind,
+                resource_id: resource.resource_id.clone(),
+                digest: resource.digest.clone(),
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         #[derive(Serialize)]
         struct Document<'a> {
             schema: u32,
@@ -584,7 +461,7 @@ impl TenantResourceManifest {
             resources: &resources,
         };
         let bytes = serde_json::to_vec(&document).map_err(|_| MaterializerError::Encoding)?;
-        if bytes.is_empty() || bytes.len() > MAX_TENANT_RESOURCE_MANIFEST_BYTES {
+        if bytes.len() > MAX_TENANT_RESOURCE_MANIFEST_BYTES {
             return Err(MaterializerError::Oversize);
         }
         let resource_manifest_sha256 =
@@ -755,31 +632,28 @@ impl TenantResourceApplyOutput {
 
 fn collect_identity_map(
     resources: &[TenantResourceIdentity],
-) -> Result<BTreeMap<(TenantResourceKind, String), String>, MaterializerError> {
+) -> Result<BTreeMap<(TenantResourceKind, &str), &str>, MaterializerError> {
     let mut seen_resource_ids = BTreeSet::new();
     let mut identities = BTreeMap::new();
     for resource in resources {
         validate_resource_id(&resource.resource_id)?;
         validate_digest(&resource.digest, "tenant_resource_identity.digest")?;
-        if !seen_resource_ids.insert(resource.resource_id.clone())
-            || identities
-                .insert(
-                    (resource.kind, resource.resource_id.clone()),
-                    resource.digest.clone(),
-                )
-                .is_some()
-        {
+        if !seen_resource_ids.insert(resource.resource_id.as_str()) {
             return Err(MaterializerError::TenantResourceResultMismatch(
                 "duplicate resource identity",
             ));
         }
+        identities.insert(
+            (resource.kind, resource.resource_id.as_str()),
+            resource.digest.as_str(),
+        );
     }
     Ok(identities)
 }
 
 fn validate_apply_mappings(
     mappings: &[TenantResourceMapping],
-    delta: &BTreeMap<(TenantResourceKind, String), String>,
+    delta: &BTreeMap<(TenantResourceKind, &str), &str>,
 ) -> Result<(), MaterializerError> {
     let expected = delta
         .keys()
@@ -789,13 +663,13 @@ fn validate_apply_mappings(
                 TenantResourceKind::User | TenantResourceKind::OauthClient
             )
         })
-        .cloned()
+        .copied()
         .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
     let mut public_client_ids = BTreeSet::new();
     for mapping in mappings {
         validate_resource_id(&mapping.resource_id)?;
-        if !actual.insert((mapping.kind, mapping.resource_id.clone())) {
+        if !actual.insert((mapping.kind, mapping.resource_id.as_str())) {
             return Err(MaterializerError::TenantResourceResultMismatch(
                 "duplicate mapping",
             ));
@@ -813,7 +687,7 @@ fn validate_apply_mappings(
             }
             TenantResourceKind::OauthClient => {
                 validate_public_id(&mapping.public_id, "OAuth client mapping", 512)?;
-                if !public_client_ids.insert(mapping.public_id.clone()) {
+                if !public_client_ids.insert(mapping.public_id.as_str()) {
                     return Err(MaterializerError::DuplicateClientMapping);
                 }
             }
@@ -844,16 +718,10 @@ fn push_manifest_resource(
     validate_resource_id(&resource_id)?;
     reject_manifest_private_or_suite_value(&payload)?;
     let payload_bytes = serde_json::to_vec(&payload).map_err(|_| MaterializerError::Encoding)?;
-    if payload_bytes.is_empty() || payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
-        return Err(if payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
-            MaterializerError::Oversize
-        } else {
-            MaterializerError::InvalidField("tenant_resource_manifest.payload")
-        });
+    if payload_bytes.len() > MAX_TENANT_RESOURCE_PAYLOAD_BYTES {
+        return Err(MaterializerError::Oversize);
     }
-    *payload_total = payload_total
-        .checked_add(payload_bytes.len())
-        .ok_or(MaterializerError::Oversize)?;
+    *payload_total += payload_bytes.len();
     if *payload_total > MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES {
         return Err(MaterializerError::Oversize);
     }
@@ -871,12 +739,13 @@ fn push_manifest_resource(
     Ok(())
 }
 
-fn stable_resource_id(prefix: &str, value: &str) -> Result<String, MaterializerError> {
-    if prefix.is_empty() || value.is_empty() {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.resource_id",
-        ));
-    }
+fn run_namespace_suffix(run_namespace: &str) -> String {
+    digest_hex(run_namespace.as_bytes())[..32].to_owned()
+}
+
+// Prefixes are fixed call-site constants; values come from the validated descriptor,
+// and run_suffix is produced by run_namespace_suffix.
+fn run_scoped_resource_id(prefix: &str, value: &str, run_suffix: &str) -> String {
     let normalized = value
         .chars()
         .map(|character| {
@@ -887,59 +756,23 @@ fn stable_resource_id(prefix: &str, value: &str) -> Result<String, MaterializerE
             }
         })
         .collect::<String>();
-    let mut candidate = format!(
-        "{}-{}{}",
-        prefix,
-        normalized.trim_matches('-'),
-        if normalized == value {
-            String::new()
-        } else {
-            format!("-{}", &digest_hex(value.as_bytes())[..16])
-        }
-    );
-    if candidate.len() > MAX_TENANT_RESOURCE_ID_BYTES {
-        candidate = format!("{}-{}", prefix, &digest_hex(value.as_bytes())[..32]);
+    let needs_hash_suffix = normalized != value;
+    let normalized = normalized.trim_matches('-');
+    let available_base_bytes = MAX_TENANT_RESOURCE_ID_BYTES - "-run-".len() - run_suffix.len();
+    let base_length = prefix.len() + 1 + normalized.len() + if needs_hash_suffix { 17 } else { 0 };
+    if base_length > available_base_bytes {
+        format!(
+            "{prefix}-{}-run-{run_suffix}",
+            &digest_hex(value.as_bytes())[..32]
+        )
+    } else if needs_hash_suffix {
+        format!(
+            "{prefix}-{normalized}-{}-run-{run_suffix}",
+            &digest_hex(value.as_bytes())[..16]
+        )
+    } else {
+        format!("{prefix}-{normalized}-run-{run_suffix}")
     }
-    validate_resource_id(&candidate)?;
-    Ok(candidate)
-}
-
-fn run_namespace_suffix(run_namespace: &str) -> String {
-    digest_hex(run_namespace.as_bytes())[..32].to_owned()
-}
-
-fn run_scoped_resource_id(
-    prefix: &str,
-    value: &str,
-    run_suffix: &str,
-) -> Result<String, MaterializerError> {
-    if run_suffix.len() != 32
-        || !run_suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.run_namespace",
-        ));
-    }
-    let suffix = format!("-run-{run_suffix}");
-    let available_base_bytes = MAX_TENANT_RESOURCE_ID_BYTES
-        .checked_sub(suffix.len())
-        .ok_or(MaterializerError::InvalidField(
-            "tenant_resource_manifest.resource_id",
-        ))?;
-    let mut base = stable_resource_id(prefix, value)?;
-    if base.len() > available_base_bytes {
-        base = format!("{}-{}", prefix, &digest_hex(value.as_bytes())[..32]);
-    }
-    if base.len() > available_base_bytes {
-        return Err(MaterializerError::InvalidField(
-            "tenant_resource_manifest.resource_id",
-        ));
-    }
-    let candidate = format!("{base}{suffix}");
-    validate_resource_id(&candidate)?;
-    Ok(candidate)
 }
 
 fn validate_resource_id(value: &str) -> Result<(), MaterializerError> {
@@ -985,10 +818,6 @@ fn validate_manifest_certificate_pem(
         return Err(MaterializerError::InvalidField(field));
     }
     Ok(())
-}
-
-fn validate_manifest_client_request(request: &Value) -> Result<(), MaterializerError> {
-    reject_manifest_private_or_suite_value(request)
 }
 
 fn reject_manifest_private_or_suite_value(value: &Value) -> Result<(), MaterializerError> {
@@ -1096,8 +925,6 @@ pub enum MaterializerError {
     SecureIo,
     #[error("onboarding output is missing a required logical client")]
     MissingClientMapping,
-    #[error("onboarding output contains an unexpected logical client")]
-    ExtraClientMapping,
     #[error("onboarding output contains duplicate actual clients")]
     DuplicateClientMapping,
     #[error("onboarding request identity does not match preparation")]
@@ -1199,7 +1026,7 @@ impl DescriptorMaterializer {
                 release: artifact_source_release.to_owned(),
                 digest: artifact_source_digest.to_owned(),
             },
-            openid4vc_credential_datasets: matrix.openid4vc_credential_datasets.clone(),
+            openid4vc_credential_datasets: BTreeMap::new(),
             openid4vc_suite_mdoc_trust_anchor_pem: matrix
                 .openid4vc_suite_mdoc_trust_anchor_pem
                 .clone(),
@@ -1232,31 +1059,31 @@ impl DescriptorMaterializer {
                 .collect(),
             raw_sha256: Some(raw_matrix_sha256.to_owned()),
         };
-        let referenced_datasets = referenced_openid4vc_credential_dataset_ids(&descriptor)?;
-        descriptor
+        let referenced_datasets = referenced_openid4vc_credential_dataset_ids(&descriptor.groups)?;
+        descriptor.openid4vc_credential_datasets = matrix
             .openid4vc_credential_datasets
-            .retain(|configuration_id, _| referenced_datasets.contains(configuration_id));
-        validate_descriptor(&descriptor)?;
+            .iter()
+            .filter(|(configuration_id, _)| referenced_datasets.contains(configuration_id.as_str()))
+            .map(|(configuration_id, claims)| (configuration_id.clone(), claims.clone()))
+            .collect();
         Ok(descriptor)
     }
 
     fn prepare_materialization(
-        descriptor: MatrixDescriptor,
+        mut descriptor: MatrixDescriptor,
         target_issuer: &str,
         suite_origin: &Origin,
         request_jti: &str,
         dynamic_registration_initial_access_token: Option<&str>,
         mdoc_issuing_country: Option<&str>,
     ) -> Result<PreparedMaterialization, MaterializerError> {
-        validate_descriptor(&descriptor)?;
         validate_target_issuer(target_issuer)?;
         validate_request_jti(request_jti)?;
         let matrix_sha256 = descriptor
             .raw_sha256
-            .clone()
+            .take()
             .ok_or(MaterializerError::InvalidField("matrix_sha256"))?;
-        let policies = collect_client_policies(&descriptor)?;
-        let registrations = collect_registrations(&descriptor)?;
+        let registrations = validate_descriptor(&descriptor)?;
         let applicant_password = Zeroizing::new(random_secret(32));
         let applicant_email = Zeroizing::new(format!("oidf-{}@example.invalid", random_hex(16)));
         let tx_code = descriptor_requires_pre_authorized_vci(&descriptor)
@@ -1288,17 +1115,14 @@ impl DescriptorMaterializer {
             .then(|| generate_attestation_material(suite_origin.as_str(), issuing_country))
             .transpose()?;
         let mut clients = BTreeMap::new();
-        for (logical_client_id, policy) in policies {
-            let registration = registrations
-                .get(&logical_client_id)
-                .ok_or(MaterializerError::InvalidField("registration_template"))?;
+        for (logical_client_id, registration) in registrations {
             clients.insert(
-                logical_client_id.clone(),
+                logical_client_id.to_owned(),
                 PreparedClient::new(
                     logical_client_id,
                     &descriptor,
-                    &policy,
-                    registration,
+                    registration.policy,
+                    registration.template,
                     target_issuer,
                     suite_origin.as_str(),
                     request_jti,
@@ -1342,7 +1166,7 @@ impl DescriptorMaterializer {
 
     /// Finalize a Suite matrix from an ordinary tenant-resource Apply.
     pub fn finalize_tenant_resources(
-        prepared: PreparedMaterialization,
+        mut prepared: PreparedMaterialization,
         apply_output: TenantResourceApplyOutput,
         tenant_signing_certificate_chain_pem: impl Into<String>,
     ) -> Result<TenantResourceMaterializedMatrix, MaterializerError> {
@@ -1378,9 +1202,9 @@ impl DescriptorMaterializer {
         }
 
         let run_suffix = run_namespace_suffix(prepared.request_jti());
-        let applicant_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix)?;
+        let applicant_resource_id = run_scoped_resource_id("user", "applicant", &run_suffix);
         let trust_policy_resource_id =
-            run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix)?;
+            run_scoped_resource_id("openid4vc-trust-policy", "provider", &run_suffix);
         let trust_policy_identity = apply_output
             .delta_resources()
             .iter()
@@ -1409,13 +1233,12 @@ impl DescriptorMaterializer {
         let mut clients = BTreeMap::new();
         for logical_client_id in prepared.clients.keys() {
             let resource_id =
-                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix)?;
+                run_scoped_resource_id("oauth-client", logical_client_id, &run_suffix);
             let public_id = mappings
                 .get(&(TenantResourceKind::OauthClient, resource_id.as_str()))
                 .ok_or(MaterializerError::MissingClientMapping)?;
             clients.insert(logical_client_id.clone(), (*public_id).to_owned());
         }
-        validate_client_mapping_keys(&prepared, &clients)?;
 
         let bindings = MaterializationBindings {
             applicant_id,
@@ -1423,54 +1246,38 @@ impl DescriptorMaterializer {
             openid4vc_request_object_trust_anchor_pem: tenant_trust_anchor_pem,
             clients,
         };
-        let matrix = materialize_matrix_document(&prepared, &bindings)?;
+        let matrix = materialize_matrix_document(&mut prepared, &bindings)?;
         Ok(TenantResourceMaterializedMatrix {
             matrix: Some(SelectedMatrix::from_materialized(
                 matrix,
                 prepared.matrix_sha256.clone(),
             )),
             matrix_sha256: prepared.matrix_sha256.clone(),
-            operation_id: apply_output.operation_id().to_owned(),
-            request_hash: apply_output.request_hash().to_owned(),
-            controller_kid: apply_output.controller_kid().to_owned(),
-            applied_revision: apply_output.revision(),
-            resource_manifest_sha256: apply_output.resource_manifest_sha256().to_owned(),
+            operation_id: apply_output.operation_id,
+            request_hash: apply_output.request_hash,
+            controller_kid: apply_output.controller_kid,
+            applied_revision: apply_output.revision,
+            resource_manifest_sha256: apply_output.resource_manifest_sha256,
             applicant_id: applicant_uuid,
-            clients: bindings.clients.clone(),
+            clients: bindings.clients,
             trust_policy_identity,
         })
     }
 }
 
-fn validate_client_mapping_keys(
-    prepared: &PreparedMaterialization,
-    clients: &BTreeMap<String, String>,
-) -> Result<(), MaterializerError> {
-    let expected = prepared.clients.keys().collect::<BTreeSet<_>>();
-    let actual = clients.keys().collect::<BTreeSet<_>>();
-    if !expected.is_subset(&actual) {
-        return Err(MaterializerError::MissingClientMapping);
-    }
-    if !actual.is_subset(&expected) {
-        return Err(MaterializerError::ExtraClientMapping);
-    }
-    Ok(())
-}
-
 fn materialize_matrix_document(
-    prepared: &PreparedMaterialization,
+    prepared: &mut PreparedMaterialization,
     bindings: &MaterializationBindings,
 ) -> Result<MatrixDocument, MaterializerError> {
     let mut groups = Vec::with_capacity(prepared.descriptor.groups.len());
-    for group in &prepared.descriptor.groups {
+    for group in std::mem::take(&mut prepared.descriptor.groups) {
         let mut plans = Vec::with_capacity(group.plans.len());
-        for plan in &group.plans {
+        for plan in group.plans {
             let config = materialize_value(
-                &plan.config_template,
+                plan.config_template,
                 &plan.secret_bindings,
                 prepared,
                 bindings,
-                &mut BTreeSet::new(),
             )?;
             let config = materialize_vci_config(
                 &plan.plan,
@@ -1491,19 +1298,19 @@ fn materialize_matrix_document(
                 prepared.attestation.as_ref(),
             )?;
             plans.push(MatrixPlan {
-                id: plan.id.clone(),
-                plan: plan.plan.clone(),
+                id: plan.id,
+                plan: plan.plan,
                 config,
-                variant: plan.variant.clone(),
-                expected_results: plan.expected_results.clone(),
+                variant: plan.variant,
+                expected_results: plan.expected_results,
             });
         }
         groups.push(MatrixGroup {
-            id: group.id.clone(),
-            profile: group.profile.clone(),
+            id: group.id,
+            profile: group.profile,
             variant: MatrixVariant {
-                id: group.variant.id.clone(),
-                values: group.variant.values.clone(),
+                id: group.variant.id,
+                values: group.variant.values,
             },
             plans,
         });
@@ -1527,14 +1334,6 @@ pub struct TenantResourceMaterializedMatrix {
     applicant_id: Uuid,
     clients: BTreeMap<String, String>,
     trust_policy_identity: Option<TenantResourceIdentity>,
-}
-
-impl Drop for TenantResourceMaterializedMatrix {
-    fn drop(&mut self) {
-        if let Some(matrix) = &mut self.matrix {
-            matrix.zeroize_config();
-        }
-    }
 }
 
 impl TenantResourceMaterializedMatrix {
@@ -1610,7 +1409,7 @@ impl std::fmt::Debug for TenantResourceMaterializedMatrix {
 
 impl PreparedClient {
     fn new(
-        logical_client_id: String,
+        logical_client_id: &str,
         descriptor: &MatrixDescriptor,
         policy: &CryptoPolicy,
         registration_template: &Value,
@@ -1648,7 +1447,7 @@ impl PreparedClient {
         )?;
         let mut request = materialize_registration_template(
             registration_template,
-            &logical_client_id,
+            logical_client_id,
             target_issuer,
             suite_origin,
             &generated.rsa_public_jwks,
@@ -1797,6 +1596,35 @@ mod tests {
     use crate::materializer::crypto::generate_mtls;
 
     #[test]
+    fn scoped_resource_ids_preserve_existing_bytes_at_length_and_normalization_boundaries() {
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let boundary = "a".repeat(78);
+        let cases = [
+            ("client".to_owned(), "oauth-client-client".to_owned()),
+            (
+                "client bad".to_owned(),
+                "oauth-client-client-bad-0f5b0b0575d09479".to_owned(),
+            ),
+            (boundary.clone(), format!("oauth-client-{boundary}")),
+            (
+                "a".repeat(79),
+                "oauth-client-daa76b4d16679957833226a884450609".to_owned(),
+            ),
+            (
+                format!("{} bad", "a".repeat(100)),
+                "oauth-client-c62229478d6097202dee780bff7fc745".to_owned(),
+            ),
+            ("客".repeat(70), "oauth-client--9ba568dccb565324".to_owned()),
+        ];
+        for (value, expected_base) in cases {
+            assert_eq!(
+                run_scoped_resource_id("oauth-client", &value, suffix),
+                format!("{expected_base}-run-{suffix}")
+            );
+        }
+    }
+
+    #[test]
     fn mdoc_dataset_binary_elements_are_materialized_as_base64url() {
         let claims = serde_json::json!({
             "org.iso.18013.5.1": {
@@ -1817,11 +1645,80 @@ mod tests {
     }
 
     #[test]
+    fn manifest_canonicalization_rejects_duplicate_resource_identities() {
+        let resources = (0..2)
+            .map(|_| TenantResourceManifestResource {
+                kind: TenantResourceKind::User,
+                resource_id: "same-user".to_owned(),
+                payload_base64url: Zeroizing::new("e30".to_owned()),
+                digest: "a".repeat(64),
+            })
+            .collect();
+        assert!(matches!(
+            TenantResourceManifest::from_resources(resources),
+            Err(MaterializerError::InvalidField(
+                "tenant_resource_manifest.resources"
+            ))
+        ));
+    }
+
+    #[test]
+    fn manifest_payload_limits_accept_exact_total_and_reject_the_next_resource() {
+        let mut resources = Vec::new();
+        let mut total = 0;
+        // A JSON string adds two quote bytes to the ASCII payload.
+        for index in 0..MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES / MAX_TENANT_RESOURCE_PAYLOAD_BYTES
+        {
+            push_manifest_resource(
+                &mut resources,
+                &mut total,
+                TenantResourceKind::User,
+                format!("user-{index}"),
+                Value::String("a".repeat(MAX_TENANT_RESOURCE_PAYLOAD_BYTES - 2)),
+            )
+            .unwrap();
+        }
+        assert_eq!(total, MAX_TENANT_RESOURCE_PAYLOAD_TOTAL_BYTES);
+        let count = resources.len();
+        assert!(matches!(
+            push_manifest_resource(
+                &mut resources,
+                &mut total,
+                TenantResourceKind::User,
+                "next-user".to_owned(),
+                Value::Null
+            ),
+            Err(MaterializerError::Oversize)
+        ));
+        assert_eq!(resources.len(), count);
+        let mut fresh_total = 0;
+        assert!(matches!(
+            push_manifest_resource(
+                &mut resources,
+                &mut fresh_total,
+                TenantResourceKind::User,
+                "oversized-user".to_owned(),
+                Value::String("a".repeat(MAX_TENANT_RESOURCE_PAYLOAD_BYTES - 1))
+            ),
+            Err(MaterializerError::Oversize)
+        ));
+        assert_eq!(fresh_total, 0);
+    }
+
+    #[test]
     fn registration_template_rejects_forbidden_control_fields() {
         for field in ["conformance_lease_id", "conformance_task_jti"] {
             let request = Value::Object([(field.to_owned(), Value::Null)].into_iter().collect());
+            let mut resources = Vec::new();
+            let mut total = 0;
             assert_eq!(
-                validate_manifest_client_request(&request),
+                push_manifest_resource(
+                    &mut resources,
+                    &mut total,
+                    TenantResourceKind::OauthClient,
+                    "client".to_owned(),
+                    serde_json::json!({"request": request}),
+                ),
                 Err(MaterializerError::InvalidField(
                     "tenant_resource_manifest.forbidden_field"
                 ))
@@ -2130,10 +2027,25 @@ mod tests {
                         serde_json::from_value(payload.clone()).expect("trust policy payload");
                     validate_openid4vc_trust_policy(&policy)
                         .expect("ordinary trust policy must satisfy the shared wire contract");
-                    for jwks in [
-                        &policy.client_attestation_jwks,
-                        &policy.key_attestation_jwks,
+                    let attestation = prepared.attestation.as_ref().expect("attestation");
+                    for (jwks, private) in [
+                        (
+                            &policy.client_attestation_jwks,
+                            &attestation.attester_private_jwks,
+                        ),
+                        (
+                            &policy.key_attestation_jwks,
+                            &attestation.key_attestation_private_jwks,
+                        ),
                     ] {
+                        let private: Value = serde_json::from_str(private).expect("private JWKS");
+                        assert_eq!(jwks["keys"].as_array().unwrap().len(), 1);
+                        for name in ["alg", "crv", "kid", "kty", "x", "y"] {
+                            assert_eq!(jwks["keys"][0][name], private["keys"][0][name]);
+                        }
+                        assert!(private["keys"][0]["d"].is_string());
+                        assert_eq!(private["keys"][0]["use"], "sig");
+                        assert!(private["keys"][0]["x5c"][0].is_string());
                         assert_eq!(
                             jwks.as_object()
                                 .expect("JWKS object")
@@ -2216,22 +2128,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_trust_policy_jwks_rejects_private_and_unknown_members() {
-        for encoded in [
-            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y","d":"secret"}]}"#,
-            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"x","y":"y","provider":"state"}]}"#,
-            r#"{"keys":[],"issuer":"https://unexpected.example"}"#,
-        ] {
-            assert!(matches!(
-                strict_openid4vc_trust_jwks(encoded),
-                Err(MaterializerError::InvalidField(
-                    "tenant_resource_manifest.openid4vc_trust_policy_jwks"
-                ))
-            ));
-        }
-    }
-
-    #[test]
     fn registration_set_metadata_is_stably_deduplicated() {
         let mut request = serde_json::json!({
             "scopes": ["openid", "profile", "openid"],
@@ -2286,6 +2182,10 @@ mod tests {
         assert_eq!(first.bytes().as_bytes(), rebuilt.bytes().as_bytes());
         assert!(matches!(
             first_prepared.tenant_resource_manifest(second_namespace),
+            Err(MaterializerError::RequestMismatch)
+        ));
+        assert!(matches!(
+            first_prepared.tenant_resource_manifest("invalid"),
             Err(MaterializerError::RequestMismatch)
         ));
         let second = second_prepared
@@ -2359,8 +2259,18 @@ mod tests {
 
     #[test]
     fn ordinary_finalize_uses_typed_apply_mappings_without_lease_identity() {
+        let mut descriptor = descriptor();
+        let plan = &mut descriptor.groups[0].plans[0];
+        plan.secret_bindings = BTreeMap::from([
+            ("outer".into(), "{{secret.inner}}".into()),
+            ("inner".into(), "{{client.web.id}}".into()),
+        ]);
+        plan.config_template["client_id"] = serde_json::json!("{{outer}}");
+        plan.config_template["nested"] = serde_json::json!([
+            {"client": "{{secret.outer}}", "literal": "保留原值"}, 17, null
+        ]);
         let prepared = prepare_for_test(
-            descriptor(),
+            descriptor,
             "https://issuer.example",
             &suite(),
             request_jti(),
@@ -2392,9 +2302,52 @@ mod tests {
             "actual-client"
         );
         assert_eq!(
+            finalized.matrix().document.groups[0].plans[0].config["nested"],
+            serde_json::json!([{"client": "actual-client", "literal": "保留原值"}, 17, null])
+        );
+        assert_eq!(
             finalized.operation_id(),
             "01890f8e-7c18-7b70-9d1e-9bb8c44a2f50"
         );
+    }
+
+    #[test]
+    fn preparation_rejects_invalid_alias_graphs_before_materialization() {
+        for (bindings, expected) in [
+            (
+                BTreeMap::from([
+                    ("outer".into(), "{{secret.inner}}".into()),
+                    ("inner".into(), "{{outer}}".into()),
+                ]),
+                MaterializerError::SecretCycle,
+            ),
+            (
+                BTreeMap::from([("outer".into(), "{{secret.missing}}".into())]),
+                MaterializerError::UnknownSecretReference("secret.missing".into()),
+            ),
+            (
+                BTreeMap::from([("outer".into(), "{{plan.other}}".into())]),
+                MaterializerError::CrossPlanReference("plan.other".into()),
+            ),
+            (
+                BTreeMap::from([("outer".into(), "{{client.missing.id}}".into())]),
+                MaterializerError::UnknownClientReference("missing".into()),
+            ),
+        ] {
+            let mut descriptor = descriptor();
+            let plan = &mut descriptor.groups[0].plans[0];
+            plan.secret_bindings = bindings;
+            plan.config_template["client_id"] = serde_json::json!("{{outer}}");
+            let error = prepare_for_test(
+                descriptor,
+                "https://issuer.example",
+                &suite(),
+                request_jti(),
+            )
+            .err()
+            .expect("invalid descriptor must fail during preparation");
+            assert_eq!(error, expected);
+        }
     }
 
     #[test]
@@ -3129,13 +3082,56 @@ mod tests {
     }
 
     #[test]
+    fn shared_clients_borrow_one_registration_and_reject_conflicts() {
+        let mut descriptor = descriptor();
+        let mut second = descriptor.groups[0].plans[0].clone();
+        second.id = "second-plan".to_owned();
+        descriptor.groups[0].plans.push(second);
+        let clients = validate_descriptor(&descriptor).expect("shared client");
+        assert_eq!(clients.len(), 1);
+        let client = &clients["web"];
+        assert!(std::ptr::eq(
+            client.policy,
+            &descriptor.groups[0].plans[0].crypto
+        ));
+        assert!(std::ptr::eq(
+            client.template,
+            descriptor.groups[0].required_roles[0]
+                .registration_template
+                .as_ref()
+                .unwrap(),
+        ));
+
+        descriptor.groups[0].plans[1].crypto.rsa_bits = 4096;
+        assert!(matches!(
+            validate_descriptor(&descriptor),
+            Err(MaterializerError::InvalidField("client crypto policy"))
+        ));
+        descriptor.groups[0].plans[1].crypto.rsa_bits = 2048;
+        let mut second_group = descriptor.groups[0].clone();
+        second_group.id = "second-group".to_owned();
+        for plan in &mut second_group.plans {
+            plan.id = format!("other-{}", plan.id);
+        }
+        second_group.required_roles[0]
+            .registration_template
+            .as_mut()
+            .unwrap()["client_name"] = serde_json::json!("conflicting client");
+        descriptor.groups.push(second_group);
+        assert!(matches!(
+            validate_descriptor(&descriptor),
+            Err(MaterializerError::InvalidField("registration_template"))
+        ));
+    }
+
+    #[test]
     fn review_cannot_be_preapproved_by_the_signed_matrix() {
         let mut descriptor = descriptor();
         descriptor.groups[0].plans[0]
             .expected_results
             .insert("oidcc-review".to_owned(), "REVIEW".to_owned());
         assert_eq!(
-            validate_descriptor(&descriptor),
+            validate_descriptor(&descriptor).map(|_| ()),
             Err(MaterializerError::InvalidField(
                 "plan.expected_results.result"
             ))
@@ -3386,6 +3382,34 @@ mod tests {
             .expect("conflicting dataset must fail"),
             MaterializerError::InvalidField("nazo.credential_dataset")
         );
+    }
+
+    #[test]
+    fn shared_vci_dataset_keeps_its_node_limit() {
+        let mut descriptor = descriptor_with_openid4vc_plan(
+            "oid4vci-1_0-issuer-test-plan",
+            BTreeMap::from([("credential_format".to_owned(), "sd_jwt_vc".to_owned())]),
+            serde_json::json!({
+                "alias": "nazo-vci-dataset",
+                "vci": {"credential_configuration_id": "eu.example.pid"},
+                "nazo": {"openid4vc_role": "issuer", "credential_format": "sd_jwt_vc"}
+            }),
+        );
+        let mut second = descriptor.groups[0].plans[0].clone();
+        second.id = "second-vci-plan".to_owned();
+        descriptor.groups[0].plans.push(second);
+        for (children, valid) in [(510, true), (511, false)] {
+            descriptor.openid4vc_credential_datasets.insert(
+                "eu.example.pid".to_owned(),
+                serde_json::json!({"claims": vec![Value::Null; children]}),
+            );
+            let result = validate_descriptor(&descriptor).map(|_| ());
+            if valid {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err(), MaterializerError::Oversize);
+            }
+        }
     }
 
     #[test]

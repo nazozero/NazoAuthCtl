@@ -10,7 +10,6 @@ use super::super::{
     ArtifactReference, BlobAttestationVerification, HostServiceInstall, RuntimeReplacement,
     container_shared,
 };
-use super::discovery;
 
 pub(super) fn available(command: &OsStr) -> bool {
     Process::new(command)
@@ -66,26 +65,6 @@ pub(super) fn stop(command: &OsStr, object_reference: &str) -> anyhow::Result<()
     Process::new(command)
         .args(["stop", object_reference])
         .run_quiet()
-}
-
-pub(super) fn quiesce_for_recovery(command: &OsStr, object_reference: &str) -> anyhow::Result<()> {
-    let output = Process::new(command)
-        .args(["inspect", "--type", "container", object_reference])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-        if stderr.contains("no such object") || stderr.contains("no such container") {
-            return Ok(());
-        }
-        bail!("Docker could not prove the recovery runtime is stopped or absent");
-    }
-    if discovery::inspect(command, object_reference)?.running {
-        stop(command, object_reference)?;
-    }
-    if discovery::inspect(command, object_reference)?.running {
-        bail!("Docker recovery runtime remained active after stop");
-    }
-    Ok(())
 }
 
 pub(super) fn restart(command: &OsStr, object_reference: &str) -> anyhow::Result<()> {

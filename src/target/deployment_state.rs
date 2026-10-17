@@ -62,8 +62,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::bail;
 use chrono::{DateTime, Utc};
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::error_codes::{CONFIG_REVISION_MISMATCH, STATE_RESET_REQUIRED};
 use crate::filesystem;
@@ -446,10 +446,10 @@ impl DeploymentState {
         let mut seen = Vec::with_capacity(self.resources.len());
         for resource in &self.resources {
             resource.validate()?;
-            if seen.contains(&resource.resource_id) {
+            if seen.contains(&resource.resource_id.as_str()) {
                 bail!("duplicate resource id '{}'", resource.resource_id);
             }
-            seen.push(resource.resource_id.clone());
+            seen.push(resource.resource_id.as_str());
         }
         if self.local_health.summary.len() > 512 {
             bail!("health summary must be at most 512 characters");
@@ -626,7 +626,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        Ok(scope_path(&self.root, &scope))
+        Ok(scope_path(&self.root, scope))
     }
 
     /// The single decision point for where one deployment's state document
@@ -643,16 +643,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        let path = self.state_path(&scope);
-        let bytes = filesystem::read_secure_regular_file(
-            &path,
-            "target DeploymentState",
-            false,
-            MAX_STATE_BYTES,
-        )
-        .map_err(|error| unreadable_state(deployment_id, &path, &error))?;
-        super::persistence::read_deployment_state(&bytes)
-            .map_err(|error| invalid_state(&path, &error))
+        read_state(&self.state_path(scope), deployment_id)
     }
 
     /// Enumerate every deployment whose state document exists under this root
@@ -666,13 +657,7 @@ impl TargetStateStore {
     pub fn list_deployments(&self) -> Result<Vec<DeploymentState>, Failure> {
         let deployments_dir = self.root.join("deployments");
         let entries = match std::fs::read_dir(&deployments_dir) {
-            Ok(entries) => entries.collect::<Result<Vec<_>, _>>().map_err(|error| {
-                Failure::new(
-                    DEPLOYMENT_UNKNOWN,
-                    format!("failed to list {}: {error}", deployments_dir.display()),
-                )
-            })?,
-            // A fresh target has no deployments directory yet: zero findings.
+            Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
                 return Err(Failure::new(
@@ -681,25 +666,37 @@ impl TargetStateStore {
                 ));
             }
         };
-        let mut scopes: Vec<String> = Vec::new();
+        let mut states = Vec::new();
         for entry in entries {
+            let entry = entry.map_err(|error| {
+                Failure::new(
+                    DEPLOYMENT_UNKNOWN,
+                    format!("failed to list {}: {error}", deployments_dir.display()),
+                )
+            })?;
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
-            if !path.join("state.json").is_file() {
-                continue;
-            }
-            match path.file_name().and_then(|name| name.to_str()) {
-                Some(scope) => scopes.push(scope.to_owned()),
-                None => scopes.push(String::from("")),
+            let scope = entry.file_name();
+            let scope = scope.to_str().ok_or_else(|| {
+                Failure::new(
+                    STATE_RESET_REQUIRED,
+                    "deployment directory name is not UTF-8",
+                )
+            })?;
+            match read_state(&path.join("state.json"), scope) {
+                Ok(state) => {
+                    journal::deployment_scope(scope).map_err(|error| {
+                        Failure::new(STATE_RESET_REQUIRED, sanitize_detail(&error.to_string()))
+                    })?;
+                    states.push(state);
+                }
+                Err(failure) if failure.code == DEPLOYMENT_UNKNOWN => {}
+                Err(failure) => return Err(failure),
             }
         }
-        scopes.sort();
-        let mut states = Vec::with_capacity(scopes.len());
-        for scope in scopes {
-            states.push(self.load_existing(&scope)?);
-        }
+        states.sort_by(|a, b| a.deployment_id.cmp(&b.deployment_id));
         Ok(states)
     }
 
@@ -765,33 +762,37 @@ impl TargetStateStore {
         } = params;
         // Port reservations are persisted in DeploymentState, including stopped
         // deployments. Serialize admission across deployment IDs before writing.
-        let _port_guard = StateLock::acquire(self.root.join("runtime-ports.lock"))?;
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
-        if let Ok(existing) = self.load_existing(deployment_id) {
-            if existing
-                .active_host_operation
-                .as_ref()
-                .is_some_and(|active| active.operation_id == operation_id)
-            {
-                return if existing.local_health.healthy == local_health.healthy {
-                    Ok(existing)
-                } else {
-                    Err(Failure::new(
-                        DEPLOYMENT_EXISTS,
-                        format!(
-                            "deployment '{deployment_id}' holds an incomplete state for operation {operation_id}"
-                        ),
-                    ))
-                };
-            }
-            return Err(Failure::new(
-                DEPLOYMENT_EXISTS,
-                format!(
-                    "a DeploymentState already exists for '{deployment_id}' at revision {}; \
+        let _port_guard = acquire_state_lock(self.root.join("runtime-ports.lock"))?;
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
+        match self.load_existing(deployment_id) {
+            Ok(existing) => {
+                if existing
+                    .active_host_operation
+                    .as_ref()
+                    .is_some_and(|active| active.operation_id == operation_id)
+                {
+                    return if existing.local_health.healthy == local_health.healthy {
+                        Ok(existing)
+                    } else {
+                        Err(Failure::new(
+                            DEPLOYMENT_EXISTS,
+                            format!(
+                                "deployment '{deployment_id}' holds an incomplete state for operation {operation_id}"
+                            ),
+                        ))
+                    };
+                }
+                return Err(Failure::new(
+                    DEPLOYMENT_EXISTS,
+                    format!(
+                        "a DeploymentState already exists for '{deployment_id}' at revision {}; \
                      bootstrap never overwrites existing state",
-                    existing.config.revision
-                ),
-            ));
+                        existing.config.revision
+                    ),
+                ));
+            }
+            Err(failure) if failure.code == DEPLOYMENT_UNKNOWN => {}
+            Err(failure) => return Err(failure),
         }
         if let Some(owner) = self
             .list_deployments()?
@@ -832,7 +833,7 @@ impl TargetStateStore {
         state.validate().map_err(|error| {
             Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string())
         })?;
-        self.persist_exact(&scope, state)
+        self.persist_exact(scope, state)
     }
 
     /// Apply a config change under revision CAS (F04). `expected_revision`
@@ -847,7 +848,7 @@ impl TargetStateStore {
         schema: String,
         operation_id: &str,
     ) -> Result<ConfigState, Failure> {
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
         let mut state = self.load_existing(deployment_id)?;
         if state
             .active_host_operation
@@ -879,7 +880,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        persist(&scope_path(&self.root, &scope), &state)?;
+        persist(&scope_path(&self.root, scope), &state)?;
         Ok(state.config)
     }
 
@@ -893,7 +894,7 @@ impl TargetStateStore {
         operation_id: &str,
         target_artifact: &str,
     ) -> Result<(), Failure> {
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
         let mut state = self.load_existing(deployment_id)?;
         if state.config.revision != expected_revision {
             return Err(Failure::new(
@@ -926,7 +927,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        persist(&scope_path(&self.root, &scope), &state)
+        persist(&scope_path(&self.root, scope), &state)
     }
 
     /// Commit an update (G03): swap `previous=current`, point `current` at
@@ -960,7 +961,7 @@ impl TargetStateStore {
             config,
             operation_id,
         } = commit;
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
         let mut state = self.load_existing(deployment_id)?;
         if state
             .active_host_operation
@@ -1032,7 +1033,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        self.persist_exact(&scope, state)
+        self.persist_exact(scope, state)
     }
 
     /// Commit the state facts produced by a completed recovery (H06). The
@@ -1046,7 +1047,7 @@ impl TargetStateStore {
         facts: &super::backup_exec::RecoveryFacts,
         operation_id: &str,
     ) -> Result<DeploymentState, Failure> {
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
         let mut state = self.load_existing(deployment_id)?;
         if state
             .active_host_operation
@@ -1086,7 +1087,7 @@ impl TargetStateStore {
 
         // Keep the formal locator from the live state. Only the schema comes
         // from the restored snapshot, and the revision remains monotonic.
-        let config_reference = state.config.reference.clone();
+        let config_reference = std::mem::take(&mut state.config.reference);
         state
             .config
             .advance(config_reference, facts.config_schema.clone())
@@ -1101,7 +1102,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        persist(&scope_path(&self.root, &scope), &state)?;
+        persist(&scope_path(&self.root, scope), &state)?;
         Ok(state)
     }
 
@@ -1116,7 +1117,7 @@ impl TargetStateStore {
         config: Option<(String, String)>,
         operation_id: &str,
     ) -> Result<DeploymentState, Failure> {
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
         let mut state = self.load_existing(deployment_id)?;
         if state
             .active_host_operation
@@ -1141,7 +1142,7 @@ impl TargetStateStore {
                 "an applied migration forbids artifact/config rollback; keep the writer stopped and recover a verified backup",
             ));
         }
-        let Some(previous) = state.artifact.previous.clone() else {
+        let Some(previous) = state.artifact.previous.take() else {
             return Err(Failure::new(
                 ROLLBACK_UNAVAILABLE,
                 format!(
@@ -1178,7 +1179,7 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        self.persist_exact(&scope, state)
+        self.persist_exact(scope, state)
     }
 
     /// Remove the state document after a completed uninstall (G06). An exact
@@ -1193,24 +1194,32 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
-        let state_path = self.state_path(&scope);
-        if !state_path.exists() {
-            return if completion_matches(
-                read_uninstall_completion(&scope_path(&self.root, &scope))?.as_ref(),
-                deployment_id,
-                expected_revision,
-                operation_id,
-            ) {
-                Ok(())
-            } else {
-                Err(Failure::new(
-                    DEPLOYMENT_UNKNOWN,
-                    format!("no DeploymentState exists for '{deployment_id}'"),
-                ))
-            };
-        }
-        let state = self.load_existing(deployment_id)?;
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
+        let state_path = self.state_path(scope);
+        let bytes = match filesystem::read_secure_regular_file(
+            &state_path,
+            "target DeploymentState",
+            false,
+            MAX_STATE_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let failure = unreadable_state(deployment_id, &state_path, &error);
+                return if failure.code == DEPLOYMENT_UNKNOWN
+                    && completion_matches(
+                        read_uninstall_completion(&scope_path(&self.root, scope))?.as_ref(),
+                        deployment_id,
+                        expected_revision,
+                        operation_id,
+                    ) {
+                    Ok(())
+                } else {
+                    Err(failure)
+                };
+            }
+        };
+        let state = super::persistence::read_deployment_state(&bytes)
+            .map_err(|error| invalid_state(&state_path, &error))?;
         if state.config.revision != expected_revision {
             return Err(Failure::new(
                 CONFIG_REVISION_MISMATCH,
@@ -1222,8 +1231,8 @@ impl TargetStateStore {
             ));
         }
         write_uninstall_completion(
-            &scope_path(&self.root, &scope),
-            &state_path,
+            &scope_path(&self.root, scope),
+            hex::encode(Sha256::digest(&bytes)),
             deployment_id,
             operation_id,
             state.config.revision,
@@ -1250,8 +1259,8 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        let _guard = StateLock::acquire(self.lock_path(deployment_id)?)?;
-        let scope_path = scope_path(&self.root, &scope);
+        let _guard = acquire_state_lock(self.lock_path(deployment_id)?)?;
+        let scope_path = scope_path(&self.root, scope);
         let Some(completion) = read_uninstall_completion(&scope_path)? else {
             return Ok(false);
         };
@@ -1263,22 +1272,30 @@ impl TargetStateStore {
         ) {
             return Ok(false);
         }
-        let state_path = self.state_path(&scope);
-        if state_path.exists() {
-            let current_sha256 = filesystem::sha256(&state_path).map_err(|error| {
-                Failure::new(
+        let state_path = self.state_path(scope);
+        let current_sha256 = match filesystem::sha256(&state_path) {
+            Ok(digest) => digest,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(true);
+            }
+            Err(error) => {
+                return Err(Failure::new(
                     STATE_RESET_REQUIRED,
                     format!("failed to hash {}: {error}", state_path.display()),
+                ));
+            }
+        };
+        if current_sha256 == completion.state_sha256 {
+            filesystem::remove_file_durable(&state_path).map_err(|error| {
+                Failure::new(
+                    DEPLOYMENT_UNKNOWN,
+                    format!("failed to remove {}: {error}", state_path.display()),
                 )
             })?;
-            if current_sha256 == completion.state_sha256 {
-                filesystem::remove_file_durable(&state_path).map_err(|error| {
-                    Failure::new(
-                        DEPLOYMENT_UNKNOWN,
-                        format!("failed to remove {}: {error}", state_path.display()),
-                    )
-                })?;
-            }
         }
         Ok(true)
     }
@@ -1287,10 +1304,10 @@ impl TargetStateStore {
         let scope = journal::deployment_scope(deployment_id).map_err(|error| {
             Failure::new(DEPLOYMENT_UNKNOWN, sanitize_detail(&error.to_string()))
         })?;
-        Ok(scope_path(&self.root, &scope).with_extension("lock"))
+        Ok(scope_path(&self.root, scope).with_extension("lock"))
     }
 
-    /// Persist one complete state generation while its StateLock is held.
+    /// Persist one complete state generation while its state lock is held.
     /// Readback cannot substitute for a successful durable publication.
     fn persist_exact(
         &self,
@@ -1308,6 +1325,17 @@ fn scope_path(root: &Path, scope: &str) -> PathBuf {
     root.join("deployments").join(scope)
 }
 
+fn read_state(path: &Path, deployment_id: &str) -> Result<DeploymentState, Failure> {
+    let bytes = filesystem::read_secure_regular_file(
+        path,
+        "target DeploymentState",
+        false,
+        MAX_STATE_BYTES,
+    )
+    .map_err(|error| unreadable_state(deployment_id, path, &error))?;
+    super::persistence::read_deployment_state(&bytes).map_err(|error| invalid_state(path, &error))
+}
+
 fn persist(path: &Path, state: &DeploymentState) -> Result<(), Failure> {
     let target = path.join("state.json");
     let bytes = serde_json::to_vec_pretty(state)
@@ -1322,17 +1350,11 @@ fn persist(path: &Path, state: &DeploymentState) -> Result<(), Failure> {
 
 fn write_uninstall_completion(
     scope: &Path,
-    state_path: &Path,
+    state_sha256: String,
     deployment_id: &str,
     operation_id: &str,
     revision: u64,
 ) -> Result<(), Failure> {
-    let state_sha256 = filesystem::sha256(state_path).map_err(|error| {
-        Failure::new(
-            STATE_RESET_REQUIRED,
-            format!("failed to hash {}: {error}", state_path.display()),
-        )
-    })?;
     let completion = UninstallCompletion {
         schema: UNINSTALL_COMPLETION_SCHEMA,
         deployment_id: deployment_id.to_owned(),
@@ -1353,23 +1375,23 @@ fn write_uninstall_completion(
 
 fn read_uninstall_completion(scope: &Path) -> Result<Option<UninstallCompletion>, Failure> {
     let path = scope.join(UNINSTALL_COMPLETION_FILE);
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Failure::new(
-                STATE_RESET_REQUIRED,
-                format!("failed to inspect {}: {error}", path.display()),
-            ));
-        }
-        Ok(_) => {}
-    }
-    let bytes = filesystem::read_secure_regular_file(&path, "uninstall completion", false, 4096)
-        .map_err(|error| {
-            Failure::new(
-                STATE_RESET_REQUIRED,
-                format!("failed to read {}: {error}", path.display()),
-            )
-        })?;
+    let bytes =
+        match filesystem::read_secure_regular_file(&path, "uninstall completion", false, 4096) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(Failure::new(
+                    STATE_RESET_REQUIRED,
+                    format!("failed to read {}: {error}", path.display()),
+                ));
+            }
+        };
     let completion: UninstallCompletion = serde_json::from_slice(&bytes).map_err(|error| {
         Failure::new(
             STATE_RESET_REQUIRED,
@@ -1407,39 +1429,20 @@ fn completion_matches(
 /// Exclusive lock serializing read-modify-write cycles on one deployment's
 /// state document. Always acquired *inside* the journal lock, keeping the
 /// global ordering journal → state deadlock-free.
-struct StateLock {
-    file: std::fs::File,
+fn acquire_state_lock(path: PathBuf) -> Result<crate::file_lock::FileLock, Failure> {
+    let parent = path.parent().expect("state lock has a parent");
+    filesystem::ensure_directory_chain(parent).map_err(|error| {
+        Failure::new(DEPLOYMENT_UNKNOWN, format!("{}: {error}", parent.display()))
+    })?;
+    crate::file_lock::FileLock::acquire(&path)
+        .map_err(|error| Failure::new(DEPLOYMENT_UNKNOWN, error.to_string()))
 }
 
-impl StateLock {
-    fn acquire(path: PathBuf) -> Result<Self, Failure> {
-        let parent = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        filesystem::ensure_directory_chain(&parent).map_err(|error| {
-            Failure::new(DEPLOYMENT_UNKNOWN, format!("{}: {error}", parent.display()))
-        })?;
-        let file = filesystem::open_lock_file(&path, false, "target state lock")
-            .map_err(|error| Failure::new(DEPLOYMENT_UNKNOWN, error.to_string()))?;
-        file.try_lock_exclusive().map_err(|error| {
-            Failure::new(
-                DEPLOYMENT_UNKNOWN,
-                format!("another writer holds {}: {error}", path.display()),
-            )
-        })?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-fn unreadable_state(deployment_id: &str, path: &Path, error: &dyn std::fmt::Display) -> Failure {
-    if !path.exists() {
+fn unreadable_state(deployment_id: &str, path: &Path, error: &anyhow::Error) -> Failure {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
         return Failure::new(
             DEPLOYMENT_UNKNOWN,
             format!(
@@ -1515,11 +1518,7 @@ pub(crate) fn canonical_recovery_artifact(
             "recovery artifact digest must be 64 lowercase hexadecimal characters",
         ));
     }
-    let reference = format!("sha256:{digest}");
-    crate::registry::validate_identifier(&reference, 256, "artifact reference").map_err(
-        |error| Failure::new(super::wire::HOST_ERR_OPERATION_INVALID, error.to_string()),
-    )?;
-    Ok(reference)
+    Ok(format!("sha256:{digest}"))
 }
 
 #[cfg(test)]
@@ -1605,7 +1604,7 @@ mod tests {
         let mut state = state;
         state.previous_release = Some(previous_release.clone());
         let scope = journal::deployment_scope("deploy-same")?;
-        persist(&scope_path(&store.root, &scope), &state)?;
+        persist(&scope_path(&store.root, scope), &state)?;
 
         let updated = store.apply_update_healthy(
             "deploy-same",
@@ -1643,7 +1642,7 @@ mod tests {
         let mut state = store.bootstrap("deploy-drift", params, "bootstrap")?;
         state.previous_release = Some(ReleaseVersion::new("v0")?);
         let scope = journal::deployment_scope("deploy-drift")?;
-        persist(&scope_path(&store.root, &scope), &state)?;
+        persist(&scope_path(&store.root, scope), &state)?;
 
         let updated = store.apply_update_healthy_from_live(
             "deploy-drift",
@@ -1679,7 +1678,7 @@ mod tests {
         let legacy = canonical.replace("\"kind\":\"host\"", "\"kind\":\"systemd\"");
         assert_ne!(legacy, canonical, "fixture must replace the runtime token");
         let scope = journal::deployment_scope("deploy-runtime-cutover")?;
-        crate::filesystem::atomic_write(&store.state_path(&scope), legacy.as_bytes(), 0o600)?;
+        crate::filesystem::atomic_write(&store.state_path(scope), legacy.as_bytes(), 0o600)?;
 
         let failure = store
             .load_existing("deploy-runtime-cutover")
@@ -1712,7 +1711,7 @@ mod tests {
         value["schema"] = serde_json::Value::from(7);
         let scope = journal::deployment_scope("deploy-schema-cutover")?;
         crate::filesystem::atomic_write(
-            &store.state_path(&scope),
+            &store.state_path(scope),
             &serde_json::to_vec(&value)?,
             0o600,
         )?;
@@ -1908,6 +1907,46 @@ mod tests {
         assert_eq!(error.code, crate::error_codes::STATE_RESET_REQUIRED);
         Ok(())
     }
+    #[test]
+    fn existing_unreadable_state_is_neither_absent_nor_bootstrappable() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("state-read-errors")?;
+        let store = TargetStateStore::open(temp.path())?;
+        let path = store.state_path("deploy-a");
+        crate::filesystem::ensure_directory_chain(&path)?;
+        for failure in [
+            store.load_existing("deploy-a").unwrap_err(),
+            store.list_deployments().unwrap_err(),
+            store
+                .bootstrap(
+                    "deploy-a",
+                    sample_params("https://a.example", "runtime-a"),
+                    "new-op",
+                )
+                .unwrap_err(),
+            store
+                .remove_deployment("deploy-a", 1, "remove-op")
+                .unwrap_err(),
+        ] {
+            assert_eq!(failure.code, STATE_RESET_REQUIRED);
+        }
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path)?;
+        crate::filesystem::atomic_write(&path, b"{ corrupt", 0o600)?;
+        assert_eq!(
+            store
+                .bootstrap(
+                    "deploy-a",
+                    sample_params("https://a.example", "runtime-a"),
+                    "new-op"
+                )
+                .unwrap_err()
+                .code,
+            STATE_RESET_REQUIRED
+        );
+        assert_eq!(std::fs::read(&path)?, b"{ corrupt");
+        Ok(())
+    }
+
     #[test]
     fn security_cloud_stopped_deployment_keeps_its_persisted_port_reservation() -> anyhow::Result<()>
     {

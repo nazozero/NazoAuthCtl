@@ -127,7 +127,14 @@ fn default_mtls_signature() -> String {
     "ECDSA-P256-SHA256".to_owned()
 }
 
-pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), MaterializerError> {
+pub(super) struct ClientRegistration<'a> {
+    pub(super) policy: &'a CryptoPolicy,
+    pub(super) template: &'a Value,
+}
+
+pub(super) fn validate_descriptor(
+    descriptor: &MatrixDescriptor,
+) -> Result<BTreeMap<&str, ClientRegistration<'_>>, MaterializerError> {
     if descriptor.schema != DESCRIPTOR_SCHEMA_VERSION {
         return Err(MaterializerError::UnsupportedSchema(descriptor.schema));
     }
@@ -146,10 +153,10 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
         validate_name(&group.id, "group.id")?;
         validate_name(&group.profile, "group.profile")?;
         validate_name(&group.variant.id, "variant.id")?;
-        if !groups.insert(group.id.clone()) {
+        if !groups.insert(group.id.as_str()) {
             return Err(MaterializerError::DuplicateId(group.id.clone()));
         }
-        role_names(&group.required_roles)?;
+        validate_role_names(&group.required_roles)?;
         if group.plans.is_empty() {
             return Err(MaterializerError::InvalidField("group.plans"));
         }
@@ -159,7 +166,7 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
             if !plan.config_template.is_object() {
                 return Err(MaterializerError::InvalidField("plan.config_template"));
             }
-            if !plans.insert(plan.id.clone()) {
+            if !plans.insert(plan.id.as_str()) {
                 return Err(MaterializerError::DuplicateId(plan.id.clone()));
             }
             if plan.expected_results.len() > 64 {
@@ -173,33 +180,31 @@ pub(super) fn validate_descriptor(descriptor: &MatrixDescriptor) -> Result<(), M
                     ));
                 }
             }
-            role_names(&plan.required_roles)?;
+            validate_role_names(&plan.required_roles)?;
             validate_crypto_policy(&plan.crypto)?;
             validate_bindings(plan)?;
             validate_value_template(&plan.config_template)?;
             validate_vci_dynamic_policy(plan)?;
             validate_template_references(&plan.config_template, &plan.secret_bindings)?;
-            validate_role_refs(plan, group, &group.required_roles, &plan.required_roles)?;
+            validate_role_refs(plan, &group.required_roles, &plan.required_roles)?;
         }
     }
     validate_openid4vc_credential_datasets(descriptor)?;
-    let clients = collect_client_policies(descriptor)?
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let clients = collect_client_registrations(descriptor)?;
     for group in &descriptor.groups {
         for plan in &group.plans {
             validate_template_clients(&plan.config_template, &plan.secret_bindings, &clients)?;
             for template in plan.secret_bindings.values() {
-                validate_template_clients(
-                    &Value::String(template.clone()),
+                validate_reference_client(
+                    parse_placeholder(template)?,
                     &plan.secret_bindings,
                     &clients,
+                    &mut BTreeSet::new(),
                 )?;
             }
         }
     }
-    Ok(())
+    Ok(clients)
 }
 
 /// Parse and validate one trust anchor used by the OpenID4VC mdoc verifier.
@@ -315,7 +320,7 @@ fn validate_openid4vc_credential_datasets(
     if descriptor.openid4vc_credential_datasets.len() > MAX_OPENID4VC_DATASETS {
         return Err(MaterializerError::Oversize);
     }
-    let referenced = referenced_openid4vc_credential_dataset_ids(descriptor)?;
+    let mut referenced = BTreeSet::new();
     for group in &descriptor.groups {
         for plan in &group.plans {
             if !plan.plan.starts_with("oid4vci-") {
@@ -324,11 +329,11 @@ fn validate_openid4vc_credential_datasets(
             let configuration_id = descriptor_vci_configuration_id(plan)?;
             let dataset = descriptor
                 .openid4vc_credential_datasets
-                .get(&configuration_id)
+                .get(configuration_id)
                 .ok_or(MaterializerError::InvalidField(
                     "openid4vc_credential_datasets",
                 ))?;
-            validate_public_credential_dataset(dataset)?;
+            referenced.insert(configuration_id);
 
             // The plan-local value is not authoritative.  If present, it is
             // required to match the descriptor map byte-for-byte so an
@@ -345,24 +350,14 @@ fn validate_openid4vc_credential_datasets(
         }
     }
 
-    if descriptor.openid4vc_credential_datasets.len() != referenced.len()
-        || descriptor
-            .openid4vc_credential_datasets
-            .keys()
-            .any(|key| !referenced.contains(key))
-    {
+    if descriptor.openid4vc_credential_datasets.len() != referenced.len() {
         return Err(MaterializerError::InvalidField(
             "openid4vc_credential_datasets",
         ));
     }
     let mut total_bytes = 0usize;
     for dataset in descriptor.openid4vc_credential_datasets.values() {
-        let encoded_len = serde_json::to_vec(dataset)
-            .map_err(|_| MaterializerError::Encoding)?
-            .len();
-        total_bytes = total_bytes
-            .checked_add(encoded_len)
-            .ok_or(MaterializerError::Oversize)?;
+        total_bytes += validate_public_credential_dataset(dataset)?;
         if total_bytes > MAX_OPENID4VC_DATASET_TOTAL_BYTES {
             return Err(MaterializerError::Oversize);
         }
@@ -371,10 +366,10 @@ fn validate_openid4vc_credential_datasets(
 }
 
 pub(super) fn referenced_openid4vc_credential_dataset_ids(
-    descriptor: &MatrixDescriptor,
-) -> Result<BTreeSet<String>, MaterializerError> {
+    groups: &[DescriptorGroup],
+) -> Result<BTreeSet<&str>, MaterializerError> {
     let mut referenced = BTreeSet::new();
-    for group in &descriptor.groups {
+    for group in groups {
         for plan in &group.plans {
             if plan.plan.starts_with("oid4vci-") {
                 referenced.insert(descriptor_vci_configuration_id(plan)?);
@@ -384,7 +379,7 @@ pub(super) fn referenced_openid4vc_credential_dataset_ids(
     Ok(referenced)
 }
 
-fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<String, MaterializerError> {
+fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<&str, MaterializerError> {
     let configured = plan
         .config_template
         .get("vci")
@@ -415,38 +410,24 @@ fn descriptor_vci_configuration_id(plan: &DescriptorPlan) -> Result<String, Mate
         ));
     }
     validate_name(value, "vci.credential_configuration_id")?;
-    Ok(value.to_owned())
+    Ok(value)
 }
 
-fn validate_public_credential_dataset(value: &Value) -> Result<(), MaterializerError> {
-    let object = value
-        .as_object()
-        .filter(|object| !object.is_empty())
-        .ok_or(MaterializerError::InvalidField(
+fn validate_public_credential_dataset(value: &Value) -> Result<usize, MaterializerError> {
+    if value.as_object().is_none_or(|object| object.is_empty()) {
+        return Err(MaterializerError::InvalidField(
             "openid4vc_credential_datasets",
-        ))?;
-    let bytes = serde_json::to_vec(value).map_err(|_| MaterializerError::Encoding)?;
-    if bytes.len() > MAX_OPENID4VC_DATASET_BYTES {
+        ));
+    }
+    let encoded_len = serde_json::to_vec(value)
+        .map_err(|_| MaterializerError::Encoding)?
+        .len();
+    if encoded_len > MAX_OPENID4VC_DATASET_BYTES {
         return Err(MaterializerError::Oversize);
     }
     let mut nodes = 0;
-    validate_public_dataset_object(object, 0, &mut nodes)
-}
-
-fn validate_public_dataset_object(
-    object: &serde_json::Map<String, Value>,
-    depth: usize,
-    nodes: &mut usize,
-) -> Result<(), MaterializerError> {
-    *nodes = (*nodes).checked_add(1).ok_or(MaterializerError::Oversize)?;
-    if depth > MAX_OPENID4VC_DATASET_DEPTH || *nodes > MAX_OPENID4VC_DATASET_NODES {
-        return Err(MaterializerError::Oversize);
-    }
-    for (key, value) in object {
-        validate_public_dataset_key(key)?;
-        validate_public_dataset_value(value, depth + 1, nodes)?;
-    }
-    Ok(())
+    validate_public_dataset_value(value, 0, &mut nodes)?;
+    Ok(encoded_len)
 }
 
 fn validate_public_dataset_value(
@@ -454,7 +435,7 @@ fn validate_public_dataset_value(
     depth: usize,
     nodes: &mut usize,
 ) -> Result<(), MaterializerError> {
-    *nodes = (*nodes).checked_add(1).ok_or(MaterializerError::Oversize)?;
+    *nodes += 1;
     if depth > MAX_OPENID4VC_DATASET_DEPTH || *nodes > MAX_OPENID4VC_DATASET_NODES {
         return Err(MaterializerError::Oversize);
     }
@@ -550,15 +531,14 @@ fn validate_vci_dynamic_policy(plan: &DescriptorPlan) -> Result<(), Materializer
 
 fn validate_role_refs(
     plan: &DescriptorPlan,
-    group: &DescriptorGroup,
     group_roles: &[RoleRequirement],
     plan_roles: &[RoleRequirement],
 ) -> Result<(), MaterializerError> {
     let mut roles = BTreeSet::new();
     for requirement in group_roles.iter().chain(plan_roles) {
-        let logical = logical_client_id(requirement)?;
-        if !roles.insert(logical.clone()) {
-            return Err(MaterializerError::DuplicateRole(logical));
+        let logical = logical_client_id(requirement);
+        if !roles.insert(logical) {
+            return Err(MaterializerError::DuplicateRole(logical.to_owned()));
         }
         for reference in &requirement.secret_refs {
             validate_binding_reference(reference, &plan.secret_bindings, &mut BTreeSet::new())?;
@@ -567,74 +547,58 @@ fn validate_role_refs(
             validate_registration_template(template)?;
         }
     }
-    let _ = group;
     Ok(())
 }
 
-pub(super) fn collect_client_policies(
+fn collect_client_registrations(
     descriptor: &MatrixDescriptor,
-) -> Result<BTreeMap<String, CryptoPolicy>, MaterializerError> {
-    let mut policies = BTreeMap::new();
-    for group in &descriptor.groups {
-        for plan in &group.plans {
-            for role in group.required_roles.iter().chain(&plan.required_roles) {
-                if role.registration_template.is_none() {
-                    continue;
-                }
-                let logical = logical_client_id(role)?;
-                if let Some(previous) = policies.get(&logical)
-                    && previous != &plan.crypto
-                {
-                    return Err(MaterializerError::InvalidField("client crypto policy"));
-                }
-                policies.insert(logical, plan.crypto.clone());
-            }
-        }
-    }
-    Ok(policies)
-}
-
-pub(super) fn collect_registrations(
-    descriptor: &MatrixDescriptor,
-) -> Result<BTreeMap<String, Value>, MaterializerError> {
-    let mut registrations = BTreeMap::new();
+) -> Result<BTreeMap<&str, ClientRegistration<'_>>, MaterializerError> {
+    let mut clients: BTreeMap<&str, ClientRegistration<'_>> = BTreeMap::new();
     for group in &descriptor.groups {
         for plan in &group.plans {
             for role in group.required_roles.iter().chain(&plan.required_roles) {
                 let Some(template) = &role.registration_template else {
                     continue;
                 };
-                let logical = logical_client_id(role)?;
-                if let Some(previous) = registrations.get(&logical)
-                    && previous != template
-                {
-                    return Err(MaterializerError::InvalidField("registration_template"));
+                let logical = logical_client_id(role);
+                match clients.entry(logical) {
+                    std::collections::btree_map::Entry::Occupied(previous) => {
+                        if previous.get().policy != &plan.crypto {
+                            return Err(MaterializerError::InvalidField("client crypto policy"));
+                        }
+                        if previous.get().template != template {
+                            return Err(MaterializerError::InvalidField("registration_template"));
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(ClientRegistration {
+                            policy: &plan.crypto,
+                            template,
+                        });
+                    }
                 }
-                registrations.insert(logical, template.clone());
             }
         }
     }
-    Ok(registrations)
+    Ok(clients)
 }
 
-fn logical_client_id(role: &RoleRequirement) -> Result<String, MaterializerError> {
-    let value = role.logical_client_id.as_deref().unwrap_or(&role.role);
-    validate_name(value, "logical_client_id")?;
-    Ok(value.to_owned())
+fn logical_client_id(role: &RoleRequirement) -> &str {
+    role.logical_client_id.as_deref().unwrap_or(&role.role)
 }
 
-fn role_names(roles: &[RoleRequirement]) -> Result<BTreeSet<String>, MaterializerError> {
+fn validate_role_names(roles: &[RoleRequirement]) -> Result<(), MaterializerError> {
     let mut names = BTreeSet::new();
     for role in roles {
         validate_name(&role.role, "role")?;
-        if !names.insert(role.role.clone()) {
+        if !names.insert(role.role.as_str()) {
             return Err(MaterializerError::DuplicateRole(role.role.clone()));
         }
         if let Some(logical) = &role.logical_client_id {
             validate_name(logical, "logical_client_id")?;
         }
     }
-    Ok(names)
+    Ok(())
 }
 
 fn validate_bindings(plan: &DescriptorPlan) -> Result<(), MaterializerError> {
@@ -646,33 +610,24 @@ fn validate_bindings(plan: &DescriptorPlan) -> Result<(), MaterializerError> {
     Ok(())
 }
 
-pub(super) fn validate_binding_reference(
-    reference: &str,
-    bindings: &BTreeMap<String, String>,
-    stack: &mut BTreeSet<String>,
+pub(super) fn validate_binding_reference<'a>(
+    reference: &'a str,
+    bindings: &'a BTreeMap<String, String>,
+    stack: &mut BTreeSet<&'a str>,
 ) -> Result<(), MaterializerError> {
     let name = reference.trim();
     if name.starts_with("plan.") || name.starts_with("group.") || name.contains("::") {
         return Err(MaterializerError::CrossPlanReference(name.to_owned()));
     }
-    if let Some(binding_name) = name.strip_prefix("secret.") {
-        if !bindings.contains_key(binding_name) {
-            return Err(MaterializerError::UnknownSecretReference(name.to_owned()));
-        }
-        if !stack.insert(binding_name.to_owned()) {
+    let binding_name = name.strip_prefix("secret.").unwrap_or(name);
+    if let Some(binding) = bindings.get(binding_name) {
+        if !stack.insert(binding_name) {
             return Err(MaterializerError::SecretCycle);
         }
-        let nested = parse_placeholder(
-            bindings
-                .get(binding_name)
-                .ok_or(MaterializerError::InvalidPlaceholder)?,
-        )?;
+        let nested = parse_placeholder(binding)?;
         let result = validate_binding_reference(nested, bindings, stack);
         stack.remove(binding_name);
         return result;
-    }
-    if bindings.contains_key(name) {
-        return validate_binding_reference(&format!("secret.{name}"), bindings, stack);
     }
     if is_builtin_reference(name) {
         return Ok(());
@@ -758,8 +713,12 @@ fn validate_template_references(
         Value::Object(values) => values
             .values()
             .try_for_each(|value| validate_template_references(value, bindings)),
-        Value::String(text) if is_placeholder(text) => {
-            validate_binding_reference(parse_placeholder(text)?, bindings, &mut BTreeSet::new())
+        Value::String(text) => {
+            if let Ok(reference) = parse_placeholder(text) {
+                validate_binding_reference(reference, bindings, &mut BTreeSet::new())
+            } else {
+                Ok(())
+            }
         }
         _ => Ok(()),
     }
@@ -768,7 +727,7 @@ fn validate_template_references(
 fn validate_template_clients(
     value: &Value,
     bindings: &BTreeMap<String, String>,
-    clients: &BTreeSet<String>,
+    clients: &BTreeMap<&str, ClientRegistration<'_>>,
 ) -> Result<(), MaterializerError> {
     match value {
         Value::Array(values) => values
@@ -777,44 +736,39 @@ fn validate_template_clients(
         Value::Object(values) => values
             .values()
             .try_for_each(|value| validate_template_clients(value, bindings, clients)),
-        Value::String(text) if is_placeholder(text) => validate_reference_client(
-            parse_placeholder(text)?,
-            bindings,
-            clients,
-            &mut BTreeSet::new(),
-        ),
+        Value::String(text) => {
+            if let Ok(reference) = parse_placeholder(text) {
+                validate_reference_client(reference, bindings, clients, &mut BTreeSet::new())
+            } else {
+                Ok(())
+            }
+        }
         _ => Ok(()),
     }
 }
 
-fn validate_reference_client(
-    name: &str,
-    bindings: &BTreeMap<String, String>,
-    clients: &BTreeSet<String>,
-    stack: &mut BTreeSet<String>,
+fn validate_reference_client<'a>(
+    name: &'a str,
+    bindings: &'a BTreeMap<String, String>,
+    clients: &BTreeMap<&str, ClientRegistration<'_>>,
+    stack: &mut BTreeSet<&'a str>,
 ) -> Result<(), MaterializerError> {
-    if let Some(binding_name) = name.strip_prefix("secret.") {
-        if !stack.insert(binding_name.to_owned()) {
+    let binding_name = name.strip_prefix("secret.").unwrap_or(name);
+    if let Some(binding) = bindings.get(binding_name) {
+        if !stack.insert(binding_name) {
             return Err(MaterializerError::SecretCycle);
         }
-        let nested = parse_placeholder(
-            bindings
-                .get(binding_name)
-                .ok_or(MaterializerError::UnknownSecretReference(name.to_owned()))?,
-        )?;
+        let nested = parse_placeholder(binding)?;
         let result = validate_reference_client(nested, bindings, clients, stack);
         stack.remove(binding_name);
         return result;
-    }
-    if bindings.contains_key(name) {
-        return validate_reference_client(&format!("secret.{name}"), bindings, clients, stack);
     }
     if let Some(rest) = name.strip_prefix("client.") {
         let logical = rest
             .split_once('.')
             .map(|(logical, _)| logical)
             .ok_or_else(|| MaterializerError::UnknownClientReference(rest.to_owned()))?;
-        if !clients.contains(logical) {
+        if !clients.contains_key(logical) {
             return Err(MaterializerError::UnknownClientReference(
                 logical.to_owned(),
             ));
@@ -868,20 +822,18 @@ pub(super) fn descriptor_requires_reference(
         group.required_roles.iter().any(|role| {
             role.secret_refs.iter().any(|secret_ref| {
                 secret_ref.trim() == reference
-                    || value_contains_reference(&Value::String(secret_ref.clone()), reference)
+                    || parse_placeholder(secret_ref).ok() == Some(reference)
             })
         }) || group.plans.iter().any(|plan| {
             value_contains_reference(&plan.config_template, reference)
-                || plan.secret_bindings.values().any(|binding| {
-                    value_contains_reference(&Value::String(binding.clone()), reference)
-                })
+                || plan
+                    .secret_bindings
+                    .values()
+                    .any(|binding| parse_placeholder(binding).ok() == Some(reference))
                 || plan.required_roles.iter().any(|role| {
                     role.secret_refs.iter().any(|secret_ref| {
                         secret_ref.trim() == reference
-                            || value_contains_reference(
-                                &Value::String(secret_ref.clone()),
-                                reference,
-                            )
+                            || parse_placeholder(secret_ref).ok() == Some(reference)
                     })
                 })
         })
@@ -896,9 +848,7 @@ pub(super) fn value_contains_reference(value: &Value, reference: &str) -> bool {
         Value::Object(values) => values
             .values()
             .any(|value| value_contains_reference(value, reference)),
-        Value::String(text) => {
-            is_placeholder(text) && parse_placeholder(text).ok() == Some(reference)
-        }
+        Value::String(text) => parse_placeholder(text).ok() == Some(reference),
         _ => false,
     }
 }
@@ -921,7 +871,7 @@ pub(super) fn parse_placeholder(value: &str) -> Result<&str, MaterializerError> 
 }
 
 pub(super) fn is_placeholder(value: &str) -> bool {
-    value.starts_with("{{") && value.ends_with("}}") && parse_placeholder(value).is_ok()
+    parse_placeholder(value).is_ok()
 }
 
 /// Validate a signed-artifact placeholder against the same reference grammar
@@ -962,8 +912,9 @@ fn validate_name(value: &str, field: &'static str) -> Result<(), MaterializerErr
 
 pub(super) fn validate_digest(value: &str, field: &'static str) -> Result<(), MaterializerError> {
     if value.len() != 64
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || value != value.to_ascii_lowercase()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(MaterializerError::InvalidField(field));
     }

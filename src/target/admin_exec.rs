@@ -42,6 +42,7 @@ pub(crate) struct AdminProvisionJob<'a> {
 
 /// Injectable target-side seam. Tests can return a receipt without spawning a
 /// container/systemd process; production uses [`HostAdminProvisioner`].
+/// Success returns a validated receipt bound to the job's operation and deployment.
 pub(crate) trait AdminProvisionExecutor: Send + Sync {
     fn execute(&self, job: &AdminProvisionJob<'_>) -> Result<AdminProvisionReceipt, Failure>;
 }
@@ -148,15 +149,6 @@ pub(crate) fn decode_admin_provision_receipt(
             ),
         )
     })?;
-    validate_admin_provision_receipt(&receipt, operation_id, deployment_id)?;
-    Ok(receipt)
-}
-
-pub(crate) fn validate_admin_provision_receipt(
-    receipt: &AdminProvisionReceipt,
-    operation_id: &str,
-    deployment_id: &str,
-) -> Result<(), Failure> {
     if receipt.schema != ADMIN_PROVISION_RECEIPT_SCHEMA
         || receipt.operation_id != operation_id
         || receipt.deployment_id != deployment_id
@@ -167,7 +159,7 @@ pub(crate) fn validate_admin_provision_receipt(
             "the administrator provisioner receipt is not bound to this operation and deployment",
         ));
     }
-    Ok(())
+    Ok(receipt)
 }
 
 fn valid_receipt_field(value: &str, maximum: usize) -> bool {

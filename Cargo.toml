@@ -15,8 +15,9 @@ repository = "https://github.com/nazozero/NazoAuthCtl"
 rust-version = "1.99"
 
 [workspace.dependencies]
-nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "c647e1d4f417350738ff20c8259e35225e405cc9", version = "0.2.16", default-features = false, features = ["ed25519"] }
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "c647e1d4f417350738ff20c8259e35225e405cc9", version = "0.2.16", package = "nazo-operator-protocol" }
+hex = "0.4.3"
+nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "8ebcfff58f266b69946a99dc2a69bc3d30738803", version = "0.3.1", default-features = false, features = ["ed25519"] }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "8ebcfff58f266b69946a99dc2a69bc3d30738803", version = "0.3.1", package = "nazo-operator-protocol" }
 
 [package]
 name = "nazoauthctl-core"
@@ -34,6 +35,7 @@ path = "src/lib.rs"
 pre-release-validation = []
 
 [dependencies]
+hex.workspace = true
 anyhow = "1.0.104"
 base64 = "0.23.1"
 bytes = "1.12.1"
@@ -47,14 +49,13 @@ hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "http1
 # the controller-identity admin client can name request/response body types.
 http-body-util = "0.1.5"
 instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
-libc = "0.2.190"
 nazo-crypto.workspace = true
 nazo-operator-protocol.workspace = true
 nazoauthctl-runtime = { path = "crates/nazoauthctl-runtime" }
 rand = "0.10.3"
 qrcode = { version = "0.14.1", default-features = false }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -70,6 +71,9 @@ x509-parser = "0.18.1"
 yaml_serde = "0.10.7"
 zeroize = { version = "1.9.0", features = ["derive", "serde"] }
 
+[dev-dependencies]
+http-body = "1.0.1"
+
 [lints.rust]
 unsafe_code = "forbid"
 
@@ -81,3 +85,7 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+[patch.crates-io]
+# Borrow immutable HTTP frames and move decoded owned strings without a body copy.
+serde_json = { git = "https://github.com/bymoye/json", rev = "7a006a7f6984324a90382d799c0fcddd0bf9606f" }

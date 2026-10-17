@@ -217,10 +217,7 @@ pub(crate) fn execute_fixed_one_shot(
             "the running runtime object does not report a digest-bound artifact",
         )
     })?;
-    let expected = job
-        .artifact_reference
-        .trim_start_matches("sha256:")
-        .to_owned();
+    let expected = job.artifact_reference.trim_start_matches("sha256:");
     if digest != expected {
         return Err(Failure::new(
             CONTROL_TARGET_DRIFT,
@@ -244,7 +241,7 @@ pub(crate) fn execute_fixed_one_shot(
     let mut read_only_paths = Vec::new();
     let mut read_write_paths = Vec::new();
     let mut transient_credentials = BTreeMap::new();
-    let mut mounts = observation.mounts.clone();
+    let mut mounts = observation.mounts;
     if host {
         environment.insert(
             super::install_exec::SERVER_CONFIG_FILE_ENV.to_owned(),
@@ -297,7 +294,7 @@ pub(crate) fn execute_fixed_one_shot(
         network: if host {
             Some("host".to_owned())
         } else {
-            observation.networks.first().cloned()
+            observation.networks.into_iter().next()
         },
         mounts,
         environment,
@@ -454,19 +451,17 @@ pub(crate) fn decode_operator_answer(
     stdout: &str,
     operation_id: &str,
 ) -> Result<ControlResult, Failure> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
+    let mut frames = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(line) = frames.next() else {
         return Err(Failure::new(
             CONTROL_OUTCOME_UNKNOWN,
             "the local NazoAuth operator produced no ControlResult; the outcome is unknown and \
              only a resumed resend of the same operation can resolve it",
         ));
-    }
-    let mut frames = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let line = frames.next().unwrap_or(trimmed);
+    };
     if frames.next().is_some() {
         return Err(Failure::new(
             CONTROL_OUTCOME_UNKNOWN,
@@ -489,8 +484,8 @@ pub(crate) fn decode_operator_answer(
             HOST_ERR_OPERATION_INVALID,
             format!(
                 "the operator answered operation '{}' while '{}' was presented",
-                sanitize(result.operation_id.clone()),
-                sanitize(operation_id.to_owned())
+                sanitize(result.operation_id),
+                sanitize(operation_id)
             ),
         ));
     }

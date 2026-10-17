@@ -1,13 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 use url::Url;
-use zeroize::Zeroizing;
 
 use super::crypto::GeneratedAttestationMaterial;
 use super::{
     MaterializationBindings, MaterializerError, PreparedMaterialization, digest_hex,
-    is_placeholder, parse_placeholder, validate_binding_reference, validate_request_jti,
+    parse_placeholder,
 };
 
 const USER_REJECT_MODULES: [&str; 2] = [
@@ -20,42 +19,30 @@ const PAR_REUSE_BEFORE_AUTH_MODULES: [&str; 2] = [
 ];
 
 pub(super) fn materialize_value(
-    value: &Value,
+    mut value: Value,
     bindings: &BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
     onboarding: &MaterializationBindings,
-    stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
-    match value {
-        Value::Array(values) => values
-            .iter()
-            .map(|value| materialize_value(value, bindings, prepared, onboarding, stack))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        Value::Object(values) => {
-            let mut output = serde_json::Map::new();
-            for (key, value) in values {
-                output.insert(
-                    key.clone(),
-                    materialize_value(value, bindings, prepared, onboarding, stack)?,
-                );
+    match &mut value {
+        Value::Array(values) => {
+            for child in values {
+                *child = materialize_value(std::mem::take(child), bindings, prepared, onboarding)?;
             }
-            Ok(Value::Object(output))
         }
-        Value::String(text) if is_placeholder(text) => resolve_reference(
-            parse_placeholder(text)?,
-            bindings,
-            prepared,
-            onboarding,
-            stack,
-        ),
+        Value::Object(values) => {
+            for child in values.values_mut() {
+                *child = materialize_value(std::mem::take(child), bindings, prepared, onboarding)?;
+            }
+        }
         Value::String(text)
             if text.contains("{{") || text.contains("}}") || text.contains("${") =>
         {
-            Err(MaterializerError::InvalidPlaceholder)
+            return resolve_reference(parse_placeholder(text)?, bindings, prepared, onboarding);
         }
-        _ => Ok(value.clone()),
+        _ => {}
     }
+    Ok(value)
 }
 
 /// Normalize the small amount of issuer-side configuration that the official
@@ -146,16 +133,12 @@ pub(super) fn materialize_vci_config(
     let attestation = attestation.ok_or(MaterializerError::InvalidField(
         "generated.vci_key_attestation",
     ))?;
-    let key_attestation_jwks = jwks_value(&attestation.key_attestation_private_jwks)?;
+    let key_attestation_jwks = json_value(&attestation.key_attestation_private_jwks)?;
     if let Some(existing) = vci.get("key_attestation_jwks")
         && existing != &key_attestation_jwks
     {
         return Err(MaterializerError::InvalidField("vci.key_attestation_jwks"));
     }
-    vci.insert(
-        "key_attestation_jwks".to_owned(),
-        key_attestation_jwks.clone(),
-    );
     let haip = plan_name.contains("haip")
         || variant.get("fapi_profile").map(String::as_str) == Some("vci_haip");
     if haip {
@@ -168,11 +151,12 @@ pub(super) fn materialize_vci_config(
                 "issuer": format!("{}/", suite_origin.trim_end_matches('/')),
                 "trust_anchor": attestation.trust_anchor_pem.to_string(),
                 "key_attestation_trust_anchor_pem": attestation.trust_anchor_pem.to_string(),
-                "attester_jwks": jwks_value(&attestation.attester_private_jwks)?,
+                "attester_jwks": json_value(&attestation.attester_private_jwks)?,
                 "key_attestation_jwks": key_attestation_jwks,
             }),
         );
     }
+    vci.insert("key_attestation_jwks".to_owned(), key_attestation_jwks);
     let mut credential = match root.remove("credential") {
         None => serde_json::Map::new(),
         Some(Value::Object(value)) => value,
@@ -239,23 +223,24 @@ fn materialize_vci_browser_overrides(
         .ok_or(MaterializerError::InvalidField("browser"))?;
     let authorization_match = format!("{}/authorize*", target_issuer.trim_end_matches('/'));
     let login_match = format!("{}/ui/auth*", target_issuer.trim_end_matches('/'));
-    let authorization_entries = browser
+    let mut authorization_entries = browser
         .iter()
-        .filter(|entry| entry.get("match").and_then(Value::as_str) == Some(&authorization_match))
-        .cloned()
-        .collect::<Vec<_>>();
-    if authorization_entries.len() != 1 {
+        .filter(|entry| entry.get("match").and_then(Value::as_str) == Some(&authorization_match));
+    let authorization_entry = authorization_entries
+        .next()
+        .ok_or(MaterializerError::InvalidField("browser.authorize"))?;
+    if authorization_entries.next().is_some() {
         return Err(MaterializerError::InvalidField("browser.authorize"));
     }
 
-    let mut rejection_browser = authorization_entries.clone();
+    let mut rejection_browser = vec![authorization_entry.clone()];
     let mut denial_controls = 0usize;
     replace_consent_approval_with_denial(&mut rejection_browser, &mut denial_controls)?;
     if denial_controls < 2 {
         return Err(MaterializerError::InvalidField("browser.consent_deny"));
     }
 
-    let mut second_authorization = authorization_entries[0].clone();
+    let mut second_authorization = authorization_entry.clone();
     second_authorization
         .as_object_mut()
         .ok_or(MaterializerError::InvalidField("browser.authorize"))?
@@ -393,15 +378,12 @@ pub(super) fn materialize_vp_config(
     // executable Matrix variant does not repeat the transport selector.
     let request_uri_signed = plan_name == "oid4vp-1final-verifier-haip-test-plan"
         || request_method.is_some_and(|value| value.starts_with("request_uri_signed"));
-    if !root.contains_key("client") {
+    let Some(client_value) = root.get_mut("client") else {
         if request_uri_signed {
             return Err(MaterializerError::InvalidField("client"));
         }
         return Ok(Value::Object(root));
-    }
-    let client_value = root
-        .get_mut("client")
-        .ok_or(MaterializerError::InvalidField("client"))?;
+    };
     let Value::Object(client) = client_value else {
         return Err(MaterializerError::InvalidField("client"));
     };
@@ -463,12 +445,13 @@ fn ensure_vci_field(
     field: &str,
     expected: &str,
 ) -> Result<(), MaterializerError> {
-    if let Some(value) = object.get(field)
-        && value.as_str() != Some(expected)
-    {
-        return Err(MaterializerError::InvalidField("nazo"));
+    if let Some(value) = object.get(field) {
+        if value.as_str() != Some(expected) {
+            return Err(MaterializerError::InvalidField("nazo"));
+        }
+    } else {
+        object.insert(field.to_owned(), Value::String(expected.to_owned()));
     }
-    object.insert(field.to_owned(), Value::String(expected.to_owned()));
     Ok(())
 }
 
@@ -491,39 +474,15 @@ fn validate_tx_code(value: &str) -> Result<(), MaterializerError> {
     Ok(())
 }
 
-fn jwks_value(value: &Zeroizing<String>) -> Result<Value, MaterializerError> {
-    serde_json::from_str(value.as_str()).map_err(|_| MaterializerError::Encoding)
-}
-
-fn resolve_reference(
-    name: &str,
-    bindings: &BTreeMap<String, String>,
+fn resolve_reference<'a>(
+    mut name: &'a str,
+    bindings: &'a BTreeMap<String, String>,
     prepared: &PreparedMaterialization,
     onboarding: &MaterializationBindings,
-    stack: &mut BTreeSet<String>,
 ) -> Result<Value, MaterializerError> {
-    validate_binding_reference(name, bindings, &mut BTreeSet::new())?;
-    if let Some(binding_name) = name.strip_prefix("secret.") {
-        if !stack.insert(binding_name.to_owned()) {
-            return Err(MaterializerError::SecretCycle);
-        }
-        let nested = parse_placeholder(
-            bindings
-                .get(binding_name)
-                .ok_or(MaterializerError::InvalidPlaceholder)?,
-        )?;
-        let result = resolve_reference(nested, bindings, prepared, onboarding, stack);
-        stack.remove(binding_name);
-        return result;
-    }
-    if bindings.contains_key(name) {
-        return resolve_reference(
-            &format!("secret.{name}"),
-            bindings,
-            prepared,
-            onboarding,
-            stack,
-        );
+    // Preparation validates the complete binding graph and keeps it private.
+    while let Some(binding) = bindings.get(name.strip_prefix("secret.").unwrap_or(name)) {
+        name = parse_placeholder(binding)?;
     }
     if name == "target.issuer" {
         return Ok(Value::String(prepared.target_issuer.clone()));
@@ -619,7 +578,7 @@ fn resolve_reference(
         })?;
         return resolve_client_reference(logical, field, prepared, &onboarding.clients);
     }
-    if name.starts_with("generated.") {
+    if let Some(field) = name.strip_prefix("generated.") {
         if prepared.clients.len() != 1 {
             return Err(MaterializerError::AmbiguousClientReference);
         }
@@ -628,12 +587,7 @@ fn resolve_reference(
             .keys()
             .next()
             .ok_or(MaterializerError::AmbiguousClientReference)?;
-        return resolve_client_reference(
-            logical,
-            name.strip_prefix("generated.").unwrap_or_default(),
-            prepared,
-            &onboarding.clients,
-        );
+        return resolve_client_reference(logical, field, prepared, &onboarding.clients);
     }
     Err(MaterializerError::UnknownSecretReference(name.to_owned()))
 }
@@ -666,8 +620,8 @@ fn resolve_client_reference(
     }
 }
 
-fn json_value(value: &Zeroizing<String>) -> Result<Value, MaterializerError> {
-    serde_json::from_str(value.as_str()).map_err(|_| MaterializerError::Encoding)
+fn json_value(value: &str) -> Result<Value, MaterializerError> {
+    serde_json::from_str(value).map_err(|_| MaterializerError::Encoding)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -723,7 +677,9 @@ pub(super) fn materialize_registration_template(
             }
             Ok(Value::Object(output))
         }
-        Value::String(text) if is_placeholder(text) => {
+        Value::String(text)
+            if text.contains("{{") || text.contains("}}") || text.contains("${") =>
+        {
             let name = parse_placeholder(text)?;
             let value = match name {
                 "target.issuer" => Value::String(target_issuer.to_owned()),
@@ -802,11 +758,6 @@ pub(super) fn materialize_registration_template(
                 _ => return Err(MaterializerError::UnknownSecretReference(name.to_owned())),
             };
             Ok(value)
-        }
-        Value::String(text)
-            if text.contains("{{") || text.contains("}}") || text.contains("${") =>
-        {
-            Err(MaterializerError::InvalidPlaceholder)
         }
         _ => Ok(value.clone()),
     }
@@ -896,10 +847,9 @@ fn validate_url_segment(value: &str) -> Result<(), MaterializerError> {
 
 fn resolve_run_alias(request_jti: &str, alias_key: &str) -> Result<String, MaterializerError> {
     validate_url_segment(alias_key)?;
-    validate_request_jti(request_jti)?;
     let suffix = request_jti
         .strip_prefix("request-")
-        .ok_or(MaterializerError::InvalidPlaceholder)?;
+        .expect("preparation validates request_jti");
     Ok(format!("nazo-{suffix}-{alias_key}"))
 }
 
