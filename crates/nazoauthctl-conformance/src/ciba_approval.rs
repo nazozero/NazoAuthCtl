@@ -93,7 +93,9 @@ impl CibaUserApprovalClient {
         if login.status != 200 {
             return Err(CibaUserApprovalError::LoginRejected(login.status));
         }
-        let login_value: Value = serde_json::from_slice(&login.body)
+        let login_value: Value = login
+            .body
+            .json()
             .map_err(|_| CibaUserApprovalError::MalformedLoginResponse)?;
         if login_value
             .get("mfa_required")
@@ -122,7 +124,9 @@ impl CibaUserApprovalClient {
                 verification.status,
             ));
         }
-        let verification_value: Value = serde_json::from_slice(&verification.body)
+        let verification_value: Value = verification
+            .body
+            .json()
             .map_err(|_| CibaUserApprovalError::MalformedVerificationResponse)?;
         if verification_value
             .get("auth_req_id")
@@ -397,7 +401,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
-            body: serde_json::to_vec(&body).expect("JSON response"),
+            body: serde_json::to_vec(&body).expect("JSON response").into(),
         }
     }
 

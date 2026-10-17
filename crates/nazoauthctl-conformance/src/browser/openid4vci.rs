@@ -182,23 +182,21 @@ pub enum OpenId4VciError {
 /// A waiting VCI module as observed from the Suite runner and the signed
 /// Matrix materialization.  `runner` is the Suite's opaque JSON; only the
 /// documented `exposed` and `browser` fields are read here.
-#[derive(Clone)]
-pub struct OpenId4VciModule {
-    pub module_id: String,
-    pub test_name: String,
-    pub variant: BTreeMap<String, String>,
-    pub plan_config: Value,
+pub struct OpenId4VciModule<'a> {
+    pub module_id: &'a str,
+    pub test_name: &'a str,
+    pub variant: &'a BTreeMap<String, String>,
+    pub plan_config: &'a Value,
     pub runner: Value,
 }
 
-impl Drop for OpenId4VciModule {
+impl Drop for OpenId4VciModule<'_> {
     fn drop(&mut self) {
-        zeroize_json_value(&mut self.plan_config);
         zeroize_json_value(&mut self.runner);
     }
 }
 
-impl fmt::Debug for OpenId4VciModule {
+impl fmt::Debug for OpenId4VciModule<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OpenId4VciModule")
@@ -211,17 +209,17 @@ impl fmt::Debug for OpenId4VciModule {
     }
 }
 
-impl OpenId4VciModule {
+impl<'a> OpenId4VciModule<'a> {
     pub fn new(
-        module_id: impl Into<String>,
-        test_name: impl Into<String>,
-        variant: BTreeMap<String, String>,
-        plan_config: Value,
+        module_id: &'a str,
+        test_name: &'a str,
+        variant: &'a BTreeMap<String, String>,
+        plan_config: &'a Value,
         runner: Value,
     ) -> Result<Self, OpenId4VciError> {
         let module = Self {
-            module_id: module_id.into(),
-            test_name: test_name.into(),
+            module_id,
+            test_name,
             variant,
             plan_config,
             runner,
@@ -256,7 +254,7 @@ impl OpenId4VciModule {
 /// independent of local browsers: VCI hosted authorization follows the
 /// Suite's bounded HTTP state machine and owns its short-lived cookie session.
 pub trait OpenId4VciIssuerDriver: Send {
-    fn drive(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError>;
+    fn drive(&mut self, module: &OpenId4VciModule<'_>) -> Result<(), OpenId4VciError>;
 }
 
 /// Rust-native client for the target's issuer-management offer endpoint and
@@ -448,7 +446,10 @@ impl OpenId4VciIssuerClient {
         {
             return Err(OpenId4VciError::InvalidHostedResponse);
         }
-        serde_json::from_slice(&response.body).map_err(|_| OpenId4VciError::InvalidHostedResponse)
+        response
+            .body
+            .json()
+            .map_err(|_| OpenId4VciError::InvalidHostedResponse)
     }
 
     fn location(&self, request_url: &Url, response: &HttpResponse) -> Result<Url, OpenId4VciError> {
@@ -660,10 +661,10 @@ impl OpenId4VciIssuerClient {
         }
     }
 
-    fn drive_offer(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+    fn drive_offer(&mut self, module: &OpenId4VciModule<'_>) -> Result<(), OpenId4VciError> {
         // The Suite owns the offer phase. A registered browser worker can
         // complete authorization without populating this HTTP driver's cache.
-        let completed_phase = self.triggered.get(&module.module_id).copied();
+        let completed_phase = self.triggered.get(module.module_id).copied();
         if completed_phase == Some(true) {
             return Ok(());
         }
@@ -704,7 +705,9 @@ impl OpenId4VciIssuerClient {
             if response.status != 200 {
                 return Err(OpenId4VciError::HttpStatus(response.status));
             }
-            let entries: Vec<Value> = serde_json::from_slice(&response.body)
+            let entries: Vec<Value> = response
+                .body
+                .json()
                 .map_err(|_| OpenId4VciError::InvalidHostedResponse)?;
             let waits = entries
                 .iter()
@@ -773,17 +776,17 @@ impl OpenId4VciIssuerClient {
             } else {
                 1
             };
-        let delivery = offer_delivery(&module.plan_config)?;
+        let delivery = offer_delivery(module.plan_config)?;
         for _ in 0..offer_count {
             let offer = self.create_offer(configuration_id, grant_type, tx_code)?;
             self.deliver_offer(&endpoint, &offer, delivery)?;
         }
         self.triggered
-            .insert(module.module_id.clone(), second_client);
+            .insert(module.module_id.to_owned(), second_client);
         Ok(())
     }
 
-    fn drive_browser(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+    fn drive_browser(&mut self, module: &OpenId4VciModule<'_>) -> Result<(), OpenId4VciError> {
         let browser = module
             .runner
             .get("browser")
@@ -819,7 +822,7 @@ impl OpenId4VciIssuerClient {
         candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         candidates.dedup_by(|left, right| left == right);
         if module.test_name != REPEATED_AUTHORIZATION_MODULE
-            && let Some(completed) = self.completed_browser_urls.get(&module.module_id)
+            && let Some(completed) = self.completed_browser_urls.get(module.module_id)
         {
             candidates.retain(|url| !completed.contains(url.as_str()));
         }
@@ -850,12 +853,12 @@ impl OpenId4VciIssuerClient {
             )?;
             let location = self.location(&authorization_url, &response)?;
             self.initial_anonymous_location(&location)?;
-            self.suite_visit(&module.module_id, &authorization_url)?;
+            self.suite_visit(module.module_id, &authorization_url)?;
             self.anonymous_browser_urls.insert(anonymous_key);
             return Ok(());
         }
 
-        self.suite_visit(&module.module_id, &authorization_url)?;
+        self.suite_visit(module.module_id, &authorization_url)?;
         let mut session = self.login_session()?;
         let response = self.send_session(
             &mut session,
@@ -897,7 +900,7 @@ impl OpenId4VciIssuerClient {
                 .ok_or(OpenId4VciError::MissingCsrfToken)?;
             validate_secret(csrf)?;
             session.csrf_token = Zeroizing::new(csrf.to_owned());
-            let decision = if USER_REJECT_MODULES.contains(&module.test_name.as_str()) {
+            let decision = if USER_REJECT_MODULES.contains(&module.test_name) {
                 "deny"
             } else {
                 "approve"
@@ -933,7 +936,7 @@ impl OpenId4VciIssuerClient {
         };
         self.complete_suite_callback(&callback)?;
         self.completed_browser_urls
-            .entry(module.module_id.clone())
+            .entry(module.module_id.to_owned())
             .or_default()
             .insert(authorization_url.to_string());
         Ok(())
@@ -1006,9 +1009,9 @@ impl OpenId4VciIssuerClient {
             Regex::new(r#"xhr\.open\('POST',\s*("(?:\\.|[^"\\])*")\s*,\s*true\);"#)
                 .expect("static Suite callback pattern")
         });
+        let html = response.body.contiguous();
         let mut matches = CALLBACK_PATTERN.captures_iter(
-            std::str::from_utf8(&response.body)
-                .map_err(|_| OpenId4VciError::InvalidHostedResponse)?,
+            std::str::from_utf8(&html).map_err(|_| OpenId4VciError::InvalidHostedResponse)?,
         );
         let capture = matches
             .next()
@@ -1057,7 +1060,7 @@ impl OpenId4VciIssuerClient {
 }
 
 impl OpenId4VciIssuerDriver for OpenId4VciIssuerClient {
-    fn drive(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+    fn drive(&mut self, module: &OpenId4VciModule<'_>) -> Result<(), OpenId4VciError> {
         let flow = module
             .variant
             .get("vci_authorization_code_flow_variant")
@@ -1100,9 +1103,12 @@ enum OfferDelivery {
     Uri,
 }
 
-fn parse_offer(body: &[u8]) -> Result<Offer, OpenId4VciError> {
-    let mut object: serde_json::Map<String, Value> =
-        serde_json::from_slice(body).map_err(|_| OpenId4VciError::InvalidOfferResponse)?;
+fn parse_offer(
+    body: &nazoauthctl_runtime::http_body::ResponseBody,
+) -> Result<Offer, OpenId4VciError> {
+    let mut object: serde_json::Map<String, Value> = body
+        .json()
+        .map_err(|_| OpenId4VciError::InvalidOfferResponse)?;
     let credential_offer = object.remove("credential_offer");
     if credential_offer
         .as_ref()
@@ -1210,34 +1216,52 @@ mod tests {
         }
     }
 
-    fn module(flow: &str, grant: &str) -> OpenId4VciModule {
+    struct ModuleFixture {
+        test_name: String,
+        variant: BTreeMap<String, String>,
+        plan_config: Value,
+        runner: Value,
+    }
+
+    impl ModuleFixture {
+        fn view(&self) -> OpenId4VciModule<'_> {
+            OpenId4VciModule::new(
+                "module-1",
+                &self.test_name,
+                &self.variant,
+                &self.plan_config,
+                self.runner.clone(),
+            )
+            .expect("module")
+        }
+    }
+
+    fn module(flow: &str, grant: &str) -> ModuleFixture {
         module_named("test", flow, grant)
     }
 
-    fn module_named(name: &str, flow: &str, grant: &str) -> OpenId4VciModule {
-        OpenId4VciModule::new(
-            "module-1",
-            name,
-            BTreeMap::from([
+    fn module_named(name: &str, flow: &str, grant: &str) -> ModuleFixture {
+        ModuleFixture {
+            test_name: name.to_owned(),
+            variant: BTreeMap::from([
                 (
                     "vci_authorization_code_flow_variant".to_owned(),
                     flow.to_owned(),
                 ),
                 ("vci_grant_type".to_owned(), grant.to_owned()),
             ]),
-            serde_json::json!({
+            plan_config: serde_json::json!({
                 "vci": {
                     "credential_configuration_id": "UniversityDegree_JWT",
                     "static_tx_code": "012345"
                 },
                 "browser": [{"match":"/authorize", "tasks": []}]
             }),
-            serde_json::json!({
+            runner: serde_json::json!({
                 "exposed": {"credential_offer_endpoint":"https://suite.example/test/a/offer"},
                 "browser": {"urls":["https://target.example/authorize?request=1"], "visited":[]}
             }),
-        )
-        .expect("module")
+        }
     }
 
     fn issuer_config(tx_code: Option<&str>) -> OpenId4VciIssuerConfig {
@@ -1258,12 +1282,12 @@ mod tests {
             HttpResponse {
                 status: 204,
                 headers: vec![],
-                body: vec![],
+                body: vec![].into(),
             },
             HttpResponse {
                 status: 200,
                 headers: vec![("Content-Type".to_owned(), "text/html".to_owned())],
-                body: br#"<script>xhr.open('POST', "https://suite.example/test/flow/implicit/submit", true);</script>"#.to_vec(),
+                body: br#"<script>xhr.open('POST', "https://suite.example/test/flow/implicit/submit", true);</script>"#.to_vec().into(),
             },
             HttpResponse {
                 status: 302,
@@ -1271,12 +1295,12 @@ mod tests {
                     "Location".to_owned(),
                     "https://suite.example/test/flow/callback?state=ok".to_owned(),
                 )],
-                body: vec![],
+                body: vec![].into(),
             },
             HttpResponse {
                 status: 200,
                 headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
-                body: br#"{"csrf_token":"consent-csrf"}"#.to_vec(),
+                body: br#"{"csrf_token":"consent-csrf"}"#.to_vec().into(),
             },
             HttpResponse {
                 status: 302,
@@ -1284,7 +1308,7 @@ mod tests {
                     "Location".to_owned(),
                     "https://target.example/ui/consent?request_id=req-1".to_owned(),
                 )],
-                body: vec![],
+                body: vec![].into(),
             },
             HttpResponse {
                 status: 200,
@@ -1292,12 +1316,12 @@ mod tests {
                     ("Content-Type".to_owned(), "application/json".to_owned()),
                     ("Set-Cookie".to_owned(), "session=s1; Path=/; HttpOnly".to_owned()),
                 ],
-                body: br#"{"csrf_token":"login-csrf"}"#.to_vec(),
+                body: br#"{"csrf_token":"login-csrf"}"#.to_vec().into(),
             },
             HttpResponse {
                 status: 204,
                 headers: vec![],
-                body: vec![],
+                body: vec![].into(),
             },
         ]
     }
@@ -1327,12 +1351,14 @@ mod tests {
                 HttpResponse {
                     status: 204,
                     headers: vec![],
-                    body: vec![],
+                    body: vec![].into(),
                 },
                 HttpResponse {
                     status: 200,
                     headers: vec![],
-                    body: br#"{"credential_offer_uri":"https://target.example/offer/1"}"#.to_vec(),
+                    body: br#"{"credential_offer_uri":"https://target.example/offer/1"}"#
+                        .to_vec()
+                        .into(),
                 },
             ]),
         });
@@ -1345,7 +1371,7 @@ mod tests {
         .expect("client");
         let mut client = client;
         client
-            .drive(&module("issuer_initiated", "pre_authorization_code"))
+            .drive(&module("issuer_initiated", "pre_authorization_code").view())
             .expect("drive");
         let requests = transport.requests.lock().expect("requests");
         let body = requests[0].body().expect("body");
@@ -1365,12 +1391,14 @@ mod tests {
         let offer = || HttpResponse {
             status: 200,
             headers: vec![],
-            body: br#"{"credential_offer_uri":"https://target.example/offer/fresh"}"#.to_vec(),
+            body: br#"{"credential_offer_uri":"https://target.example/offer/fresh"}"#
+                .to_vec()
+                .into(),
         };
         let delivered = || HttpResponse {
             status: 204,
             headers: vec![],
-            body: vec![],
+            body: vec![].into(),
         };
         let waits = |count| HttpResponse {
             status: 200,
@@ -1379,7 +1407,8 @@ mod tests {
                 serde_json::json!({"src":"VCIWaitForCredentialOffer"});
                 count
             ])
-            .unwrap(),
+            .unwrap()
+            .into(),
         };
         let (transport, mut client) = client_with_responses(vec![
             delivered(),
@@ -1398,32 +1427,32 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("static_tx_code");
-        client.drive_offer(&module).expect("first offer");
+        client.drive_offer(&module.view()).expect("first offer");
         client
-            .drive_offer(&module)
+            .drive_offer(&module.view())
             .expect("pending browser does not request another offer");
         assert_eq!(transport.requests.lock().unwrap().len(), 2);
         // Another registered browser worker may complete the first flow. The
         // local HTTP driver's completed-URL cache is deliberately empty.
         module.runner["browser"] = serde_json::json!({"urls":[], "visited":["https://target.example/authorize?state=first"]});
         client
-            .drive_offer(&module)
+            .drive_offer(&module.view())
             .expect("first wait cannot trigger a second offer");
         assert_eq!(transport.requests.lock().unwrap().len(), 3);
         client
-            .drive_offer(&module)
+            .drive_offer(&module.view())
             .expect("official second wait triggers fresh offer");
         client
-            .drive_offer(&module)
+            .drive_offer(&module.view())
             .expect("second offer is not duplicated");
         module.runner["browser"] =
             serde_json::json!({"urls":["https://target.example/authorize?state=second"]});
         client
-            .drive_offer(&module)
+            .drive_offer(&module.view())
             .expect("no offer during second browser");
         module.runner["browser"] = serde_json::json!({"urls":[]});
         client
-            .drive_offer(&module)
+            .drive_offer(&module.view())
             .expect("later polls never create a third offer");
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 6);
@@ -1452,11 +1481,16 @@ mod tests {
             transport.clone(),
         )
         .expect("client");
+        let variant = BTreeMap::from([(
+            "vci_authorization_code_flow_variant".to_owned(),
+            "issuer_initiated".to_owned(),
+        )]);
+        let config = serde_json::json!({"vci":{"credential_configuration_id":"id"}});
         let module = OpenId4VciModule::new(
             "module-1",
             "test",
-            BTreeMap::from([("vci_authorization_code_flow_variant".to_owned(), "issuer_initiated".to_owned())]),
-            serde_json::json!({"vci":{"credential_configuration_id":"id"}}),
+            &variant,
+            &config,
             serde_json::json!({"exposed":{"credential_offer_endpoint":"https://evil.example/test/a"}}),
         )
         .expect("module");
@@ -1482,7 +1516,7 @@ mod tests {
         )
         .expect("client");
         assert_eq!(
-            client.drive(&module("issuer_initiated", "pre_authorization_code")),
+            client.drive(&module("issuer_initiated", "pre_authorization_code").view()),
             Err(OpenId4VciError::TransactionCodeMismatch)
         );
         assert!(transport.requests.lock().expect("requests").is_empty());
@@ -1502,7 +1536,7 @@ mod tests {
         )
         .expect("client");
         client
-            .drive(&module("wallet_initiated", "authorization_code"))
+            .drive(&module("wallet_initiated", "authorization_code").view())
             .expect("drive");
         assert_eq!(transport.requests.lock().expect("requests").len(), 7);
     }
@@ -1511,11 +1545,14 @@ mod tests {
     fn hosted_user_reject_posts_deny_and_completes_callback() {
         let (transport, mut client) = client_with_responses(hosted_responses());
         client
-            .drive(&module_named(
-                "fapi2-security-profile-final-user-rejects-authentication",
-                "wallet_initiated",
-                "authorization_code",
-            ))
+            .drive(
+                &module_named(
+                    "fapi2-security-profile-final-user-rejects-authentication",
+                    "wallet_initiated",
+                    "authorization_code",
+                )
+                .view(),
+            )
             .expect("drive");
         let requests = transport.requests.lock().expect("requests");
         let decision = requests
@@ -1536,7 +1573,7 @@ mod tests {
             HttpResponse {
                 status: 204,
                 headers: vec![],
-                body: vec![],
+                body: vec![].into(),
             },
             HttpResponse {
                 status: 302,
@@ -1544,16 +1581,19 @@ mod tests {
                     "Location".to_owned(),
                     "https://target.example/ui/auth?next=https%3A%2F%2Ftarget.example%2Fauthorize%3Frequest%3D1".to_owned(),
                 )],
-                body: vec![],
+                body: vec![].into(),
             },
         ];
         let (transport, mut client) = client_with_responses(responses);
         client
-            .drive(&module_named(
-                INITIAL_ANONYMOUS_MODULE,
-                "wallet_initiated",
-                "authorization_code",
-            ))
+            .drive(
+                &module_named(
+                    INITIAL_ANONYMOUS_MODULE,
+                    "wallet_initiated",
+                    "authorization_code",
+                )
+                .view(),
+            )
             .expect("anonymous visit");
         let requests = transport.requests.lock().expect("requests");
         let authorize = requests
@@ -1573,21 +1613,21 @@ mod tests {
                     "Location".to_owned(),
                     "https://evil.example/ui/consent?request_id=req-1".to_owned(),
                 )],
-                body: vec![],
+                body: vec![].into(),
             },
             HttpResponse {
                 status: 200,
                 headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
-                body: br#"{"csrf_token":"login-csrf"}"#.to_vec(),
+                body: br#"{"csrf_token":"login-csrf"}"#.to_vec().into(),
             },
             HttpResponse {
                 status: 204,
                 headers: vec![],
-                body: vec![],
+                body: vec![].into(),
             },
         ];
         let (transport, mut client) = client_with_responses(responses);
-        let result = client.drive(&module("wallet_initiated", "authorization_code"));
+        let result = client.drive(&module("wallet_initiated", "authorization_code").view());
         assert_eq!(result, Err(OpenId4VciError::InvalidAuthorizationUrl));
         assert_eq!(transport.requests.lock().expect("requests").len(), 3);
     }
@@ -1598,17 +1638,17 @@ mod tests {
             HttpResponse {
                 status: 200,
                 headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
-                body: br#"{"mfa_required":true,"csrf_token":"ignored"}"#.to_vec(),
+                body: br#"{"mfa_required":true,"csrf_token":"ignored"}"#.to_vec().into(),
             },
             HttpResponse {
                 status: 204,
                 headers: vec![],
-                body: vec![],
+                body: vec![].into(),
             },
         ];
         let (transport, mut client) = client_with_responses(responses);
         assert_eq!(
-            client.drive(&module("wallet_initiated", "authorization_code")),
+            client.drive(&module("wallet_initiated", "authorization_code").view()),
             Err(OpenId4VciError::MfaRequired)
         );
         assert_eq!(transport.requests.lock().expect("requests").len(), 2);
@@ -1620,17 +1660,17 @@ mod tests {
             HttpResponse {
                 status: 200,
                 headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
-                body: br#"{}"#.to_vec(),
+                body: br#"{}"#.to_vec().into(),
             },
             HttpResponse {
                 status: 204,
                 headers: vec![],
-                body: vec![],
+                body: vec![].into(),
             },
         ];
         let (_, mut client) = client_with_responses(responses);
         assert_eq!(
-            client.drive(&module("wallet_initiated", "authorization_code")),
+            client.drive(&module("wallet_initiated", "authorization_code").view()),
             Err(OpenId4VciError::MissingCsrfToken)
         );
     }
@@ -1650,7 +1690,7 @@ mod tests {
         .expect("client");
         let mut pending = module("wallet_initiated", "authorization_code");
         pending.runner["browser"]["urls"] = serde_json::json!([]);
-        assert_eq!(client.drive(&pending), Err(OpenId4VciError::Pending));
+        assert_eq!(client.drive(&pending.view()), Err(OpenId4VciError::Pending));
         assert!(transport.requests.lock().expect("requests").is_empty());
     }
 }

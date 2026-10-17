@@ -113,7 +113,7 @@ impl ParallelFixtureTransport {
         Ok(HttpResponse {
             status,
             headers: Vec::new(),
-            body: serde_json::to_vec(&body).expect("json"),
+            body: serde_json::to_vec(&body).expect("json").into(),
         })
     }
 

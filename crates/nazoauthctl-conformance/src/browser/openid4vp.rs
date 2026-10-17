@@ -467,7 +467,9 @@ impl OpenId4VpVerifierClient {
         if !(200..300).contains(&response.status) {
             return Err(OpenId4VpError::UnexpectedStatus);
         }
-        let response: CreatePresentationResponse = serde_json::from_slice(&response.body)
+        let response: CreatePresentationResponse = response
+            .body
+            .json()
             .map_err(|_| OpenId4VpError::MalformedResponse)?;
         if response.expires_in == 0
             || response.idempotency.create_request_jti != idempotency.create_request_jti
@@ -691,7 +693,7 @@ mod tests {
         }
         let request_body: Value =
             serde_json::from_slice(request.body().expect("create body")).expect("create body JSON");
-        let response_body: Value = serde_json::from_slice(&response.body).expect("create JSON");
+        let response_body: Value = response.body.json().expect("create JSON");
         let mut response_body = response_body.as_object().expect("create object").clone();
         if response_body.contains_key("create_request_jti")
             || response_body.contains_key("create_request_sha256")
@@ -741,7 +743,9 @@ mod tests {
             "create_request_sha256".to_owned(),
             Value::String(create_request_sha256),
         );
-        response.body = serde_json::to_vec(&response_body).expect("bound create JSON");
+        response.body = serde_json::to_vec(&response_body)
+            .expect("bound create JSON")
+            .into();
     }
 
     fn binding() -> ConformanceBinding {
@@ -780,7 +784,8 @@ mod tests {
                     "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                     "expires_in": 300,
                 }))
-                .expect("response"),
+                .expect("response")
+                .into(),
             };
             bind_test_create_response(&request, &mut response);
             Ok(response)
@@ -837,7 +842,8 @@ mod tests {
                     "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                     "expires_in": 300,
                 }))
-                .expect("response"),
+                .expect("response")
+                .into(),
             })),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
@@ -870,7 +876,8 @@ mod tests {
                     "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                     "expires_in": 300
                 }))
-                .expect("response"),
+                .expect("response")
+                .into(),
             })),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
@@ -952,7 +959,8 @@ mod tests {
                         "create_request_jti": body["create_request_jti"],
                         "create_request_sha256": hash,
                     }))
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 })
             }
         }
@@ -996,7 +1004,8 @@ mod tests {
                     "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                     "expires_in": 300
                 }))
-                .expect("response"),
+                .expect("response")
+                .into(),
             })),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
@@ -1046,7 +1055,7 @@ mod tests {
                     "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                     "verification_ui_url": "https://issuer.example/ui/verification-result#receipt=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
                 }))
-                .expect("response"),
+                .expect("response").into(),
             })),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
@@ -1081,7 +1090,8 @@ mod tests {
                     "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                     "expires_in": 300
                 }))
-                .expect("response"),
+                .expect("response")
+                .into(),
             })),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
@@ -1172,12 +1182,12 @@ mod tests {
                         } else {
                             vec![("Location".to_owned(), completion_url.to_string())]
                         },
-                        body: Vec::new(),
+                        body: Vec::new().into(),
                     },
                     HttpResponse {
                         status: target_status,
                         headers: Vec::new(),
-                        body: b"complete".to_vec(),
+                        body: b"complete".to_vec().into(),
                     },
                 ])),
             });
@@ -1244,12 +1254,13 @@ mod tests {
                         "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                         "expires_in": 300
                     }))
-                    .expect("start response"),
+                    .expect("start response")
+                    .into(),
                 },
                 HttpResponse {
                     status: 200,
                     headers: Vec::new(),
-                    body: Vec::new(),
+                    body: Vec::new().into(),
                 },
             ])),
         });
@@ -1289,7 +1300,7 @@ mod tests {
             responses: std::sync::Mutex::new(VecDeque::from([HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: Vec::new(),
+                body: Vec::new().into(),
             }])),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
@@ -1329,7 +1340,7 @@ mod tests {
             responses: std::sync::Mutex::new(VecDeque::from([HttpResponse {
                 status: 400,
                 headers: Vec::new(),
-                body: Vec::new(),
+                body: Vec::new().into(),
             }])),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
@@ -1373,7 +1384,7 @@ mod tests {
                     "https://issuer.example/openid4vp/complete/00000000-0000-0000-0000-000000000000"
                         .to_owned(),
                 )],
-                body: Vec::new(),
+                body: Vec::new().into(),
             }])),
         });
         let mut client = OpenId4VpVerifierClient::with_transport(
