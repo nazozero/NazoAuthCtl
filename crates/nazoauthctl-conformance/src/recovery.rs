@@ -1317,19 +1317,10 @@ fn validate_tenant_resource_journal(
     if journal.binding.proxy.is_none() && !journal.proxy_cleanup_complete {
         bail!("tenant-resource proxy cleanup marker is incomplete without a proxy binding");
     }
-    let suite_inventory_transferred = matches!(
-        &journal.suite_retention,
-        SuiteRetentionDisposition::Retained { .. }
-    );
     if let Some(suite) = &journal.suite {
         let origin = crate::Origin::parse_suite(&suite.origin)
             .map_err(|_| anyhow::anyhow!("Suite recovery origin is invalid"))?;
         if origin.as_str() != suite.origin
-            || (!suite.cleanup_complete
-                && !suite_inventory_transferred
-                && suite.plan_ids.is_empty()
-                && suite.module_ids.is_empty()
-                && suite.pending_create_intents.is_empty())
             || suite.plan_ids.len() > MAX_SUITE_RECOVERY_PLANS
             || suite.module_ids.len() > MAX_SUITE_RECOVERY_MODULES
             || suite.pending_create_intents.len()
@@ -2481,6 +2472,40 @@ mod tests {
         validate_tenant_resource_journal(&journal, "deployment-1")
             .expect("authoritative absence did not settle the rewound tenant");
         assert!(tenant_resource_obligations_complete(&journal));
+    }
+
+    #[test]
+    fn deleted_unstarted_suite_plans_survive_reopen_before_cleanup_finishes() {
+        let work =
+            nazoauthctl_runtime::filesystem::PrivateTempDir::new("oidf-plan-cleanup").unwrap();
+        let store = ConformanceRecoveryStore::open(work.path(), "deployment-1").unwrap();
+        let origin = "https://www.certification.openid.net";
+        let mut guard = store.begin_ordinary_run(binding()).unwrap();
+        guard.mark_tenant_absent(1).unwrap();
+        for id in ["plan-1", "plan-2"] {
+            guard
+                .begin_suite_create_with_retention(origin, id, false)
+                .unwrap();
+            guard.record_suite_plan(origin, id, id).unwrap();
+        }
+        for id in ["plan-1", "plan-2"] {
+            guard.release_deleted_suite_plan(id).unwrap();
+            drop(guard);
+            guard = store.claim_pending().unwrap().pop().unwrap();
+            assert!(
+                !guard
+                    .suite_recovery()
+                    .unwrap()
+                    .plan_ids
+                    .iter()
+                    .any(|p| p == id)
+            );
+            assert!(!guard.suite_cleanup_complete());
+        }
+        assert!(guard.suite_recovery().unwrap().plan_ids.is_empty());
+        guard.mark_suite_cleanup_complete().unwrap();
+        guard.finish().unwrap();
+        assert!(store.claim_pending().unwrap().is_empty());
     }
 
     #[test]

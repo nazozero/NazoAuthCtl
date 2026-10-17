@@ -2927,6 +2927,57 @@ mod tests {
     }
 
     #[test]
+    fn bundled_plain_vci_preflight_accepts_suite_without_encryption_test() {
+        let bundled = crate::bundled_oidf_matrix().unwrap();
+        let group = bundled
+            .groups
+            .iter()
+            .find(|g| g.id == "openid4vc-vci")
+            .unwrap();
+        for id in [
+            "openid4vc-vci-p028",
+            "openid4vc-vci-p031",
+            "openid4vc-vci-p032",
+        ] {
+            let plan = group.plans.iter().find(|p| p.id == id).unwrap();
+            let transport = Arc::new(DefinitionTransport {
+                // Suite 5.3.3 excludes the encryption-algorithm test from plain variants.
+                modules: serde_json::json!([{"testModule": "oid4vci-1_0-issuer-metadata-test"}]),
+                requests: Mutex::new(Vec::new()),
+            });
+            let client = SuiteClient::with_transport(
+                Origin::parse("https://suite.example").unwrap(),
+                Some(BearerToken::new("suite-token").unwrap()),
+                transport,
+                ClientConfig::default(),
+            )
+            .unwrap();
+            let mut matrix = one_plan_matrix(serde_json::json!({}));
+            matrix.document.groups[0].plans[0].expected_results = plan.expected_results.clone();
+            let runner = ConformanceRunner::new(ConformanceRunConfig {
+                client,
+                matrix,
+                target_origin: None,
+                binding: Some(test_binding()),
+                poll_timeout: Duration::from_secs(1),
+                control: RunControl::default(),
+                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+                plan_resource_budgets: one_plan_budgets(),
+                selected_resource_budget: budget(1, 1, 60),
+                jobs: 1,
+                automation: Vec::new(),
+                suite_resource_observer: None,
+            })
+            .unwrap();
+
+            let prepared = runner.prepare_run(&mut ());
+            assert!(prepared.errors.is_empty(), "{id}: {:?}", prepared.errors);
+            assert!(prepared.matrix_expectations_satisfied);
+            assert_eq!(prepared.planned.len(), 1);
+        }
+    }
+
+    #[test]
     fn duplicate_signed_skip_definition_stops_before_module_creation() {
         let transport = Arc::new(DefinitionTransport {
             modules: serde_json::json!([
