@@ -8,7 +8,7 @@ The workspace has three boundaries in addition to its root library:
 | --- | --- |
 | Root `nazoauthctl-core`, under `src/` | CLI contracts, host/instance registry, controller workflows, release verification, target protocol, journals, TLS and recovery decisions. |
 | `crates/nazoauthctl` | Executable entry and OIDF command routing. |
-| `crates/nazoauthctl-runtime` | Audited filesystem/process primitives and Docker, Podman and host runtime implementations. |
+| `crates/nazoauthctl-runtime` | Audited filesystem/process primitives, shared HTTP frame storage, and Docker, Podman and host runtime implementations. |
 | `crates/nazoauthctl-conformance` | Official Suite clients, bounded orchestration, signed driver/Matrix handling and private evidence. It does not own official test results. |
 
 The registry locates an instance; the target owns deployment state and execution

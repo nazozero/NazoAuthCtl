@@ -496,12 +496,14 @@ impl SuiteClient {
             let body = if response.body.is_empty() {
                 Value::Null
             } else if (200..300).contains(&response.status) {
-                serde_json::from_slice(&response.body)
+                response
+                    .body
+                    .json()
                     .map_err(|_| SuiteClientError::MalformedResponse)?
             } else {
                 // Error pages are not part of the machine-readable contract;
                 // preserve only the status and never echo their body.
-                serde_json::from_slice(&response.body).unwrap_or(Value::Null)
+                response.body.json().unwrap_or(Value::Null)
             };
             return Ok(RawResponse {
                 status: response.status,
@@ -654,8 +656,15 @@ fn parse_plan_created(body: Value) -> Result<PlanCreated, SuiteClientError> {
 }
 
 fn is_finalisation_race(value: &Value) -> bool {
-    let text = serde_json::to_string(value).unwrap_or_default();
-    text.contains("runInBackground called after runFinalisationTaskInBackground()")
+    const MESSAGE: &str = "runInBackground called after runFinalisationTaskInBackground()";
+    match value {
+        Value::String(text) => text.contains(MESSAGE),
+        Value::Array(values) => values.iter().any(is_finalisation_race),
+        Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| key.contains(MESSAGE) || is_finalisation_race(value)),
+        _ => false,
+    }
 }
 
 fn wait_state_call_timeout_ms(remaining: Duration, transport_timeout: Duration) -> u128 {
@@ -674,6 +683,21 @@ fn wait_state_call_timeout_ms(remaining: Duration, transport_timeout: Duration) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalisation_race_searches_json_without_reencoding_it() {
+        let message = "runInBackground called after runFinalisationTaskInBackground()";
+        assert!(is_finalisation_race(
+            &serde_json::json!({"errors":[{"message":message}]})
+        ));
+        assert!(is_finalisation_race(&serde_json::json!({message: false})));
+        assert!(!is_finalisation_race(&serde_json::json!([
+            "runInBackground called after ",
+            "runFinalisationTaskInBackground()",
+            null,
+            500
+        ])));
+    }
     use crate::transport::TransportError;
     use std::sync::{Arc, Mutex};
 
@@ -683,7 +707,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 201,
                 headers: vec![],
-                body: b"{}".to_vec(),
+                body: b"{}".to_vec().into(),
             })
         }
     }
@@ -764,7 +788,7 @@ mod tests {
             response: HttpResponse {
                 status: 200,
                 headers: vec![],
-                body: vec![b'{'; 32],
+                body: vec![b'{'; 32].into(),
             },
         });
         let client = SuiteClient::with_transport(
@@ -810,7 +834,8 @@ mod tests {
                     self.authenticated_body.clone()
                 } else {
                     b"{}".to_vec()
-                },
+                }
+                .into(),
             })
         }
     }
@@ -863,7 +888,7 @@ mod tests {
                 Ok(HttpResponse {
                     status: if first { 302 } else { 200 },
                     headers: vec![("Location".into(), self.location.into())],
-                    body: b"{}".to_vec(),
+                    body: b"{}".to_vec().into(),
                 })
             }
         }
@@ -966,7 +991,7 @@ mod tests {
                 response: HttpResponse {
                     status: 200,
                     headers: vec![],
-                    body: b"<html>not the Suite API</html>".to_vec(),
+                    body: b"<html>not the Suite API</html>".to_vec().into(),
                 },
             }),
             ClientConfig::default(),
@@ -994,7 +1019,8 @@ mod tests {
                         "_id": "module-a-log-entry",
                         "upload": "placeholder-a"
                     }]))
-                    .expect("images"),
+                    .expect("images")
+                    .into(),
                 },
                 1 => HttpResponse {
                     status: 200,
@@ -1003,7 +1029,8 @@ mod tests {
                         "_id": "module-a-log-entry",
                         "img": "stored"
                     }))
-                    .expect("upload"),
+                    .expect("upload")
+                    .into(),
                 },
                 _ => panic!("unexpected request"),
             };
@@ -1063,7 +1090,9 @@ mod tests {
                 Ok(HttpResponse {
                     status: 200,
                     headers: vec![],
-                    body: serde_json::to_vec(&self.0).expect("placeholder response"),
+                    body: serde_json::to_vec(&self.0)
+                        .expect("placeholder response")
+                        .into(),
                 })
             }
         }

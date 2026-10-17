@@ -280,8 +280,12 @@ fn fetch_verified_artifact(
     if !trust.accepts_url(manifest_url) {
         return Err(ArtifactDiscoveryError::UntrustedManifestUrl);
     }
-    let manifest_bytes = transport.get(manifest_url, MAX_SIGNED_DRIVER_BYTES as u64)?;
-    let compact_manifest = compact_manifest(&manifest_bytes)?;
+    let mut manifest_text =
+        String::from_utf8(transport.get(manifest_url, MAX_SIGNED_DRIVER_BYTES as u64)?)
+            .map_err(|_| ArtifactDiscoveryError::ManifestEncoding)?;
+    let compact_len = compact_manifest(&manifest_text)?.len();
+    manifest_text.truncate(compact_len);
+    let compact_manifest = manifest_text;
     let driver =
         verify_oidf_driver_manifest(&compact_manifest, trust, available_capabilities, now)?;
     let driver_payload = transport.get(driver.driver_url(), driver.driver_size())?;
@@ -296,8 +300,7 @@ fn fetch_verified_artifact(
     })
 }
 
-fn compact_manifest(bytes: &[u8]) -> Result<String, ArtifactDiscoveryError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| ArtifactDiscoveryError::ManifestEncoding)?;
+fn compact_manifest(text: &str) -> Result<&str, ArtifactDiscoveryError> {
     let compact = text
         .strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
@@ -305,7 +308,7 @@ fn compact_manifest(bytes: &[u8]) -> Result<String, ArtifactDiscoveryError> {
     if compact.is_empty() || compact.chars().any(char::is_whitespace) {
         return Err(ArtifactDiscoveryError::ManifestEncoding);
     }
-    Ok(compact.to_owned())
+    Ok(compact)
 }
 
 struct CachedVerificationInput<'a> {
@@ -331,9 +334,11 @@ fn verify_cached_entry(
         return Err(ArtifactDiscoveryError::CacheRecord);
     }
 
-    let compact_manifest = compact_manifest(input.compact_manifest)?;
+    let text = std::str::from_utf8(input.compact_manifest)
+        .map_err(|_| ArtifactDiscoveryError::ManifestEncoding)?;
+    let compact_manifest = compact_manifest(text)?;
     let manifest =
-        verify_oidf_driver_manifest(&compact_manifest, trust, available_capabilities, now)?;
+        verify_oidf_driver_manifest(compact_manifest, trust, available_capabilities, now)?;
     let driver = manifest.verify_driver_payload(input.driver)?;
     let (artifact, driver, matrix) =
         verify_oidf_matrix_with_driver(manifest, driver, input.matrix)?;
@@ -543,6 +548,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn compact_manifest_borrows_the_validated_text() {
+        for suffix in ["", "\n", "\r\n"] {
+            let text = format!("header.payload.signature{suffix}");
+            let compact = compact_manifest(&text).unwrap();
+            assert_eq!(compact, "header.payload.signature");
+            assert_eq!(compact.as_ptr(), text.as_ptr());
+        }
+        for text in ["", "\n", "header. payload.signature", "token\n\n"] {
+            assert!(compact_manifest(text).is_err());
+        }
+    }
 
     const NOW: i64 = 1_800_000_000;
     const MANIFEST_URL: &str = "https://artifacts.example/oidf/stable/driver.jws";
