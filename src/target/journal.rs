@@ -339,7 +339,12 @@ impl TargetJournal {
             return Ok(result);
         }
         if let super::wire::HostOutcome::Failed { ref code, .. } = result.outcome
-            && (code == "CONTROL_OUTCOME_UNKNOWN" || code == "OUTCOME_UNKNOWN")
+            && matches!(
+                code.as_str(),
+                super::control_exec::CONTROL_OUTCOME_UNKNOWN
+                    | super::control_exec::CONTROL_EXECUTION_UNAVAILABLE
+                    | "OUTCOME_UNKNOWN"
+            )
         {
             return Ok(result);
         }
