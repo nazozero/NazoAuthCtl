@@ -501,6 +501,42 @@ mod tests {
     };
 
     #[test]
+    fn bundled_ciba_clients_use_ciba_audiences_without_fapi2_assurance() {
+        let matrix: serde_json::Value = serde_json::from_slice(BUNDLED_MATRIX).unwrap();
+        let group = matrix["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["id"] == "fapi-ciba")
+            .unwrap();
+        let mut checked = 0;
+        for plan in group["plans"].as_array().unwrap() {
+            for role in plan["required_roles"].as_array().unwrap() {
+                let registration = &role["registration_template"];
+                assert_eq!(registration["security_policy"]["assurance"], "baseline");
+                assert_eq!(
+                    registration["security_policy"]["allow_cross_device_flows"],
+                    true
+                );
+                assert_eq!(registration["require_mtls_bound_tokens"], true);
+                assert_eq!(registration["require_par_request_object"], true);
+                assert_eq!(
+                    registration["backchannel_authentication_request_signing_alg"],
+                    "PS256"
+                );
+                if registration["token_endpoint_auth_method"] == "private_key_jwt" {
+                    assert_eq!(
+                        registration["allow_client_assertion_endpoint_audience"],
+                        true
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8);
+    }
+
+    #[test]
     fn bundled_haip_clients_require_pushed_authorization() {
         let matrix: serde_json::Value = serde_json::from_slice(BUNDLED_MATRIX).unwrap();
         let mut checked = 0;

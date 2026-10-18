@@ -1,6 +1,8 @@
 """Security regressions for the signed artifact source boundary."""
-import pathlib
+import copy
+import json
 import os
+import pathlib
 import shutil
 import subprocess
 import tempfile
@@ -8,6 +10,18 @@ import unittest
 import generate_oidf_artifact as generator
 
 class GitSourceTest(unittest.TestCase):
+    def test_ciba_amendment_preserves_protocol_requirements_and_other_profiles(self):
+        bundled = pathlib.Path(__file__).resolve().parents[2] / "crates/nazoauthctl-conformance/resources/oidf/matrix.json"
+        groups = json.loads(bundled.read_text(encoding="utf-8"))["groups"]
+        generator.apply_reviewed_amendments(groups)
+        expected = copy.deepcopy(groups)
+        ciba = next(group for group in groups if group["id"] == "fapi-ciba")
+        for plan in ciba["plans"]:
+            for role in plan["required_roles"]:
+                role["registration_template"]["security_policy"]["assurance"] = "fapi2"
+        generator.apply_reviewed_amendments(groups)
+        self.assertEqual(groups, expected)
+
     @unittest.skipUnless(os.name == "posix", "Unix artifact output permissions")
     def test_atomic_output_replaces_regular_files_and_rejects_symlinks(self):
         with tempfile.TemporaryDirectory(prefix="oidf-output-") as directory:

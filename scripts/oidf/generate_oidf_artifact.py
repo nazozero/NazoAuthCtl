@@ -335,6 +335,12 @@ def apply_reviewed_amendments(groups: list[dict[str, object]]) -> None:
 
     for group in groups:
         migrate_ciba_reference(group)
+        if group["id"] == "fapi-ciba":
+            # These plans test FAPI-CIBA ID1, whose client assertions also
+            # accept endpoint audiences. FAPI 2 mandates issuer-only audiences.
+            for plan in group["plans"]:
+                for role in plan["required_roles"]:
+                    role["registration_template"]["security_policy"]["assurance"] = "baseline"
 
 
 def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict[str, object], dict[str, int]]:
