@@ -50,6 +50,12 @@ Backup validation probes the token schema before computing its sentinel. Legacy 
 
 The bundled HAIP issuer clients explicitly require PAR, as required by HAIP 1.0 section 4 when using the authorization endpoint. Wallet attestation authentication remains unchanged. This changes the recorded matrix digest without excluding any module.
 
+The FAPI-CIBA ID1 plans register clients with baseline assurance and explicit
+CIBA requirements: signed authentication requests, mTLS-bound tokens and
+endpoint audiences for `private_key_jwt`. They do not select FAPI 2 assurance,
+which requires issuer-only assertion audiences. FAPI 2 plans retain their own
+assurance policy; no Suite result or expected outcome is changed.
+
 The official VP wallet may return a result page instead of an HTTP redirect. The controller then visits only the completion URL returned by the target start operation. Target rejection or an unrelated redirect still fails. Historical signed-receipt checks remain for older records, and official REVIEW outcomes remain unchanged.
 
 For issuer-initiated multiple-client authorization, the Suite log's two explicit `VCIWaitForCredentialOffer` transitions determine when the second offer is due. A local completed-browser cache is not authoritative because another registered browser worker can complete the first flow. No offer is sent while browser URLs are pending, and repeated polling remains bounded to two offers.
