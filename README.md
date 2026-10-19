@@ -175,7 +175,7 @@ attestation inputs supplied by that workflow.
 <summary><strong>Conformance and TLS references</strong></summary>
 
 - [CLI language, output and interaction](docs/cli-presentation.md)
-- [OIDF artifact workflow](docs/oidf-artifacts.md)
+- [OIDF test workflow](docs/oidf.md)
 - [Conformance run options](docs/conformance-run-options.md)
 - [Shared signing keys](docs/shared-signing-keys.md)
 - [TLS deployment](docs/tls-deployment.md)

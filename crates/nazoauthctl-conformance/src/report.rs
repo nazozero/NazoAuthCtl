@@ -55,7 +55,7 @@ pub struct ModuleReport {
     /// The Suite's result is preserved verbatim and evaluated separately by
     /// the explicit outcome fields below.
     pub official_result: Option<String>,
-    /// The signed Matrix exception applying to this exact module, if any.
+    /// The bundled Matrix exception applying to this exact module, if any.
     pub expected_result: Option<String>,
     /// Controller classification derived from the official status/result and
     /// raw condition log. Only `PASSED` contributes to an overall Suite pass.
@@ -231,10 +231,10 @@ pub struct ConformanceReport {
     /// remains skipped and never contributes to `suite_pass`.
     pub skipped_modules: Vec<String>,
     /// Variant-qualified identities that actually finished
-    /// `SKIPPED` and were explicitly allowed by the signed Matrix.
+    /// `SKIPPED` and were explicitly allowed by the bundled Matrix.
     pub expected_skipped_modules: Vec<String>,
     /// Variant-qualified identities that actually finished
-    /// `SKIPPED` without an exact signed Matrix allowance.
+    /// `SKIPPED` without an exact bundled Matrix allowance.
     pub unexpected_skipped_modules: Vec<String>,
     /// Signed `SKIPPED` declarations whose test name was absent from, or was
     /// duplicated in, the Suite's definition of that Matrix plan.

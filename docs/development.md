@@ -16,7 +16,7 @@ records. Resource discovery does not grant authority to mutate a resource.
 Keep declared external/delegated/managed responsibilities when adding operations.
 Shared protocol definitions come from the immutable `nazo-operator-protocol`
 dependency in [Cargo.toml](../Cargo.toml). The existing local VP extension and
-its upstream integration boundary are documented in [oidf-artifacts.md](oidf-artifacts.md).
+its upstream integration boundary are documented in [oidf.md](oidf.md).
 
 Follow the existing command → controller → target operation → journal/receipt
 chain. Retries retain the original operation identity and canonical content;
@@ -29,7 +29,7 @@ Current formats and migration-aware rollback are defined in
 [compatibility.md](compatibility.md). TLS uses the existing lifecycle with its
 own explicit provider authority; consult [tls-deployment.md](tls-deployment.md)
 only for transport/certificate work. OIDF contracts are in
-[oidf-artifacts.md](oidf-artifacts.md), with operational selection and failure
+[oidf.md](oidf.md), with operational selection and failure
 behavior in [conformance-run-options.md](conformance-run-options.md).
 
 Published persistence fixtures are part of that contract. `self verify-state`

@@ -705,7 +705,7 @@ impl ConformanceRunner {
                         matrix_expectations_satisfied = false;
                         for identity in unknown_expected_skips {
                             errors.push(format!(
-                                "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: {identity}"
+                                "bundled Matrix expected SKIPPED module is not uniquely defined by Suite plan: {identity}"
                             ));
                             unknown_declared_skip_modules.push(identity);
                         }
@@ -1485,7 +1485,7 @@ fn module_has_browser_config(plan_config: &Value, test_name: &str) -> Result<boo
     Ok(override_browser || plan_config.get("browser").is_some())
 }
 
-/// `PlannedPlan` exists only after the signed Matrix was materialized and its
+/// `PlannedPlan` exists only after the bundled Matrix was materialized and its
 /// selected plan definitions were enumerated. The official OpenID4VP verifier
 /// family is therefore a signed capability classification here, not a
 /// suite/test-case exception (and never a p038-specific branch).
@@ -3048,7 +3048,7 @@ mod tests {
         assert_eq!(report.unknown_declared_skip_modules, ["p/declared-skip"]);
         assert!(report.errors.iter().any(|error| {
             error
-                == "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
+                == "bundled Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
         }));
         assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
         assert!(report.modules.is_empty());
