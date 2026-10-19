@@ -1684,7 +1684,9 @@ fn probe_ephemeral_tenant(issuer: &str) -> anyhow::Result<()> {
     loop {
         match transport.send(HttpRequest::get(metadata_url.clone()), 128 * 1024) {
             Ok(response) if response.status == 200 => {
-                let metadata: serde_json::Value = serde_json::from_slice(&response.body)
+                let metadata: serde_json::Value = response
+                    .body
+                    .json()
                     .context("temporary tenant discovery is not JSON")?;
                 if metadata.get("issuer").and_then(serde_json::Value::as_str) != Some(issuer) {
                     bail!("temporary tenant discovery issuer does not match its routed issuer");

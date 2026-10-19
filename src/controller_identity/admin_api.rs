@@ -38,7 +38,6 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::BodyExt as _;
 use serde::{Deserialize, Serialize};
@@ -94,46 +93,7 @@ pub struct AdminHttpResponse {
     pub set_cookie_headers: Vec<String>,
 }
 
-/// Retains HTTP data frames until their JSON consumer reads them.
-#[derive(Clone, Default)]
-pub struct AdminResponseBody {
-    first: Bytes,
-    rest: Vec<Bytes>,
-}
-
-impl From<Bytes> for AdminResponseBody {
-    fn from(first: Bytes) -> Self {
-        Self {
-            first,
-            rest: Vec::new(),
-        }
-    }
-}
-
-impl From<Vec<u8>> for AdminResponseBody {
-    fn from(bytes: Vec<u8>) -> Self {
-        Bytes::from(bytes).into()
-    }
-}
-
-impl AdminResponseBody {
-    fn len(&self) -> usize {
-        self.first.len() + self.rest.iter().map(Bytes::len).sum::<usize>()
-    }
-
-    pub fn json<T: serde::de::DeserializeOwned>(&self) -> serde_json::Result<T> {
-        if self.rest.is_empty() {
-            serde_json::from_slice(&self.first)
-        } else {
-            let chunks =
-                std::iter::once(self.first.as_ref()).chain(self.rest.iter().map(Bytes::as_ref));
-            let mut deserializer = serde_json::Deserializer::from_chunks(chunks);
-            let value = T::deserialize(&mut deserializer)?;
-            deserializer.end()?;
-            Ok(value)
-        }
-    }
-}
+pub use nazoauthctl_runtime::http_body::ResponseBody as AdminResponseBody;
 
 impl fmt::Debug for AdminHttpResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -251,11 +211,7 @@ where
             if let Ok(data) = frame.map_err(anyhow::Error::from_boxed)?.into_data()
                 && !data.is_empty()
             {
-                if collected.first.is_empty() {
-                    collected.first = data;
-                } else {
-                    collected.rest.push(data);
-                }
+                collected.push(data);
             }
         }
         let body = collected;
@@ -1512,6 +1468,7 @@ fn decode_recovery_commit(raw: &AdminResponseBody) -> Result<RecoveryCommitView,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::sync::{Arc, Mutex};
 
     const SLOT_JSON: &str = r#"{"deployment_id":"deploy-alpha","controller_id":"01900000-0000-7000-8000-000000000001","label":"ops","kid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0","slot_index":0,"issued_at":"2026-08-24T00:00:00Z","expires_at":"2026-09-23T00:00:00Z","status":"active","warning":null}"#;
@@ -1948,7 +1905,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(response.body.first.as_ptr(), pointer);
+            assert_eq!(response.body.chunks().next().unwrap().as_ptr(), pointer);
             assert_eq!(response.body.len(), MAX_RESPONSE_BYTES);
 
             for (sizes, oversized) in [
@@ -1981,8 +1938,8 @@ mod tests {
                     assert_eq!(result.unwrap_err().to_string(), "length limit exceeded");
                 } else {
                     let body = result.unwrap().body;
-                    let actual: Vec<_> = std::iter::once(&body.first)
-                        .chain(&body.rest)
+                    let actual: Vec<_> = body
+                        .chunks()
                         .flat_map(|frame| frame.iter().copied())
                         .collect();
                     assert_eq!(actual, expected);
@@ -2016,16 +1973,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(response.body.first.as_ptr(), pointers[0]);
-                assert_eq!(response.body.rest[0].as_ptr(), pointers[1]);
+                assert_eq!(response.body.chunks().next().unwrap().as_ptr(), pointers[0]);
+                assert_eq!(response.body.chunks().nth(1).unwrap().as_ptr(), pointers[1]);
                 assert_eq!(response.body.json::<serde_json::Value>().unwrap(), expected);
             }
         });
         for trailing in [b" true".as_slice(), b"{", b"\xff"] {
-            let body = AdminResponseBody {
-                first: Bytes::from_static(json),
-                rest: vec![Bytes::copy_from_slice(trailing)],
-            };
+            let mut body = AdminResponseBody::from(Bytes::from_static(json));
+            body.push(Bytes::copy_from_slice(trailing));
             assert!(body.json::<serde_json::Value>().is_err());
         }
     }

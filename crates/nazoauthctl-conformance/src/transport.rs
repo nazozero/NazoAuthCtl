@@ -1,7 +1,8 @@
-use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use nazoauthctl_runtime::http_body::ResponseBody;
+use reqwest::Client;
 use reqwest::redirect::Policy;
 use url::Url;
 
@@ -64,7 +65,7 @@ impl HttpRequest {
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: ResponseBody,
 }
 
 impl HttpResponse {
@@ -89,6 +90,7 @@ pub trait Transport: Send + Sync {
 #[derive(Clone)]
 pub struct HttpTransport {
     client: Client,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl HttpTransport {
@@ -101,7 +103,15 @@ impl HttpTransport {
             .redirect(Policy::none())
             .build()
             .map_err(|_| TransportError::Network(TransportFailureStage::BuildClient))?;
-        Ok(Self { client })
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|_| TransportError::Network(TransportFailureStage::BuildClient))?;
+        Ok(Self {
+            client,
+            runtime: Arc::new(runtime),
+        })
     }
 }
 
@@ -111,51 +121,58 @@ impl Transport for HttpTransport {
         request: HttpRequest,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, TransportError> {
-        let mut builder = self
-            .client
-            .request(request.method.as_reqwest(), request.url);
-        for (name, value) in request.headers {
-            builder = builder.header(name, value);
-        }
-        if let Some(body) = request.body {
-            builder = builder.body(body);
-        }
-        let response = builder
-            .send()
-            .map_err(|error| TransportError::Network(classify_send_failure(&error)))?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > max_response_bytes as u64)
-        {
-            return Err(TransportError::Oversize);
-        }
-        let status = response.status().as_u16();
-        let mut header_bytes = 0usize;
-        let mut headers = Vec::new();
-        for (name, value) in response.headers().iter() {
-            let Some(value) = value.to_str().ok() else {
-                continue;
-            };
-            header_bytes = header_bytes
-                .saturating_add(name.as_str().len())
-                .saturating_add(value.len());
-            if header_bytes > max_response_bytes {
+        self.runtime.block_on(async {
+            let mut builder = self
+                .client
+                .request(request.method.as_reqwest(), request.url);
+            for (name, value) in request.headers {
+                builder = builder.header(name, value);
+            }
+            if let Some(body) = request.body {
+                builder = builder.body(body);
+            }
+            let mut response = builder
+                .send()
+                .await
+                .map_err(|error| TransportError::Network(classify_send_failure(&error)))?;
+            if response
+                .content_length()
+                .is_some_and(|length| length > max_response_bytes as u64)
+            {
                 return Err(TransportError::Oversize);
             }
-            headers.push((name.as_str().to_owned(), value.to_owned()));
-        }
-        let mut body = Vec::new();
-        response
-            .take(max_response_bytes.saturating_add(1) as u64)
-            .read_to_end(&mut body)
-            .map_err(|_| TransportError::Network(TransportFailureStage::ReadBody))?;
-        if body.len() > max_response_bytes {
-            return Err(TransportError::Oversize);
-        }
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
+            let status = response.status().as_u16();
+            let mut header_bytes = 0usize;
+            let mut headers = Vec::new();
+            for (name, value) in response.headers().iter() {
+                let Some(value) = value.to_str().ok() else {
+                    continue;
+                };
+                header_bytes = header_bytes
+                    .saturating_add(name.as_str().len())
+                    .saturating_add(value.len());
+                if header_bytes > max_response_bytes {
+                    return Err(TransportError::Oversize);
+                }
+                headers.push((name.as_str().to_owned(), value.to_owned()));
+            }
+            let mut body = ResponseBody::default();
+            let mut remaining = max_response_bytes;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| TransportError::Network(TransportFailureStage::ReadBody))?
+            {
+                remaining = remaining
+                    .checked_sub(chunk.len())
+                    .ok_or(TransportError::Oversize)?;
+                body.push(chunk);
+            }
+            Ok(HttpResponse {
+                status,
+                headers,
+                body,
+            })
         })
     }
 }
@@ -223,21 +240,37 @@ impl std::error::Error for TransportError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     #[test]
     fn real_http_transport_bounds_headers_and_declared_or_streamed_bodies() {
         use std::io::Write as _;
         use std::net::TcpListener;
 
-        let transport = HttpTransport {
-            client: Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("test client"),
-        };
+        let mut transport = HttpTransport::new(Duration::from_secs(5)).expect("test transport");
+        transport.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client");
         let limit = 128;
         for (response, oversize) in [
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n40\r\n{}\r\n40\r\n{}\r\n0\r\n\r\n",
+                    "x".repeat(64),
+                    "y".repeat(64)
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n40\r\n{}\r\n41\r\n{}\r\n0\r\n\r\n",
+                    "x".repeat(64),
+                    "y".repeat(65)
+                ),
+                true,
+            ),
             (
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: 128\r\n\r\n{}",
