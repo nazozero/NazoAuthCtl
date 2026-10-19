@@ -62,3 +62,25 @@ Recovery journals retain their persisted content identities and resource
 ownership records. Upgrading the controller does not recompute old run identities
 or require the old Matrix to clean up temporary tenants, proxy trust or Suite
 resources. Suite retention records and review evidence remain available.
+
+The run evidence sink commits each run into a unique owner-only directory with
+a manifest-last digest envelope, and preserves structured output when outer
+cleanup fails. Control evidence binds every operation to its operation ID,
+canonical request hash, typed result, revision, and manifest transition, and
+proves cleanup back to the enumerated baseline. Suite outcomes and controller
+evidence remain distinct facts; neither is presented as a Suite signature.
+
+Before ordinary Apply, `oidf run` durably stores the exact
+`ControlOperation`, canonical request hash, and private manifest path. Response
+loss replays that same operation. Cleanup first enumerates the run identities,
+then issues a digest-bound Revoke, persists each typed terminal result, and
+removes the private manifest only through the journal's deletion-intent state
+machine. mTLS trust is an ordinary tenant resource; ingress forwards the RFC
+9440 client-certificate header and no per-run proxy trust file is installed.
+
+The pinned operator-protocol dependency remains authoritative for its exported
+types. The existing VP receipt/intent extension in `oidf_protocol.rs` is not
+present in that pinned revision. Its active consumers remain explicit local
+imports until the producer and shared protocol can be updated together; it must
+not masquerade as a re-export of the dependency. Removing it independently
+would remove a currently used conformance capability.
