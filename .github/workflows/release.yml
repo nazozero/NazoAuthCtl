@@ -120,7 +120,7 @@ jobs:
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             --workdir /workspace \
-            rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 \
+            rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 \
             bash -euo pipefail -c '
               umask 0022
               cargo test --locked --workspace --all-targets --all-features --target "${{ matrix.target }}"
@@ -139,7 +139,7 @@ jobs:
           mkdir -p release
           cp "target/${{ matrix.target }}/release/nazoauthctl${{ matrix.extension }}" \
             "release/nazoauthctl-${{ matrix.target }}${{ matrix.extension }}"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: controller-${{ matrix.target }}
           path: release/nazoauthctl-${{ matrix.target }}${{ matrix.extension }}
@@ -154,7 +154,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: controller-*
           path: release

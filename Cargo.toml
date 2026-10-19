@@ -16,8 +16,8 @@ rust-version = "1.99"
 
 [workspace.dependencies]
 hex = "0.4.3"
-nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "8ebcfff58f266b69946a99dc2a69bc3d30738803", version = "0.3.1", default-features = false, features = ["ed25519"] }
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "8ebcfff58f266b69946a99dc2a69bc3d30738803", version = "0.3.1", package = "nazo-operator-protocol" }
+nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "118dc00adc37f9b12c3129070344927b68a2e673", version = "0.3.3", default-features = false, features = ["ed25519"] }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "118dc00adc37f9b12c3129070344927b68a2e673", version = "0.3.3", package = "nazo-operator-protocol" }
 
 [package]
 name = "nazoauthctl-core"
@@ -59,20 +59,20 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 rustls-pki-types = "1.15.1"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
 tar = "0.4.46"
-tokio = { version = "1.53.2", features = ["rt", "time"] }
+tokio = { version = "1.53.3", features = ["rt", "time"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 unicode-width = "0.2.2"
-uuid = { version = "1.27.0", features = ["v7", "serde"] }
+uuid = { version = "1.28.0", features = ["v7", "serde"] }
 x509-parser = "0.18.1"
 yaml_serde = "0.10.7"
-zeroize = { version = "1.9.0", features = ["derive", "serde"] }
+zeroize = { version = "1.9.1", features = ["derive", "serde"] }
 
 [dev-dependencies]
-http-body = "1.0.1"
+http-body = "1.1.0"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -88,4 +88,4 @@ panic = "abort"
 
 [patch.crates-io]
 # Borrow immutable HTTP frames and move decoded owned strings without a body copy.
-serde_json = { git = "https://github.com/bymoye/json", rev = "7a006a7f6984324a90382d799c0fcddd0bf9606f" }
+serde_json = { git = "https://github.com/bymoye/json", rev = "797bb92cabc5c67621d5d5fc3e60ed9284a02c63" }
