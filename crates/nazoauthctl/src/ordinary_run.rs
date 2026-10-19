@@ -1,7 +1,7 @@
 //! Ordinary tenant-resource backed OIDF orchestration.
 //!
-//! This is the only producer path for `conformance run`. The signed artifact
-//! owns executable Matrix facts; NazoAuth owns ordinary tenant resources; the
+//! This is the producer path for `oidf run`. The bundled Matrix
+//! owns test configuration; NazoAuth owns ordinary tenant resources; the
 //! Suite remains an external test runner. No conformance lease or Suite-only
 //! NazoAuth management endpoint is used here.
 
@@ -22,28 +22,27 @@ use cliclack::{
 };
 use nazo_operator_protocol::{ControlOperationPayload, ControlResultData, ControlTenantBoundary};
 use nazoauthctl_conformance::{
-    ArtifactMaterializationBinding, BearerToken, BrowserTargetOrigin, CibaUserApprovalClient,
-    ClientConfig, ConformanceAutomation, ConformanceBinding, ConformanceRecoveryStore,
-    ConformanceRunConfig, ConformanceRunner, CredentialStore, DescriptorMaterializer,
-    EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
+    BearerToken, BrowserTargetOrigin, BundledMaterializationBinding, BundledOidfMatrix,
+    CibaUserApprovalClient, ClientConfig, ConformanceAutomation, ConformanceBinding,
+    ConformanceRecoveryStore, ConformanceRunConfig, ConformanceRunner, CredentialStore,
+    DescriptorMaterializer, EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
     EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceRuntimeIdentity,
     EvidenceSourceIdentity, GroupProgress, GroupStatus, HttpRequest, HttpTransport, ModuleOutcome,
-    OidfArtifactMatrix, OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget,
-    OidfPlanSelection, OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver,
-    OpenId4VpVerifier, OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity,
-    ProgressEvent, ProgressSink, RunControl, StableRenderer, SuiteClient, SuiteClientError,
-    SuiteResourceObserver, SuiteRetentionDeferredReview, SuiteRetentionManifest,
-    SuiteRetentionManifestReceipt, SuiteRetentionPlan, TenantResourceApplyOutput,
-    TenantResourceControlOperation, TenantResourceRecoveryBinding, TenantResourceRecoveryPhase,
-    Transport, activity_label, bundled_oidf_matrix, current_matrix_label,
-    open_bundled_oidf_driver_plan, recover_proxy_trust, recover_suite_resources,
-    write_private_control_evidence_bundle,
+    OidfDriverAutomation, OidfDriverLane, OidfPlanResourceBudget, OidfPlanSelection,
+    OpenId4VciIssuerClient, OpenId4VciIssuerConfig, OpenId4VciIssuerDriver, OpenId4VpVerifier,
+    OpenId4VpVerifierClient, Origin, OutputLanguage, ProgressActivity, ProgressEvent, ProgressSink,
+    RunControl, StableRenderer, SuiteClient, SuiteClientError, SuiteResourceObserver,
+    SuiteRetentionDeferredReview, SuiteRetentionManifest, SuiteRetentionManifestReceipt,
+    SuiteRetentionPlan, TenantResourceApplyOutput, TenantResourceControlOperation,
+    TenantResourceRecoveryBinding, TenantResourceRecoveryPhase, Transport, activity_label,
+    bundled_oidf_matrix, current_matrix_label, open_bundled_oidf_driver_plan, recover_proxy_trust,
+    recover_suite_resources, write_private_control_evidence_bundle,
 };
 use serde::Serialize;
 use url::Url;
 use zeroize::Zeroizing;
 
-use super::{RunInvocation, current_unix_time};
+use super::RunInvocation;
 
 const MAX_STDIN_TOKEN_BYTES: u64 = 16 * 1024;
 
@@ -503,16 +502,11 @@ fn execute_with_progress<S: ProgressSink>(
         .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
 
     progress.activity(&ProgressActivity::LoadingMatrix);
-    let now = current_unix_time()?;
-    let driver_plan = open_bundled_oidf_driver_plan(
-        OidfPlanSelection {
-            groups: invocation.groups.clone(),
-            plans: invocation.plans.clone(),
-            excluded_plans: invocation.excluded_plans.clone(),
-        },
-        &suite_origin,
-        now,
-    )
+    let driver_plan = open_bundled_oidf_driver_plan(OidfPlanSelection {
+        groups: invocation.groups.clone(),
+        plans: invocation.plans.clone(),
+        excluded_plans: invocation.excluded_plans.clone(),
+    })
     .context("bundled OIDF Matrix cannot be opened")?;
     let requires_vci = driver_plan.plans.iter().any(|plan| {
         matches!(
@@ -526,7 +520,7 @@ fn execute_with_progress<S: ProgressSink>(
             OidfDriverAutomation::Openid4vp { .. }
         )
     });
-    let artifact_digest = driver_plan.artifact.driver_manifest_sha256.clone();
+    let artifact_digest = driver_plan.source.content_sha256.clone();
 
     progress.activity(&ProgressActivity::AuthenticatingSuite);
     let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language, progress)?;
@@ -559,7 +553,7 @@ fn execute_with_progress<S: ProgressSink>(
         .iter()
         .map(|plan| (plan.group_id.as_str(), plan.plan_id.as_str()))
         .collect::<BTreeSet<_>>();
-    let matrix = select_artifact_matrix_for_run(matrix, &selected_plan_ids);
+    let matrix = select_bundled_matrix_for_run(matrix, &selected_plan_ids);
     let plan_lanes = driver_plan
         .plans
         .iter()
@@ -575,9 +569,9 @@ fn execute_with_progress<S: ProgressSink>(
         .collect::<BTreeMap<_, _>>();
     let mut selected_resource_budget = driver_plan.selected_resource_budget;
     // The official Suite owns each plan's live module list and may add tests
-    // without changing the plan identity. Bound the run by the artifact-wide
+    // without changing the plan identity. Bound the run by the bundled Matrix
     // module ceiling instead of treating an old per-plan count as immutable.
-    selected_resource_budget.modules = driver_plan.artifact.resource_bounds.max_modules;
+    selected_resource_budget.modules = driver_plan.module_limit;
     let request_jti = format!("request-{}", hex::encode(rand::random::<[u8; 16]>()));
     let evidence_directory = create_evidence_directory(recovery_directory, &request_jti)?;
     let ephemeral_tenant = EphemeralTenant::new(
@@ -588,10 +582,6 @@ fn execute_with_progress<S: ProgressSink>(
     progress.activity(&ProgressActivity::PreparingTenant {
         issuer: ephemeral_tenant.issuer.clone(),
     });
-    let materialization_now = current_unix_time()?;
-    if materialization_now > driver_plan.latest_execution_start_at {
-        bail!("signed artifact no longer has enough validity remaining for the selected run");
-    }
     let requires_ciba = driver_plan
         .plans
         .iter()
@@ -599,12 +589,12 @@ fn execute_with_progress<S: ProgressSink>(
     let dynamic_registration_initial_access_token = session
         .dynamic_registration_initial_access_token(&invocation.tenant_id)
         .context("failed to derive the run tenant RFC 7591 initial access token")?;
-    let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
+    let prepared = DescriptorMaterializer::prepare_tenant_resources_from_bundled_matrix(
         &matrix,
-        ArtifactMaterializationBinding {
-            artifact_source_release: &driver_plan.artifact.revision,
-            artifact_source_digest: &artifact_digest,
-            raw_matrix_sha256: &driver_plan.artifact.matrix_sha256,
+        BundledMaterializationBinding {
+            test_source_release: &driver_plan.source.revision,
+            test_source_digest: &artifact_digest,
+            raw_matrix_sha256: &driver_plan.source.matrix_sha256,
             target_issuer: &ephemeral_tenant.issuer,
             suite_origin: &suite_origin,
             request_jti: &request_jti,
@@ -613,7 +603,7 @@ fn execute_with_progress<S: ProgressSink>(
             ),
         },
     )
-    .context("failed to prepare ordinary run material from the signed Matrix")?;
+    .context("failed to prepare ordinary run material from the bundled Matrix")?;
     let manifest = prepared
         .tenant_resource_manifest(&request_jti)
         .context("failed to materialize run-unique tenant resources")?;
@@ -734,13 +724,13 @@ fn execute_with_progress<S: ProgressSink>(
             &manifest,
             final_active,
         )
-        .context("Apply typed mappings do not match the prepared signed Matrix")?;
+        .context("Apply typed mappings do not match the prepared bundled Matrix")?;
         DescriptorMaterializer::finalize_tenant_resources(
             prepared,
             apply_output,
             deployment_trust_anchor,
         )
-        .context("Apply typed mappings do not match the prepared signed Matrix")
+        .context("Apply typed mappings do not match the prepared bundled Matrix")
     })();
     let ordinary = match setup_result {
         Ok(ordinary) => ordinary,
@@ -754,7 +744,7 @@ fn execute_with_progress<S: ProgressSink>(
         tenant_id: invocation.tenant_id.clone(),
         target_issuer: ephemeral_tenant.issuer.clone(),
         artifact_digest: artifact_digest.clone(),
-        artifact_revision: driver_plan.artifact.revision.clone(),
+        artifact_revision: driver_plan.source.revision.clone(),
         matrix_sha256: ordinary.matrix_sha256().to_owned(),
         selected_groups: driver_plan.selected_group_count,
         selected_plans: driver_plan.selected_plan_count,
@@ -971,7 +961,7 @@ fn execute_with_progress<S: ProgressSink>(
             },
             source: EvidenceSourceIdentity {
                 suite_origin: suite_origin.to_string(),
-                artifact: Box::new(driver_plan.artifact),
+                test_source: Box::new(driver_plan.source),
             },
             control: EvidenceControlIdentity {
                 deployment_id: deployment.deployment_id.clone(),
@@ -1086,7 +1076,7 @@ mod acceptance_tests {
     #[test]
     fn run_materializes_exact_driver_selection_including_exclusions() {
         use nazoauthctl_conformance::{
-            OidfPlanSelection, Origin, bundled_oidf_matrix, open_bundled_oidf_driver_plan,
+            OidfPlanSelection, bundled_oidf_matrix, open_bundled_oidf_driver_plan,
         };
 
         let matrix = bundled_oidf_matrix().unwrap();
@@ -1096,22 +1086,18 @@ mod acceptance_tests {
             .find(|group| group.plans.len() > 1)
             .unwrap();
         let excluded = group.plans[0].id.clone();
-        let driver = open_bundled_oidf_driver_plan(
-            OidfPlanSelection {
-                groups: vec![group.id.clone()],
-                plans: Vec::new(),
-                excluded_plans: vec![excluded.clone()],
-            },
-            &Origin::parse_public_suite("https://www.certification.openid.net").unwrap(),
-            1_800_000_000,
-        )
+        let driver = open_bundled_oidf_driver_plan(OidfPlanSelection {
+            groups: vec![group.id.clone()],
+            plans: Vec::new(),
+            excluded_plans: vec![excluded.clone()],
+        })
         .unwrap();
         let expected = driver
             .plans
             .iter()
             .map(|plan| (plan.group_id.as_str(), plan.plan_id.as_str()))
             .collect();
-        let selected = super::select_artifact_matrix_for_run(matrix, &expected);
+        let selected = super::select_bundled_matrix_for_run(matrix, &expected);
         let actual = selected
             .groups
             .iter()
@@ -1684,7 +1670,9 @@ fn probe_ephemeral_tenant(issuer: &str) -> anyhow::Result<()> {
     loop {
         match transport.send(HttpRequest::get(metadata_url.clone()), 128 * 1024) {
             Ok(response) if response.status == 200 => {
-                let metadata: serde_json::Value = serde_json::from_slice(&response.body)
+                let metadata: serde_json::Value = response
+                    .body
+                    .json()
                     .context("temporary tenant discovery is not JSON")?;
                 if metadata.get("issuer").and_then(serde_json::Value::as_str) != Some(issuer) {
                     bail!("temporary tenant discovery issuer does not match its routed issuer");
@@ -3578,10 +3566,10 @@ fn create_evidence_directory(recovery_directory: &Path, run_id: &str) -> anyhow:
     }
 }
 
-fn select_artifact_matrix_for_run(
-    matrix: &OidfArtifactMatrix,
+fn select_bundled_matrix_for_run(
+    matrix: &BundledOidfMatrix,
     selected_plan_ids: &BTreeSet<(&str, &str)>,
-) -> OidfArtifactMatrix {
+) -> BundledOidfMatrix {
     let groups = matrix
         .groups
         .iter()
@@ -3592,7 +3580,7 @@ fn select_artifact_matrix_for_run(
                 .filter(|plan| selected_plan_ids.contains(&(group.id.as_str(), plan.id.as_str())))
                 .cloned()
                 .collect();
-            (!plans.is_empty()).then(|| nazoauthctl_conformance::OidfArtifactMatrixGroup {
+            (!plans.is_empty()).then(|| nazoauthctl_conformance::BundledOidfMatrixGroup {
                 id: group.id.clone(),
                 profile: group.profile.clone(),
                 variant: group.variant.clone(),
@@ -3601,7 +3589,7 @@ fn select_artifact_matrix_for_run(
             })
         })
         .collect();
-    OidfArtifactMatrix {
+    BundledOidfMatrix {
         schema: matrix.schema,
         name: matrix.name.clone(),
         openid4vc_credential_datasets: matrix.openid4vc_credential_datasets.clone(),

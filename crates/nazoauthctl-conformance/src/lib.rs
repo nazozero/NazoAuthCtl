@@ -7,20 +7,19 @@
 //! results are retained verbatim; orchestration only treats `FINISHED` with
 //! the Suite's `PASSED` result as a successful module.
 
-mod artifact;
-mod artifact_discovery;
-mod artifact_driver;
-mod artifact_plan;
 mod browser;
+mod bundled;
 mod ciba_approval;
 mod client;
 mod credentials;
+mod driver;
 mod evidence;
 mod materializer;
 mod matrix;
 mod oidf_protocol;
 mod orchestrator;
 mod origin;
+mod plan;
 mod progress;
 mod proxy_trust;
 mod recovery;
@@ -28,29 +27,6 @@ mod report;
 use nazoauthctl_runtime::secure_file;
 mod transport;
 
-pub use artifact::{
-    ArtifactError, ArtifactTrustPolicy, MAX_ARTIFACT_MATRIX_BYTES, MAX_SIGNED_DRIVER_BYTES,
-    OIDF_ARTIFACT_SCHEMA_VERSION, OIDF_DRIVER_ENGINE_PROTOCOL, OIDF_MATRIX_SCHEMA_VERSION,
-    OIDF_TRUST_POLICY_SCHEMA_VERSION, OidfArtifactMatrix, OidfArtifactMatrixGroup,
-    OidfArtifactMatrixPlan, OidfArtifactMatrixVariant, OidfDriverIdentity, OidfDriverManifest,
-    OidfMatrixIdentity, OidfPlanResourceBudget, OidfResourceBounds, OidfSuiteIdentity,
-    VerifiedOidfArtifact, VerifiedOidfDriverManifest, read_artifact_driver, read_artifact_matrix,
-    read_compact_manifest, verify_oidf_artifact, verify_oidf_driver_manifest, verify_oidf_matrix,
-};
-pub use artifact_discovery::{
-    ArtifactDiscoveryError, CachedOidfArtifact, OIDF_ARTIFACT_CACHE_MAX_ENTRIES,
-    OIDF_ARTIFACT_CACHE_MIN_FREE_BYTES, OIDF_ARTIFACT_CACHE_SCHEMA_VERSION, ResolvedOidfArtifact,
-    open_cached_oidf_artifact, open_cached_oidf_driver_plan, resolve_oidf_artifact,
-};
-pub use artifact_driver::{
-    MAX_ARTIFACT_DRIVER_BYTES, OIDF_DRIVER_SCHEMA_VERSION, OidfDriverAutomation, OidfDriverHandler,
-    OidfDriverLane, OidfDriverProgram,
-};
-pub use artifact_plan::{
-    OidfBoundedRunnerContract, OidfDriverInspectionPlan, OidfDriverPlanEntry, OidfPlanError,
-    OidfPlanSelection, bundled_oidf_matrix, bundled_oidf_selection_choices,
-    open_bundled_oidf_driver_plan, resolve_bundled_oidf_plan_id, resolve_bundled_oidf_selection,
-};
 pub use browser::{
     BrowserError, BrowserPolicy, BrowserReviewScreenshotSource, BrowserRunnerState,
     BrowserTargetOrigin, ConformanceBinding, OpenId4VciError, OpenId4VciIssuerClient,
@@ -58,6 +34,10 @@ pub use browser::{
     OpenId4VpError, OpenId4VpPresentation, OpenId4VpStartRequest,
     OpenId4VpVerificationReceiptProvenance, OpenId4VpVerifier, OpenId4VpVerifierClient,
     ReviewScreenshotMarker,
+};
+pub use bundled::{
+    BundledOidfMatrix, BundledOidfMatrixGroup, BundledOidfMatrixPlan, BundledOidfMatrixVariant,
+    OIDF_MATRIX_SCHEMA_VERSION, OidfPlanResourceBudget, OidfSuiteReference, OidfTestSource,
 };
 pub use ciba_approval::{
     CibaApprovalFailureStage, CibaUserApprovalClient, CibaUserApprovalError, ciba_approval_requests,
@@ -67,6 +47,7 @@ pub use client::{
     PlanCreated, SuiteClient, SuiteClientError,
 };
 pub use credentials::{BearerToken, CredentialStore, CredentialStoreError};
+pub use driver::{OidfDriverAutomation, OidfDriverHandler, OidfDriverLane, OidfDriverProgram};
 pub use evidence::{
     EvidenceBundleIdentity, EvidenceBundleReceipt, EvidenceControlIdentity,
     EvidenceControlOperation, EvidenceDeploymentIdentity, EvidenceError, EvidenceRuntimeIdentity,
@@ -74,7 +55,7 @@ pub use evidence::{
     write_private_control_evidence_bundle,
 };
 pub use materializer::{
-    ArtifactMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
+    BundledMaterializationBinding, CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup,
     DescriptorMaterializer, DescriptorPlan, DescriptorSource, DescriptorVariant,
     MAX_DESCRIPTOR_BYTES, MaterializerError, MatrixDescriptor, PreparedMaterialization,
     RoleRequirement, SecureBytes, TenantResourceApplyOutput, TenantResourceManifest,
@@ -89,6 +70,11 @@ pub use orchestrator::{
     RunSummary, SuiteResourceObserver, recover_suite_resources,
 };
 pub use origin::{Origin, OriginError};
+pub use plan::{
+    OidfDriverPlanEntry, OidfExecutionPlan, OidfPlanError, OidfPlanSelection, bundled_oidf_matrix,
+    bundled_oidf_selection_choices, open_bundled_oidf_driver_plan, resolve_bundled_oidf_plan_id,
+    resolve_bundled_oidf_selection,
+};
 pub use progress::{
     GroupProgress, GroupStatus, OutputLanguage, ProgressActivity, ProgressEvent, ProgressSink,
     ProgressSnapshot, StableRenderer, activity_label, current_matrix_label, redacted_variant,

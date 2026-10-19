@@ -27,7 +27,7 @@ use crate::origin::Origin;
 /// Version of the short-lived, controller-private NazoAuth resource
 /// manifest emitted by this materializer.  It intentionally mirrors the
 /// server's ordinary tenant-resource apply envelope rather than the Suite
-/// matrix or artifact schemas.
+/// bundled matrix schemas.
 pub const TENANT_RESOURCE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 const MAX_TENANT_RESOURCE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
@@ -48,7 +48,6 @@ use crypto::{
     generate_client_crypto, random_hex, random_secret, random_tx_code, registration_requires_mtls,
     validate_materialized_mtls_registration,
 };
-pub(crate) use descriptor::artifact_placeholder_is_valid;
 pub use descriptor::{
     CryptoPolicy, DESCRIPTOR_SCHEMA_VERSION, DescriptorGroup, DescriptorPlan, DescriptorSource,
     DescriptorVariant, MAX_DESCRIPTOR_BYTES, MatrixDescriptor, RoleRequirement,
@@ -938,17 +937,17 @@ pub enum MaterializerError {
 }
 
 /// Cohesive provenance, target, run, and trust binding for materializing one
-/// signed artifact Matrix.
+/// bundled Matrix.
 #[derive(Clone, Copy)]
-pub struct ArtifactMaterializationBinding<'a> {
-    pub artifact_source_release: &'a str,
-    pub artifact_source_digest: &'a str,
+pub struct BundledMaterializationBinding<'a> {
+    pub test_source_release: &'a str,
+    pub test_source_digest: &'a str,
     pub raw_matrix_sha256: &'a str,
     pub target_issuer: &'a str,
     pub suite_origin: &'a Origin,
     pub request_jti: &'a str,
     /// Run-tenant RFC 7591 initial access token derived from the deployment
-    /// root. Ordinary runs may expose it to a signed plan, but never persist it
+    /// root. Ordinary runs may expose it to a bundled plan, but never persist it
     /// in the recovery journal.
     pub dynamic_registration_initial_access_token: Option<&'a str>,
 }
@@ -967,24 +966,24 @@ impl DescriptorMaterializer {
         Ok(descriptor)
     }
 
-    /// Prepare directly from the signed artifact Matrix.  The artifact is the
+    /// Prepare directly from the bundled Matrix.  The artifact is the
     /// sole authority for executable plans and public OpenID4VC inputs; this
     /// conversion only adapts its shared descriptor fields before invoking the
     /// existing descriptor validator and preparation pipeline.  The caller's
     /// raw Matrix digest is retained verbatim and is never replaced by a
     /// digest of a re-serialized descriptor.
-    /// Prepare the tenant-resource path from the signed artifact Matrix.
-    pub fn prepare_tenant_resources_from_artifact_matrix(
-        matrix: &crate::artifact::OidfArtifactMatrix,
-        binding: ArtifactMaterializationBinding<'_>,
+    /// Prepare the tenant-resource path from the bundled Matrix.
+    pub fn prepare_tenant_resources_from_bundled_matrix(
+        matrix: &crate::bundled::BundledOidfMatrix,
+        binding: BundledMaterializationBinding<'_>,
     ) -> Result<PreparedMaterialization, MaterializerError> {
-        let descriptor = Self::descriptor_from_artifact_matrix(
+        let descriptor = Self::descriptor_from_bundled_matrix(
             matrix,
-            binding.artifact_source_release,
-            binding.artifact_source_digest,
+            binding.test_source_release,
+            binding.test_source_digest,
             binding.raw_matrix_sha256,
         )?;
-        // VP certificate profiles use signed matrix facts independently of the
+        // VP certificate profiles use bundled matrix facts independently of the
         // subset of datasets provisioned into the credential issuer.
         let mdoc_issuing_country = matrix
             .openid4vc_credential_datasets
@@ -1013,18 +1012,18 @@ impl DescriptorMaterializer {
         )
     }
 
-    fn descriptor_from_artifact_matrix(
-        matrix: &crate::artifact::OidfArtifactMatrix,
-        artifact_source_release: &str,
-        artifact_source_digest: &str,
+    fn descriptor_from_bundled_matrix(
+        matrix: &crate::bundled::BundledOidfMatrix,
+        test_source_release: &str,
+        test_source_digest: &str,
         raw_matrix_sha256: &str,
     ) -> Result<MatrixDescriptor, MaterializerError> {
         validate_digest(raw_matrix_sha256, "matrix_sha256")?;
         let mut descriptor = MatrixDescriptor {
             schema: DESCRIPTOR_SCHEMA_VERSION,
             source: DescriptorSource {
-                release: artifact_source_release.to_owned(),
-                digest: artifact_source_digest.to_owned(),
+                release: test_source_release.to_owned(),
+                digest: test_source_digest.to_owned(),
             },
             openid4vc_credential_datasets: BTreeMap::new(),
             openid4vc_suite_mdoc_trust_anchor_pem: matrix
@@ -1130,7 +1129,7 @@ impl DescriptorMaterializer {
             );
         }
         // These values are run-scoped credentials, not deployment profile
-        // configuration.  Generate them only when the signed descriptor
+        // configuration.  Generate them only when the validated descriptor
         // actually references the credential. This keeps unrelated runs from
         // receiving a token and prevents a second run from reusing a DB-unique
         // deployment token.
@@ -2482,7 +2481,7 @@ mod tests {
     #[test]
     fn artifact_matrix_bridge_validates_descriptor_and_preserves_raw_digest() {
         let descriptor = descriptor();
-        let mut matrix = crate::artifact::OidfArtifactMatrix {
+        let mut matrix = crate::bundled::BundledOidfMatrix {
             schema: crate::OIDF_MATRIX_SCHEMA_VERSION,
             name: "official-fixed-matrix".to_owned(),
             openid4vc_credential_datasets: descriptor.openid4vc_credential_datasets.clone(),
@@ -2492,10 +2491,10 @@ mod tests {
             groups: descriptor
                 .groups
                 .iter()
-                .map(|group| crate::OidfArtifactMatrixGroup {
+                .map(|group| crate::BundledOidfMatrixGroup {
                     id: group.id.clone(),
                     profile: group.profile.clone(),
-                    variant: crate::OidfArtifactMatrixVariant {
+                    variant: crate::BundledOidfMatrixVariant {
                         id: group.variant.id.clone(),
                         values: group.variant.values.clone(),
                     },
@@ -2503,7 +2502,7 @@ mod tests {
                     plans: group
                         .plans
                         .iter()
-                        .map(|plan| crate::OidfArtifactMatrixPlan {
+                        .map(|plan| crate::BundledOidfMatrixPlan {
                             id: plan.id.clone(),
                             plan: plan.plan.clone(),
                             driver_handler: "default".to_owned(),
@@ -2514,7 +2513,6 @@ mod tests {
                             },
                             config_template: plan.config_template.clone(),
                             variant: plan.variant.clone(),
-                            required_capabilities: Vec::new(),
                             expected_results: plan.expected_results.clone(),
                             required_roles: plan.required_roles.clone(),
                             secret_bindings: plan.secret_bindings.clone(),
@@ -2529,11 +2527,11 @@ mod tests {
             serde_json::json!({"given_name":"Unselected"}),
         );
         let raw_digest = "f".repeat(64);
-        let artifact_source_digest = "a".repeat(64);
+        let test_source_digest = "a".repeat(64);
         let suite_origin = suite();
-        let binding = ArtifactMaterializationBinding {
-            artifact_source_release: "test",
-            artifact_source_digest: &artifact_source_digest,
+        let binding = BundledMaterializationBinding {
+            test_source_release: "test",
+            test_source_digest: &test_source_digest,
             raw_matrix_sha256: &raw_digest,
             target_issuer: "https://issuer.example",
             suite_origin: &suite_origin,
@@ -2541,7 +2539,7 @@ mod tests {
             dynamic_registration_initial_access_token: None,
         };
         let prepared =
-            DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(&matrix, binding)
+            DescriptorMaterializer::prepare_tenant_resources_from_bundled_matrix(&matrix, binding)
                 .expect("artifact matrix preparation");
         assert_eq!(prepared.matrix_sha256(), raw_digest);
         assert!(prepared.descriptor.openid4vc_credential_datasets.is_empty());
@@ -2554,7 +2552,7 @@ mod tests {
     #[test]
     fn ordinary_artifact_preparation_uses_only_the_deployment_dcr_token() {
         let descriptor = descriptor();
-        let mut matrix = crate::artifact::OidfArtifactMatrix {
+        let mut matrix = crate::bundled::BundledOidfMatrix {
             schema: crate::OIDF_MATRIX_SCHEMA_VERSION,
             name: "official-fixed-matrix".to_owned(),
             openid4vc_credential_datasets: descriptor.openid4vc_credential_datasets.clone(),
@@ -2564,10 +2562,10 @@ mod tests {
             groups: descriptor
                 .groups
                 .iter()
-                .map(|group| crate::OidfArtifactMatrixGroup {
+                .map(|group| crate::BundledOidfMatrixGroup {
                     id: group.id.clone(),
                     profile: group.profile.clone(),
-                    variant: crate::OidfArtifactMatrixVariant {
+                    variant: crate::BundledOidfMatrixVariant {
                         id: group.variant.id.clone(),
                         values: group.variant.values.clone(),
                     },
@@ -2575,7 +2573,7 @@ mod tests {
                     plans: group
                         .plans
                         .iter()
-                        .map(|plan| crate::OidfArtifactMatrixPlan {
+                        .map(|plan| crate::BundledOidfMatrixPlan {
                             id: plan.id.clone(),
                             plan: plan.plan.clone(),
                             driver_handler: "default".to_owned(),
@@ -2586,7 +2584,6 @@ mod tests {
                             },
                             config_template: plan.config_template.clone(),
                             variant: plan.variant.clone(),
-                            required_capabilities: Vec::new(),
                             expected_results: plan.expected_results.clone(),
                             required_roles: plan.required_roles.clone(),
                             secret_bindings: plan.secret_bindings.clone(),
@@ -2598,14 +2595,14 @@ mod tests {
         };
         matrix.groups[0].plans[0].config_template["initial_access_token"] =
             serde_json::json!("{{generated.dynamic_registration_initial_access_token}}");
-        let artifact_source_digest = "a".repeat(64);
+        let test_source_digest = "a".repeat(64);
         let raw_matrix_sha256 = "f".repeat(64);
         let suite_origin = suite();
-        let result = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
+        let result = DescriptorMaterializer::prepare_tenant_resources_from_bundled_matrix(
             &matrix,
-            ArtifactMaterializationBinding {
-                artifact_source_release: "test",
-                artifact_source_digest: &artifact_source_digest,
+            BundledMaterializationBinding {
+                test_source_release: "test",
+                test_source_digest: &test_source_digest,
                 raw_matrix_sha256: &raw_matrix_sha256,
                 target_issuer: "https://issuer.example",
                 suite_origin: &suite_origin,
@@ -2620,11 +2617,11 @@ mod tests {
             ))
         ));
 
-        let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
+        let prepared = DescriptorMaterializer::prepare_tenant_resources_from_bundled_matrix(
             &matrix,
-            ArtifactMaterializationBinding {
-                artifact_source_release: "test",
-                artifact_source_digest: &artifact_source_digest,
+            BundledMaterializationBinding {
+                test_source_release: "test",
+                test_source_digest: &test_source_digest,
                 raw_matrix_sha256: &raw_matrix_sha256,
                 target_issuer: "https://issuer.example",
                 suite_origin: &suite_origin,
@@ -3686,7 +3683,7 @@ mod tests {
     }
     #[test]
     fn security_cloud_vp_only_matrix_keeps_mdoc_certificate_profile_without_issuer_datasets() {
-        let mut matrix: crate::artifact::OidfArtifactMatrix =
+        let mut matrix: crate::bundled::BundledOidfMatrix =
             serde_json::from_str(include_str!("../resources/oidf/matrix.json")).unwrap();
         matrix.groups.retain(|group| group.id == "openid4vc-vp");
         for group in &mut matrix.groups {
@@ -3695,11 +3692,11 @@ mod tests {
             });
         }
         assert!(matrix.groups.iter().any(|group| !group.plans.is_empty()));
-        let prepared = DescriptorMaterializer::prepare_tenant_resources_from_artifact_matrix(
+        let prepared = DescriptorMaterializer::prepare_tenant_resources_from_bundled_matrix(
             &matrix,
-            ArtifactMaterializationBinding {
-                artifact_source_release: "test",
-                artifact_source_digest: &"a".repeat(64),
+            BundledMaterializationBinding {
+                test_source_release: "test",
+                test_source_digest: &"a".repeat(64),
                 raw_matrix_sha256: &"b".repeat(64),
                 target_issuer: "https://issuer.example",
                 suite_origin: &suite(),

@@ -2,9 +2,11 @@
 //!
 //! This crate owns the neutral runtime contract and the Docker/Podman
 //! implementations, systemd integration, and the audited filesystem
-//! primitives used by the controller core.
+//! primitives used by the controller core, plus HTTP frame storage shared with
+//! the conformance client.
 
 pub mod filesystem;
+pub mod http_body;
 pub mod process;
 pub mod runtime_backend;
 pub mod secure_file;

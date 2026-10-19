@@ -13,10 +13,10 @@ use uuid::Uuid;
 #[cfg(unix)]
 use zeroize::Zeroizing;
 
-use crate::{ConformanceReport, VerifiedOidfArtifact};
+use crate::{ConformanceReport, OidfTestSource};
 
 #[cfg(unix)]
-const EVIDENCE_BUNDLE_SCHEMA: u32 = 4;
+const EVIDENCE_BUNDLE_SCHEMA: u32 = 5;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceRuntimeIdentity {
@@ -37,7 +37,7 @@ pub struct EvidenceDeploymentIdentity {
 #[serde(deny_unknown_fields)]
 pub struct EvidenceSourceIdentity {
     pub suite_origin: String,
-    pub artifact: Box<VerifiedOidfArtifact>,
+    pub test_source: Box<OidfTestSource>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,7 +301,7 @@ pub fn write_private_control_evidence_bundle(
                         .as_ref()
                         .ok_or(EvidenceError::Identity)?;
                     let context = crate::recovery::VpReceiptContext {
-                        artifact_digest: &identity.source.artifact.driver_manifest_sha256,
+                        artifact_digest: &identity.source.test_source.content_sha256,
                         matrix_sha256: &report.matrix_digest,
                         suite_plan_id: &module.suite_plan_id,
                         suite_module_id: module_id,
@@ -516,8 +516,8 @@ fn validate_identity(
     report: &ConformanceReport,
     identity: &EvidenceBundleIdentity,
 ) -> Result<(), EvidenceError> {
-    if crate::artifact::validate_identifier(&identity.run_jti, 128).is_err()
-        || crate::artifact::validate_identifier(&identity.deployment.deployment_id, 128).is_err()
+    if crate::plan::validate_identifier(&identity.run_jti, 128).is_err()
+        || crate::plan::validate_identifier(&identity.deployment.deployment_id, 128).is_err()
         || !bounded(&identity.deployment.release, 128)
         || identity.deployment.target_issuer.ends_with('/')
     {
@@ -530,9 +530,9 @@ fn validate_identity(
     if !valid_runtime_identity(&identity.deployment.runtime) {
         return Err(EvidenceError::Identity);
     }
-    let artifact = &identity.source.artifact;
+    let artifact = &identity.source.test_source;
     if !lower_hex(&artifact.matrix_sha256, 64)
-        || !lower_hex(&artifact.driver_manifest_sha256, 64)
+        || !lower_hex(&artifact.content_sha256, 64)
         || !lower_hex(&artifact.driver_sha256, 64)
     {
         return Err(EvidenceError::Identity);
@@ -667,7 +667,7 @@ fn valid_resource_set(resources: &[TenantResourceIdentity]) -> bool {
     !resources.is_empty()
         && resources.len() <= nazo_operator_protocol::MAX_TENANT_RESOURCE_IDENTITIES
         && resources.iter().all(|resource| {
-            crate::artifact::validate_identifier(&resource.resource_id, 256).is_ok()
+            crate::plan::validate_identifier(&resource.resource_id, 256).is_ok()
                 && lower_hex(&resource.digest, 64)
         })
 }
@@ -678,7 +678,7 @@ fn valid_apply_mappings(
 ) -> bool {
     let mut seen = std::collections::BTreeSet::new();
     mappings.iter().all(|mapping| {
-        crate::artifact::validate_identifier(&mapping.resource_id, 256).is_ok()
+        crate::plan::validate_identifier(&mapping.resource_id, 256).is_ok()
             && !mapping.public_id.is_empty()
             && mapping.public_id.len() <= 512
             && !mapping.public_id.chars().any(char::is_control)
@@ -882,15 +882,10 @@ mod tests {
             },
             source: EvidenceSourceIdentity {
                 suite_origin: report.suite_origin.clone(),
-                artifact: Box::new(serde_json::from_value(json!({
-                    "artifact_id":"artifact", "revision":"revision", "source":"test", "signer_identity":"test", "signer_key_id":"key",
-                    "driver_manifest_sha256":"b".repeat(64), "driver_manifest_size":1,
-                    "suite":{"origin":report.suite_origin,"release":"test","revision":"revision","image_digest":"sha256:test"},
-                    "engine_protocol":1,"required_capabilities":[],"driver_schema":1,"driver_sha256":"c".repeat(64),
-                    "driver_size":1,"driver_handlers":1,"matrix_sha256":report.matrix_digest,
-                    "matrix_size":1,"matrix_groups":1,"matrix_plans":1,"matrix_modules":1,"matrix_clients":1,
-                    "matrix_wall_clock_seconds":1,"not_before":0,"expires_at":1,
-                    "resource_bounds":{"max_plans":1,"max_modules":1,"max_clients":1,"max_wall_clock_seconds":1}
+                test_source: Box::new(serde_json::from_value(json!({
+                    "controller_version":"test", "revision":"revision", "content_sha256":"b".repeat(64),
+                    "suite_reference":{"release":"test","revision":"revision","image_digest":"sha256:test"},
+                    "driver_sha256":"c".repeat(64), "matrix_sha256":report.matrix_digest
                 })).unwrap()),
             },
             control: EvidenceControlIdentity { deployment_id: "deployment".into(), tenant_id: tenant_id.clone(), operations, cleanup_complete: true },
@@ -1013,7 +1008,7 @@ mod tests {
             "status":"verified","completed_at":provenance["completed_at"],
             "intent_sha256":provenance["intent_sha256"],"capability_sha256":provenance["capability_sha256"],
             "evidence_context":{
-                "run_jti":binding.run_id,"artifact_sha256":identity.source.artifact.driver_manifest_sha256,
+                "run_jti":binding.run_id,"artifact_sha256":identity.source.test_source.content_sha256,
                 "matrix_sha256":report.matrix_digest,"suite_plan_id":"suite-plan","suite_module_id":"module",
                 "test_name":"test","variant_sha256":sha256(b"{}")
             },

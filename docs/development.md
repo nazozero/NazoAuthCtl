@@ -8,15 +8,15 @@ The workspace has three boundaries in addition to its root library:
 | --- | --- |
 | Root `nazoauthctl-core`, under `src/` | CLI contracts, host/instance registry, controller workflows, release verification, target protocol, journals, TLS and recovery decisions. |
 | `crates/nazoauthctl` | Executable entry and OIDF command routing. |
-| `crates/nazoauthctl-runtime` | Audited filesystem/process primitives and Docker, Podman and host runtime implementations. |
-| `crates/nazoauthctl-conformance` | Official Suite clients, bounded orchestration, signed driver/Matrix handling and private evidence. It does not own official test results. |
+| `crates/nazoauthctl-runtime` | Audited filesystem/process primitives, shared HTTP frame storage, and Docker, Podman and host runtime implementations. |
+| `crates/nazoauthctl-conformance` | Official Suite clients, bounded orchestration, bundled test-plan compilation and private evidence. It does not own official test results. |
 
 The registry locates an instance; the target owns deployment state and execution
 records. Resource discovery does not grant authority to mutate a resource.
 Keep declared external/delegated/managed responsibilities when adding operations.
 Shared protocol definitions come from the immutable `nazo-operator-protocol`
 dependency in [Cargo.toml](../Cargo.toml). The existing local VP extension and
-its upstream integration boundary are documented in [oidf-artifacts.md](oidf-artifacts.md).
+its upstream integration boundary are documented in [oidf.md](oidf.md).
 
 Follow the existing command → controller → target operation → journal/receipt
 chain. Retries retain the original operation identity and canonical content;
@@ -29,7 +29,7 @@ Current formats and migration-aware rollback are defined in
 [compatibility.md](compatibility.md). TLS uses the existing lifecycle with its
 own explicit provider authority; consult [tls-deployment.md](tls-deployment.md)
 only for transport/certificate work. OIDF contracts are in
-[oidf-artifacts.md](oidf-artifacts.md), with operational selection and failure
+[oidf.md](oidf.md), with operational selection and failure
 behavior in [conformance-run-options.md](conformance-run-options.md).
 
 Published persistence fixtures are part of that contract. `self verify-state`
@@ -46,6 +46,12 @@ expiry terminates and reaps the process tree using the platform cleanup primitiv
 `stdin_output` and `stdin_stdout` take owned byte buffers without copying them;
 borrowed inputs are copied to give the bounded writer thread independent ownership.
 The writer zeroizes its input on completion.
+
+Operator tasks preserve durable stdout receipts even on a nonzero exit. Without
+a receipt, only the server's closed rejection marker is forwarded; arbitrary
+stderr remains private. Registry unavailability before admission retains both
+operation journals for retry and does not stop the writer. A missing receipt
+without proof of pre-admission rejection remains an unknown migration outcome.
 
 The SSH transport preserves the local `SSH_AUTH_SOCK` value for OpenSSH agent
 authentication for ordinary operations, transfer sessions, recovery forwards and

@@ -408,6 +408,7 @@ impl ConformanceRunner {
         let deadline = started + self.config.poll_timeout;
         let mut observed = initial;
         let mut first_round = true;
+        let variant = runtime_variant_for_definition(plan, module);
         let mut last_wait_report = None;
         loop {
             if self.config.control.is_interrupted() {
@@ -453,14 +454,9 @@ impl ConformanceRunner {
                 }
                 Err(error) => return Err(error.to_string()),
             };
-            let module_context = OpenId4VciModule::new(
-                module_id.to_owned(),
-                module.test_name.clone(),
-                runtime_variant_for_definition(plan, module),
-                plan.config.clone(),
-                runner,
-            )
-            .map_err(|error| error.to_string())?;
+            let module_context =
+                OpenId4VciModule::new(module_id, &module.test_name, &variant, &plan.config, runner)
+                    .map_err(|error| error.to_string())?;
             let drive_result = {
                 let mut issuer = issuer
                     .lock()
@@ -709,7 +705,7 @@ impl ConformanceRunner {
                         matrix_expectations_satisfied = false;
                         for identity in unknown_expected_skips {
                             errors.push(format!(
-                                "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: {identity}"
+                                "bundled Matrix expected SKIPPED module is not uniquely defined by Suite plan: {identity}"
                             ));
                             unknown_declared_skip_modules.push(identity);
                         }
@@ -871,7 +867,7 @@ impl ConformanceRunner {
                         } else {
                             None
                         };
-                    let instance = match self
+                    let mut instance = match self
                         .config
                         .client
                         .create_module(&plan.suite_plan_id, module)
@@ -919,7 +915,15 @@ impl ConformanceRunner {
                     // The Suite's create response normally auto-queues a
                     // runner. Explicit start is only valid for CONFIGURED;
                     // WAITING/RUNNING/terminal states are observed directly.
-                    let initial = initial_runner_info(&instance.raw);
+                    let alias = instance
+                        .raw
+                        .as_object_mut()
+                        .and_then(|object| object.remove("alias"))
+                        .and_then(|value| match value {
+                            Value::String(alias) => Some(alias),
+                            _ => None,
+                        });
+                    let initial = initial_runner_info(&mut instance.raw);
                     let initial = match initial {
                         Some(info) => Some(info),
                         None => match self.config.client.module_info(&instance.id) {
@@ -1040,10 +1044,8 @@ impl ConformanceRunner {
                                 groups[group_index].status = GroupStatus::Failed;
                                 break 'execute;
                             };
-                            let alias = instance
-                                .raw
-                                .get("alias")
-                                .and_then(Value::as_str)
+                            let alias = alias
+                                .as_deref()
                                 .or_else(|| plan.config.get("alias").and_then(Value::as_str));
                             let Some(alias) = alias else {
                                 errors.push("OpenID4VP module has no verifier alias".to_owned());
@@ -1483,7 +1485,7 @@ fn module_has_browser_config(plan_config: &Value, test_name: &str) -> Result<boo
     Ok(override_browser || plan_config.get("browser").is_some())
 }
 
-/// `PlannedPlan` exists only after the signed Matrix was materialized and its
+/// `PlannedPlan` exists only after the bundled Matrix was materialized and its
 /// selected plan definitions were enumerated. The official OpenID4VP verifier
 /// family is therefore a signed capability classification here, not a
 /// suite/test-case exception (and never a p038-specific branch).
@@ -1849,8 +1851,9 @@ fn definition_identity(matrix_plan_id: &str, module: &ModuleDefinition) -> Strin
     format!("{matrix_plan_id}/{}?variant={variant}", module.test_name)
 }
 
-fn initial_runner_info(value: &Value) -> Option<Value> {
-    (value.get("status").or_else(|| value.get("state"))).map(|_| value.clone())
+fn initial_runner_info(value: &mut Value) -> Option<Value> {
+    value.get("status").or_else(|| value.get("state"))?;
+    Some(std::mem::take(value))
 }
 
 fn status(value: &Value) -> Option<&str> {
@@ -1948,6 +1951,22 @@ fn suite_log_has_upload_placeholder(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_runner_info_transfers_the_response_instead_of_cloning_it() {
+        let mut raw =
+            serde_json::json!({"status":"WAITING", "exposed":{"payload":"kept allocation"}});
+        let pointer = raw["exposed"]["payload"].as_str().unwrap().as_ptr();
+        let info = initial_runner_info(&mut raw).unwrap();
+        assert!(raw.is_null());
+        assert_eq!(
+            info["exposed"]["payload"].as_str().unwrap().as_ptr(),
+            pointer
+        );
+        let mut missing = serde_json::json!({"id":"module"});
+        assert!(initial_runner_info(&mut missing).is_none());
+        assert_eq!(missing["id"], "module");
+    }
     #[cfg(unix)]
     use crate::OpenId4VpCompletionOutcome;
     use crate::ReviewScreenshotReport;
@@ -2116,7 +2135,7 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("recovery json"),
+                body: serde_json::to_vec(&body).expect("recovery json").into(),
             })
         }
     }
@@ -2154,7 +2173,7 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers: vec![],
-                body,
+                body: body.into(),
             })
         }
     }
@@ -2255,7 +2274,9 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("deferred review JSON"),
+                body: serde_json::to_vec(&body)
+                    .expect("deferred review JSON")
+                    .into(),
             })
         }
     }
@@ -2317,7 +2338,7 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("budget drift json"),
+                body: serde_json::to_vec(&body).expect("budget drift json").into(),
             })
         }
     }
@@ -2353,7 +2374,7 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("definition json"),
+                body: serde_json::to_vec(&body).expect("definition json").into(),
             })
         }
     }
@@ -2445,7 +2466,9 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("duplicate definition json"),
+                body: serde_json::to_vec(&body)
+                    .expect("duplicate definition json")
+                    .into(),
             })
         }
     }
@@ -3025,7 +3048,7 @@ mod tests {
         assert_eq!(report.unknown_declared_skip_modules, ["p/declared-skip"]);
         assert!(report.errors.iter().any(|error| {
             error
-                == "signed Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
+                == "bundled Matrix expected SKIPPED module is not uniquely defined by Suite plan: p/declared-skip"
         }));
         assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
         assert!(report.modules.is_empty());
@@ -3124,7 +3147,9 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("plan-create failure json"),
+                body: serde_json::to_vec(&body)
+                    .expect("plan-create failure json")
+                    .into(),
             })
         }
     }
@@ -3495,7 +3520,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("json"),
+                body: serde_json::to_vec(&body).expect("json").into(),
             })
         }
     }
@@ -3835,7 +3860,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("json"),
+                body: serde_json::to_vec(&body).expect("json").into(),
             })
         }
     }
@@ -3883,7 +3908,7 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers,
-                body: serde_json::to_vec(&body).expect("json"),
+                body: serde_json::to_vec(&body).expect("json").into(),
             })
         }
     }
@@ -3980,13 +4005,15 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).expect("json"),
+                body: serde_json::to_vec(&body).expect("json").into(),
             })
         }
     }
 
     struct PendingIssuer {
         drives: usize,
+        config_address: usize,
+        variant_address: Option<usize>,
     }
 
     #[derive(Default)]
@@ -3995,14 +4022,23 @@ mod tests {
     }
 
     impl OpenId4VciIssuerDriver for RecordingIssuer {
-        fn drive(&mut self, module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+        fn drive(&mut self, module: &OpenId4VciModule<'_>) -> Result<(), OpenId4VciError> {
             self.variants.push(module.variant.clone());
             Ok(())
         }
     }
 
     impl OpenId4VciIssuerDriver for PendingIssuer {
-        fn drive(&mut self, _module: &OpenId4VciModule) -> Result<(), OpenId4VciError> {
+        fn drive(&mut self, module: &OpenId4VciModule<'_>) -> Result<(), OpenId4VciError> {
+            assert_eq!(
+                module.plan_config as *const Value as usize,
+                self.config_address
+            );
+            let variant_address = module.variant as *const BTreeMap<String, String> as usize;
+            if let Some(previous) = self.variant_address {
+                assert_eq!(variant_address, previous);
+            }
+            self.variant_address = Some(variant_address);
             self.drives += 1;
             Err(OpenId4VciError::Pending)
         }
@@ -4041,7 +4077,6 @@ mod tests {
             suite_resource_observer: None,
         })
         .expect("runner");
-        let issuer = Arc::new(Mutex::new(PendingIssuer { drives: 0 }));
         let plan = PlannedPlan {
             group_index: 0,
             matrix_plan_id: "matrix-plan".into(),
@@ -4065,6 +4100,11 @@ mod tests {
             test_name: "test".into(),
             variant: BTreeMap::new(),
         };
+        let issuer = Arc::new(Mutex::new(PendingIssuer {
+            drives: 0,
+            config_address: &plan.config as *const Value as usize,
+            variant_address: None,
+        }));
         let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
         let error = runner
             .drive_vci_waiting_interruptible(

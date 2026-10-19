@@ -66,7 +66,7 @@ pub struct DescriptorPlan {
     pub config_template: Value,
     #[serde(default)]
     pub variant: BTreeMap<String, String>,
-    /// Exact Suite module names which the signed Matrix permits to finish as
+    /// Exact Suite module names which the bundled Matrix permits to finish as
     /// `SKIPPED`. `REVIEW` is a live result and is never pre-approved.
     #[serde(default)]
     pub expected_results: BTreeMap<String, String>,
@@ -872,20 +872,6 @@ pub(super) fn parse_placeholder(value: &str) -> Result<&str, MaterializerError> 
 
 pub(super) fn is_placeholder(value: &str) -> bool {
     parse_placeholder(value).is_ok()
-}
-
-/// Validate a signed-artifact placeholder against the same reference grammar
-/// used by descriptor validation and runtime materialization.  The artifact
-/// layer must not maintain a second, narrower list: real matrices contain
-/// target URL paths as well as client, generated, onboarding, and chained
-/// secret references.
-pub(crate) fn artifact_placeholder_is_valid(
-    value: &str,
-    bindings: &BTreeMap<String, String>,
-) -> bool {
-    parse_placeholder(value).is_ok_and(|reference| {
-        validate_binding_reference(reference, bindings, &mut BTreeSet::new()).is_ok()
-    })
 }
 
 fn validate_crypto_policy(policy: &CryptoPolicy) -> Result<(), MaterializerError> {

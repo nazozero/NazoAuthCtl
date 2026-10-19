@@ -23,6 +23,26 @@ separate Cargo tool, pip environment, Node package manifest, or Dockerfile.
 
 ## Compatibility and useful changes
 
+The shared protocol and Ed25519 backend use the released NazoAuth 0.3.3 commit;
+the protocol source is unchanged from the previous 0.3.1 pin. The controller
+still builds only the Ed25519 primitive feature, not the server runtime.
+
+- [Serde JSON 1.0.154](https://github.com/serde-rs/json/releases/tag/v1.0.154)
+  adds `preserve_order` support without `std`; 1.0.152 and 1.0.153 fix numeric
+  edge cases and invalid UTF-8 error positions. The pinned fork merges these
+  releases while retaining immutable chunk input and owned-string transfer.
+  This application uses `std`, so no new feature flag is needed.
+- [Tokio 1.53.3](https://github.com/tokio-rs/tokio/releases/tag/tokio-1.53.3)
+  moves semaphore and duplex-stream wakeups outside internal locks and fixes
+  paused-time advancement. The new `AsyncFd::register` APIs have no current
+  controller caller.
+- [Zeroize 1.9.1](https://github.com/RustCrypto/utils/blob/master/zeroize/CHANGELOG.md)
+  avoids double-zeroizing initialized vector elements and makes `Zeroizing`'s
+  debug output opaque. Existing secret owners benefit without new wrappers.
+- [UUID 1.28](https://github.com/uuid-rs/uuid/releases/tag/v1.28.0) adds optional
+  Serde format adapters. Existing persisted and signed UUID representations
+  remain unchanged; the adapters are not enabled merely because they exist.
+
 The controller identity owner prepares an opaque Ed25519 key once when loading
 or creating it. Signing and verification use that object directly, retaining
 the persisted 32-byte seed, public key, key identifier and accepted journal JWS
