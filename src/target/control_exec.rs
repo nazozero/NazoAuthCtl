@@ -327,9 +327,8 @@ pub(crate) fn execute_fixed_one_shot(
 /// must resume the same operation id instead of minting a new one.
 pub const CONTROL_OUTCOME_UNKNOWN: &str = "CONTROL_OUTCOME_UNKNOWN";
 
-/// Stable failure code: the local NazoAuth operator could not be invoked at
-/// all (engine missing or unsupported runtime backend). No
-/// envelope was presented to any authority.
+/// Stable failure code: the local operator could not run or its controller
+/// registry was unavailable before acceptance. Retry the prepared operation.
 pub const CONTROL_EXECUTION_UNAVAILABLE: &str = "CONTROL_EXECUTION_UNAVAILABLE";
 
 /// Stable failure code: the running runtime object serves a different
@@ -406,21 +405,21 @@ impl ControlOperationExecutor for HostControlOperator {
     }
 }
 
-fn operator_rejection_code(detail: &str) -> Option<&'static str> {
+pub(super) fn operator_rejection_code(detail: &str) -> Option<&'static str> {
     let class = detail.lines().find_map(|line| {
         let line = line.trim();
         let marker = line.rsplit_once(": ").map_or(line, |(_, suffix)| suffix);
         marker.strip_prefix(OPERATOR_REJECTION_PREFIX)
     })?;
     match class {
-        "request" => Some(crate::error_codes::INPUT_INVALID),
+        // Released servers also emit this class when an accepted result
+        // cannot be encoded. It cannot prove rejection before acceptance.
+        "request" => None,
         "authorization" => Some(crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED),
         "deployment" => Some(crate::error_codes::TARGET_IDENTITY_MISMATCH),
         "revision" => Some(crate::error_codes::CONFIG_REVISION_MISMATCH),
         "conflict" => Some(crate::error_codes::OPERATION_ID_CONFLICT),
-        // Transient pre-acceptance unavailability keeps the prepared operation
-        // so an ordinary retry reuses the same id.
-        "unavailable" => None,
+        "unavailable" => Some(CONTROL_EXECUTION_UNAVAILABLE),
         _ => None,
     }
 }
@@ -595,6 +594,10 @@ mod tests {
     #[test]
     fn exact_server_rejection_classes_map_once() {
         assert_eq!(
+            operator_rejection_code("nazoauth-operator-rejection=request"),
+            None
+        );
+        assert_eq!(
             operator_rejection_code(
                 "nazoauth failed with status 1: nazoauth-operator-rejection=authorization"
             ),
@@ -612,7 +615,7 @@ mod tests {
         );
         assert_eq!(
             operator_rejection_code("nazoauth-operator-rejection=unavailable"),
-            None
+            Some(super::CONTROL_EXECUTION_UNAVAILABLE)
         );
     }
 
