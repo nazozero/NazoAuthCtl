@@ -132,9 +132,10 @@ classification rather than a pass.
 
 The bundled Matrix follows Suite 5.3.3's VCI plan filtering: plain credential
 variants do not include the unsupported-encryption-algorithm test and declare
-no skip exception for it. Encrypted variants still run that test. The Matrix's
-v5.2.2 source label records its provenance, not the live Suite version. The
-separate external-artifact generator remains pinned to its declared Suite release.
+no skip exception for it. Encrypted variants still run that test. The bundled and external signed artifacts both use the committed Matrix, driver
+and Suite 5.3.3 identity in `resources/oidf`. The generator preserves their exact
+bytes, so it cannot reintroduce historical skip exceptions or client policies.
+The artifact revision is derived from its driver and Matrix content.
 
 ## Local verification boundary
 

@@ -19,26 +19,8 @@ import time
 import urllib.parse
 
 
-ARTIFACT_ID = "nazoauth-oidf-v5.2.2-ordinary-provider"
-SOURCE_COMMIT = "77c362f9fc62e5114f3c61e2b4420f864d7112ab"
-SOURCE_PATH = "crates/authorization-server/resources/nazoauth-conformance-matrix-v1.json"
-SUITE_RELEASE = "release-v5.2.2"
-SUITE_REVISION = "321bc5bc53601b9690b54c023c0cbfac0f0230f2"
-SUITE_IMAGE = "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415"
+RESOURCE_PATH = "crates/nazoauthctl-conformance/resources/oidf"
 RUNNER_CAPABILITY = "nazoauth.client.create"
-# The Suite may add modules within a plan between release revisions. Keep the
-# signed per-plan allocation conservative while retaining the artifact-wide
-# verifier bound.
-PLAN_MODULE_UPPER_BOUND = 128
-PLAN_WALL_CLOCK_SECONDS = 1800
-VCI_UNSUPPORTED_ENCRYPTION_MODULE = (
-    "oid4vci-1_0-issuer-fail-unsupported-encryption-algorithm"
-)
-VCI_PLAIN_ENCRYPTION_SKIP_PLANS = (
-    "openid4vc-vci-p028",
-    "openid4vc-vci-p031",
-    "openid4vc-vci-p032",
-)
 P256_COMPRESSED_SPKI_PREFIX = bytes.fromhex(
     "3039301306072a8648ce3d020106082a8648ce3d030107032200"
 )
@@ -147,7 +129,7 @@ def require_git_clean(repo: pathlib.Path, arguments: list[str], message: str) ->
         raise ValueError(message)
 
 
-def verify_generator_checkout(reviewed_commit: str) -> None:
+def verify_generator_checkout(reviewed_commit: str) -> pathlib.Path:
     if LOWER_HEX_COMMIT.fullmatch(reviewed_commit) is None:
         raise ValueError("--reviewed-generator-commit must be 40 lowercase hexadecimal characters")
 
@@ -162,16 +144,22 @@ def verify_generator_checkout(reviewed_commit: str) -> None:
     require_git_clean(root, ["diff", "--quiet", "--"], "generator checkout has tracked worktree changes")
     require_git_clean(root, ["diff", "--cached", "--quiet", "--"], "generator checkout has staged changes")
 
+    return root
 
-def read_source_matrix(repo: pathlib.Path) -> dict[str, object]:
-    source_bytes = run_git(repo, ["show", f"{SOURCE_COMMIT}:{SOURCE_PATH}"])
-    try:
-        source = json.loads(source_bytes.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("the source matrix is not valid UTF-8 JSON") from error
-    if not isinstance(source, dict):
-        raise ValueError("the source matrix root must be an object")
-    return source
+
+def read_bundled_artifacts(repo: pathlib.Path, commit: str):
+    driver_bytes = run_git(repo, ["show", f"{commit}:{RESOURCE_PATH}/driver.json"])
+    matrix_bytes = run_git(repo, ["show", f"{commit}:{RESOURCE_PATH}/matrix.json"])
+    suite = json.loads(run_git(repo, ["show", f"{commit}:{RESOURCE_PATH}/suite.json"]))
+    matrix = json.loads(matrix_bytes)
+    plans = [plan for group in matrix["groups"] for plan in group["plans"]]
+    bounds = {
+        "max_plans": len(plans),
+        "max_modules": sum(plan["resource_budget"]["modules"] for plan in plans),
+        "max_clients": sum(plan["resource_budget"]["clients"] for plan in plans),
+        "max_wall_clock_seconds": sum(plan["resource_budget"]["wall_clock_seconds"] for plan in plans),
+    }
+    return driver_bytes, matrix_bytes, suite, bounds
 
 
 def fsync_directory(directory: pathlib.Path) -> None:
@@ -254,145 +242,6 @@ def verify_signing_key(path: pathlib.Path) -> None:
         raise ValueError("signing key must be owner-only")
 
 
-def handler_for(group_id: str) -> tuple[str, dict[str, object]]:
-    if group_id == "fapi-ciba":
-        return "browser-ciba", {"id": "browser-ciba", "automation": {"kind": "browser"}, "lane": "ciba"}
-    if group_id.startswith("openid4vc-vci"):
-        return "openid4vci-parallel", {
-            "id": "openid4vci-parallel",
-            "automation": {"kind": "openid4vci"},
-            "lane": "parallel",
-        }
-    if group_id == "openid4vc-vp-haip":
-        return "openid4vp-haip-parallel", {
-            "id": "openid4vp-haip-parallel",
-            "automation": {"kind": "openid4vp", "haip": True},
-            "lane": "parallel",
-        }
-    if group_id == "openid4vc-vp":
-        return "openid4vp-parallel", {
-            "id": "openid4vp-parallel",
-            "automation": {"kind": "openid4vp", "haip": False},
-            "lane": "parallel",
-        }
-    return "browser-parallel", {
-        "id": "browser-parallel",
-        "automation": {"kind": "browser"},
-        "lane": "parallel",
-    }
-
-
-def apply_reviewed_amendments(groups: list[dict[str, object]]) -> None:
-    amendments = set(VCI_PLAIN_ENCRYPTION_SKIP_PLANS)
-    found: set[str] = set()
-    for group in groups:
-        plans = group.get("plans")
-        if not isinstance(plans, list):
-            raise ValueError("transformed matrix group plans must be an array")
-        for plan in plans:
-            if not isinstance(plan, dict):
-                raise ValueError("transformed matrix plans must be objects")
-            plan_id = plan.get("id")
-            if plan_id not in amendments:
-                continue
-            if plan_id in found:
-                raise ValueError(f"reviewed amendment plan is duplicated: {plan_id}")
-            variant = plan.get("variant")
-            if not isinstance(variant, dict) or variant.get("vci_credential_encryption") != "plain":
-                raise ValueError(
-                    f"reviewed amendment plan must have vci_credential_encryption=plain: {plan_id}"
-                )
-            expected_results = plan.get("expected_results")
-            if not isinstance(expected_results, dict):
-                raise ValueError(f"reviewed amendment plan expected_results must be an object: {plan_id}")
-            if (
-                VCI_UNSUPPORTED_ENCRYPTION_MODULE in expected_results
-                and expected_results[VCI_UNSUPPORTED_ENCRYPTION_MODULE] != "SKIPPED"
-            ):
-                raise ValueError(
-                    f"reviewed amendment would overwrite a different expected result: {plan_id}"
-                )
-            expected_results[VCI_UNSUPPORTED_ENCRYPTION_MODULE] = "SKIPPED"
-            found.add(plan_id)
-
-    missing = amendments - found
-    if missing:
-        raise ValueError(f"reviewed amendment plans are missing: {sorted(missing)}")
-
-    old_ciba_reference = "target.ciba_automated_decision_url"
-    new_ciba_reference = "target.ciba_user_approval_callback_url"
-
-    def migrate_ciba_reference(value: object) -> object:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                value[key] = migrate_ciba_reference(item)
-        elif isinstance(value, list):
-            for index, item in enumerate(value):
-                value[index] = migrate_ciba_reference(item)
-        elif isinstance(value, str):
-            return value.replace(old_ciba_reference, new_ciba_reference)
-        return value
-
-    for group in groups:
-        migrate_ciba_reference(group)
-        if group["id"] == "fapi-ciba":
-            # These plans test FAPI-CIBA ID1, whose client assertions also
-            # accept endpoint audiences. FAPI 2 mandates issuer-only audiences.
-            for plan in group["plans"]:
-                for role in plan["required_roles"]:
-                    role["registration_template"]["security_policy"]["assurance"] = "baseline"
-
-
-def transform_matrix(source: dict[str, object]) -> tuple[dict[str, object], dict[str, object], dict[str, int]]:
-    groups: list[dict[str, object]] = []
-    handlers: dict[str, dict[str, object]] = {}
-    plan_count = 0
-    client_count = 0
-    for source_group in source["groups"]:
-        group = dict(source_group)
-        plans: list[dict[str, object]] = []
-        handler_id, handler = handler_for(group["id"])
-        handlers[handler_id] = handler
-        for source_plan in group["plans"]:
-            plan = dict(source_plan)
-            required_roles = plan.get("required_roles", [])
-            plan["driver_handler"] = handler_id
-            plan["resource_budget"] = {
-                "modules": PLAN_MODULE_UPPER_BOUND,
-                "clients": len(required_roles),
-                "wall_clock_seconds": PLAN_WALL_CLOCK_SECONDS,
-            }
-            plan["required_capabilities"] = [RUNNER_CAPABILITY]
-            plan.setdefault("expected_results", {})
-            plans.append(plan)
-            plan_count += 1
-            client_count += len(required_roles)
-        group["plans"] = plans
-        groups.append(group)
-
-    apply_reviewed_amendments(groups)
-
-    matrix = {
-        "schema": 3,
-        "name": "NazoAuth ordinary-provider OIDF v5.2.2 matrix",
-        "openid4vc_credential_datasets": source["openid4vc_credential_datasets"],
-        "openid4vc_suite_mdoc_trust_anchor_pem": source["openid4vc_suite_mdoc_trust_anchor_pem"],
-        "groups": groups,
-    }
-    driver = {
-        "schema": 1,
-        "engine_protocol": 2,
-        "handlers": [handlers[key] for key in sorted(handlers)],
-    }
-    bounds = {
-        "max_plans": plan_count,
-        "max_modules": plan_count * PLAN_MODULE_UPPER_BOUND,
-        "max_clients": client_count,
-        "max_wall_clock_seconds": plan_count * PLAN_WALL_CLOCK_SECONDS,
-    }
-    return matrix, driver, bounds
-
-
 def parse_der_integer(value: bytes, offset: int) -> tuple[int, int]:
     if offset + 2 > len(value) or value[offset] != 0x02:
         raise ValueError("ECDSA signature does not contain an INTEGER")
@@ -466,7 +315,6 @@ def derived_metadata(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-repo", required=True, type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--trust-policy-output", type=pathlib.Path)
     parser.add_argument("--signing-key", type=pathlib.Path)
@@ -494,11 +342,10 @@ def main() -> None:
         if missing:
             parser.error(f"normal signing mode requires: {', '.join(missing)}")
 
-    verify_generator_checkout(args.reviewed_generator_commit)
-    source_matrix = read_source_matrix(args.source_repo)
-    matrix, driver, bounds = transform_matrix(source_matrix)
-    matrix_bytes = compact_json(matrix)
-    driver_bytes = compact_json(driver)
+    repo = verify_generator_checkout(args.reviewed_generator_commit)
+    driver_bytes, matrix_bytes, suite, bounds = read_bundled_artifacts(
+        repo, args.reviewed_generator_commit
+    )
     revision_digest = hashlib.sha256(driver_bytes)
     revision_digest.update(matrix_bytes)
     artifact_revision = revision_digest.hexdigest()[:40]
@@ -534,7 +381,7 @@ def main() -> None:
     issued_at = int(time.time()) - 5
     manifest = {
         "schema": 4,
-        "artifact_id": ARTIFACT_ID,
+        "artifact_id": f"nazoauth-oidf-{suite['release'].removeprefix('release-')}-ordinary-provider",
         "revision": artifact_revision,
         "source": source_url,
         "signer_identity": f"{source_url}signer-v1",
@@ -543,9 +390,7 @@ def main() -> None:
         "expires_at": issued_at + 30 * 24 * 60 * 60,
         "suite": {
             "origin": suite_origin,
-            "release": SUITE_RELEASE,
-            "revision": SUITE_REVISION,
-            "image_digest": SUITE_IMAGE,
+            **suite,
         },
         "engine_protocol": 2,
         "required_capabilities": [RUNNER_CAPABILITY],
@@ -580,8 +425,8 @@ def main() -> None:
         "driver_sha256": computed["driver"]["sha256"],
         "matrix_sha256": computed["matrix"]["sha256"],
         "key_id": key_id,
-        "suite_revision": SUITE_REVISION,
-        "suite_image_digest": SUITE_IMAGE,
+        "suite_revision": suite["revision"],
+        "suite_image_digest": suite["image_digest"],
     }
 
     # No output is mutated until all source, provenance, key and deterministic

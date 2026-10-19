@@ -1,5 +1,4 @@
 """Security regressions for the signed artifact source boundary."""
-import copy
 import json
 import os
 import pathlib
@@ -10,17 +9,28 @@ import unittest
 import generate_oidf_artifact as generator
 
 class GitSourceTest(unittest.TestCase):
-    def test_ciba_amendment_preserves_protocol_requirements_and_other_profiles(self):
-        bundled = pathlib.Path(__file__).resolve().parents[2] / "crates/nazoauthctl-conformance/resources/oidf/matrix.json"
-        groups = json.loads(bundled.read_text(encoding="utf-8"))["groups"]
-        generator.apply_reviewed_amendments(groups)
-        expected = copy.deepcopy(groups)
-        ciba = next(group for group in groups if group["id"] == "fapi-ciba")
-        for plan in ciba["plans"]:
-            for role in plan["required_roles"]:
-                role["registration_template"]["security_policy"]["assurance"] = "fapi2"
-        generator.apply_reviewed_amendments(groups)
-        self.assertEqual(groups, expected)
+    def test_signed_artifact_uses_exact_reviewed_bundled_bytes(self):
+        bundled = pathlib.Path(__file__).resolve().parents[2] / generator.RESOURCE_PATH
+        with tempfile.TemporaryDirectory(prefix="oidf-bundled-fixture-") as directory:
+            repo = pathlib.Path(directory)
+            target = repo / generator.RESOURCE_PATH
+            target.mkdir(parents=True)
+            for name in ("driver.json", "matrix.json", "suite.json"):
+                shutil.copyfile(bundled / name, target / name)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.PIPE)
+            git("init", "-q")
+            git("add", ".")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign", "-qm", "reviewed bundles")
+            commit = git("rev-parse", "HEAD").decode().strip()
+            (target / "matrix.json").write_text("unreviewed replacement")
+            driver, matrix, suite, bounds = generator.read_bundled_artifacts(repo, commit)
+            self.assertEqual(driver, (bundled / "driver.json").read_bytes())
+            self.assertEqual(matrix, (bundled / "matrix.json").read_bytes())
+            self.assertEqual(suite, json.loads((bundled / "suite.json").read_bytes()))
+            plans = [plan for group in json.loads(matrix)["groups"] for plan in group["plans"]]
+            self.assertEqual(bounds["max_plans"], len(plans))
+            self.assertEqual(bounds["max_modules"], sum(plan["resource_budget"]["modules"] for plan in plans))
 
     @unittest.skipUnless(os.name == "posix", "Unix artifact output permissions")
     def test_atomic_output_replaces_regular_files_and_rejects_symlinks(self):

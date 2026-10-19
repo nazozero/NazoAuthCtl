@@ -22,7 +22,14 @@ use crate::{
 
 const BUNDLED_DRIVER: &[u8] = include_bytes!("../resources/oidf/driver.json");
 const BUNDLED_MATRIX: &[u8] = include_bytes!("../resources/oidf/matrix.json");
-const BUNDLED_SOURCE_REVISION: &str = "77c362f9fc62e5114f3c61e2b4420f864d7112ab";
+const BUNDLED_SUITE: &[u8] = include_bytes!("../resources/oidf/suite.json");
+
+#[derive(Deserialize)]
+struct BundledSuite {
+    release: String,
+    revision: String,
+    image_digest: String,
+}
 
 pub const OIDF_DRIVER_INSPECTION_PLAN_SCHEMA: u32 = 5;
 
@@ -253,9 +260,14 @@ pub fn open_bundled_oidf_driver_plan(
     artifact_hasher.update(BUNDLED_DRIVER);
     artifact_hasher.update(BUNDLED_MATRIX);
     let artifact_digest = hex::encode(artifact_hasher.finalize());
+    let suite: BundledSuite =
+        serde_json::from_slice(BUNDLED_SUITE).map_err(|_| OidfPlanError::CacheIdentity)?;
     let artifact = VerifiedOidfArtifact {
-        artifact_id: "nazoauthctl-bundled-oidf-v5.2.2".to_owned(),
-        revision: BUNDLED_SOURCE_REVISION.to_owned(),
+        artifact_id: format!(
+            "nazoauthctl-bundled-oidf-{}",
+            suite.release.trim_start_matches("release-")
+        ),
+        revision: artifact_digest[..40].to_owned(),
         source: "nazoauthctl-bundled".to_owned(),
         signer_identity: "nazoauthctl-release".to_owned(),
         signer_key_id: "nazoauthctl-release".to_owned(),
@@ -264,10 +276,9 @@ pub fn open_bundled_oidf_driver_plan(
             .map_err(|_| OidfPlanError::ResourceBound)?,
         suite: OidfSuiteIdentity {
             origin: suite_origin.as_str().to_owned(),
-            release: "release-v5.2.2".to_owned(),
-            revision: "321bc5bc53601b9690b54c023c0cbfac0f0230f2".to_owned(),
-            image_digest: "sha256:ca3fb5be36fc2f471942f474ad7ff40677f29d40ce7a9f7525db1102b89b0415"
-                .to_owned(),
+            release: suite.release,
+            revision: suite.revision,
+            image_digest: suite.image_digest,
         },
         engine_protocol: OIDF_DRIVER_ENGINE_PROTOCOL,
         required_capabilities: vec!["nazoauth.client.create".to_owned()],
