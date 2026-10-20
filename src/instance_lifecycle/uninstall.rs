@@ -16,12 +16,12 @@
 
 use anyhow::{Context as _, bail};
 
-use super::{LifecycleContext, resolve_live_instance};
+use super::{LifecycleContext, resolve_instance_target};
 use crate::controller_identity::store::ControllerKeyStore;
 use crate::file_lock::FileLock;
 use crate::target::{
-    ExecutionTarget, HostOperation, HostOutcome, ResourceOwnership, ResourceScope,
-    StateMutationPayload,
+    HostOperation, HostOperationBody, HostOutcome, InstanceInspection, ResourceOwnership,
+    ResourceScope, StateMutationPayload,
 };
 
 /// One uninstall plan: exact deletions plus everything deliberately kept.
@@ -95,14 +95,16 @@ pub(crate) fn plan_uninstall(
     context: &LifecycleContext,
     selector: Option<&str>,
 ) -> anyhow::Result<UninstallPlan> {
-    Ok(prepare_uninstall(context, selector)?.0)
+    let (record, host, _, inspection) =
+        super::resolve_live_instance(context, selector, "uninstall")?;
+    Ok(uninstall_plan(&record, &host, inspection))
 }
 
-fn prepare_uninstall(
-    context: &LifecycleContext,
-    selector: Option<&str>,
-) -> anyhow::Result<(UninstallPlan, Box<dyn ExecutionTarget + Send>)> {
-    let (record, host, target, inspection) = resolve_live_instance(context, selector, "uninstall")?;
+fn uninstall_plan(
+    record: &crate::registry::InstanceRecord,
+    host: &crate::registry::HostRecord,
+    inspection: InstanceInspection,
+) -> UninstallPlan {
     let mut managed_deletions = Vec::new();
     let mut kept_external = Vec::new();
     for resource in inspection.resources {
@@ -120,19 +122,16 @@ fn prepare_uninstall(
             _ => kept_external.push(entry),
         }
     }
-    Ok((
-        UninstallPlan {
-            deployment_id: inspection.deployment_id,
-            alias: record.alias,
-            host_alias: host.alias,
-            revision: inspection.revision,
-            managed_deletions,
-            runtime_object: inspection.runtime.object,
-            config_reference: inspection.config_reference,
-            kept_external,
-        },
-        target,
-    ))
+    UninstallPlan {
+        deployment_id: inspection.deployment_id,
+        alias: record.alias.clone(),
+        host_alias: host.alias.clone(),
+        revision: inspection.revision,
+        managed_deletions,
+        runtime_object: inspection.runtime.object,
+        config_reference: inspection.config_reference,
+        kept_external,
+    }
 }
 
 /// Execute a previously shown plan. `confirmed` must be an explicit operator
@@ -145,36 +144,73 @@ pub(crate) fn run_uninstall(
     confirmed: bool,
 ) -> anyhow::Result<String> {
     let action = "uninstall";
-    let (plan, target) = prepare_uninstall(context, selector)?;
-    if !confirmed {
-        use std::io::IsTerminal as _;
-        if !crate::ui::json_mode()
-            && std::io::stdin().is_terminal()
-            && std::io::stderr().is_terminal()
+    let (record, host, target) = resolve_instance_target(context, selector, action)?;
+    let instance_dir = controller_keys.instance_dir(&record.deployment_id)?;
+    // Outside the key directory: this exact confirmed operation must survive
+    // key cleanup if forgetting the local registry record subsequently fails.
+    let pending_path = instance_dir.with_extension("uninstall.json");
+    let pending = if pending_path.try_exists()? {
+        let bytes = crate::filesystem::read_secure_regular_file(
+            &pending_path,
+            "pending uninstall",
+            false,
+            crate::target::MAX_HOST_OPERATION_BYTES as u64,
+        )?;
+        let operation = crate::target::parse_host_operation(&bytes)?;
+        if operation.deployment_id.as_deref() != Some(record.deployment_id.as_str())
+            || !matches!(
+                operation.operation,
+                HostOperationBody::StateMutate {
+                    mutation: StateMutationPayload::Uninstall {}
+                }
+            )
         {
-            crate::ui::print_report(&plan.render());
-            if !cliclack::confirm(crate::ui::text(
-                "Delete the resources listed above?",
-                "确认删除以上列出的资源？",
-            ))
-            .initial_value(false)
-            .interact()?
-            {
-                return Ok(crate::ui::text(
-                    "Uninstall cancelled; no resources deleted.",
-                    "已取消卸载，未删除资源。",
-                )
-                .into());
-            }
-        } else {
-            return Ok(crate::ui::message!(
-                "{}\nre-run with explicit confirmation (--yes at the CLI boundary) to execute",
-                "{}\n以上仅为计划，尚未删除资源。确认后添加 --yes 重新运行。",
-                plan.render()
-            ));
+            bail!("pending uninstall does not match this deployment");
         }
-    }
-    let instance_dir = controller_keys.instance_dir(&plan.deployment_id)?;
+        Some(operation)
+    } else {
+        None
+    };
+    let operation = if let Some(operation) = pending {
+        operation
+    } else {
+        let inspection = target.inspect_instance(&record.deployment_id)?;
+        let plan = uninstall_plan(&record, &host, inspection);
+        if !confirmed {
+            use std::io::IsTerminal as _;
+            if !crate::ui::json_mode()
+                && std::io::stdin().is_terminal()
+                && std::io::stderr().is_terminal()
+            {
+                crate::ui::print_report(&plan.render());
+                if !cliclack::confirm(crate::ui::text(
+                    "Delete the resources listed above?",
+                    "确认删除以上列出的资源？",
+                ))
+                .initial_value(false)
+                .interact()?
+                {
+                    return Ok(crate::ui::text(
+                        "Uninstall cancelled; no resources deleted.",
+                        "已取消卸载，未删除资源。",
+                    )
+                    .into());
+                }
+            } else {
+                return Ok(crate::ui::message!(
+                    "{}\nre-run with explicit confirmation (--yes at the CLI boundary) to execute",
+                    "{}\n以上仅为计划，尚未删除资源。确认后添加 --yes 重新运行。",
+                    plan.render()
+                ));
+            }
+        }
+        HostOperation::state_mutate(
+            uuid::Uuid::now_v7().to_string(),
+            plan.deployment_id,
+            Some(plan.revision),
+            StateMutationPayload::Uninstall {},
+        )
+    };
     crate::filesystem::ensure_private_directory(
         &instance_dir,
         "controller instance lifecycle directory",
@@ -189,16 +225,32 @@ pub(crate) fn run_uninstall(
     let _transfer_lock = FileLock::acquire(&instance_dir.join("backup-transfer.lock"))?;
     ensure_no_pending_remote_cleanup(&instance_dir)?;
 
-    let operation = HostOperation::state_mutate(
-        uuid::Uuid::now_v7().to_string(),
-        plan.deployment_id.clone(),
-        Some(plan.revision),
-        StateMutationPayload::Uninstall {},
-    );
+    // Another confirmed invocation may have acquired these same lifecycle
+    // locks first. Reuse its saved operation rather than replacing its identity.
+    let operation = if pending_path.try_exists()? {
+        crate::target::parse_host_operation(&crate::filesystem::read_secure_regular_file(
+            &pending_path,
+            "pending uninstall",
+            false,
+            crate::target::MAX_HOST_OPERATION_BYTES as u64,
+        )?)?
+    } else {
+        crate::filesystem::atomic_write(
+            &pending_path,
+            &crate::target::encode_host_operation(&operation)?,
+            0o600,
+        )?;
+        operation
+    };
     let result = target.execute_host_operation(&operation)?;
     match result.outcome {
         HostOutcome::Completed { .. } => {}
         HostOutcome::Failed { code, detail } => {
+            if code == crate::error_codes::CONFIG_REVISION_MISMATCH {
+                // The target rejects stale plans before deletion. A fresh
+                // invocation must show and confirm the new resource plan.
+                crate::filesystem::remove_file_durable(&pending_path)?;
+            }
             bail!("{action} failed on the target: {code}: {detail}")
         }
     }
@@ -207,32 +259,33 @@ pub(crate) fn run_uninstall(
     // and siblings stay. Controller Slot rows are part of an external database
     // and therefore follow the plan's explicit keep decision.
     controller_keys
-        .remove_instance(&plan.deployment_id)
+        .remove_instance(&record.deployment_id)
         .with_context(|| {
             format!(
                 "instance '{}' was uninstalled, but its local controller key cleanup failed; the InstanceRecord was retained so cleanup can be retried",
-                plan.alias
+                record.alias
             )
         })?;
     context
         .registry
-        .forget_instance_by_deployment(&plan.deployment_id)
+        .forget_instance_by_deployment(&record.deployment_id)
         .with_context(|| {
             format!(
                 "instance '{}' was uninstalled and its local controller keys were removed, but its stale InstanceRecord could not be forgotten",
-                plan.alias
+                record.alias
             )
         })?;
 
+    crate::filesystem::remove_file_durable(&pending_path)?;
     Ok(crate::ui::message!(
         "uninstalled instance '{}' (deployment {})\n\
          managed resources removed per plan; external/shared resources were never touched\n\
          Controller Slots in kept external data were unchanged\n\
          InstanceRecord and local controller key material removed; HostRecord '{}' and sibling instances remain\n",
         "实例“{}”已卸载（部署 {}）\n\n已按计划删除托管资源，保留外部和共享资源及其控制器授权。\n已清理本地实例记录和控制器密钥；主机“{}”及其其他实例保持不变。\n",
-        plan.alias,
-        plan.deployment_id,
-        plan.host_alias,
+        record.alias,
+        record.deployment_id,
+        host.alias,
     ))
 }
 

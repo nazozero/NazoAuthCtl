@@ -157,7 +157,11 @@ fn submit_pending_recovery(
             &pending.candidate_kid,
             commit,
         ),
-        Err(error @ (AdminApiError::Transport(_) | AdminApiError::MalformedResponse(_))) => {
+        Err(
+            error @ (AdminApiError::Transport(_)
+            | AdminApiError::MalformedResponse(_)
+            | AdminApiError::OutcomeUnknown { .. }),
+        ) => {
             let path = pending_recovery_path(keys, &pending.deployment_id)?;
             Err(anyhow::anyhow!(error)).with_context(|| {
                 format!(
@@ -967,11 +971,29 @@ mod tests {
 
     #[test]
     fn recover_resumes_the_exact_submission_after_an_unknown_outcome() {
+        for response in [
+            None,
+            Some((500, r#"{"error":"server_error"}"#)),
+            Some((502, "<html>Bad Gateway</html>")),
+            Some((503, r#"{"error":"temporarily_unavailable"}"#)),
+            Some((400, "<html>Proxy error</html>")),
+            Some((409, "{}")),
+            Some((200, "{}")),
+        ] {
+            assert_recovery_resumes(response);
+        }
+    }
+
+    fn assert_recovery_resumes(response: Option<(u16, &str)>) {
         let fixture = Fixture::new().expect("fixture");
         let old = generate_material(DEPLOYMENT);
         let nonce = [9u8; 32];
         let first = Canned::default();
-        first.push_error("response lost after send");
+        if let Some((status, body)) = response {
+            first.push(status, body);
+        } else {
+            first.push_error("response lost after send");
+        }
         first.push(
             200,
             &format!(

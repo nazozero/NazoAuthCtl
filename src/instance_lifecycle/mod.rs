@@ -61,6 +61,29 @@ pub(crate) fn resolve_live_instance(
     Box<dyn ExecutionTarget + Send>,
     InstanceInspection,
 )> {
+    let (record, host, target) = resolve_instance_target(context, selector, action)?;
+    let inspection = target
+        .inspect_instance(&record.deployment_id)
+        .with_context(|| {
+            format!(
+                "the deployment state of '{}' could not be read; {} changed nothing",
+                record.deployment_id, action
+            )
+        })?;
+    Ok((record, host, target, inspection))
+}
+
+/// Resolves the registered target without requiring a still-installed runtime.
+/// Uninstall completion may legitimately outlive its DeploymentState.
+fn resolve_instance_target(
+    context: &LifecycleContext,
+    selector: Option<&str>,
+    action: &str,
+) -> anyhow::Result<(
+    crate::registry::InstanceRecord,
+    HostRecord,
+    Box<dyn ExecutionTarget + Send>,
+)> {
     let record = resolve_instance(&context.registry, selector, action)?;
     let host = context
         .registry
@@ -74,15 +97,7 @@ pub(crate) fn resolve_live_instance(
             host.alias, action
         )
     })?;
-    let inspection = target
-        .inspect_instance(&record.deployment_id)
-        .with_context(|| {
-            format!(
-                "the deployment state of '{}' could not be read; {} changed nothing",
-                record.deployment_id, action
-            )
-        })?;
-    Ok((record, host, target, inspection))
+    Ok((record, host, target))
 }
 
 /// Extract a typed failure from a HostResult, preserving the stable code.

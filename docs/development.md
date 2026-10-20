@@ -140,3 +140,22 @@ Inspection isolates unrelated corrupt records. Exact instance/key lookup reads
 the selected record. Recovery journals retain durable intent and recorded side
 effects; a write failure is not converted into success by reading cached bytes.
 Derived recovery staging can be rebuilt from the verified immutable snapshot.
+
+Recovery checks the target configuration revision inside its existing serial
+execution boundary before quiescing or switching paths. A previously accepted
+operation resumes under its recorded identity. After restore, the server returns
+a 3661-second JWT invalidation deadline based on the enforced historical TTL
+maximum plus clock skew, regardless of the restored TTL setting.
+
+Controller recovery preserves the exact pending request and candidate key after
+transport failure, malformed responses or HTTP 5xx, because those outcomes do
+not prove rejection. Reconciliation that completes an existing add/rotate
+operation does not request a new admin login; login occurs only when a new
+approval is needed.
+
+Uninstall persists its exact operation beside the deployment key directory
+until remote removal and local cleanup both complete. Retrying that operation
+can finish cleanup after the runtime or key directory has disappeared. Stored
+health retains its original observation time; loading it does not constitute a
+new health check. A confirmed privilege failure before admission is retryable
+rather than a completed host-operation result.

@@ -260,10 +260,9 @@ fn create_snapshot(
     let runtime_artifact = observation.artifact;
     let runtime_instance_key_id = verify_runtime_identity(&data, state)?;
     let connection = postgres_connection(&database_url)?;
-    let database_sentinel_sha256 = database_sentinel_with_connection(&connection)?;
     let dump_path = staging.join("postgresql.dump");
     let archive_path = staging.join("deployment.tar");
-    run_pg_dump(&connection, &dump_path)?;
+    let database_sentinel_sha256 = snapshot_database(&connection, &dump_path)?;
     let archive_files = create_deployment_archive(
         &archive_path,
         &data,
@@ -2227,7 +2226,34 @@ fn verify_runtime_identity(data: &Path, state: &DeploymentState) -> anyhow::Resu
     Ok(statement.instance_key_id)
 }
 
-fn run_pg_dump(connection: &PostgresConnection, output: &Path) -> anyhow::Result<()> {
+fn export_database_snapshot(
+    connection: &PostgresConnection,
+) -> anyhow::Result<(crate::process::LineSession, String)> {
+    let mut session = postgres_sentinel_process(connection).line_session(1024)?;
+    let reply = session.exchange(
+        b"BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;\nSELECT pg_export_snapshot();\n"
+            .to_vec(),
+    )?;
+    let snapshot = std::str::from_utf8(&reply)?.trim().to_owned();
+    ensure!(!snapshot.is_empty(), "database snapshot is missing");
+    Ok((session, snapshot))
+}
+
+fn snapshot_database(connection: &PostgresConnection, output: &Path) -> anyhow::Result<String> {
+    let (mut session, snapshot) = export_database_snapshot(connection)?;
+    let fact = session.exchange(DATABASE_SENTINEL_SCRIPT.as_bytes().to_vec())?;
+    let digest = database_sentinel_digest(&fact)?;
+    run_pg_dump(connection, output, &snapshot)?;
+    // The exporting read-only transaction and its schema locks live until the
+    // dump finishes. Dropping the session releases both, including on error.
+    Ok(digest)
+}
+
+fn run_pg_dump(
+    connection: &PostgresConnection,
+    output: &Path,
+    snapshot: &str,
+) -> anyhow::Result<()> {
     run_postgres_command(
         "pg_dump",
         connection,
@@ -2235,6 +2261,8 @@ fn run_pg_dump(connection: &PostgresConnection, output: &Path) -> anyhow::Result
             "--format=custom",
             "--no-owner",
             "--no-privileges",
+            "--snapshot",
+            snapshot,
             "--file",
             output.to_str().context("snapshot path is not UTF-8")?,
         ],
@@ -2353,8 +2381,8 @@ fn ensure_postgres_output(program: &str, output: std::process::Output) -> anyhow
     }
     Ok(output)
 }
-fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow::Result<String> {
-    let output = crate::process::Process::new("psql")
+fn postgres_sentinel_process(connection: &PostgresConnection) -> crate::process::Process {
+    crate::process::Process::new("psql")
         .arg("--dbname")
         .arg(connection.url_without_password.as_str())
         .args([
@@ -2366,7 +2394,14 @@ fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow:
             "--file=-",
         ])
         .env("PGPASSWORD", &connection.password)
-        .stdin_output(DATABASE_SENTINEL_SCRIPT.as_bytes())
+}
+
+fn database_sentinel_with_connection(connection: &PostgresConnection) -> anyhow::Result<String> {
+    let script = format!(
+        "BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;\n{DATABASE_SENTINEL_SCRIPT}\nCOMMIT;\n"
+    );
+    let output = postgres_sentinel_process(connection)
+        .stdin_output(script.into_bytes())
         .context("failed to run database sentinel")?;
     let output = ensure_postgres_output("psql", output)?;
     database_sentinel_digest(&output.stdout)
@@ -3425,7 +3460,7 @@ cat "$BACKUP_REPLAY_TEST_ROOT/sentinel""#,
                 } else {
                     "legacy.dump"
                 });
-                run_pg_dump(&source, &dump)?;
+                ensure!(snapshot_database(&source, &dump)? == expected);
                 create_database(&admin, &restored_name)?;
                 restore_database(&admin, &dump, &restored_name)?;
                 let actual =
@@ -3476,7 +3511,7 @@ cat "$BACKUP_REPLAY_TEST_ROOT/sentinel""#,
                 "ALTER TABLE missing_issuances RENAME TO oauth_token_issuances",
             )?;
             let dump = temp.path().join("released.dump");
-            run_pg_dump(&source, &dump)?;
+            ensure!(snapshot_database(&source, &dump)? == released);
             create_database(&admin, &restored_name)?;
             restore_database(&admin, &dump, &restored_name)?;
             ensure!(
@@ -3490,6 +3525,33 @@ cat "$BACKUP_REPLAY_TEST_ROOT/sentinel""#,
                 database_sentinel_with_connection(&source)? != released,
                 "changed durable issuance facts must change the released sentinel"
             );
+            // A newly installed 0.3.2 database records only the squashed baseline.
+            sentinel_fixture_sql(
+                &source,
+                "DROP TABLE oauth_token_issuances; DELETE FROM __diesel_schema_migrations; INSERT INTO __diesel_schema_migrations VALUES ('20261017000400')",
+            )?;
+            let fresh = database_sentinel_with_connection(&source)?;
+            let (mut snapshot_session, snapshot) = export_database_snapshot(&source)?;
+            // This ordinary commit must not leak into either backup component,
+            // even if it lands between export, counting and pg_dump.
+            sentinel_fixture_sql(&source, "INSERT INTO users VALUES (99)")?;
+            let fact = snapshot_session.exchange(DATABASE_SENTINEL_SCRIPT.as_bytes().to_vec())?;
+            ensure!(database_sentinel_digest(&fact)? == fresh);
+            let dump = temp.path().join("fresh-concurrent.dump");
+            run_pg_dump(&source, &dump, &snapshot)?;
+            drop(snapshot_session);
+            create_database(&admin, &restored_name)?;
+            restore_database(&admin, &dump, &restored_name)?;
+            ensure!(
+                database_sentinel_with_connection(&admin.with_database(&restored_name))? == fresh,
+                "fresh baseline backup and sentinel must share the exported snapshot"
+            );
+            ensure!(database_sentinel_with_connection(&source)? != fresh);
+            drop_database(&admin, &restored_name)?;
+            sentinel_fixture_sql(
+                &source,
+                "DELETE FROM __diesel_schema_migrations; INSERT INTO __diesel_schema_migrations VALUES ('20260926000100')",
+            )?;
             sentinel_fixture_sql(
                 &source,
                 "CREATE TABLE oauth_tokens (id INTEGER PRIMARY KEY)",
@@ -3531,6 +3593,31 @@ cat "$BACKUP_REPLAY_TEST_ROOT/sentinel""#,
         restored_cleanup?;
         source_cleanup?;
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a current-server migrated isolated NAZOAUTHCTL_TEST_DATABASE_URL and PostgreSQL tools"]
+    fn database_snapshot_round_trips_current_server_migrations() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-current-server")?;
+        let url_file = temp.path().join("database-url");
+        write_fixture(&url_file, std::env::var("NAZOAUTHCTL_TEST_DATABASE_URL")?)?;
+        let source = postgres_connection(&url_file)?;
+        let restored_name = format!("nazo_snapshot_restore_{}", Uuid::now_v7().simple());
+        let dump = temp.path().join("database.dump");
+        let expected = snapshot_database(&source, &dump)?;
+        create_database(&source, &restored_name)?;
+        let result = (|| -> anyhow::Result<()> {
+            restore_database(&source, &dump, &restored_name)?;
+            ensure!(
+                database_sentinel_with_connection(&source.with_database(&restored_name))?
+                    == expected,
+                "the current server schema must survive snapshot and restore with the same sentinel"
+            );
+            Ok(())
+        })();
+        let cleanup = drop_database(&source, &restored_name);
+        result?;
+        cleanup
     }
 
     #[test]

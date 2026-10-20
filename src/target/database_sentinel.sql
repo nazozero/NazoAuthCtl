@@ -1,8 +1,5 @@
--- One psql session owns shape selection, relation locks and the count snapshot.
+-- The caller owns a REPEATABLE READ transaction, shared with pg_dump on backup.
 -- The caller uses -X -q -A -t -v ON_ERROR_STOP=1 so only the final fact is output.
--- The final SELECT takes its statement snapshot after every count table is
--- locked, rather than reusing a snapshot taken by the initial presence probe.
-BEGIN READ ONLY ISOLATION LEVEL READ COMMITTED;
 LOCK TABLE controller_recovery_roots, controller_registry_slots,
     __diesel_schema_migrations, oauth_clients, recovery_invalidations,
     tenants, user_totp_credentials, users IN ACCESS SHARE MODE;
@@ -26,7 +23,7 @@ LOCK TABLE oauth_token_issuances IN ACCESS SHARE MODE;
 WITH shape AS (
     SELECT
         EXISTS (SELECT 1 FROM __diesel_schema_migrations
-                WHERE version = '20260926000100') AS minimal_recorded,
+                WHERE version IN ('20260926000100', '20261017000400')) AS minimal_recorded,
         EXISTS (SELECT 1 FROM __diesel_schema_migrations
                 WHERE version = '20260805000500') AS issuance_recorded,
         (SELECT MAX(version)::text FROM __diesel_schema_migrations) AS migration_head,
@@ -96,4 +93,3 @@ DO $$ BEGIN
     RAISE EXCEPTION 'unsupported database sentinel schema: migration ledger and token relations disagree';
 END $$;
 \endif
-COMMIT;

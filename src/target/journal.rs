@@ -279,7 +279,7 @@ impl TargetJournal {
             .as_ref()
             .is_some_and(|line| matches!(line.status, JournalStatus::Pending));
 
-        let retry_failed_recovery_phase = latest.as_ref().is_some_and(|line| {
+        let retry_failed_phase = latest.as_ref().is_some_and(|line| {
             matches!(line.status, JournalStatus::Failed)
                 && matches!(
                     operation.operation,
@@ -288,6 +288,9 @@ impl TargetJournal {
                         | super::wire::HostOperationBody::BackupRecoveryCandidateControl { .. }
                         | super::wire::HostOperationBody::BackupRecoveryCandidateCleanup { .. }
                         | super::wire::HostOperationBody::BackupRecoveryActivate { .. }
+                        | super::wire::HostOperationBody::StateMutate {
+                            mutation: super::deployment_state::StateMutationPayload::Uninstall {}
+                        }
                 )
         });
 
@@ -296,12 +299,11 @@ impl TargetJournal {
         // the immutable export can reproduce the same offset/hash response,
         // while retaining archive chunks here would turn the journal into a
         // second backup store. A pending line likewise resumes by execution.
-        // Failed backup recovery is the one exception: its filesystem stages
-        // are bound to this operation id, so retrying under a new id would
-        // abandon the only forward-resumable state.
+        // Recovery stages and uninstall completion are bound to this operation
+        // id. Their owners resume idempotently, including partial deletion.
         if let Some(line) = latest
             && !matches!(line.status, JournalStatus::Pending)
-            && !retry_failed_recovery_phase
+            && !retry_failed_phase
             && let Some(result) = line.result
         {
             return Ok(result);
@@ -344,6 +346,9 @@ impl TargetJournal {
                 super::control_exec::CONTROL_OUTCOME_UNKNOWN
                     | super::control_exec::CONTROL_EXECUTION_UNAVAILABLE
                     | "OUTCOME_UNKNOWN"
+                    // This code comes only from the host privilege preflight,
+                    // before the first execution side effect.
+                    | crate::error_codes::PRIVILEGE_REQUIRED
             )
         {
             return Ok(result);
@@ -872,6 +877,41 @@ mod tests {
             second.outcome,
             HostOutcome::Failed { ref code, .. } if code == "RETRY_EXECUTED"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn privilege_preflight_and_partial_uninstall_allow_exact_retry() -> anyhow::Result<()> {
+        for (operation, code) in [
+            (
+                ping_operation("privilege"),
+                crate::error_codes::PRIVILEGE_REQUIRED,
+            ),
+            (
+                HostOperation::state_mutate(
+                    Uuid::now_v7().to_string(),
+                    "deploy-alpha",
+                    Some(2),
+                    super::super::deployment_state::StateMutationPayload::Uninstall {},
+                ),
+                "DELETION_FAILED",
+            ),
+        ] {
+            let temp = filesystem::PrivateTempDir::new("nazoauthctl-journal-host-retry")?;
+            let journal = TargetJournal::open(temp.path().join("state"))?;
+            journal.run_journaled(&operation, |operation| {
+                HostResult::failed(&operation.operation_id, code, "first")
+            })?;
+            let reexecuted = std::cell::Cell::new(false);
+            journal.run_journaled(&operation, |operation| {
+                reexecuted.set(true);
+                HostResult::completed(
+                    operation.operation_id.clone(),
+                    HostCompletionBody::StateMutateNoop { revision: 2 },
+                )
+            })?;
+            assert!(reexecuted.get(), "{code}");
+        }
         Ok(())
     }
 
