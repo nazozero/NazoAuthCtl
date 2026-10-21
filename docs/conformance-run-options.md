@@ -5,6 +5,12 @@ default. Official failures remain recorded as `FAILED` and still make the run
 fail; continuation only allows later selected modules and plans to produce
 evidence.
 
+An OpenID4VCI callback HTTP error is an ordinary module failure when the Suite
+already reports that module terminal with result `FAILED`. The runner records
+that result and continues the plan. Without that authoritative failure, the
+HTTP error remains an orchestration error; its status code is included in the
+diagnostic. No failed result is converted to a pass.
+
 Use `--fail-fast` when diagnosing the first error. This explicitly stops later
 dispatch after the first ordinary failure. Interrupts, unresolved resource
 ownership, and cleanup safety conditions still stop the run regardless of this
@@ -51,7 +57,7 @@ Backup validation probes the token schema before computing its sentinel. Legacy 
 The bundled HAIP issuer clients explicitly require PAR, as required by HAIP 1.0 section 4 when using the authorization endpoint. Wallet attestation authentication remains unchanged. This changes the recorded matrix digest without excluding any module.
 
 The FAPI-CIBA ID1 plans register clients with baseline assurance and explicit
-CIBA requirements: signed authentication requests, mTLS-bound tokens and
+CIBA requirements: signed authentication requests, PS256 ID Tokens, mTLS-bound tokens and
 endpoint audiences for `private_key_jwt`. They do not select FAPI 2 assurance,
 which requires issuer-only assertion audiences. FAPI 2 plans retain their own
 assurance policy; no Suite result or expected outcome is changed.

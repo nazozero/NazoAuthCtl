@@ -175,7 +175,7 @@ pub enum OpenId4VciError {
     InvalidCookie,
     #[error("OpenID4VCI HTTP transport failed")]
     Transport(#[source] TransportError),
-    #[error("OpenID4VCI HTTP response status was not accepted")]
+    #[error("OpenID4VCI HTTP response status {0} was not accepted")]
     HttpStatus(u16),
 }
 

@@ -366,6 +366,7 @@ mod tests {
                 );
                 assert_eq!(registration["require_mtls_bound_tokens"], true);
                 assert_eq!(registration["require_par_request_object"], true);
+                assert_eq!(registration["id_token_signed_response_alg"], "PS256");
                 assert_eq!(
                     registration["backchannel_authentication_request_signing_alg"],
                     "PS256"

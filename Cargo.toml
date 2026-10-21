@@ -8,7 +8,7 @@ default-members = ["crates/nazoauthctl"]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/nazozero/NazoAuthCtl"
@@ -16,8 +16,8 @@ rust-version = "1.99"
 
 [workspace.dependencies]
 hex = "0.4.3"
-nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "446e23c0f7c04939ec461292164f44963c95387c", version = "0.3.4", default-features = false, features = ["ed25519"] }
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "446e23c0f7c04939ec461292164f44963c95387c", version = "0.3.4", package = "nazo-operator-protocol" }
+nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "de519732c6227adff4334c8386036eed09b2a0ae", version = "0.3.5", default-features = false, features = ["ed25519"] }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "de519732c6227adff4334c8386036eed09b2a0ae", version = "0.3.5", package = "nazo-operator-protocol" }
 
 [package]
 name = "nazoauthctl-core"

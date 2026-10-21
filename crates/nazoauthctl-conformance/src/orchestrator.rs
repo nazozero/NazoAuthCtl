@@ -465,6 +465,18 @@ impl ConformanceRunner {
             };
             match drive_result {
                 Ok(()) | Err(OpenId4VciError::Pending) => {}
+                Err(error @ OpenId4VciError::HttpStatus(_)) => {
+                    // A Suite callback can fail its HTTP request because the
+                    // module just recorded an official failure. That outcome
+                    // belongs to the module, not to the remaining plan.
+                    if let Ok(state) = self.config.client.module_info(module_id)
+                        && is_terminal(&state)
+                        && state.get("result").and_then(Value::as_str) == Some("FAILED")
+                    {
+                        return Ok(state);
+                    }
+                    return Err(error.to_string());
+                }
                 Err(error) => return Err(error.to_string()),
             }
             self.wait_for_runner_refresh(deadline, "OpenID4VCI")?;
@@ -2050,6 +2062,7 @@ mod tests {
     }
 
     struct DuplicateDefinitionTransport {
+        result: &'static str,
         created_modules: AtomicUsize,
         module_info_calls: Mutex<BTreeMap<String, usize>>,
         requests: Mutex<Vec<(HttpMethod, String)>>,
@@ -2454,7 +2467,7 @@ mod tests {
                     } else {
                         (
                             200,
-                            serde_json::json!({"status":"FINISHED","result":"PASSED"}),
+                            serde_json::json!({"status":"FINISHED","result":self.result}),
                         )
                     }
                 }
@@ -2831,126 +2844,139 @@ mod tests {
 
     #[test]
     fn same_name_distinct_variants_create_exact_suite_instances_and_runtime_overlays() {
-        let transport = Arc::new(DuplicateDefinitionTransport {
-            created_modules: AtomicUsize::new(0),
-            module_info_calls: Mutex::new(BTreeMap::new()),
-            requests: Mutex::new(Vec::new()),
-            runner_variants: Mutex::new(Vec::new()),
-        });
-        let client = SuiteClient::with_transport(
-            Origin::parse("https://suite.example").expect("origin"),
-            Some(BearerToken::new("suite-token").expect("token")),
-            transport.clone(),
-            ClientConfig::default(),
-        )
-        .expect("client");
-        let mut matrix = one_plan_matrix(serde_json::json!({}));
-        let matrix_plan = &mut matrix.document.groups[0].plans[0];
-        matrix_plan.plan = "oid4vci-issuer-test-plan".to_owned();
-        matrix_plan.variant = BTreeMap::from([
-            (
-                "vci_authorization_code_flow_variant".to_owned(),
-                "wallet_initiated".to_owned(),
-            ),
-            (
-                "credential_configuration".to_owned(),
-                "matrix-default".to_owned(),
-            ),
-            ("matrix_only".to_owned(), "kept".to_owned()),
-        ]);
-        let issuer = Arc::new(Mutex::new(RecordingIssuer::default()));
-        let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
-        let runner = ConformanceRunner::new(ConformanceRunConfig {
-            client,
-            matrix,
-            target_origin: None,
-            binding: Some(test_binding()),
-            poll_timeout: Duration::from_secs(1),
-            control: RunControl::default(),
-            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
-            plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
-            selected_resource_budget: budget(2, 1, 60),
-            jobs: 1,
+        for result in ["PASSED", "FAILED"] {
+            let transport = Arc::new(DuplicateDefinitionTransport {
+                result,
+                created_modules: AtomicUsize::new(0),
+                module_info_calls: Mutex::new(BTreeMap::new()),
+                requests: Mutex::new(Vec::new()),
+                runner_variants: Mutex::new(Vec::new()),
+            });
+            let client = SuiteClient::with_transport(
+                Origin::parse("https://suite.example").expect("origin"),
+                Some(BearerToken::new("suite-token").expect("token")),
+                transport.clone(),
+                ClientConfig::default(),
+            )
+            .expect("client");
+            let mut matrix = one_plan_matrix(serde_json::json!({}));
+            let matrix_plan = &mut matrix.document.groups[0].plans[0];
+            matrix_plan.plan = "oid4vci-issuer-test-plan".to_owned();
+            matrix_plan.variant = BTreeMap::from([
+                (
+                    "vci_authorization_code_flow_variant".to_owned(),
+                    "wallet_initiated".to_owned(),
+                ),
+                (
+                    "credential_configuration".to_owned(),
+                    "matrix-default".to_owned(),
+                ),
+                ("matrix_only".to_owned(), "kept".to_owned()),
+            ]);
+            let issuer = Arc::new(Mutex::new(RecordingIssuer {
+                error: (result == "FAILED").then_some(OpenId4VciError::HttpStatus(500)),
+                ..RecordingIssuer::default()
+            }));
+            let issuer_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> = issuer.clone();
+            let runner = ConformanceRunner::new(ConformanceRunConfig {
+                client,
+                matrix,
+                target_origin: None,
+                binding: Some(test_binding()),
+                poll_timeout: Duration::from_secs(1),
+                control: RunControl::default(),
+                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+                plan_resource_budgets: BTreeMap::from([("p".to_owned(), budget(2, 1, 60))]),
+                selected_resource_budget: budget(2, 1, 60),
+                jobs: 1,
 
-            automation: vec![ConformanceAutomation {
-                issuer: Some(issuer_driver),
-                ..ConformanceAutomation::default()
-            }],
-            suite_resource_observer: None,
-        })
-        .expect("runner");
+                automation: vec![ConformanceAutomation {
+                    issuer: Some(issuer_driver),
+                    ..ConformanceAutomation::default()
+                }],
+                suite_resource_observer: None,
+            })
+            .expect("runner");
 
-        let report = runner.run(&mut ()).report;
+            let report = runner.run(&mut ()).report;
 
-        assert!(report.errors.is_empty());
-        assert!(report.local_success);
-        assert!(report.orchestration_integrity.all_modules_terminal);
-        assert_eq!(report.modules.len(), 2);
-        assert_eq!(
-            report
-                .modules
-                .iter()
-                .map(|module| module.test_name.as_str())
-                .collect::<Vec<_>>(),
-            ["happy-flow", "happy-flow"]
-        );
-        assert_eq!(
-            report
-                .modules
-                .iter()
-                .filter_map(|module| module.module_id.as_deref())
-                .collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from(["module-1", "module-2"])
-        );
-        assert_eq!(
-            report
-                .modules
-                .iter()
-                .map(|module| module
-                    .variant
-                    .get("credential_configuration")
-                    .map(String::as_str))
-                .collect::<Vec<_>>(),
-            [Some("plain"), Some("encrypted")]
-        );
-        assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
-        assert_eq!(
-            transport
-                .requests
-                .lock()
-                .expect("duplicate definition requests")
-                .iter()
-                .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
-                .count(),
-            2
-        );
-        assert_eq!(
-            transport
-                .runner_variants
-                .lock()
-                .expect("duplicate definition variants")
-                .as_slice(),
-            [
-                "{\"credential_configuration\":\"plain\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}",
-                "{\"credential_configuration\":\"encrypted\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}"
-            ]
-        );
-        let observed_variants = issuer.lock().expect("recording issuer").variants.clone();
-        assert_eq!(observed_variants.len(), 2);
-        assert!(observed_variants.iter().all(|variant| {
-            variant.get("matrix_only").map(String::as_str) == Some("kept")
-                && variant
-                    .get("vci_authorization_code_flow_variant")
-                    .map(String::as_str)
-                    == Some("issuer_initiated")
-        }));
-        assert_eq!(
-            observed_variants
-                .iter()
-                .map(|variant| variant.get("credential_configuration").map(String::as_str))
-                .collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from([Some("plain"), Some("encrypted")])
-        );
+            assert!(report.errors.is_empty());
+            assert!(report.local_success);
+            assert!(report.orchestration_integrity.all_modules_terminal);
+            assert_eq!(report.modules.len(), 2);
+            assert!(
+                report
+                    .modules
+                    .iter()
+                    .all(|module| module.official_result.as_deref() == Some(result))
+            );
+            assert_eq!(report.suite_pass, result == "PASSED");
+            assert_eq!(
+                report
+                    .modules
+                    .iter()
+                    .map(|module| module.test_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["happy-flow", "happy-flow"]
+            );
+            assert_eq!(
+                report
+                    .modules
+                    .iter()
+                    .filter_map(|module| module.module_id.as_deref())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                std::collections::BTreeSet::from(["module-1", "module-2"])
+            );
+            assert_eq!(
+                report
+                    .modules
+                    .iter()
+                    .map(|module| module
+                        .variant
+                        .get("credential_configuration")
+                        .map(String::as_str))
+                    .collect::<Vec<_>>(),
+                [Some("plain"), Some("encrypted")]
+            );
+            assert_eq!(report.cleanup.deleted_plans, ["suite-plan"]);
+            assert_eq!(
+                transport
+                    .requests
+                    .lock()
+                    .expect("duplicate definition requests")
+                    .iter()
+                    .filter(|(method, path)| *method == HttpMethod::Post && path == "/api/runner")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                transport
+                    .runner_variants
+                    .lock()
+                    .expect("duplicate definition variants")
+                    .as_slice(),
+                [
+                    "{\"credential_configuration\":\"plain\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}",
+                    "{\"credential_configuration\":\"encrypted\",\"vci_authorization_code_flow_variant\":\"issuer_initiated\"}"
+                ]
+            );
+            let observed_variants = issuer.lock().expect("recording issuer").variants.clone();
+            assert_eq!(observed_variants.len(), 2);
+            assert!(observed_variants.iter().all(|variant| {
+                variant.get("matrix_only").map(String::as_str) == Some("kept")
+                    && variant
+                        .get("vci_authorization_code_flow_variant")
+                        .map(String::as_str)
+                        == Some("issuer_initiated")
+            }));
+            assert_eq!(
+                observed_variants
+                    .iter()
+                    .map(|variant| variant.get("credential_configuration").map(String::as_str))
+                    .collect::<std::collections::BTreeSet<_>>(),
+                std::collections::BTreeSet::from([Some("plain"), Some("encrypted")])
+            );
+        }
     }
 
     #[test]
@@ -4023,12 +4049,13 @@ mod tests {
     #[derive(Default)]
     struct RecordingIssuer {
         variants: Vec<BTreeMap<String, String>>,
+        error: Option<OpenId4VciError>,
     }
 
     impl OpenId4VciIssuerDriver for RecordingIssuer {
         fn drive(&mut self, module: &OpenId4VciModule<'_>) -> Result<(), OpenId4VciError> {
             self.variants.push(module.variant.clone());
-            Ok(())
+            self.error.map_or(Ok(()), Err)
         }
     }
 
@@ -4125,6 +4152,27 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(issuer.lock().expect("issuer").drives >= 1);
+        let failed_driver: Arc<Mutex<dyn OpenId4VciIssuerDriver>> =
+            Arc::new(Mutex::new(RecordingIssuer {
+                error: Some(OpenId4VciError::HttpStatus(503)),
+                ..RecordingIssuer::default()
+            }));
+        let error = runner
+            .drive_vci_waiting_interruptible(
+                &mut (),
+                &failed_driver,
+                &plan,
+                &module,
+                "m",
+                serde_json::json!({"status":"WAITING"}),
+            )
+            .expect_err(
+                "an HTTP error without a failed Suite terminal must remain an orchestration error",
+            );
+        assert_eq!(
+            error,
+            "OpenID4VCI HTTP response status 503 was not accepted"
+        );
     }
 
     #[cfg(unix)]
