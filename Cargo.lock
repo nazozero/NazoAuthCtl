@@ -1647,8 +1647,8 @@ dependencies = [
 
 [[package]]
 name = "nazo-crypto"
-version = "0.3.3"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=ea0d3d012b280660d0bd7ebde8f90e55fde1eaec#ea0d3d012b280660d0bd7ebde8f90e55fde1eaec"
+version = "0.3.4"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=446e23c0f7c04939ec461292164f44963c95387c#446e23c0f7c04939ec461292164f44963c95387c"
 dependencies = [
  "ed25519-dalek",
  "thiserror",
@@ -1656,8 +1656,8 @@ dependencies = [
 
 [[package]]
 name = "nazo-operator-protocol"
-version = "0.3.3"
-source = "git+https://github.com/nazozero/NazoAuth.git?rev=ea0d3d012b280660d0bd7ebde8f90e55fde1eaec#ea0d3d012b280660d0bd7ebde8f90e55fde1eaec"
+version = "0.3.4"
+source = "git+https://github.com/nazozero/NazoAuth.git?rev=446e23c0f7c04939ec461292164f44963c95387c#446e23c0f7c04939ec461292164f44963c95387c"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "cliclack",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-conformance"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "nazoauthctl-runtime"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "atomic-write-file",
