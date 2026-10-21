@@ -409,13 +409,13 @@ fn data_tree_walk_keeps_open_directory_identity_and_rejects_special_entries() ->
     symlink(outside.join("data"), root.join("link"))?;
     assert!(visit_directory_tree(&root, &mut |_, _| Ok(())).is_err());
     fs::remove_file(root.join("link"))?;
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        root.join("pipe"),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
-    )?;
+    assert!(
+        std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(root.join("pipe"))
+            .status()?
+            .success()
+    );
     assert!(visit_directory_tree(&root, &mut |_, _| Ok(())).is_err());
     Ok(())
 }
