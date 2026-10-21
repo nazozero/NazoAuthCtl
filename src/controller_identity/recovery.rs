@@ -157,7 +157,11 @@ fn submit_pending_recovery(
             &pending.candidate_kid,
             commit,
         ),
-        Err(error @ (AdminApiError::Transport(_) | AdminApiError::MalformedResponse(_))) => {
+        Err(
+            error @ (AdminApiError::Transport(_)
+            | AdminApiError::MalformedResponse(_)
+            | AdminApiError::OutcomeUnknown { .. }),
+        ) => {
             let path = pending_recovery_path(keys, &pending.deployment_id)?;
             Err(anyhow::anyhow!(error)).with_context(|| {
                 format!(
@@ -315,55 +319,19 @@ pub(crate) struct OutputFileSecretDelivery {
 impl ReplacementSecretDelivery for OutputFileSecretDelivery {
     fn deliver(&self, display: &str) -> anyhow::Result<()> {
         use std::io::Write as _;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&self.path)
-                .context("creating the output secret file failed (it must not exist yet)")?;
-            let result = (|| -> anyhow::Result<()> {
-                file.write_all(display.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                let _ = std::fs::remove_file(&self.path);
-                return Err(error)
-                    .context("writing the output secret file failed; partial file removed");
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&self.path)
-                .context("creating the output secret file failed (it must not exist yet)")?;
+        let mut file = crate::filesystem::create_private_file(&self.path)
+            .context("creating the output secret file failed (it must not exist yet)")?;
+        let result = (|| -> anyhow::Result<()> {
+            file.write_all(display.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            crate::filesystem::sync_parent(&self.path)
+        })();
+        if let Err(error) = result {
             drop(file);
-            if let Err(error) = crate::filesystem::set_mode(&self.path, 0o600) {
-                let _ = std::fs::remove_file(&self.path);
-                return Err(error)
-                    .context("protecting output secret file ACL failed; empty file removed");
-            }
-            let result = (|| -> anyhow::Result<()> {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&self.path)
-                    .context("reopening output secret file failed")?;
-                file.write_all(display.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                let _ = std::fs::remove_file(&self.path);
-                return Err(error)
-                    .context("writing the output secret file failed; partial file removed");
-            }
+            let _ = std::fs::remove_file(&self.path);
+            return Err(error)
+                .context("persisting the output secret file failed; no root change authorized");
         }
         Ok(())
     }
@@ -967,11 +935,29 @@ mod tests {
 
     #[test]
     fn recover_resumes_the_exact_submission_after_an_unknown_outcome() {
+        for response in [
+            None,
+            Some((500, r#"{"error":"server_error"}"#)),
+            Some((502, "<html>Bad Gateway</html>")),
+            Some((503, r#"{"error":"temporarily_unavailable"}"#)),
+            Some((400, "<html>Proxy error</html>")),
+            Some((409, "{}")),
+            Some((200, "{}")),
+        ] {
+            assert_recovery_resumes(response);
+        }
+    }
+
+    fn assert_recovery_resumes(response: Option<(u16, &str)>) {
         let fixture = Fixture::new().expect("fixture");
         let old = generate_material(DEPLOYMENT);
         let nonce = [9u8; 32];
         let first = Canned::default();
-        first.push_error("response lost after send");
+        if let Some((status, body)) = response {
+            first.push(status, body);
+        } else {
+            first.push_error("response lost after send");
+        }
         first.push(
             200,
             &format!(

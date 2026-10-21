@@ -583,6 +583,15 @@ fn open_handle_with_mode(
     Ok(file)
 }
 
+pub(super) fn create_private_file(path: &Path) -> anyhow::Result<File> {
+    open_handle_with_mode(
+        path,
+        FILE_GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+        CREATE_NEW,
+        Some(0o600),
+    )
+}
+
 fn open_directory_handle(path: &Path, desired: u32) -> anyhow::Result<File> {
     let name = wide(path)?;
     let flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS;

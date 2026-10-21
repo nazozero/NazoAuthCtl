@@ -78,3 +78,9 @@ modules and corrects the earlier blanket PNG-only objection to 17 OIDC records.
 That historical run contained three mdoc privacy warnings; its result is not
 a statement about current server releases. Certification approval remains
 separate from local execution success.
+
+`acceptance_pass` requires a non-empty defined module set, all modules terminal,
+successful local orchestration/resource settlement, the selected acceptance
+policy and the matrix expectations. An empty or unfinished run cannot pass
+acceptance. Official Suite pass and outstanding human review remain separate
+report fields.

@@ -1412,7 +1412,11 @@ impl ConformanceRunner {
             errors: errors.into_inner(),
             local_success,
             suite_pass,
-            acceptance_pass: outcomes.acceptance_pass && matrix_expectations_satisfied,
+            acceptance_pass: local_success
+                && defined_modules > 0
+                && all_modules_terminal
+                && outcomes.acceptance_pass
+                && matrix_expectations_satisfied,
             review_pending: deferred_review_modules > 0 || external_review_pending,
             human_review_required,
             human_review_modules: outcomes.human_review_modules,

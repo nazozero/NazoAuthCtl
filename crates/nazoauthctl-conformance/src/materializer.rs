@@ -2962,8 +2962,30 @@ mod tests {
     }
 
     #[test]
+    fn oidc_materialization_does_not_validate_unused_mdoc_anchor() {
+        let mut descriptor = descriptor_json();
+        descriptor["openid4vc_suite_mdoc_trust_anchor_pem"] =
+            serde_json::json!("unused-invalid-anchor");
+        let descriptor =
+            DescriptorMaterializer::from_bytes(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        let prepared = prepare_for_test(
+            descriptor,
+            "https://issuer.example",
+            &suite(),
+            request_jti(),
+        )
+        .unwrap();
+        assert!(prepared.attestation.is_none());
+    }
+
+    #[test]
     fn suite_mdoc_anchor_is_required_and_cryptographically_validated() {
-        let mut missing = descriptor_json();
+        let vc_descriptor = || {
+            let mut descriptor = descriptor_json();
+            descriptor["groups"][0]["plans"][0]["plan"] = serde_json::json!("oid4vci-test-plan");
+            descriptor
+        };
+        let mut missing = vc_descriptor();
         missing
             .as_object_mut()
             .expect("descriptor object")
@@ -2975,7 +2997,7 @@ mod tests {
             .is_err()
         );
 
-        let mut malformed = descriptor_json();
+        let mut malformed = vc_descriptor();
         malformed["openid4vc_suite_mdoc_trust_anchor_pem"] =
             serde_json::json!("-----BEGIN CERTIFICATE-----\nVEVST1I=\n-----END CERTIFICATE-----\n");
         assert!(
@@ -2985,7 +3007,7 @@ mod tests {
             .is_err()
         );
 
-        let mut expired = descriptor_json();
+        let mut expired = vc_descriptor();
         expired["openid4vc_suite_mdoc_trust_anchor_pem"] =
             serde_json::json!(generated_test_anchor(
                 "expired-suite-mdoc",
@@ -3000,7 +3022,7 @@ mod tests {
             .is_err()
         );
 
-        let mut leaf = descriptor_json();
+        let mut leaf = vc_descriptor();
         leaf["openid4vc_suite_mdoc_trust_anchor_pem"] =
             serde_json::json!(generated_test_anchor("leaf-suite-mdoc", IsCa::NoCa, 1, 30));
         assert!(

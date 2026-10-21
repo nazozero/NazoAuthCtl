@@ -414,6 +414,12 @@ fn recover(
         return Ok(());
     }
     validate_previous_receipt(&transaction, current.as_ref())?;
+    if let Some(receipt) = restore_archived_receipt(store, &transaction)? {
+        cleanup_challenge(&transaction)?;
+        archive_transaction(store, &transaction)?;
+        crate::ui::print_value(&serde_json::to_value(receipt)?);
+        return Ok(());
+    }
     if Utc::now().timestamp() > transaction.expires_at {
         abort_transaction(store, &mut transaction, "transaction-expired")?;
         bail!("ACME issuance expired; challenge and pending journal were safely retired")
@@ -1696,6 +1702,34 @@ fn load_receipt_record(
     }))
 }
 
+/// Finish the archive/current commit gap without inventing new issuance facts.
+fn restore_archived_receipt(
+    store: &TlsStore,
+    transaction: &AcmeTransaction,
+) -> anyhow::Result<Option<AcmeReceipt>> {
+    let directory = acme_binding_directory(
+        store,
+        &transaction.deployment_id,
+        &transaction.tenant,
+        &transaction.hostname,
+    );
+    let archive = directory
+        .join("receipts")
+        .join(format!("{}.json", transaction.target_revision));
+    let Some(bytes) =
+        read_optional_private(&archive, "ACME issuance receipt archive", MAX_RECEIPT_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let receipt: AcmeReceipt =
+        serde_json::from_slice(&bytes).context("ACME issuance receipt archive is invalid")?;
+    validate_receipt_shape(store, &receipt)?;
+    validate_receipt_transaction(&receipt, transaction)?;
+    validate_receipt_artifacts(store, &receipt)?;
+    atomic_write(&directory.join("current.json"), &bytes, 0o600)?;
+    Ok(Some(receipt))
+}
+
 fn validate_receipt_artifacts(store: &TlsStore, receipt: &AcmeReceipt) -> anyhow::Result<()> {
     let certificate = read_secure_regular_file(
         &receipt.certificate_path,
@@ -2281,6 +2315,72 @@ mod tests {
         receipt = test_receipt(&transaction);
         receipt.allowed_origins = Vec::new();
         assert!(validate_receipt_shape(&store, &receipt).is_err());
+    }
+
+    #[test]
+    fn recovery_republishes_archived_receipt_without_changing_issuance_time() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let work = PrivateTempDir::new("acme-archive-recovery").unwrap();
+        let store = TlsStore {
+            config_root: work.path().join("config"),
+            state_root: work.path().join("state"),
+        };
+        let mut transaction = test_transaction_for_store(&store);
+        let (_, key) = Key::generate_pkcs8().unwrap();
+        let digest = sha256(key.secret_pkcs8_der());
+        transaction.account_key_sha256 = Some(digest.clone());
+        let account = AccountRecord {
+            schema: ACCOUNT_SCHEMA, deployment_id: transaction.deployment_id.clone(),
+            acme_config_sha256: transaction.acme_config_sha256.clone(),
+            directory_url: transaction.directory_url.clone(), allowed_origins: transaction.allowed_origins.clone(),
+            contacts_sha256: "a".repeat(64), account_key_sha256: digest, created_at: 1,
+            credentials: serde_json::from_value(serde_json::json!({
+                "id":"https://acme.example/account/1", "key_pkcs8":URL_SAFE_NO_PAD.encode(key.secret_pkcs8_der()),
+                "directory": transaction.directory_url,
+            })).unwrap(),
+        };
+        atomic_write(
+            &transaction.account_path,
+            &serde_json::to_vec(&account).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        // The archive binds already validated material by digest; this recovery
+        // step does not contact ACME or issue/validate a new certificate.
+        let certificate = b"previously validated certificate";
+        let private_key = b"previously validated private key";
+        transaction.certificate_sha256 = Some(sha256(certificate));
+        transaction.private_key_sha256 = Some(sha256(private_key));
+        atomic_write(
+            &transaction.workspace.join("fullchain.pem"),
+            certificate,
+            0o644,
+        )
+        .unwrap();
+        atomic_write(
+            &transaction.workspace.join("private-key.pem"),
+            private_key,
+            0o600,
+        )
+        .unwrap();
+        let receipt = test_receipt(&transaction);
+        persist_receipt(&store, &transaction, &receipt).unwrap();
+        let directory = acme_binding_directory(
+            &store,
+            &transaction.deployment_id,
+            &transaction.tenant,
+            &transaction.hostname,
+        );
+        let archive = fs::read(directory.join("receipts/1.json")).unwrap();
+        fs::remove_file(directory.join("current.json")).unwrap();
+        let recovered = restore_archived_receipt(&store, &transaction)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.issued_at, receipt.issued_at);
+        assert_eq!(fs::read(directory.join("current.json")).unwrap(), archive);
+        transaction.jti = Uuid::now_v7().to_string();
+        assert!(restore_archived_receipt(&store, &transaction).is_err());
+        assert_eq!(fs::read(directory.join("current.json")).unwrap(), archive);
     }
 
     #[test]

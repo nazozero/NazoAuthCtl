@@ -761,7 +761,7 @@ impl HostInstallExecutor {
             job.order.runtime_root.as_deref(),
         )?;
         for directory in &managed_directories {
-            prepare_owned_directory(directory, job.deployment_id, performed)?;
+            prepare_owned_directory(directory, job.deployment_id, kind, performed)?;
         }
 
         // 2. Atomic config write with integrity check.
@@ -955,10 +955,16 @@ fn validate_endpoint_reachability(
 fn prepare_owned_directory(
     path: &Path,
     deployment_id: &str,
+    kind: RuntimeBackendKind,
     performed: &mut PerformedSteps,
 ) -> Result<(), Failure> {
-    filesystem::ensure_directory_chain(path)
-        .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
+    if kind == RuntimeBackendKind::Host {
+        filesystem::ensure_service_directory_chain(path)
+    } else {
+        filesystem::ensure_directory_chain(path)
+    }
+    .and_then(|()| filesystem::set_mode(path, 0o700))
+    .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
     let marker = path.join(".nazoauth-owned");
     atomic_write(&marker, deployment_id.as_bytes(), 0o440)
         .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
@@ -1354,7 +1360,7 @@ pub(super) fn cache_systemd_artifact(
 ) -> anyhow::Result<PathBuf> {
     let artifacts_root = runtime_root.join("artifacts");
     let cache_dir = artifacts_root.join(digest);
-    filesystem::ensure_directory_chain(&cache_dir)?;
+    filesystem::ensure_service_directory_chain(&cache_dir)?;
     for directory in [runtime_root, artifacts_root.as_path(), cache_dir.as_path()] {
         filesystem::set_mode(directory, 0o755)?;
     }

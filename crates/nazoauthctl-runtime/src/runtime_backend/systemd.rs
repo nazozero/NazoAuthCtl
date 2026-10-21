@@ -9,9 +9,9 @@ use anyhow::{Context as _, bail};
 use crate::{
     ArtifactReference, RuntimeBackendKind,
     filesystem::{
-        atomic_write, copy_atomic_from_file, ensure_directory_chain, open_secure_regular_file,
-        read_secure_regular_file, remove_file_durable, set_mode, sha256, sha256_file,
-        validate_secure_directory,
+        atomic_write, copy_atomic_from_file, ensure_directory_chain,
+        ensure_service_directory_chain, open_secure_regular_file, read_secure_regular_file,
+        remove_file_durable, set_mode, sha256, sha256_file, validate_secure_directory,
     },
     process::Process,
 };
@@ -419,18 +419,12 @@ impl RuntimeBackend for SystemdBackend {
                 .run_quiet()?;
         }
         require_non_root_service_user(&install.service_user)?;
-        ensure_directory_chain(&install.data_root)?;
+        ensure_service_directory_chain(&install.data_root)?;
         let binary_directory = install
             .binary
             .parent()
             .context("systemd binary has no parent directory")?;
-        ensure_directory_chain(binary_directory)?;
-        ensure_service_path_ancestors_traversable(
-            std::iter::once(install.data_root.as_path())
-                .chain(std::iter::once(binary_directory))
-                .chain(install.config.parent())
-                .chain(install.secret_paths.iter().filter_map(|path| path.parent())),
-        )?;
+        ensure_service_directory_chain(binary_directory)?;
         set_mode(binary_directory, 0o755)?;
         Process::new("chown")
             .arg("-R")
@@ -463,6 +457,13 @@ impl RuntimeBackend for SystemdBackend {
         for path in &install.secret_paths {
             set_mode(path, 0o440)?;
         }
+        require_service_paths_traversable(
+            &install.service_user,
+            std::iter::once(install.data_root.as_path())
+                .chain(std::iter::once(binary_directory))
+                .chain(install.config.parent())
+                .chain(install.secret_paths.iter().filter_map(|path| path.parent())),
+        )?;
         let mut source = open_secure_regular_file(
             &install.source_binary,
             "verified systemd source binary",
@@ -680,39 +681,25 @@ fn managed_service_user_comment(service_name: &str) -> String {
     format!("nazoauthctl {service_name}")
 }
 
-#[cfg(unix)]
-fn ensure_service_path_ancestors_traversable<'a>(
+fn require_service_paths_traversable<'a>(
+    service_user: &str,
     directories: impl IntoIterator<Item = &'a Path>,
 ) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let ancestors = directories
-        .into_iter()
-        .flat_map(|directory| directory.ancestors().skip(1))
-        .filter(|directory| directory.parent().is_some())
-        .collect::<BTreeSet<_>>();
-    for directory in ancestors {
-        let metadata = fs::symlink_metadata(directory)
-            .with_context(|| format!("failed to inspect {}", directory.display()))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    // Check the actual service identity, including its group/ACL permissions.
+    // Never widen permissions on an existing parent outside the deployment.
+    for directory in directories.into_iter().collect::<BTreeSet<_>>() {
+        if !Process::new("runuser")
+            .args(["-u", service_user, "--", "test", "-x"])
+            .arg(directory)
+            .succeeds()
+        {
             bail!(
-                "systemd service path ancestor is not a real directory: {}",
+                "service user {service_user} cannot traverse {}; choose an accessible install path or grant access to that user",
                 directory.display()
             );
         }
-        let mode = metadata.permissions().mode() & 0o7777;
-        if mode & 0o111 != 0o111 {
-            set_mode(directory, mode | 0o111)?;
-        }
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_service_path_ancestors_traversable<'a>(
-    _directories: impl IntoIterator<Item = &'a Path>,
-) -> anyhow::Result<()> {
-    bail!("systemd services are supported only on Unix targets")
 }
 
 fn validate_systemd_scalar(name: &str, value: &str) -> anyhow::Result<()> {
@@ -1168,31 +1155,29 @@ fn validate_mutable_unit(object_reference: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::ensure_service_path_ancestors_traversable;
     use super::{
         command_is_nazoauth_server, operator_credential_name, parse_systemd_exec_start,
         systemd_credential_path, systemd_property_matches, validate_non_root_service_uid,
     };
+    #[cfg(unix)]
+    use crate::filesystem::ensure_service_directory_chain;
 
     #[cfg(unix)]
     #[test]
-    fn systemd_service_can_traverse_managed_parent_directories() {
+    fn service_path_creation_never_widens_existing_private_ancestors() {
         use std::{fs, os::unix::fs::PermissionsExt as _};
 
         let work = crate::filesystem::PrivateTempDir::new("nazoauthctl-systemd-path").unwrap();
         let install_root = work.path().join("private-install-root");
         let data_parent = install_root.join("data");
         let data_root = data_parent.join("deploy-test");
-        fs::create_dir_all(&data_root).unwrap();
+        fs::create_dir_all(&install_root).unwrap();
         fs::set_permissions(&install_root, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&data_parent, fs::Permissions::from_mode(0o700)).unwrap();
-
-        ensure_service_path_ancestors_traversable([data_root.as_path()]).unwrap();
+        ensure_service_directory_chain(&data_root).unwrap();
 
         assert_eq!(
             fs::metadata(&install_root).unwrap().permissions().mode() & 0o777,
-            0o711
+            0o700
         );
         assert_eq!(
             fs::metadata(&data_parent).unwrap().permissions().mode() & 0o777,

@@ -379,3 +379,60 @@ fn verified_atomic_copy_checks_all_bytes_before_publishing() {
         "failed copy must remove its staging file"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn data_tree_walk_keeps_open_directory_identity_and_rejects_special_entries() -> anyhow::Result<()>
+{
+    use std::os::unix::fs::symlink;
+    let work = PrivateTempDir::new("nazoauthctl-tree-walk")?;
+    let root = work.path().join("tree");
+    let outside = work.path().join("outside");
+    fs::create_dir(&root)?;
+    fs::create_dir(&outside)?;
+    fs::write(root.join("data"), b"owned")?;
+    fs::write(outside.join("data"), b"foreign")?;
+    let mut contents = Vec::new();
+    visit_directory_tree(&root, &mut |relative, file| {
+        if relative.as_os_str().is_empty() {
+            fs::rename(&root, work.path().join("original"))?;
+            symlink(&outside, &root)?;
+        } else {
+            file.read_to_end(&mut contents)?;
+        }
+        Ok(())
+    })?;
+    assert_eq!(contents, b"owned");
+    assert!(visit_directory_tree(&root, &mut |_, _| Ok(())).is_err());
+    fs::remove_file(&root)?;
+    fs::create_dir(&root)?;
+    symlink(outside.join("data"), root.join("link"))?;
+    assert!(visit_directory_tree(&root, &mut |_, _| Ok(())).is_err());
+    fs::remove_file(root.join("link"))?;
+    assert!(
+        std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(root.join("pipe"))
+            .status()?
+            .success()
+    );
+    assert!(visit_directory_tree(&root, &mut |_, _| Ok(())).is_err());
+    Ok(())
+}
+
+#[test]
+fn private_file_is_created_once_and_written_through_its_original_handle() -> anyhow::Result<()> {
+    use std::io::Write;
+    let work = PrivateTempDir::new("nazoauthctl-private-create")?;
+    let path = work.path().join("secret");
+    let mut file = create_private_file(&path)?;
+    assert!(create_private_file(&path).is_err());
+    file.write_all(b"secret")?;
+    file.sync_all()?;
+    drop(file);
+    assert_eq!(
+        read_secure_regular_file(&path, "secret", true, 6)?.as_slice(),
+        b"secret"
+    );
+    Ok(())
+}

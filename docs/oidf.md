@@ -84,3 +84,10 @@ present in that pinned revision. Its active consumers remain explicit local
 imports until the producer and shared protocol can be updated together; it must
 not masquerade as a re-export of the dependency. Removing it independently
 would remove a currently used conformance capability.
+
+A terminal failed tenant Disable or Finalize settles that control operation. The
+next cleanup attempt reads the current directory revision and creates a new
+operation, so a concurrent directory update cannot pin recovery to a stale CAS.
+An in-progress result or lost response keeps the original operation and revision
+until its durable outcome is known. The revision is cleared only after the
+controller operation journal has settled the terminal result.

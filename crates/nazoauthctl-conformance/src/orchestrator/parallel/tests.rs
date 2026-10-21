@@ -386,6 +386,7 @@ fn module_persistence_failure_stops_dispatch_but_preserves_created_instance_for_
     assert_eq!(report.modules[0].module_id.as_deref(), Some("m-plan-a"));
     assert_eq!(report.cleanup.cancelled, ["m-plan-a"]);
     assert!(!report.local_success);
+    assert!(!report.acceptance_pass);
 }
 
 #[test]
@@ -922,6 +923,7 @@ fn plan_error_stops_independent_queued_plans() {
     let summary = runner.run(&mut ());
 
     assert!(!summary.report.local_success);
+    assert!(!summary.report.acceptance_pass);
     assert!(
         summary
             .report

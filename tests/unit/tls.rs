@@ -223,21 +223,51 @@ fn recovery_accepts_only_the_exact_previous_or_committed_receipt() {
         transaction.leaf_certificate_sha256.clone(),
     );
     assert!(validate_committed_receipt_binding(&transaction, &committed).is_ok());
-    assert!(ensure_source_not_current(Some(&committed), &transaction.source, None).is_err());
+    assert!(
+        ensure_source_not_current(
+            Some(&committed),
+            &transaction.source,
+            None,
+            &transaction.provider_config_sha256,
+            &transaction.trust_anchors_sha256
+        )
+        .is_err()
+    );
     let different_source = CertificateSourceBinding::ExternalFiles {
         certificate_sha256: "1".repeat(64),
         private_key_sha256: "2".repeat(64),
     };
-    assert!(ensure_source_not_current(Some(&committed), &different_source, None).is_ok());
+    assert!(
+        ensure_source_not_current(
+            Some(&committed),
+            &different_source,
+            None,
+            &transaction.provider_config_sha256,
+            &transaction.trust_anchors_sha256
+        )
+        .is_ok()
+    );
     let proxy_digest = "9".repeat(64);
     assert!(
-        ensure_source_not_current(Some(&committed), &transaction.source, Some(&proxy_digest))
-            .is_ok()
+        ensure_source_not_current(
+            Some(&committed),
+            &transaction.source,
+            Some(&proxy_digest),
+            &transaction.provider_config_sha256,
+            &transaction.trust_anchors_sha256
+        )
+        .is_ok()
     );
     committed.proxy_configuration_sha256 = Some(proxy_digest.clone());
     assert!(
-        ensure_source_not_current(Some(&committed), &transaction.source, Some(&proxy_digest))
-            .is_err()
+        ensure_source_not_current(
+            Some(&committed),
+            &transaction.source,
+            Some(&proxy_digest),
+            &transaction.provider_config_sha256,
+            &transaction.trust_anchors_sha256
+        )
+        .is_err()
     );
     assert!(validate_committed_receipt_binding(&transaction, &committed).is_err());
     committed.proxy_configuration_sha256 = None;
@@ -1044,7 +1074,7 @@ fn activated_generation_is_deactivated_before_rollback_public_proof() {
         active_generation(&transaction.provider).unwrap(),
         Some(generation.clone())
     );
-    restore_previous_activation(&transaction).unwrap();
+    restore_previous_activation(&transaction, None).unwrap();
     remove_inactive_generation(&transaction).unwrap();
     assert!(active_generation(&transaction.provider).unwrap().is_none());
     assert!(!generation.exists());
@@ -1234,4 +1264,73 @@ fn test_receipt(
         transaction_expires_at: transaction.expires_at,
         verified_at: transaction.created_at,
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn provider_update_reuses_committed_snapshot_for_roots_and_reload() -> anyhow::Result<()> {
+    let work = PrivateTempDir::new("tls-provider-update")?;
+    let store = TlsStore {
+        config_root: work.path().join("config"),
+        state_root: work.path().join("state"),
+    };
+    let mut previous = test_transaction(work.path().join("material"));
+    ensure_private_directory(&previous.generation, "old TLS generation")?;
+    previous.trust_anchors_pem = test_server_identity().0;
+    previous.trust_anchors_sha256 = sha256(previous.trust_anchors_pem.as_bytes());
+    previous.phase = TransactionPhase::Committed;
+    let receipt = test_receipt(
+        &previous,
+        &previous.jti,
+        previous.target_revision,
+        previous.generation.clone(),
+        previous.leaf_certificate_sha256.clone(),
+    );
+    finalize_transaction(&store, &previous)?;
+    activate(&previous)?;
+    let old_provider = loaded_provider_from_transaction(&store, &previous)?;
+    let mut candidate = previous.clone();
+    candidate.jti = uuid::Uuid::now_v7().to_string();
+    candidate.generation = previous
+        .provider
+        .material_root
+        .join("generations/2-candidate");
+    candidate.previous_generation = Some(previous.generation.clone());
+    candidate.provider.reload.program = PathBuf::from("/usr/bin/false");
+    candidate.provider.request_timeout_seconds = 2;
+    candidate.provider.public_url = "https://auth.example/new-health".to_owned();
+    candidate.provider_config_sha256 = "1".repeat(64);
+    candidate.provider_snapshot_sha256 = provider_snapshot_sha256(&candidate.provider)?;
+    candidate.trust_anchors_pem = test_server_identity().0;
+    candidate.trust_anchors_sha256 = sha256(candidate.trust_anchors_pem.as_bytes());
+    let new_provider = loaded_provider_from_transaction(&store, &candidate)?;
+    validate_provider_update(&store, Some(&receipt), &new_provider)?;
+    assert!(validate_receipt_provider_authority(&receipt, &new_provider).is_err());
+    ensure_source_not_current(
+        Some(&receipt),
+        &candidate.source,
+        None,
+        &new_provider.config_sha256,
+        &new_provider.trust_anchors_sha256,
+    )?;
+    let archived = load_committed_transaction(&store, &receipt)?;
+    let restored_provider = loaded_provider_from_transaction(&store, &archived)?;
+    assert_eq!(restored_provider.trust_anchors, old_provider.trust_anchors);
+    assert_ne!(restored_provider.trust_anchors, new_provider.trust_anchors);
+    assert_eq!(restored_provider.public_url, old_provider.public_url);
+    ensure_private_directory(&candidate.generation, "candidate TLS generation")?;
+    activate(&candidate)?;
+    // The failing new reload command must not be used to restore the old generation.
+    restore_previous_activation(&candidate, Some(&archived))?;
+    assert_eq!(
+        active_generation(&candidate.provider)?,
+        Some(previous.generation)
+    );
+    let mut changed = new_provider;
+    changed.config.material_root = work.path().join("different-root");
+    assert!(validate_provider_update(&store, Some(&receipt), &changed).is_err());
+    let mut replaced_receipt = receipt;
+    replaced_receipt.provider_config_sha256 = "2".repeat(64);
+    assert!(load_committed_transaction(&store, &replaced_receipt).is_err());
+    Ok(())
 }

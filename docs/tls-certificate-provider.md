@@ -326,3 +326,12 @@ Rollback checks that the previous certificate is currently valid, matches its
 hostname/private key, and satisfies its recorded trust/material bindings. The
 `minimum_validity_seconds` admission threshold applies to new material, not to
 a still-valid previous generation needed for rollback.
+
+An explicit certificate `plan`/`apply` may update provider settings and trust
+anchors while retaining the bound material root and activation link. A provider
+change creates a new revision even when the certificate source is unchanged.
+`check` still requires the current provider to match the committed revision.
+Rollback and interrupted-transaction recovery use the previous committed
+transaction's provider commands, health URL, and embedded trust anchors; retain
+its command executables until the update completes. Editing provider files does
+not rewrite prior rollback evidence.

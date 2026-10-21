@@ -23,6 +23,17 @@ fn fixture(name: &str) -> (PrivateTempDir, std::path::PathBuf) {
 fn windows_private_acl_removes_preexisting_foreign_allow() {
     let (_dir, path) = fixture("nazoauth-win-acl");
     atomic_write(&path, b"secret", 0o600).expect("private file should be written");
+    let granted = std::process::Command::new("icacls")
+        .arg(&path)
+        .args(["/grant", "*S-1-1-0:R"])
+        .output()
+        .expect("icacls should grant Everyone read access to this test file");
+    assert!(
+        granted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+    assert!(read_secure_regular_file(&path, "foreign-readable fixture", true, 128).is_err());
     set_mode(&path, 0o600).expect("existing private ACL should be replaceable");
     let bytes = read_secure_regular_file(&path, "private fixture", true, 128)
         .expect("private ACL should validate");
@@ -63,7 +74,7 @@ fn windows_private_file_is_protected_before_first_write() {
 }
 
 #[test]
-fn windows_private_key_file_denies_other_account() {
+fn windows_read_only_private_key_is_readable_by_owner() {
     let (_dir, path) = fixture("nazoauth-win-key");
     atomic_write(&path, b"key-shaped", 0o400).expect("read-only private key should be written");
     let bytes = read_secure_regular_file(&path, "private key", true, 128)

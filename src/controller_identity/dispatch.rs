@@ -341,8 +341,12 @@ fn validate_result_contract(
 
     let data = result.result.as_ref();
     let matches_operation = match operation {
-        ControlOperationPayload::MigrateApply
-        | ControlOperationPayload::KeysList
+        // TODO remove the None receipt compatibility once all pre-extension
+        // server releases and their pending migration journals are retired.
+        ControlOperationPayload::MigrateApply => {
+            data.is_none() || matches!(data, Some(ControlResultData::MigrationApplied { .. }))
+        }
+        ControlOperationPayload::KeysList
         | ControlOperationPayload::KeysValidate
         | ControlOperationPayload::KeysGenerateLocal { .. }
         | ControlOperationPayload::KeysRegisterExternal { .. } => data.is_none(),

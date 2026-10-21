@@ -309,12 +309,7 @@ pub(super) fn local_image_matches_digest(command: &OsStr, image_reference: &str)
     })
 }
 
-/// Resolve the trusted repository digest for an image reference.
-///
-/// `local_image_id` is the container's recorded immutable local image ID and
-/// serves as a pure lookup fallback when the engine no longer resolves the
-/// original reference (e.g. index-digest storage quirks). The trust model is
-/// unchanged: the digest only validates through the requested-digest match.
+/// Resolve the repository digest of the actual image; a declared digest must still match.
 pub(super) fn resolve_image_digest(
     command: &OsStr,
     image_reference: &str,
@@ -347,31 +342,25 @@ pub(super) fn resolve_image_digest(
     Ok(digest.to_ascii_lowercase())
 }
 
-/// Run one `image inspect --format` query against the image reference,
-/// falling back to the container's recorded local image ID when the engine
-/// no longer resolves that reference.
+/// Inspect the actual container image when its immutable identity is known.
+/// A moved tag must never replace an observed runtime identity.
 fn image_inspect_output(
     command: &OsStr,
     image_reference: &str,
     local_image_id: Option<&str>,
     format: &str,
 ) -> anyhow::Result<String> {
-    match container_shared::command_stdout(
+    container_shared::command_stdout(
         command,
-        &["image", "inspect", image_reference, "--format", format],
+        &[
+            "image",
+            "inspect",
+            local_image_id.unwrap_or(image_reference),
+            "--format",
+            format,
+        ],
         "Docker",
-    ) {
-        Ok(output) => Ok(output),
-        Err(reference_error) => match local_image_id {
-            Some(id) => container_shared::command_stdout(
-                command,
-                &["image", "inspect", id, "--format", format],
-                "Docker",
-            )
-            .map_err(|_| reference_error),
-            None => Err(reference_error),
-        },
-    }
+    )
 }
 
 pub(super) fn resolve_local_image_id(

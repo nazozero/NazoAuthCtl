@@ -401,6 +401,9 @@ pub struct DeploymentState {
     /// Verified release version of `artifact.previous`, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_release: Option<ReleaseVersion>,
+    /// Operation-owned immutable configuration paired with artifact.previous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_config_snapshot: Option<String>,
 }
 
 impl DeploymentState {
@@ -602,6 +605,7 @@ pub struct TargetStateStore {
 /// current. Keeping them as one value prevents artifact, release version,
 /// rollback policy, and optional config from drifting across call sites.
 pub(crate) struct UpdateCommit {
+    pub(crate) config_snapshot: Option<String>,
     pub(crate) artifact: String,
     pub(crate) release: Option<ReleaseVersion>,
     pub(crate) config: Option<(String, String)>,
@@ -828,6 +832,7 @@ impl TargetStateStore {
             local_health,
             current_release,
             previous_release: None,
+            previous_config_snapshot: None,
             applied_migration: None,
         };
         state.validate().map_err(|error| {
@@ -956,6 +961,7 @@ impl TargetStateStore {
         recorded_current_was_live: bool,
     ) -> Result<DeploymentState, Failure> {
         let UpdateCommit {
+            config_snapshot,
             artifact: new_current,
             release: new_release,
             config,
@@ -998,18 +1004,21 @@ impl TargetStateStore {
             // A completed migration does not prove compatibility with the old binary.
             state.artifact.previous = None;
             state.previous_release = None;
+            state.previous_config_snapshot = None;
         }
         let artifact_changed = state.artifact.current.as_deref() != Some(new_current.as_str());
-        if artifact_changed {
+        if artifact_changed || config.is_some() {
             if recorded_current_was_live && state.applied_migration.is_none() {
                 state.artifact.previous = state.artifact.current.take();
                 // The release version swap mirrors the artifact reference
                 // swap so the envelope facts stay attached to the right
                 // generation.
                 state.previous_release = state.current_release.take();
+                state.previous_config_snapshot = config_snapshot;
             } else {
                 state.artifact.previous = None;
                 state.previous_release = None;
+                state.previous_config_snapshot = None;
             }
             state.artifact.current = Some(new_current);
         }
@@ -1082,6 +1091,7 @@ impl TargetStateStore {
         state.artifact.previous = None;
         state.artifact.current = Some(new_current);
         state.previous_release = None;
+        state.previous_config_snapshot = None;
         state.current_release = Some(facts.release.clone());
         state.applied_migration = None;
 
@@ -1161,6 +1171,7 @@ impl TargetStateStore {
         let old_release = state.current_release.take();
         state.current_release = state.previous_release.take();
         state.previous_release = old_release;
+        state.previous_config_snapshot = config.as_ref().map(|_| operation_id.to_owned());
         if let Some((reference, schema)) = config {
             state
                 .config
@@ -1554,6 +1565,7 @@ mod tests {
             .expect_err("an applied migration must refuse rollback");
         assert_eq!(fenced.code, ROLLBACK_RECOVERY_REQUIRED);
         let commit = |operation_id: &str, artifact: &str| UpdateCommit {
+            config_snapshot: Some("test-snapshot".to_owned()),
             artifact: artifact.to_owned(),
             release: None,
             config: None,
@@ -1610,6 +1622,7 @@ mod tests {
             "deploy-same",
             1,
             UpdateCommit {
+                config_snapshot: Some("test-snapshot".to_owned()),
                 artifact: current.clone(),
                 release: Some(current_release),
                 config: None,
@@ -1648,6 +1661,7 @@ mod tests {
             "deploy-drift",
             1,
             UpdateCommit {
+                config_snapshot: Some("test-snapshot".to_owned()),
                 artifact: verified_live.clone(),
                 release: Some(ReleaseVersion::new("v2")?),
                 config: None,

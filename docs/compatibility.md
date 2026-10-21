@@ -46,23 +46,31 @@ CI runs the executable against frozen v0.2.27/v0.2.28 persistence fixtures and
 asserts that reading does not alter their bytes. Those fixtures must accumulate,
 not be replaced with the newest schema when a version changes.
 
-Rollback after a migration is governed by recorded execution facts. A pending
-applied migration fences artifact rollback, and a successful migrated update
-clears the previous-artifact reference. Database recovery also clears that
-reference. Updates without migration retain the previous-artifact rollback
-path. Recovery still uses an independently verified snapshot, without trusting
+Rollback after migration is governed by the signed operation's durable result.
+A receipt proving the schema unchanged preserves the previous artifact and its
+configuration. Changed schemas, older receipts without this proof, and unknown
+outcomes retain the database recovery fence. Database recovery clears the old
+rollback generation. Configuration snapshots belong to individual operations;
+a successful update commits its previous artifact and snapshot pointer together,
+and rollback saves the current configuration before swapping the pair. Failed
+updates cannot replace the last committed rollback configuration. Legacy states
+without a paired snapshot require a verified backup rather than guessing from
+a matching schema name. Recovery still uses an independently verified snapshot, without trusting
 the currently running server.
 
 ## Database backup sentinel compatibility
 
-Snapshot and restore compute the database sentinel in one read-only,
-read-committed PostgreSQL transaction. The controller locks the required
+Snapshot creation holds one read-only, repeatable-read PostgreSQL transaction
+open while computing the sentinel and exporting its snapshot. `pg_dump` uses
+that exact exported snapshot; the transaction closes after the dump finishes.
+Restore validation computes the sentinel in its own read-only transaction. The controller locks the required
 relations, then checks both the migration ledger and the token-storage shape.
-The final SELECT reads every count and the migration head from one statement
-snapshot taken after those locks; it does not reuse the presence probe's snapshot.
+The count query and migration head therefore describe the same database view as
+the dump, including when application writes continue during backup.
 The legacy `oauth_tokens` layout retains its exact historical hash preimage.
-The minimal layout introduced by migration `20260926000100` counts refresh
-contracts, families and spent proofs separately. When durable
+The minimal layout introduced by migration `20260926000100`, or created by the
+fresh-install baseline `20261017000400`, counts refresh contracts, families and
+spent proofs separately. When durable
 `oauth_token_issuances` is present, preserve the released 0.3.0 issuance-count
 preimage so existing backup manifests continue to validate. Both token layouts
 are checked after relation locks. Missing, mixed or ledger-inconsistent
@@ -75,9 +83,8 @@ a new dump selects its matching released storage facts. Do not add compatibility
 tables or views to the server to satisfy a controller backup query.
 
 The sentinel is a bounded identity check alongside the immutable dump's byte
-checksum, not a replacement for it. Its transaction does not extend across the
-separate `pg_dump` process; this change does not promise a new cross-process
-snapshot boundary or make a checksum-only check into a restore-test receipt.
+checksum, not a replacement for it. Sharing the dump snapshot does not turn a
+checksum-only check into a restore-test receipt.
 
 The focused real-PostgreSQL regression is
 `target::backup_exec::tests::database_sentinel_postgres_models_and_dump_restore`
@@ -86,8 +93,11 @@ cross-platform suite: run it with `--ignored --exact` and an isolated
 `NAZOAUTHCTL_TEST_DATABASE_URL` whose role can create databases, plus matching
 `psql`, `pg_dump` and `pg_restore` tools. It creates and removes only its
 randomly named test databases and checks legacy/current dump-restore hashes,
-changed facts, unknown layouts and missing tables. The regular suite retains
+concurrent writes, fresh/upgrade baselines, changed facts, unknown layouts and missing tables. The regular suite retains
 the published manifest checksum fixtures and output-pollution checks.
+`database_snapshot_round_trips_current_server_migrations` additionally runs the
+production snapshot/restore path against an isolated database already migrated
+by the current server, using the same environment variable and tool prerequisites.
 
 ## Operation-specific compatibility
 

@@ -517,6 +517,17 @@ fn dispatch_validated_host_operation(
                     .expected_revision
                     .expect("validated revision binding");
                 let state = store.load_existing(deployment_id)?;
+                if state.config.revision != expected_revision
+                    && !state
+                        .active_host_operation
+                        .as_ref()
+                        .is_some_and(|active| active.operation_id == operation.operation_id)
+                {
+                    return Err(Failure::new(
+                        CONFIG_REVISION_MISMATCH,
+                        "recovery plan no longer matches the deployment revision",
+                    ));
+                }
                 let backend = runtime_backend::backend(state.runtime.kind);
                 let runtime_was_running = backend
                     .quiesce_for_recovery(&state.runtime.object)
@@ -1390,6 +1401,7 @@ fn answer_rollback(
         config_schema: &state.config.schema,
         current_artifact,
         previous_artifact: state.artifact.previous.as_deref(),
+        previous_config_snapshot: state.previous_config_snapshot.as_deref(),
         expected_revision,
         scope_dir: &scope_dir,
         store,
@@ -1420,6 +1432,12 @@ fn answer_uninstall(
         .as_deref()
         .expect("validated deployment binding");
     let state = store.load_existing(deployment_id)?;
+    if state.config.revision != expected_revision {
+        return Err(Failure::new(
+            CONFIG_REVISION_MISMATCH,
+            "uninstall plan no longer matches the deployment revision",
+        ));
+    }
     let job = uninstall_exec::DeletionJob {
         operation_id: &operation.operation_id,
         deployment_id,
@@ -1808,7 +1826,7 @@ fn inspection_from_state(
     Ok(InstanceInspection {
         deployment_id: state.deployment_id,
         issuer: state.issuer,
-        observed_at: Utc::now(),
+        observed_at: state.local_health.checked_at,
         revision: state.config.revision,
         runtime: state.runtime,
         artifact: state.artifact,
@@ -2138,6 +2156,28 @@ mod tests {
     }
 
     #[test]
+    fn stale_recovery_rejects_before_touching_runtime_or_snapshot() -> anyhow::Result<()> {
+        let (_temp, target, journal) = temp_target()?;
+        seed_sample_deployment(&journal, "deploy-alpha")?;
+        let state = TargetStateStore::open(journal.root())?.load_existing("deploy-alpha")?;
+        let operation = HostOperation::backup_recover(
+            Uuid::now_v7().to_string(),
+            "deploy-alpha",
+            state.config.revision + 1,
+            "a".repeat(64),
+            Uuid::now_v7().to_string(),
+        );
+        // The fixture has neither a runtime nor a backup. Reaching either
+        // before the revision fence would return a different failure.
+        let result = target.execute_host_operation(&operation)?;
+        assert!(matches!(
+            result.outcome,
+            HostOutcome::Failed { code, .. } if code == CONFIG_REVISION_MISMATCH
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn local_ping_smoke_executes_without_json_loopback() -> anyhow::Result<()> {
         let (_temp, target, _journal) = temp_target()?;
         let operation = HostOperation::ping(Uuid::now_v7().to_string(), "smoke-probe");
@@ -2427,7 +2467,9 @@ mod tests {
             .join("deploy-alpha")
             .join("state.json");
         let raw = std::fs::read_to_string(&state_path)?;
-        let persisted: DeploymentState = serde_json::from_str(&raw)?;
+        let mut persisted: DeploymentState = serde_json::from_str(&raw)?;
+        persisted.local_health.checked_at = Utc::now() - chrono::Duration::days(1);
+        std::fs::write(&state_path, serde_json::to_vec(&persisted)?)?;
         assert_eq!(persisted.deployment_id, "deploy-alpha");
         assert_eq!(persisted.resources.len(), 4);
 
@@ -2449,10 +2491,8 @@ mod tests {
         let health = target.read_health("deploy-alpha")?;
         assert_eq!(health.deployment_id, "deploy-alpha");
         assert!(!health.healthy);
-        // Each method performs its own live read, so timestamps are
-        // independent; they must still be fresh.
-        let age = (chrono::Utc::now() - health.observed_at).num_milliseconds();
-        assert!((0..60_000).contains(&age), "stale health read: {age}ms");
+        assert_eq!(inspection.observed_at, persisted.local_health.checked_at);
+        assert_eq!(health.observed_at, persisted.local_health.checked_at);
         Ok(())
     }
 

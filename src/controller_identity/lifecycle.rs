@@ -246,12 +246,24 @@ fn reconcile_from_snapshot(
         .map(|summary| summary.kid)
         .collect();
 
-    // A committed candidate waiting for local activation?
-    if let Some(slot) = snapshot
-        .active_slots()
-        .find(|slot| local_kids.iter().any(|kid| kid == &slot.kid))
-    {
-        let previous_active = keys.load_active(deployment)?;
+    let previous_active = keys.load_active(deployment)?;
+    // Reconcile the recorded controller, not whichever locally owned slot the
+    // server lists first. Rotation changes its kid but not its controller ID.
+    // An unbound enrollment can be recovered only from an unambiguous candidate.
+    let mut candidates = snapshot.active_slots().filter(|slot| {
+        local_kids.iter().any(|kid| kid == &slot.kid)
+            && record
+                .controller_id
+                .as_deref()
+                .is_none_or(|id| id == slot.controller_id)
+    });
+    let slot = candidates.next();
+    let slot = if record.controller_id.is_some() || candidates.next().is_none() {
+        slot
+    } else {
+        None
+    };
+    if let Some(slot) = slot {
         let needs_pointer = previous_active
             .as_ref()
             .map(|loaded| loaded.kid() != slot.kid)
@@ -293,7 +305,7 @@ fn reconcile_from_snapshot(
         }
 
         // Fully consistent? Then there is nothing to recover.
-        if !needs_pointer && !needs_fields && retired.is_empty() {
+        if !needs_pointer && !needs_fields {
             return Ok(None);
         }
 
@@ -1102,20 +1114,19 @@ fn validate_issued_approval(issued: &IssuedApproval, expected_action: &str) -> a
     Ok(())
 }
 
-fn approval_callback<'a, A: ControllerRegistryApi>(
-    api: &'a A,
+fn approval_callback<'a>(
     token: Option<&'a str>,
-    issue_with_admin_access: bool,
+    issue: impl FnOnce(&str, &ApprovalRequestBody) -> anyhow::Result<IssuedApproval> + 'a,
 ) -> impl FnOnce(&ProposalPresentation<'_>) -> anyhow::Result<String> + 'a {
     move |presentation| {
         // Keep JSON stdout to the terminal result; this is a human approval preview.
         if !crate::ui::json_mode() {
             crate::ui::print_report(&presentation.render());
         }
-        if token.is_some() || !issue_with_admin_access {
+        if token.is_some() {
             return obtain_approval_token(token, presentation.action);
         }
-        let issued = api.issue_approval(&approval_request(presentation)?)?;
+        let issued = issue(presentation.issuer, &approval_request(presentation)?)?;
         validate_issued_approval(&issued, presentation.action)?;
         Ok(issued.approval_token)
     }
@@ -1147,19 +1158,17 @@ pub(crate) fn run_controller_command(
         } => {
             let explicit = selector.merge_global(global, "controller add")?;
             let record = crate::fleet::resolve_instance(&registry, explicit, "controller add")?;
-            let issue_approval = approval_token.is_none();
-            let api = if issue_approval {
-                make_authenticated_api(&record.issuer, credentials_file.as_deref())?
-            } else {
-                make_public_api(&record.issuer)?
-            };
+            let api = make_public_api(&record.issuer)?;
             let report = add_flow(
                 &api,
                 &registry,
                 &keys,
                 record,
                 &label,
-                approval_callback(&api, approval_token.as_deref(), issue_approval),
+                approval_callback(approval_token.as_deref(), |issuer, body| {
+                    Ok(make_authenticated_api(issuer, credentials_file.as_deref())?
+                        .issue_approval(body)?)
+                }),
             )?;
             crate::ui::print_report(&report);
         }
@@ -1171,19 +1180,17 @@ pub(crate) fn run_controller_command(
         } => {
             let explicit = selector.merge_global(global, "controller rotate")?;
             let record = crate::fleet::resolve_instance(&registry, explicit, "controller rotate")?;
-            let issue_approval = approval_token.is_none();
-            let api = if issue_approval {
-                make_authenticated_api(&record.issuer, credentials_file.as_deref())?
-            } else {
-                make_public_api(&record.issuer)?
-            };
+            let api = make_public_api(&record.issuer)?;
             let report = rotate_flow(
                 &api,
                 &registry,
                 &keys,
                 record,
                 label.as_deref(),
-                approval_callback(&api, approval_token.as_deref(), issue_approval),
+                approval_callback(approval_token.as_deref(), |issuer, body| {
+                    Ok(make_authenticated_api(issuer, credentials_file.as_deref())?
+                        .issue_approval(body)?)
+                }),
             )?;
             crate::ui::print_report(&report);
         }
@@ -1195,19 +1202,17 @@ pub(crate) fn run_controller_command(
         } => {
             let explicit = selector.merge_global(global, "controller revoke")?;
             let record = crate::fleet::resolve_instance(&registry, explicit, "controller revoke")?;
-            let issue_approval = approval_token.is_none();
-            let api = if issue_approval {
-                make_authenticated_api(&record.issuer, credentials_file.as_deref())?
-            } else {
-                make_public_api(&record.issuer)?
-            };
+            let api = make_public_api(&record.issuer)?;
             let report = revoke_flow(
                 &api,
                 &registry,
                 &keys,
                 record,
                 &controller_id,
-                approval_callback(&api, approval_token.as_deref(), issue_approval),
+                approval_callback(approval_token.as_deref(), |issuer, body| {
+                    Ok(make_authenticated_api(issuer, credentials_file.as_deref())?
+                        .issue_approval(body)?)
+                }),
             )?;
             crate::ui::print_report(&report);
         }
@@ -1277,12 +1282,7 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
     let keys = ControllerKeyStore::open_default()?;
     let explicit = selector.merge_global(global, "bind")?;
     let record = crate::fleet::resolve_instance(&registry, explicit, "bind")?;
-    let issue_approval = approval_token.is_none();
-    let api = if issue_approval {
-        make_authenticated_api(&record.issuer, credentials_file.as_deref())?
-    } else {
-        make_public_api(&record.issuer)?
-    };
+    let api = make_public_api(&record.issuer)?;
     // P0-4/P0-3: bind now also mints the Recovery Root, so its secret needs a
     // delivery channel with exactly the same fail-closed rules as recovery.
     let delivery: std::sync::Arc<dyn recovery::ReplacementSecretDelivery> =
@@ -1292,15 +1292,19 @@ pub(crate) fn run_bind(options: BindOptions, global: Option<&str>) -> anyhow::Re
             }
             None => std::sync::Arc::new(recovery::InteractiveSecretDelivery),
         };
-    let report = bind_flow(
-        &api,
-        &registry,
-        &keys,
-        record,
-        &label,
-        approval_callback(&api, approval_token.as_deref(), issue_approval),
-        delivery.as_ref(),
-    )?;
+    let report =
+        bind_flow(
+            &api,
+            &registry,
+            &keys,
+            record,
+            &label,
+            approval_callback(approval_token.as_deref(), |issuer, body| {
+                Ok(make_authenticated_api(issuer, credentials_file.as_deref())?
+                    .issue_approval(body)?)
+            }),
+            delivery.as_ref(),
+        )?;
     crate::ui::print_report(&report);
     Ok(())
 }
@@ -1657,7 +1661,7 @@ mod tests {
             &f.keys,
             f.record(),
             "ops",
-            approval_callback(&api, None, true),
+            approval_callback(None, |_, body| Ok(api.issue_approval(body)?)),
             &SilentDelivery,
         )?;
         assert!(report.contains("committed for 'production'"), "{report}");
@@ -1747,7 +1751,9 @@ mod tests {
             &f.keys,
             f.record(),
             "ops",
-            approval_callback(&api, Some("explicit-approval-token"), true),
+            approval_callback(Some("explicit-approval-token"), |_, body| {
+                Ok(api.issue_approval(body)?)
+            }),
             &SilentDelivery,
         )?;
         assert!(api.approval_requests.borrow().is_empty());
@@ -1774,7 +1780,7 @@ mod tests {
             &f.keys,
             f.record(),
             "ops",
-            approval_callback(&api, None, true),
+            approval_callback(None, |_, body| Ok(api.issue_approval(body)?)),
             &SilentDelivery,
         )
         .expect_err("approval rejection must stop bind");
@@ -2234,6 +2240,34 @@ mod tests {
         // Public fingerprint only; the full kid and any seed bytes never show.
         assert!(!rendered.contains(candidate.kid.as_str()), "{rendered}");
         assert!(!rendered.contains(&summary.public_key), "{rendered}");
+        Ok(())
+    }
+    #[test]
+    fn two_active_slots_rotate_the_recorded_controller() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let first = f.keys.get_or_create_active("deploy-alpha")?;
+        let second = f.keys.generate_candidate("deploy-alpha")?;
+        f.keys.set_active_kid("deploy-alpha", &second.kid)?;
+        f.mark_bound(CONTROLLER_B)?;
+        let api = FakeApi::default();
+        let mut second_slot = slot_view(CONTROLLER_B, &second.kid, SlotStatus::Active, 20);
+        second_slot.slot_index = 1;
+        api.push_snapshot(vec![
+            slot_view(CONTROLLER_A, first.kid(), SlotStatus::Active, 20),
+            second_slot,
+        ]);
+        let message = rotate_flow(
+            &api,
+            &f.registry,
+            &f.keys,
+            f.record(),
+            None,
+            fixed_approval("audit-rotation-approval"),
+        )?;
+        assert_eq!(f.record().controller_id.as_deref(), Some(CONTROLLER_B));
+        assert_eq!(api.rotate_calls.borrow().len(), 1);
+        assert_eq!(api.rotate_calls.borrow()[0].controller_id, CONTROLLER_B);
+        assert!(message.contains("committed"));
         Ok(())
     }
 }

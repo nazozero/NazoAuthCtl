@@ -40,10 +40,11 @@ pub const MAX_HOST_OPERATION_BYTES: usize = 6 * 1024 * 1024;
 pub const MAX_CONTROL_CHANGE_SET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum serialized HostResult accepted from stdout before parsing fails.
-pub const MAX_HOST_RESULT_BYTES: usize = 1024 * 1024;
+pub const MAX_HOST_RESULT_BYTES: usize =
+    super::backup::MAX_BACKUP_EVIDENCE_BYTES as usize + 64 * 1024;
 
 /// Raw bytes in one backup-transfer message.  The base64 wire expansion and
-/// JSON envelope still stay comfortably within the 1 MiB HostResult cap.
+/// JSON envelope stay below the HostResult cap.
 pub const MAX_BACKUP_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 /// A transfer can never exceed one accepted snapshot artifact.
 pub const MAX_BACKUP_TRANSFER_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;

@@ -321,16 +321,7 @@ pub(super) fn local_image_matches_digest(command: &OsStr, image_reference: &str)
     })
 }
 
-/// Resolve the trusted repository digest for an image reference.
-///
-/// `local_image_id` is the container's recorded immutable local image ID.
-/// Podman quirk: a container started from an index (manifest-list) digest
-/// reference can be stored under the platform manifest digest, after which
-/// the index reference stops resolving for `image inspect`. The local image
-/// ID always resolves, and its `RepoDigests` list carries every digest the
-/// engine retained — including the requested one — so it is a pure lookup
-/// fallback, never a trust downgrade: the requested-digest match below is
-/// unchanged.
+/// Resolve the repository digest of the actual image; a declared digest must still match.
 pub(super) fn resolve_image_digest(
     command: &OsStr,
     image_reference: &str,
@@ -365,31 +356,25 @@ pub(super) fn resolve_image_digest(
     Ok(digest.to_ascii_lowercase())
 }
 
-/// Run one `image inspect --format` query against the image reference,
-/// falling back to the container's recorded local image ID when Podman no
-/// longer resolves the original reference (index-digest storage quirk).
+/// Inspect the actual container image when its immutable identity is known.
+/// A moved tag must never replace an observed runtime identity.
 fn image_inspect_output(
     command: &OsStr,
     image_reference: &str,
     local_image_id: Option<&str>,
     format: &str,
 ) -> anyhow::Result<String> {
-    match container_shared::command_stdout(
+    container_shared::command_stdout(
         command,
-        &["image", "inspect", image_reference, "--format", format],
+        &[
+            "image",
+            "inspect",
+            local_image_id.unwrap_or(image_reference),
+            "--format",
+            format,
+        ],
         "Podman",
-    ) {
-        Ok(output) => Ok(output),
-        Err(reference_error) => match local_image_id {
-            Some(id) => container_shared::command_stdout(
-                command,
-                &["image", "inspect", id, "--format", format],
-                "Podman",
-            )
-            .map_err(|_| reference_error),
-            None => Err(reference_error),
-        },
-    }
+    )
 }
 
 pub(super) fn resolve_local_image_id(
@@ -434,7 +419,7 @@ mod tests {
                 other.as_str(),
                 true,
                 true,
-                2,
+                1,
             ),
             (
                 vec![format!("image@{other}")],
@@ -467,10 +452,7 @@ mod tests {
             let recorded = std::fs::read_to_string(&calls).unwrap();
             let targets = recorded.lines().collect::<Vec<_>>();
             assert_eq!(targets.len(), expected_calls);
-            assert_eq!(targets[0], reference);
-            if reference_missing {
-                assert_eq!(targets[1], local_id);
-            }
+            assert_eq!(targets[0], local_id);
         }
     }
 

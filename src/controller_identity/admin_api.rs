@@ -565,8 +565,10 @@ pub enum AdminApiError {
         error: String,
         description: String,
     },
-    /// 2xx but the body violates the frozen response schema (contract drift).
+    /// The body violates the frozen response schema (contract drift).
     MalformedResponse(anyhow::Error),
+    /// HTTP failed without an authoritative application rejection.
+    OutcomeUnknown { status: u16 },
     /// The request never produced an authoritative outcome.
     Transport(anyhow::Error),
 }
@@ -617,6 +619,9 @@ impl fmt::Display for AdminApiError {
                 "admin API response violated the frozen contract: {error:#}"
             ),
             Self::Transport(error) => write!(formatter, "admin API transport failed: {error:#}"),
+            Self::OutcomeUnknown { status } => {
+                write!(formatter, "admin API outcome is unknown (HTTP {status})")
+            }
         }
     }
 }
@@ -1072,8 +1077,24 @@ fn decode_response(response: AdminHttpResponse) -> Result<AdminResponseBody, Adm
     if (200..300).contains(&response.status) {
         return Ok(response.body);
     }
-    let parsed: ErrorBodyWire = response.body.json().unwrap_or_default();
-    if response.status == 409 && parsed.error.as_deref() == Some("controller_slot_limit") {
+    // A proxy or server failure may follow a successful commit. Its HTTP status
+    // cannot authorize deleting the private key needed to resume that commit.
+    if !(400..500).contains(&response.status) {
+        return Err(AdminApiError::OutcomeUnknown {
+            status: response.status,
+        });
+    }
+    let parsed: ErrorBodyWire = response
+        .body
+        .json()
+        .map_err(|error| AdminApiError::MalformedResponse(error.into()))?;
+    let error = parsed
+        .error
+        .filter(|code| !code.is_empty())
+        .ok_or_else(|| {
+            AdminApiError::MalformedResponse(anyhow::anyhow!("rejection has no error code"))
+        })?;
+    if response.status == 409 && error == "controller_slot_limit" {
         let mut summaries = Vec::new();
         for wire in parsed.active_slots.unwrap_or_default() {
             let expires_at = parse_timestamp(&wire.expires_at, "expires_at")
@@ -1090,7 +1111,7 @@ fn decode_response(response: AdminHttpResponse) -> Result<AdminResponseBody, Adm
     }
     Err(AdminApiError::Rejected {
         status: response.status,
-        error: parsed.error.unwrap_or_else(|| "unknown_error".to_owned()),
+        error,
         description: parsed
             .error_description
             .unwrap_or_else(|| "the server returned no description".to_owned()),
@@ -2145,7 +2166,7 @@ mod tests {
 
     #[test]
     fn rejection_shapes_surface_status_code_and_description() {
-        let cases: [(u16, &str, &str); 4] = [
+        let cases: [(u16, &str, &str); 3] = [
             (
                 400,
                 r#"{"error":"invalid_request","error_description":"审批令牌已过期；请在十分钟窗口内完成提交."}"#,
@@ -2160,11 +2181,6 @@ mod tests {
                 400,
                 r#"{"error":"invalid_request","error_description":"审批令牌与本次提交的动作内容不一致."}"#,
                 "invalid_request",
-            ),
-            (
-                503,
-                r#"{"error":"server_error","error_description":"审批状态查询失败."}"#,
-                "server_error",
             ),
         ];
         for (status, body, expected_error) in cases {

@@ -2780,6 +2780,9 @@ fn cleanup_ephemeral_tenant(
                 Ok(())
             },
         )?;
+        if let nazoauthctl_core::ConformanceControlOutcome::Failed(completion) = &outcome {
+            recovery.reset_failed_tenant_cleanup(&completion.result)?;
+        }
         successful_control_completion(outcome, "temporary tenant Disable")?;
     }
     let expected_revision = match recovery.tenant_finalize_expected_revision() {
@@ -2803,6 +2806,9 @@ fn cleanup_ephemeral_tenant(
             Ok(())
         },
     )?;
+    if let nazoauthctl_core::ConformanceControlOutcome::Failed(completion) = &outcome {
+        recovery.reset_failed_tenant_cleanup(&completion.result)?;
+    }
     let completion = successful_control_completion(outcome, "temporary tenant Finalize")?;
     let ControlResultData::TenantDirectoryMutation {
         action,
@@ -3226,10 +3232,17 @@ fn execute_pending_recovery_candidate(
                     .map_err(anyhow::Error::from)
                 })
                 .transpose()?;
-            let _ =
+            let outcome =
                 resume_pending_candidate(session, expected, operation, change_set, |completion| {
                     persist_pending_recovery_completion(step, recovery, completion)
                 })?;
+            if matches!(
+                step,
+                PendingRecoveryStep::TenantDisable(_) | PendingRecoveryStep::TenantFinalize(_)
+            ) && let nazoauthctl_core::ConformanceControlOutcome::Failed(completion) = outcome
+            {
+                recovery.reset_failed_tenant_cleanup(&completion.result)?;
+            }
             Ok(())
         }
     }

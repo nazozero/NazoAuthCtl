@@ -194,6 +194,65 @@ pub fn set_data_tree_identity(
     visit(directory, uid, gid, preserve_owner)
 }
 
+/// Visit an existing Unix data tree through open descriptors. Names below a
+/// runtime-writable directory never become authority for a later file open.
+#[cfg(unix)]
+pub fn visit_directory_tree(
+    path: &Path,
+    visitor: &mut impl FnMut(&Path, &mut File) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use rustix::fs::{Dir, Mode, OFlags, openat};
+    use std::os::unix::fs::MetadataExt as _;
+
+    fn visit(
+        relative: &Path,
+        mut file: File,
+        visitor: &mut impl FnMut(&Path, &mut File) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let metadata = file.metadata()?;
+        if !(metadata.is_dir() || metadata.is_file() && metadata.nlink() == 1) {
+            bail!("data tree contains a special file or hard link");
+        }
+        visitor(relative, &mut file)?;
+        if metadata.is_dir() {
+            let mut names = Vec::new();
+            for entry in Dir::read_from(&file)? {
+                let entry = entry?;
+                if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+                    names.push(entry.file_name().to_owned());
+                }
+            }
+            names.sort();
+            for name in names {
+                let child = openat(
+                    &file,
+                    name.as_c_str(),
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                let child_path =
+                    relative.join(name.to_str().context("data tree name is not UTF-8")?);
+                visit(&child_path, File::from(child), visitor)?;
+            }
+        }
+        Ok(())
+    }
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let start = if path.is_absolute() { "/" } else { "." };
+    let mut directory = openat(rustix::fs::CWD, start, flags, Mode::empty())?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                directory = openat(&directory, name, flags, Mode::empty())?;
+            }
+            _ => bail!("data tree path is not normalized"),
+        }
+    }
+    visit(Path::new(""), File::from(directory), visitor)
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -228,6 +287,29 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> 
             .with_context(|| format!("failed to atomically activate {}", path.display()))?;
         sync_parent(path)?;
         Ok(())
+    }
+}
+
+/// Create a new private file without an inherited-access window. The caller
+/// owns the handle through writing and synchronization; existing files fail.
+pub fn create_private_file(path: &Path) -> anyhow::Result<File> {
+    #[cfg(windows)]
+    {
+        windows::create_private_file(path)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        Ok(OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        bail!("private file creation is unsupported on this platform")
     }
 }
 
@@ -699,7 +781,7 @@ pub fn remove_file_durable(path: &Path) -> anyhow::Result<()> {
 pub fn ensure_directory_chain(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        ensure_directory_chain_at(path)
+        ensure_directory_chain_at(path, 0o700)
     }
     #[cfg(windows)]
     {
@@ -713,13 +795,27 @@ pub fn ensure_directory_chain(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Create service-path directories with traversal access, without changing any
+/// existing ancestor. Files and deployment leaf directories keep their separate
+/// ownership and mode rules. Private external parents require operator action.
+pub fn ensure_service_directory_chain(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        ensure_directory_chain_at(path, 0o711)
+    }
+    #[cfg(not(unix))]
+    {
+        ensure_directory_chain(path)
+    }
+}
+
 /// Walk the Unix directory chain through directory descriptors. Each child is
 /// opened with `O_NOFOLLOW` relative to the already-open parent, so a rename or
 /// symlink substitution cannot redirect creation between a path check and
 /// `mkdir`.
 #[cfg(unix)]
-fn ensure_directory_chain_at(path: &Path) -> anyhow::Result<()> {
-    use rustix::fs::{Mode, OFlags, fsync, mkdirat, openat};
+fn ensure_directory_chain_at(path: &Path, new_mode: rustix::fs::RawMode) -> anyhow::Result<()> {
+    use rustix::fs::{Mode, OFlags, fchmod, fsync, mkdirat, openat};
 
     let start = if path.is_absolute() {
         Path::new("/")
@@ -752,12 +848,18 @@ fn ensure_directory_chain_at(path: &Path) -> anyhow::Result<()> {
                         path.display()
                     )
                 })?;
-                openat(&directory, name, flags, Mode::empty()).with_context(|| {
-                    format!(
-                        "failed to open created directory component for {}",
-                        path.display()
-                    )
-                })?
+                let created =
+                    openat(&directory, name, flags, Mode::empty()).with_context(|| {
+                        format!(
+                            "failed to open created directory component for {}",
+                            path.display()
+                        )
+                    })?;
+                if new_mode != 0o700 {
+                    fchmod(&created, Mode::from_raw_mode(new_mode))?;
+                    fsync(&created)?;
+                }
+                created
             }
             Err(error) => {
                 return Err(error)
@@ -930,7 +1032,7 @@ pub fn sha256(path: &Path) -> anyhow::Result<String> {
 #[cfg(unix)]
 fn configure_secure_open(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt as _;
-    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
 }
 
 pub fn sha256_file(file: &mut File, description: &str) -> anyhow::Result<String> {

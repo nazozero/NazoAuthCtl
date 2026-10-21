@@ -172,6 +172,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
             job.deployment_id,
             job.expected_revision,
             crate::target::deployment_state::UpdateCommit {
+                config_snapshot: Some("test-snapshot".to_owned()),
                 artifact: NEW_REF.to_owned(),
                 release: Some(crate::target::ReleaseVersion::new("v9").expect("identity")),
                 config,
@@ -594,6 +595,7 @@ fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
         DEPLOYMENT,
         1,
         crate::target::deployment_state::UpdateCommit {
+            config_snapshot: Some("test-snapshot".to_owned()),
             artifact: NEW_REF.to_owned(),
             release: None,
             config: None,
@@ -709,6 +711,60 @@ fn uninstall_removes_local_instance_state_and_keeps_siblings() -> anyhow::Result
 }
 
 // ---------------------------------------------------------------- H04/H06
+
+#[test]
+fn uninstall_resumes_local_cleanup_after_target_state_is_gone() -> anyhow::Result<()> {
+    for keys_already_removed in [false, true] {
+        let fixture = Fixture::new()?;
+        let (_, _, target) = super::resolve_instance_target(
+            &fixture.context,
+            Some(&format!("inst-{DEPLOYMENT}")),
+            "uninstall",
+        )?;
+        let operation = HostOperation::state_mutate(
+            uuid::Uuid::now_v7().to_string(),
+            DEPLOYMENT,
+            Some(1),
+            StateMutationPayload::Uninstall {},
+        );
+        let pending = fixture
+            .keys
+            .instance_dir(DEPLOYMENT)?
+            .with_extension("uninstall.json");
+        crate::filesystem::atomic_write(
+            &pending,
+            &crate::target::encode_host_operation(&operation)?,
+            0o600,
+        )?;
+        let result = target.execute_host_operation(&operation)?;
+        assert!(matches!(result.outcome, HostOutcome::Completed { .. }));
+        // The injected deletion executor records the call; emulate its durable
+        // completion tail before crashing during the controller's local cleanup.
+        fixture
+            .store()?
+            .remove_deployment(DEPLOYMENT, 1, &operation.operation_id)?;
+        if keys_already_removed {
+            fixture.keys.remove_instance(DEPLOYMENT)?;
+        }
+        run_uninstall(
+            &fixture.context,
+            &fixture.keys,
+            Some(&format!("inst-{DEPLOYMENT}")),
+            true,
+        )?;
+        assert_eq!(*fixture.deletion.calls.lock().unwrap(), 1);
+        assert!(!pending.exists());
+        assert!(fixture.keys.load_active(DEPLOYMENT)?.is_none());
+        assert!(
+            fixture
+                .context
+                .registry
+                .update_controller_binding(DEPLOYMENT, None, None)
+                .is_err()
+        );
+    }
+    Ok(())
+}
 
 #[test]
 fn uninstall_plan_and_operation_log_keep_external_resources_listed() -> anyhow::Result<()> {

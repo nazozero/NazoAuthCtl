@@ -1281,6 +1281,12 @@ fn run_verify(merged: Option<&str>) -> anyhow::Result<()> {
     let prober = CurlPublicProber;
     let report = verify_public(&prober, &record.issuer);
     crate::ui::print_report(&report.render());
+    if matches!(
+        report.verdict,
+        crate::clean_install::PublicVerdict::Failed { .. }
+    ) {
+        crate::ui::fail!("public verification failed", "公网验证失败");
+    }
     Ok(())
 }
 

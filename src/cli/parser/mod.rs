@@ -173,13 +173,7 @@ fn parse_limited_selector(
     default: usize,
     maximum: usize,
 ) -> anyhow::Result<(InstanceSelector, usize)> {
-    let parsed = fleet::parse_options(values, &["--limit"], &[], command)?;
-    if parsed.positionals.len() > 1 {
-        crate::ui::fail!(
-            "{command} accepts at most one selector argument",
-            "{command} 最多接受一个实例选择参数"
-        );
-    }
+    let parsed = fleet::selector_parts(values, &["--limit"], &[], command)?;
     let limit = match parsed.values.get("--limit") {
         Some(raw) => raw.parse::<usize>().with_context(|| {
             crate::ui::message!(
@@ -197,8 +191,8 @@ fn parse_limited_selector(
     }
     Ok((
         InstanceSelector {
-            positional: parsed.positionals.into_iter().next(),
-            named: None,
+            positional: parsed.positional,
+            named: parsed.named,
         },
         limit,
     ))
@@ -215,6 +209,22 @@ fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Cli>> 
 mod tests {
     use super::*;
     use crate::cli::types::{AdminCommand, Command};
+
+    #[test]
+    fn limited_commands_accept_the_shared_named_selector() {
+        for command in ["logs", "operation"] {
+            let (selector, limit) = parse_limited_selector(
+                ["--instance", "production", "--limit", "7"].map(str::to_owned),
+                command,
+                20,
+                1000,
+            )
+            .unwrap();
+            assert_eq!(selector.named.as_deref(), Some("production"));
+            assert!(selector.positional.is_none());
+            assert_eq!(limit, 7);
+        }
+    }
 
     #[test]
     fn verify_rejects_all_instead_of_ignoring_it() {
