@@ -7,7 +7,8 @@ operator protocol 3 and release-manifest schema 7. The protocol crate remains
 an immutable Cargo dependency; updating a server release with the same protocol
 does not require changing that dependency or rebuilding the controller.
 
-The release gate builds the exact controller commit and resolves the latest
+Platform builds and the server compatibility gate run in parallel; publishing
+requires both to succeed. The release gate builds the exact controller commit and resolves the latest
 stable NazoAuth release once. Manual invocation may instead select an explicit
 server release tag. Every download, attestation check, and execution uses that
 resolved tag, so a newer release published during the job does not change its
@@ -29,6 +30,12 @@ forbids artifact rollback, its previous-artifact reference is not offered as a
 rollback target. Pending migration fences are retained. An unknown or damaged
 format is preserved for diagnosis, never automatically deleted or treated as a
 fresh instance. Missing facts in an unfinished operation must not be invented.
+
+`self check` and `self update` resolve the latest official Release once. If that
+Release is older than the running controller, for example after a withdrawal,
+they report no upgrade and leave the installation and trust state unchanged.
+An explicitly requested version still passes artifact verification and the
+anti-downgrade policy; downgrades require `self rollback`.
 
 `nazoauthctl self verify-state` checks the current user's registry, keys and
 pending control/recovery journals, plus local deployment states, backup metadata

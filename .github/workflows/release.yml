@@ -99,7 +99,7 @@ jobs:
       packages: read
 
   build:
-    needs: [policy, server-compatibility]
+    needs: policy
     strategy:
       fail-fast: false
       matrix:
@@ -147,7 +147,7 @@ jobs:
 
   attest:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, server-compatibility]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

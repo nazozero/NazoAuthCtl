@@ -160,6 +160,11 @@ fn release_compatibility_gate_resolves_a_server_without_a_fixed_version_pair() {
     assert!(gate.contains("controller_ref: ${{ github.sha }}"));
     assert!(!gate.contains("server_release:"));
     assert!(!gate.contains("previous"));
+    let build = workflow.split_once("\n  build:").unwrap().1;
+    let (build, publish) = build.split_once("\n  attest:").unwrap();
+    assert!(build.contains("needs: policy"));
+    assert!(!build.contains("needs: [policy, server-compatibility]"));
+    assert!(publish.contains("needs: [build, server-compatibility]"));
 }
 
 #[test]

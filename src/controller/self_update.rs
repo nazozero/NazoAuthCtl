@@ -108,12 +108,36 @@ pub(super) fn controller_state_directory() -> anyhow::Result<PathBuf> {
     Ok(crate::registry::RegistryStore::default_root()?.join("controller-self"))
 }
 
+fn controller_candidate(
+    version: Option<&str>,
+) -> anyhow::Result<Option<crate::release::VerifiedControllerRelease>> {
+    let candidate = crate::release::VerifiedControllerRelease::verify(
+        version,
+        concat!("v", env!("CARGO_PKG_VERSION")),
+    )?;
+    if candidate.is_none() {
+        crate::ui::print_value(&json!({
+            "installed": env!("CARGO_PKG_VERSION"),
+            "update_available": false,
+            "repository": "nazozero/NazoAuthCtl",
+        }));
+        crate::ui::human!(
+            "No newer controller release is available; keeping {}",
+            "没有可升级的控制器版本，保留当前版本 {}",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    Ok(candidate)
+}
+
 pub(super) fn controller_check(version: Option<&str>) -> anyhow::Result<()> {
     let directory = controller_state_directory()?;
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
     recover_controller_self_operation(&directory)?;
-    let release = crate::release::VerifiedControllerRelease::verify(version)?;
+    let Some(release) = controller_candidate(version)? else {
+        return Ok(());
+    };
     enforce_controller_trust(&directory, &release.version, &release.sha256)?;
     crate::ui::print_value(&json!({
         "installed": env!("CARGO_PKG_VERSION"),
@@ -129,7 +153,9 @@ pub(super) fn controller_update(version: Option<&str>) -> anyhow::Result<()> {
     ensure_private_directory(&directory, "controller self-update state")?;
     let _lock = FileLock::acquire(&directory.join(".lock"))?;
     recover_controller_self_operation(&directory)?;
-    let release = crate::release::VerifiedControllerRelease::verify(version)?;
+    let Some(release) = controller_candidate(version)? else {
+        return Ok(());
+    };
     let previous_trust = enforce_controller_trust(&directory, &release.version, &release.sha256)?;
     release.persist_evidence(&directory.join("evidence").join(&release.version))?;
     let current = std::env::current_exe().context("failed to resolve the running controller")?;

@@ -160,8 +160,20 @@ impl VerifiedControllerRelease {
     /// download, digest check, bounded attestation query, cosign verification
     /// pinned to the controller release-workflow identity, and provenance
     /// subject binding happen exactly once here.
-    pub(crate) fn verify(requested_version: Option<&str>) -> anyhow::Result<Self> {
+    /// An automatically selected Release older than the running controller
+    /// is not an update candidate (for example after a Release withdrawal).
+    /// Skip it before downloading; explicitly selected versions still follow
+    /// verification and the caller's anti-downgrade policy.
+    pub(crate) fn verify(
+        requested_version: Option<&str>,
+        installed_version: &str,
+    ) -> anyhow::Result<Option<Self>> {
         let version = resolve_version(CONTROLLER_REPOSITORY, requested_version)?;
+        if requested_version.is_none()
+            && compare_versions(&version, installed_version)? == std::cmp::Ordering::Less
+        {
+            return Ok(None);
+        }
         let target = release_target().context("this platform has no official controller target")?;
         let suffix = if target.contains("windows") {
             ".exe"
@@ -219,12 +231,12 @@ impl VerifiedControllerRelease {
                 "{ARTIFACT_UNVERIFIED}: no verified controller provenance matched the requested target"
             );
         }
-        Ok(Self {
+        Ok(Some(Self {
             work,
             version,
             artifact_name,
             sha256: digest,
-        })
+        }))
     }
 
     pub(crate) fn artifact(&self) -> PathBuf {
@@ -716,6 +728,54 @@ fn verify_blob_attestation(
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn withdrawn_latest_controller_is_not_downloaded_or_installed() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "NAZOAUTHCTL_WITHDRAWN_RELEASE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(VerifiedControllerRelease::verify(None, "v1.0.0")?.is_none());
+            // Equal/newer candidates and explicit requests must still reach
+            // artifact verification, which this metadata-only fixture rejects.
+            for (requested, installed) in [
+                (None, "v0.9.0"),
+                (None, "v0.8.0"),
+                (Some("v0.9.0"), "v1.0.0"),
+            ] {
+                assert!(VerifiedControllerRelease::verify(requested, installed).is_err());
+            }
+            return Ok(());
+        }
+        let directory = PrivateTempDir::new("ctl-withdrawn-release")?;
+        let curl = directory.path().join("curl");
+        fs::write(
+            &curl,
+            "#!/bin/sh\nfor arg do\ncase \"$arg\" in\nhttps://api.github.com/repos/nazozero/NazoAuthCtl/releases/latest) printf '%s' '{\"tag_name\":\"v0.9.0\"}'; exit 0;;\nesac\ndone\nexit 91\n",
+        )?;
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o700))?;
+        let path = std::env::join_paths(std::iter::once(directory.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "release::cache_tests::withdrawn_latest_controller_is_not_downloaded_or_installed",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("NAZOAUTHCTL_TESTING", "1")
+            .env("PATH", path)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "withdrawn-release regression failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
 
     #[test]
     fn release_version_parsing_preserves_tag_and_precedence_rules() {
