@@ -319,55 +319,19 @@ pub(crate) struct OutputFileSecretDelivery {
 impl ReplacementSecretDelivery for OutputFileSecretDelivery {
     fn deliver(&self, display: &str) -> anyhow::Result<()> {
         use std::io::Write as _;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&self.path)
-                .context("creating the output secret file failed (it must not exist yet)")?;
-            let result = (|| -> anyhow::Result<()> {
-                file.write_all(display.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                let _ = std::fs::remove_file(&self.path);
-                return Err(error)
-                    .context("writing the output secret file failed; partial file removed");
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&self.path)
-                .context("creating the output secret file failed (it must not exist yet)")?;
+        let mut file = crate::filesystem::create_private_file(&self.path)
+            .context("creating the output secret file failed (it must not exist yet)")?;
+        let result = (|| -> anyhow::Result<()> {
+            file.write_all(display.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            crate::filesystem::sync_parent(&self.path)
+        })();
+        if let Err(error) = result {
             drop(file);
-            if let Err(error) = crate::filesystem::set_mode(&self.path, 0o600) {
-                let _ = std::fs::remove_file(&self.path);
-                return Err(error)
-                    .context("protecting output secret file ACL failed; empty file removed");
-            }
-            let result = (|| -> anyhow::Result<()> {
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&self.path)
-                    .context("reopening output secret file failed")?;
-                file.write_all(display.as_bytes())?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
-                Ok(())
-            })();
-            if let Err(error) = result {
-                let _ = std::fs::remove_file(&self.path);
-                return Err(error)
-                    .context("writing the output secret file failed; partial file removed");
-            }
+            let _ = std::fs::remove_file(&self.path);
+            return Err(error)
+                .context("persisting the output secret file failed; no root change authorized");
         }
         Ok(())
     }

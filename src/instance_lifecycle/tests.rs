@@ -172,6 +172,7 @@ impl LifecycleExecutor for ScriptedLifecycle {
             job.deployment_id,
             job.expected_revision,
             crate::target::deployment_state::UpdateCommit {
+                config_snapshot: Some("test-snapshot".to_owned()),
                 artifact: NEW_REF.to_owned(),
                 release: Some(crate::target::ReleaseVersion::new("v9").expect("identity")),
                 config,
@@ -594,6 +595,7 @@ fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
         DEPLOYMENT,
         1,
         crate::target::deployment_state::UpdateCommit {
+            config_snapshot: Some("test-snapshot".to_owned()),
             artifact: NEW_REF.to_owned(),
             release: None,
             config: None,

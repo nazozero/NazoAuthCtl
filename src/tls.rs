@@ -425,6 +425,7 @@ pub(crate) fn run(
             let source = bind_certificate_source(&resolved_source, &material)?;
             let receipt = load_receipt(&store, &record, &input.tenant, &input.hostname)?;
             let plan = build_plan(
+                &store,
                 &record,
                 &input,
                 &provider,
@@ -631,13 +632,13 @@ fn apply(
         .as_ref()
         .map(|template| template.sha256.clone());
     validate_active_receipt(&provider.config, previous.as_ref())?;
-    if let Some(previous) = previous.as_ref() {
-        validate_receipt_provider_authority(previous, &provider)?;
-    }
+    validate_provider_update(store, previous.as_ref(), &provider)?;
     ensure_source_not_current(
         previous.as_ref(),
         &source,
         proxy_configuration_sha256.as_deref(),
+        &provider.config_sha256,
+        &provider.trust_anchors_sha256,
     )?;
     let expected_revision = previous.as_ref().map_or(0, |receipt| receipt.revision);
     let target_revision = expected_revision
@@ -761,7 +762,7 @@ fn apply(
         }
         Err(error) => {
             transaction.last_error = Some(format!("{error:#}"));
-            match rollback_transaction(&mut transaction, previous.as_ref(), &provider) {
+            match rollback_transaction(store, &mut transaction, previous.as_ref()) {
                 Ok(()) => {
                     finalize_transaction(store, &transaction)?;
                     bail!(
@@ -840,8 +841,7 @@ fn recover(
     }
     let observed = active_generation(&transaction.provider)?;
     validate_recovery_activation_state(&transaction, observed.as_deref())?;
-    let provider = loaded_provider_from_transaction(store, &transaction)?;
-    rollback_transaction(&mut transaction, previous.as_ref(), &provider).with_context(|| {
+    rollback_transaction(store, &mut transaction, previous.as_ref()).with_context(|| {
         format!(
             "{}: pending TLS transaction {} still requires recovery",
             crate::error_codes::TLS_RECOVERY_REQUIRED,
@@ -943,6 +943,54 @@ fn validate_receipt_provider_authority(
     Ok(())
 }
 
+// The committed transaction already owns the complete provider and trust-root
+// snapshot. Reuse it for rollback rather than reading mutable configuration files.
+fn load_committed_transaction(
+    store: &TlsStore,
+    receipt: &CertificateReceipt,
+) -> anyhow::Result<CertificateTransaction> {
+    let path = binding_directory(
+        store,
+        &receipt.deployment_id,
+        &receipt.tenant,
+        &receipt.hostname,
+    )
+    .join("transactions")
+    .join(format!("{}.json", receipt.jti));
+    let bytes = read_secure_regular_file(
+        &path,
+        "committed TLS transaction",
+        true,
+        MAX_TRANSACTION_BYTES,
+    )?;
+    let transaction: CertificateTransaction =
+        serde_json::from_slice(&bytes).context("committed TLS transaction is invalid")?;
+    validate_provider_snapshot(&transaction)?;
+    validate_committed_receipt_binding(&transaction, receipt)?;
+    if transaction.phase != TransactionPhase::Committed {
+        bail!("TLS rollback snapshot is not a committed transaction");
+    }
+    Ok(transaction)
+}
+
+fn validate_provider_update(
+    store: &TlsStore,
+    previous: Option<&CertificateReceipt>,
+    provider: &LoadedProvider,
+) -> anyhow::Result<()> {
+    if let Some(previous) = previous {
+        let transaction = load_committed_transaction(store, previous)?;
+        if transaction.provider.material_root != provider.config.material_root
+            || transaction.provider.activation_link != provider.config.activation_link
+        {
+            bail!("TLS provider update must retain the material root and activation link");
+        }
+        let previous_provider = loaded_provider_from_transaction(store, &transaction)?;
+        validate_receipt_provider_authority(previous, &previous_provider)?;
+    }
+    Ok(())
+}
+
 fn source_file_sha256(source: &CertificateSourceBinding) -> (&str, &str) {
     match source {
         CertificateSourceBinding::ExternalFiles {
@@ -958,6 +1006,7 @@ fn source_file_sha256(source: &CertificateSourceBinding) -> (&str, &str) {
 }
 
 fn build_plan(
+    store: &TlsStore,
     record: &TlsRecord,
     input: &TlsCertificateInput,
     provider: &LoadedProvider,
@@ -966,12 +1015,16 @@ fn build_plan(
     current: Option<&CertificateReceipt>,
 ) -> anyhow::Result<CertificatePlan> {
     validate_active_receipt(&provider.config, current)?;
-    if let Some(current) = current {
-        validate_receipt_provider_authority(current, provider)?;
-    }
+    validate_provider_update(store, current, provider)?;
     let proxy_template = proxy_config::load_template(input, &provider.config)?;
     let proxy_configuration_sha256 = proxy_template.map(|template| template.sha256);
-    ensure_source_not_current(current, source, proxy_configuration_sha256.as_deref())?;
+    ensure_source_not_current(
+        current,
+        source,
+        proxy_configuration_sha256.as_deref(),
+        &provider.config_sha256,
+        &provider.trust_anchors_sha256,
+    )?;
     let current_revision = current.map_or(0, |receipt| receipt.revision);
     Ok(CertificatePlan {
         schema: PLAN_SCHEMA,
@@ -1009,10 +1062,14 @@ fn ensure_source_not_current(
     current: Option<&CertificateReceipt>,
     source: &CertificateSourceBinding,
     proxy_configuration_sha256: Option<&str>,
+    provider_config_sha256: &str,
+    trust_anchors_sha256: &str,
 ) -> anyhow::Result<()> {
     if current.is_some_and(|receipt| {
         &receipt.source == source
             && receipt.proxy_configuration_sha256.as_deref() == proxy_configuration_sha256
+            && receipt.provider_config_sha256 == provider_config_sha256
+            && receipt.trust_anchors_sha256 == trust_anchors_sha256
     }) {
         bail!("the selected TLS certificate source is already the active committed revision");
     }
@@ -1255,24 +1312,29 @@ fn activate(transaction: &CertificateTransaction) -> anyhow::Result<()> {
 }
 
 fn rollback_transaction(
+    store: &TlsStore,
     transaction: &mut CertificateTransaction,
     previous: Option<&CertificateReceipt>,
-    provider: &LoadedProvider,
 ) -> anyhow::Result<()> {
     if transaction.phase.activation_may_have_happened() {
+        let previous_transaction = previous
+            .map(|receipt| load_committed_transaction(store, receipt))
+            .transpose()?;
+        let restore_context = previous_transaction.as_ref().unwrap_or(transaction);
+        let provider = loaded_provider_from_transaction(store, restore_context)?;
         let previous_roots = previous
             .map(|receipt| {
-                validate_rollback_material(receipt, provider).map(|roots| (receipt, roots))
+                validate_rollback_material(receipt, &provider).map(|roots| (receipt, roots))
             })
             .transpose()?;
-        restore_previous_activation(transaction)?;
+        restore_previous_activation(transaction, previous_transaction.as_ref())?;
         match previous_roots {
             Some((previous, roots)) => verify_public(
                 &provider.public_url,
                 &transaction.hostname,
                 &previous.leaf_certificate_sha256,
                 roots,
-                &transaction.provider,
+                &provider.config,
                 previous.proxy_configuration_sha256.as_deref(),
             )?,
             None => verify_public_not_leaf(
@@ -1290,15 +1352,23 @@ fn rollback_transaction(
     Ok(())
 }
 
-fn restore_previous_activation(transaction: &CertificateTransaction) -> anyhow::Result<()> {
+fn restore_previous_activation(
+    transaction: &CertificateTransaction,
+    previous: Option<&CertificateTransaction>,
+) -> anyhow::Result<()> {
+    let restore_context = previous.unwrap_or(transaction);
     match &transaction.previous_generation {
         Some(previous_generation) => {
-            proxy_config::validate_native(transaction, previous_generation)?;
+            proxy_config::validate_native(restore_context, previous_generation)?;
             symlink_atomic(previous_generation, &transaction.provider.activation_link)?;
         }
         None => remove_file_durable(&transaction.provider.activation_link)?,
     }
-    execute_provider_command(transaction, &transaction.provider.reload, "rollback reload")?;
+    execute_provider_command(
+        restore_context,
+        &restore_context.provider.reload,
+        "rollback reload",
+    )?;
     if active_generation(&transaction.provider)? != transaction.previous_generation {
         bail!("TLS rollback activation pointer does not match the previous generation");
     }

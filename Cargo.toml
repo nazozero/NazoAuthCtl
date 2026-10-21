@@ -16,8 +16,8 @@ rust-version = "1.99"
 
 [workspace.dependencies]
 hex = "0.4.3"
-nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "118dc00adc37f9b12c3129070344927b68a2e673", version = "0.3.3", default-features = false, features = ["ed25519"] }
-nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "118dc00adc37f9b12c3129070344927b68a2e673", version = "0.3.3", package = "nazo-operator-protocol" }
+nazo-crypto = { git = "https://github.com/nazozero/NazoAuth.git", rev = "35b17a8b124cf3a3e9add48213a982a43015ea9b", version = "0.3.3", default-features = false, features = ["ed25519"] }
+nazo-operator-protocol = { git = "https://github.com/nazozero/NazoAuth.git", rev = "35b17a8b124cf3a3e9add48213a982a43015ea9b", version = "0.3.3", package = "nazo-operator-protocol" }
 
 [package]
 name = "nazoauthctl-core"

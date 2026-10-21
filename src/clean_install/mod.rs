@@ -22,7 +22,7 @@ mod public_verify;
 
 // CLI-surface re-exports (I wave): the dispatcher consumes these without the
 // private module paths.
-pub(crate) use public_verify::{CurlPublicProber, verify_public};
+pub(crate) use public_verify::{CurlPublicProber, PublicVerdict, verify_public};
 
 use anyhow::{Context as _, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

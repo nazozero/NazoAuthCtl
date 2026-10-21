@@ -629,6 +629,29 @@ impl ConformanceRecoveryGuard {
         self.journal.tenant_cleanup_complete
     }
 
+    /// Call only after the control journal has settled a failed Disable or
+    /// Finalize. Directory failures are rolled-back business outcomes; unknown
+    /// commits remain in progress and must retain their original operation.
+    pub fn reset_failed_tenant_cleanup(&mut self, result: &ControlResult) -> anyhow::Result<()> {
+        if result.outcome != ControlOutcome::Failed || self.journal.tenant_cleanup_complete {
+            bail!("tenant cleanup can reset only after a terminal failure");
+        }
+        if self.journal.tenant_disabled {
+            self.journal.tenant_finalize_expected_revision = None;
+        } else {
+            self.journal.tenant_disable_expected_revision = None;
+        }
+        if self
+            .journal
+            .terminal_failure
+            .as_ref()
+            .is_some_and(|failure| failure.operation_id == result.operation_id)
+        {
+            self.journal.terminal_failure = None;
+        }
+        self.persist()
+    }
+
     pub fn tenant_absent(&self) -> bool {
         self.journal.tenant_absence_revision.is_some()
     }
@@ -2705,6 +2728,44 @@ mod tests {
         guard.mark_tenant_absent(1).unwrap();
         guard.finish().unwrap();
         assert!(store.claim_pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_cleanup_discards_stale_revision_but_unknown_commit_keeps_it() {
+        let work =
+            nazoauthctl_runtime::filesystem::PrivateTempDir::new("oidf-cleanup-conflict").unwrap();
+        let store =
+            ConformanceRecoveryStore::open(&work.path().join("recovery"), "deployment-1").unwrap();
+        let mut guard = store.begin_ordinary_run(binding()).unwrap();
+        guard.mark_tenant_created().unwrap();
+        guard.prepare_tenant_disable(1).unwrap();
+        let mut result = operation(ControlResultData::TenantDirectoryMutation {
+            action: "disable".into(),
+            tenant_id: binding().tenant_id,
+            previous_revision: 1,
+            revision: 2,
+        })
+        .result;
+        result.outcome = ControlOutcome::InProgress;
+        result.completed_at = None;
+        result.result = None;
+        assert!(guard.reset_failed_tenant_cleanup(&result).is_err());
+        assert_eq!(guard.tenant_disable_expected_revision(), Some(1));
+        result.outcome = ControlOutcome::Failed;
+        result.completed_at = Some(2);
+        result.error = Some(nazo_operator_protocol::ControlErrorCode::ExecutionFailed);
+        guard.reset_failed_tenant_cleanup(&result).unwrap();
+        drop(guard);
+        let mut guard = store.claim_pending().unwrap().pop().unwrap();
+        assert_eq!(guard.tenant_disable_expected_revision(), None);
+        guard.prepare_tenant_disable(3).unwrap();
+        guard.mark_tenant_disabled().unwrap();
+        guard.prepare_tenant_finalize(4).unwrap();
+        guard.reset_failed_tenant_cleanup(&result).unwrap();
+        assert!(guard.tenant_disabled());
+        assert_eq!(guard.tenant_disable_expected_revision(), Some(3));
+        assert_eq!(guard.tenant_finalize_expected_revision(), None);
+        guard.prepare_tenant_finalize(5).unwrap();
     }
 
     #[test]

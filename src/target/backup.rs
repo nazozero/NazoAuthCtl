@@ -487,6 +487,12 @@ fn write_evidence<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     let parent = path.parent().context("backup evidence has no parent")?;
     filesystem::ensure_private_directory(parent, "backup evidence directory")?;
     let bytes = serde_json::to_vec_pretty(value)?;
+    if bytes.len() as u64 > MAX_BACKUP_EVIDENCE_BYTES {
+        bail!(
+            "backup evidence exceeds its {}-byte read/write limit",
+            MAX_BACKUP_EVIDENCE_BYTES
+        );
+    }
     filesystem::atomic_write(path, &bytes, 0o600).context("failed to persist backup evidence")
 }
 

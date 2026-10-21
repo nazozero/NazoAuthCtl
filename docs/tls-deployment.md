@@ -131,8 +131,9 @@ nazoauthctl verify --instance INSTANCE
 
 The explicit tag pins this transaction to the selected artifact. Omitting
 `--to` uses ordinary dynamic release resolution. Update still performs migration
-admission. An applied migration requires verified database recovery rather than
-artifact-only rollback. Before migration, rollback restores config before
+admission. A migration receipt proving an unchanged schema preserves paired
+artifact/configuration rollback; a changed schema or an outcome without that
+proof requires verified database recovery. Before migration, rollback restores config before
 starting the old artifact.
 
 Readiness follows the configured transport. HTTPS connects to loopback while
@@ -162,3 +163,8 @@ deployment's initial installation, renewal/key replacement, public leaf switch,
 rollback, interrupted recovery, and service continuity with ctl stopped. Keep
 run-specific binaries, logs, and receipts in CI artifacts or the associated
 issue/PR; local tests do not establish distributed Release acceptance.
+
+For systemd installs, newly created service-path parents allow traversal, while
+deployment leaf directories and files retain their service ownership rules.
+Existing ancestor permissions are never widened. A private external parent must
+already grant traversal to the service user, or the install must use another path.

@@ -248,6 +248,7 @@ pub(crate) struct RollbackJob<'a> {
     pub config_schema: &'a str,
     pub current_artifact: &'a str,
     pub previous_artifact: Option<&'a str>,
+    pub previous_config_snapshot: Option<&'a str>,
     pub expected_revision: u64,
     pub scope_dir: &'a Path,
     pub store: &'a TargetStateStore,
@@ -301,8 +302,8 @@ pub(crate) struct PerformedSteps {
     pub(crate) migration_applied: bool,
     pub(crate) migration_outcome_unknown: bool,
     pub(crate) migration_result: Option<nazo_operator_protocol::ControlResult>,
-    pub(crate) runtime_before_update: Option<runtime_backend::RuntimeReplacement>,
-    pub(crate) runtime_before_update_was_running: bool,
+    pub(crate) runtime_before_change: Option<runtime_backend::RuntimeReplacement>,
+    pub(crate) runtime_before_change_was_running: bool,
 }
 
 /// Production executor backed by the real adapters.
@@ -497,11 +498,11 @@ impl HostLifecycleExecutor {
                 .transpose()?;
 
         if replacement.is_some() && kind.is_container() {
-            performed.runtime_before_update = Some(exact_replacement_from_observation(
+            performed.runtime_before_change = Some(exact_replacement_from_observation(
                 &observation,
                 job.runtime_object,
             )?);
-            performed.runtime_before_update_was_running = observation.running;
+            performed.runtime_before_change_was_running = observation.running;
         }
 
         // 2. Snapshot the current config so a failed activation restores the
@@ -531,12 +532,12 @@ impl HostLifecycleExecutor {
                         sanitize(error.to_string()),
                     )
                 })?;
+            performed.wrote_config = true;
             grant_runtime_config_read(
                 Path::new(job.config_reference),
                 job.runtime_kind,
                 job.deployment_id,
             )?;
-            performed.wrote_config = true;
         }
 
         // 3.5. Application migration: run one-shot task using the VERIFIED target artifact.
@@ -648,15 +649,17 @@ impl HostLifecycleExecutor {
             validate_migration_result(job.operation_id, request_hash, &control_result)?;
             match control_result.outcome {
                 nazo_operator_protocol::ControlOutcome::Succeeded => {
+                    performed.migration_applied = migration_requires_recovery(&control_result);
                     performed.migration_result = Some(control_result);
-                    performed.migration_applied = true;
                     performed.migration_outcome_unknown = false;
-                    job.store.record_migration_applied(
-                        job.deployment_id,
-                        job.expected_revision,
-                        job.operation_id,
-                        &format!("sha256:{new_digest}"),
-                    )?;
+                    if performed.migration_applied {
+                        job.store.record_migration_applied(
+                            job.deployment_id,
+                            job.expected_revision,
+                            job.operation_id,
+                            &format!("sha256:{new_digest}"),
+                        )?;
+                    }
                 }
                 nazo_operator_protocol::ControlOutcome::Failed => {
                     performed.migration_outcome_unknown = false;
@@ -711,6 +714,9 @@ impl HostLifecycleExecutor {
             job.deployment_id,
             job.expected_revision,
             super::deployment_state::UpdateCommit {
+                config_snapshot: performed
+                    .snapshotted_config
+                    .then(|| job.operation_id.to_owned()),
                 artifact: format!("sha256:{new_digest}"),
                 release: Some(verified.release),
                 config: staged_config_change(job.config_reference, job.config),
@@ -744,6 +750,14 @@ impl HostLifecycleExecutor {
         // 0. Live identity hook on the CURRENT object before anything moves.
         let observation = live_observation(backend.as_ref(), job.runtime_object)?;
         require_observation_serves(&observation, job.current_artifact)?;
+
+        if kind.is_container() {
+            performed.runtime_before_change = Some(exact_replacement_from_observation(
+                &observation,
+                job.runtime_object,
+            )?);
+            performed.runtime_before_change_was_running = observation.running;
+        }
 
         // 1. Offline handle verification: the previous artifact must exist in
         // the local engine image store right now (no network fetch — a
@@ -802,27 +816,50 @@ impl HostLifecycleExecutor {
         // 2. Config snapshot decision BEFORE touching the runtime: restore
         // only when explicitly saved, integrity-intact, and still belonging to
         // the deployment's current config generation.
+        let snapshot_operation = job.previous_config_snapshot.ok_or_else(|| {
+            Failure::new(
+                ROLLBACK_ARTIFACT_MISSING,
+                "previous artifact has no paired configuration snapshot; recover a verified backup",
+            )
+        })?;
         let restored_config =
-            read_restorable_snapshot(job.scope_dir, job.config_schema).map_err(|error| {
+            read_restorable_snapshot(job.scope_dir, snapshot_operation).map_err(|error| {
                 Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string()))
             })?;
+        if restored_config.is_none() {
+            return Err(Failure::new(
+                ROLLBACK_ARTIFACT_MISSING,
+                "paired configuration snapshot is missing",
+            ));
+        }
+        // This rollback is itself a generation change. Save its current bytes
+        // before activation so a second rollback restores the exact pair.
+        snapshot_config(
+            job.scope_dir,
+            job.operation_id,
+            job.config_reference,
+            job.config_schema,
+            restored_config.as_ref().map(|(_, schema)| schema.as_str()),
+            None,
+        )
+        .map_err(|error| Failure::new(HOST_ERR_OPERATION_INVALID, sanitize(error.to_string())))?;
 
         // Restore configuration before starting the previous artifact: the
         // runtime and its readiness probe must observe the same transport.
         if let Some((bytes, _)) = &restored_config {
             performed.config_before_rollback = Some(
-                filesystem::read_secure_regular_file(
-                    Path::new(job.config_reference),
-                    "current configuration",
-                    false,
-                    super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
-                )
-                .map_err(|error| {
-                    Failure::new(
-                        super::install_exec::CONFIG_INVALID,
-                        sanitize(error.to_string()),
-                    )
-                })?,
+                read_restorable_snapshot(job.scope_dir, job.operation_id)
+                    .and_then(|snapshot| {
+                        snapshot.map(|(bytes, _)| bytes).ok_or_else(|| {
+                            anyhow::anyhow!("rollback starting configuration is missing")
+                        })
+                    })
+                    .map_err(|error| {
+                        Failure::new(
+                            super::install_exec::CONFIG_INVALID,
+                            sanitize(error.to_string()),
+                        )
+                    })?,
             );
             filesystem::atomic_write(Path::new(job.config_reference), bytes, 0o600).map_err(
                 |error| {
@@ -949,6 +986,13 @@ pub(crate) fn lifecycle_database_url(secrets_root: &str) -> Result<String, Failu
 /// Target-side pre-activation gate for the nested MigrateApply.  This is only
 /// an adapter to the controller's one result-binding authority; it adds no
 /// second operation/result contract.
+fn migration_requires_recovery(result: &nazo_operator_protocol::ControlResult) -> bool {
+    !matches!(
+        result.result,
+        Some(nazo_operator_protocol::ControlResultData::MigrationApplied { unchanged: true })
+    )
+}
+
 fn validate_migration_result(
     operation_id: &str,
     request_hash: &str,
@@ -1051,7 +1095,7 @@ mod tests {
             Some(b"original"),
         )?;
         assert_eq!(
-            read_restorable_snapshot(temp.path(), "v2")?
+            read_restorable_snapshot(temp.path(), OPERATION_ID)?
                 .unwrap()
                 .0
                 .as_slice(),
@@ -1070,14 +1114,18 @@ mod tests {
         )?;
         snapshot_config(temp.path(), OPERATION_ID, reference, "v1", Some("v2"), None)?;
         assert_eq!(
-            read_restorable_snapshot(temp.path(), "v2")?
+            read_restorable_snapshot(temp.path(), OPERATION_ID)?
                 .unwrap()
                 .0
                 .as_slice(),
             b"original"
         );
 
-        filesystem::atomic_write(&temp.path().join(SNAPSHOT_BYTES_FILE), b"tampered", 0o600)?;
+        filesystem::atomic_write(
+            &config_snapshot_directory(temp.path(), OPERATION_ID)?.join(SNAPSHOT_BYTES_FILE),
+            b"tampered",
+            0o600,
+        )?;
         assert!(
             snapshot_config(
                 temp.path(),
@@ -1089,6 +1137,89 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_update_and_repeated_rollback_preserve_artifact_config_pairs() -> anyhow::Result<()> {
+        use super::super::deployment_state::{
+            ArtifactRefs, BootstrapParams, RuntimeSurface, UpdateCommit,
+        };
+        let temp = filesystem::PrivateTempDir::new("config-generation-pairs")?;
+        let store = TargetStateStore::open(temp.path().join("state"))?;
+        let config = temp.path().join("config.json");
+        let reference = config.to_str().unwrap();
+        let a = format!("sha256:{}", "a".repeat(64));
+        let b = format!("sha256:{}", "b".repeat(64));
+        let initial = store.bootstrap(
+            "deploy-pair",
+            BootstrapParams {
+                issuer: "https://auth.example".to_owned(),
+                runtime: RuntimeSurface::new("podman", "pair-runtime", 8000)?,
+                artifact: ArtifactRefs {
+                    current: Some(a.clone()),
+                    previous: None,
+                },
+                config_reference: reference.to_owned(),
+                config_schema: "v1".to_owned(),
+                resources: Vec::new(),
+                current_release: None,
+            },
+            "bootstrap",
+        )?;
+        filesystem::atomic_write(&config, b"config-a", 0o600)?;
+        snapshot_config(temp.path(), "update-b", reference, "v1", Some("v1"), None)?;
+        filesystem::atomic_write(&config, b"config-b", 0o600)?;
+        let mut state = store.apply_update_healthy(
+            "deploy-pair",
+            initial.config.revision,
+            UpdateCommit {
+                config_snapshot: Some("update-b".to_owned()),
+                artifact: b.clone(),
+                release: None,
+                config: Some((reference.to_owned(), "v1".to_owned())),
+                operation_id: "update-b".to_owned(),
+            },
+        )?;
+        // An unsuccessful candidate has its own snapshot and cannot replace A.
+        snapshot_config(temp.path(), "failed-c", reference, "v1", Some("v1"), None)?;
+        assert_eq!(
+            read_restorable_snapshot(
+                temp.path(),
+                state.previous_config_snapshot.as_deref().unwrap()
+            )?
+            .unwrap()
+            .0
+            .as_slice(),
+            b"config-a"
+        );
+        for (operation, expected_artifact, expected_bytes) in [
+            ("rollback-a", &a, b"config-a".as_slice()),
+            ("rollback-b", &b, b"config-b".as_slice()),
+        ] {
+            let (saved, schema) = read_restorable_snapshot(
+                temp.path(),
+                state.previous_config_snapshot.as_deref().unwrap(),
+            )?
+            .unwrap();
+            snapshot_config(
+                temp.path(),
+                operation,
+                reference,
+                &state.config.schema,
+                Some(&schema),
+                None,
+            )?;
+            filesystem::atomic_write(&config, &saved, 0o600)?;
+            state = store.apply_rollback_healthy(
+                "deploy-pair",
+                state.config.revision,
+                Some((reference.to_owned(), schema)),
+                operation,
+            )?;
+            assert_eq!(state.artifact.current.as_ref(), Some(expected_artifact));
+            assert_eq!(std::fs::read(&config)?, expected_bytes);
+        }
         Ok(())
     }
 
@@ -1229,6 +1360,17 @@ mod tests {
             accepted_at: 1,
             completed_at: Some(2),
             result: None,
+        }
+    }
+
+    #[test]
+    fn only_an_unchanged_migration_receipt_preserves_binary_rollback() {
+        let mut result = terminal_result();
+        assert!(migration_requires_recovery(&result));
+        for unchanged in [false, true] {
+            result.result = Some(ControlResultData::MigrationApplied { unchanged });
+            validate_migration_result(OPERATION_ID, &"a".repeat(64), &result).unwrap();
+            assert_eq!(migration_requires_recovery(&result), !unchanged);
         }
     }
 
@@ -2043,12 +2185,8 @@ const SNAPSHOT_META_SCHEMA: u32 = 2;
 pub(super) const SNAPSHOT_BYTES_FILE: &str = "rollback-config.bin";
 pub(super) const SNAPSHOT_META_FILE: &str = "rollback-config.json";
 
-/// Snapshot metadata binding the saved bytes to the two config generations it
-/// separates: the schema it replaced (`config_schema`) and the schema that
-/// replaced it (`replaced_by_schema`). A rollback restores the snapshot only
-/// while the deployment's live config still runs `replaced_by_schema`, which
-/// is exactly the condition under which the snapshot is the explicitly-saved,
-/// schema-compatible previous generation (goal plan 07 §5 item 2).
+/// Immutable pre-operation configuration. DeploymentState selects the snapshot
+/// paired with its previous artifact; schema names do not identify generations.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ConfigSnapshotMeta {
@@ -2062,6 +2200,18 @@ pub(super) struct ConfigSnapshotMeta {
     pub replaced_by_schema: Option<String>,
 }
 
+fn config_snapshot_directory(scope_dir: &Path, operation_id: &str) -> anyhow::Result<PathBuf> {
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        anyhow::bail!("invalid configuration snapshot operation identifier");
+    }
+    Ok(scope_dir.join("config-snapshots").join(operation_id))
+}
+
 fn snapshot_config(
     scope_dir: &Path,
     operation_id: &str,
@@ -2070,9 +2220,11 @@ fn snapshot_config(
     replacing_schema: Option<&str>,
     current_config: Option<&[u8]>,
 ) -> anyhow::Result<()> {
-    let meta_path = scope_dir.join(SNAPSHOT_META_FILE);
-    let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
-    if meta_path.exists() || bytes_path.exists() {
+    let directory = config_snapshot_directory(scope_dir, operation_id)?;
+    filesystem::ensure_private_directory(&directory, "operation configuration snapshot")?;
+    let meta_path = directory.join(SNAPSHOT_META_FILE);
+    let bytes_path = directory.join(SNAPSHOT_BYTES_FILE);
+    if meta_path.exists() {
         let meta_bytes = filesystem::read_secure_regular_file(
             &meta_path,
             "config snapshot metadata",
@@ -2098,6 +2250,7 @@ fn snapshot_config(
             }
             return Ok(());
         }
+        anyhow::bail!("configuration snapshot belongs to another operation");
     }
     let current_bytes;
     let bytes = match current_config {
@@ -2123,16 +2276,14 @@ fn snapshot_config(
     filesystem::atomic_write(&meta_path, &serde_json::to_vec_pretty(&meta)?, 0o600)
 }
 
-/// Decide whether the saved snapshot may be restored: explicitly present,
-/// byte-integrity intact, and the live config generation still equals the
-/// generation the update installed (otherwise the snapshot is stale and the
-/// rollback touches references only).
+/// Read exactly the immutable snapshot selected by the committed generation.
 fn read_restorable_snapshot(
     scope_dir: &Path,
-    live_schema: &str,
+    operation_id: &str,
 ) -> anyhow::Result<Option<(zeroize::Zeroizing<Vec<u8>>, String)>> {
-    let meta_path = scope_dir.join(SNAPSHOT_META_FILE);
-    let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
+    let directory = config_snapshot_directory(scope_dir, operation_id)?;
+    let meta_path = directory.join(SNAPSHOT_META_FILE);
+    let bytes_path = directory.join(SNAPSHOT_BYTES_FILE);
     if !meta_path.exists() || !bytes_path.exists() {
         return Ok(None);
     }
@@ -2150,11 +2301,8 @@ fn read_restorable_snapshot(
             meta.schema
         );
     }
-    let Some(replaced_by) = meta.replaced_by_schema.as_deref() else {
-        return Ok(None);
-    };
-    if replaced_by != live_schema {
-        return Ok(None);
+    if meta.operation_id != operation_id {
+        anyhow::bail!("configuration snapshot belongs to another operation");
     }
     let bytes = filesystem::read_secure_regular_file(
         &bytes_path,
@@ -2237,6 +2385,7 @@ fn rollback_update(job: &UpdateJob<'_>, performed: &PerformedSteps) -> Result<()
         let restore = if performed.snapshotted_config {
             restore_snapshot_bytes(
                 job.scope_dir,
+                job.operation_id,
                 job.config_reference,
                 job.runtime_kind,
                 job.deployment_id,
@@ -2255,47 +2404,16 @@ fn rollback_update(job: &UpdateJob<'_>, performed: &PerformedSteps) -> Result<()
             errors.push(error.detail);
         }
     }
-    if performed.replaced_runtime {
-        if job.runtime_kind == RuntimeBackendKind::Host {
-            if let Err(error) = redeploy_digest(
-                job.runtime_kind,
-                job.runtime_object,
-                job.current_artifact,
-                job.runtime_root,
-            ) {
-                errors.push(format!(
-                    "restoring the verified pre-update host artifact failed: {}",
-                    error.detail
-                ));
-            }
-        } else {
-            match &performed.runtime_before_update {
-                Some(replacement) => {
-                    let backend = runtime_backend::backend(job.runtime_kind);
-                    if let Err(error) = backend.replace(replacement) {
-                        errors.push(format!(
-                            "restoring the pre-update runtime failed: {}",
-                            sanitize(error.to_string())
-                        ));
-                    } else if performed.runtime_before_update_was_running {
-                        if let Err(error) = backend.start(job.runtime_object) {
-                            errors.push(format!(
-                                "starting the restored pre-update runtime failed: {}",
-                                sanitize(error.to_string())
-                            ));
-                        }
-                    } else if let Err(error) = backend.stop(job.runtime_object) {
-                        errors.push(format!(
-                            "restoring the stopped pre-update runtime state failed: {}",
-                            sanitize(error.to_string())
-                        ));
-                    }
-                }
-                None => errors.push(
-                    "the exact pre-update runtime was not retained before replacement".to_owned(),
-                ),
-            }
-        }
+    if performed.replaced_runtime
+        && let Err(error) = restore_runtime_before_change(
+            job.runtime_kind,
+            job.runtime_object,
+            job.current_artifact,
+            job.runtime_root,
+            performed,
+        )
+    {
+        errors.push(error.detail);
     }
     rollback_result(errors)
 }
@@ -2328,40 +2446,76 @@ fn restore_current_after_failed_rollback(
         }
     }
     if performed.replaced_runtime
-        && let Err(error) = redeploy_digest(
+        && let Err(error) = restore_runtime_before_change(
             job.runtime_kind,
             job.runtime_object,
             job.current_artifact,
             job.runtime_root,
+            performed,
         )
     {
-        errors.push(format!(
-            "restoring the current runtime failed: {}",
-            error.detail
-        ));
+        errors.push(error.detail);
     }
     rollback_result(errors)
 }
 
+fn restore_runtime_before_change(
+    kind: RuntimeBackendKind,
+    object: &str,
+    artifact: &str,
+    runtime_root: Option<&str>,
+    performed: &PerformedSteps,
+) -> Result<(), Failure> {
+    if kind == RuntimeBackendKind::Host {
+        return redeploy_digest(kind, object, artifact, runtime_root);
+    }
+    let replacement = performed.runtime_before_change.as_ref().ok_or_else(|| {
+        Failure::new(
+            ACTIVATION_FAILED,
+            "the exact runtime was not retained before replacement",
+        )
+    })?;
+    let backend = runtime_backend::backend(kind);
+    backend.replace(replacement).map_err(|error| {
+        Failure::new(
+            ACTIVATION_FAILED,
+            sanitize(format!("restoring the previous runtime failed: {error}")),
+        )
+    })?;
+    let result = if performed.runtime_before_change_was_running {
+        backend.start(object)
+    } else {
+        backend.stop(object)
+    };
+    result.map_err(|error| {
+        Failure::new(
+            ACTIVATION_FAILED,
+            sanitize(format!(
+                "restoring the previous running state failed: {error}"
+            )),
+        )
+    })
+}
+
 fn restore_snapshot_bytes(
     scope_dir: &Path,
+    operation_id: &str,
     config_reference: &str,
     kind: RuntimeBackendKind,
     deployment_id: &str,
 ) -> Result<(), Failure> {
-    let bytes_path = scope_dir.join(SNAPSHOT_BYTES_FILE);
-    let bytes = filesystem::read_secure_regular_file(
-        &bytes_path,
-        "config snapshot bytes",
-        false,
-        super::install_exec::MAX_CONFIG_CONTENT_BYTES as u64,
-    )
-    .map_err(|error| {
-        Failure::new(
-            super::install_exec::CONFIG_INVALID,
-            sanitize(format!("reading the config snapshot failed: {error}")),
-        )
-    })?;
+    let bytes = read_restorable_snapshot(scope_dir, operation_id)
+        .and_then(|snapshot| {
+            snapshot
+                .map(|(bytes, _)| bytes)
+                .ok_or_else(|| anyhow::anyhow!("operation configuration snapshot is missing"))
+        })
+        .map_err(|error| {
+            Failure::new(
+                super::install_exec::CONFIG_INVALID,
+                sanitize(format!("reading the config snapshot failed: {error}")),
+            )
+        })?;
     filesystem::atomic_write(Path::new(config_reference), &bytes, 0o600).map_err(|error| {
         Failure::new(
             super::install_exec::CONFIG_INVALID,

@@ -1401,6 +1401,7 @@ fn answer_rollback(
         config_schema: &state.config.schema,
         current_artifact,
         previous_artifact: state.artifact.previous.as_deref(),
+        previous_config_snapshot: state.previous_config_snapshot.as_deref(),
         expected_revision,
         scope_dir: &scope_dir,
         store,

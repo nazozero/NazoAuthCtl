@@ -45,8 +45,10 @@
 //! * steady-state cap 16 MiB per file — an append that crosses it triggers
 //!   compaction on the next journal use;
 //! * compaction keeps the newest terminal history down to an 8 MiB budget,
-//!   never fewer than the newest 128 terminal lines, plus exactly the latest
+//!   preferring the newest 128 terminal lines within the 16 MiB cap, plus the latest
 //!   still-unsettled `pending` line for each interrupted operation;
+//! * new operations stop at 8 MiB of unsettled entries, reserving room for
+//!   terminal receipts; existing pending operations can still resume;
 //! * reads tolerate up to 32 MiB so a crash between an oversized append and
 //!   its compaction still parses and self-heals instead of wedging.
 //!
@@ -56,7 +58,8 @@
 //! kind is resumable without double side effects.
 //!
 //! Lines are schema-checked (`deny_unknown_fields`), bounded, and parsed
-//! strictly: a torn append or foreign byte fails closed with the stable
+//! strictly: only an incomplete final JSON record is discarded under the writer lock.
+//! Complete malformed records fail closed with the stable
 //! [`TARGET_JOURNAL_INVALID`] code instead of being repaired. The read-only
 //! [`TargetJournal::operation_log`] view projects recent operations with their
 //! status and outcome for status/doctor surfaces (CLI wiring lands with the
@@ -91,6 +94,7 @@ pub const JOURNAL_SCHEMA: u32 = 2;
 /// current schema or violates its own invariants. Repair is manual and
 /// explicit; there is no lenient reader.
 pub const TARGET_JOURNAL_INVALID: &str = "TARGET_JOURNAL_INVALID";
+pub const TARGET_JOURNAL_CAPACITY: &str = "TARGET_JOURNAL_CAPACITY";
 
 /// Steady-state upper bound for one deployment's journal file. An append that
 /// crosses it schedules compaction before the next journal use.
@@ -99,8 +103,7 @@ const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 /// Compaction keeps the newest terminal history down to this byte budget.
 const TRIM_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Compaction always retains at least this many of the newest terminal lines,
-/// even when they exceed the byte budget together.
+/// Preferred terminal count, subordinate to the steady-state byte cap.
 const MIN_RETAINED_TERMINAL_LINES: usize = 128;
 
 /// Read tolerance above the steady-state cap: a crash between an oversized
@@ -114,9 +117,11 @@ const READ_TOLERANCE_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) struct JournalBounds {
     /// Steady-state cap: appends beyond this trigger compaction.
     pub(crate) max_bytes: u64,
+    /// Unsettled admissions leave room for the largest terminal receipt.
+    pub(crate) max_pending_bytes: u64,
     /// Byte budget the newest terminal history is kept within.
     pub(crate) target_bytes: u64,
-    /// Minimum number of newest terminal lines always retained.
+    /// Preferred number of newest terminal lines within the hard byte budget.
     pub(crate) min_terminal_retained: usize,
     /// Read cap used while parsing (>= `max_bytes` so recovery stays possible).
     pub(crate) read_cap: u64,
@@ -126,6 +131,7 @@ impl Default for JournalBounds {
     fn default() -> Self {
         Self {
             max_bytes: MAX_JOURNAL_BYTES,
+            max_pending_bytes: 8 * 1024 * 1024,
             target_bytes: TRIM_TARGET_BYTES,
             min_terminal_retained: MIN_RETAINED_TERMINAL_LINES,
             read_cap: READ_TOLERANCE_BYTES,
@@ -253,12 +259,12 @@ impl TargetJournal {
         let operation_hash = canonical_operation_hash(operation)?;
         let lines = match compacted {
             Some(lines) => lines,
-            None => read_lines_with(&path, self.bounds.read_cap)?,
+            None => read_lines_with(&path, self.bounds.read_cap, true)?,
         };
 
         let mut latest: Option<JournalLine> = None;
         for line in lines
-            .into_iter()
+            .iter()
             .filter(|line| line.operation_id == operation.operation_id)
         {
             if line.operation_hash != operation_hash {
@@ -272,7 +278,7 @@ impl TargetJournal {
                     ),
                 ));
             }
-            latest = Some(line);
+            latest = Some(line.clone());
         }
 
         let resumed = latest
@@ -311,18 +317,31 @@ impl TargetJournal {
 
         let action = operation.operation.kind().to_owned();
         if !resumed {
-            self.append(
-                &path,
-                &JournalLine {
-                    schema: JOURNAL_SCHEMA,
-                    operation_id: operation.operation_id.clone(),
-                    operation_hash: operation_hash.clone(),
-                    action: action.clone(),
-                    recorded_at: Utc::now(),
-                    status: JournalStatus::Pending,
-                    result: None,
-                },
-            )?;
+            let pending = JournalLine {
+                schema: JOURNAL_SCHEMA,
+                operation_id: operation.operation_id.clone(),
+                operation_hash: operation_hash.clone(),
+                action: action.clone(),
+                recorded_at: Utc::now(),
+                status: JournalStatus::Pending,
+                result: None,
+            };
+            let mut pending_bytes = serde_json::to_vec(&pending)?.len() as u64 + 1;
+            let mut seen = HashSet::new();
+            for line in lines.iter().rev() {
+                if seen.insert(&line.operation_id) && matches!(line.status, JournalStatus::Pending)
+                {
+                    pending_bytes += serde_json::to_vec(line)?.len() as u64 + 1;
+                }
+            }
+            if pending_bytes > self.bounds.max_pending_bytes {
+                return Ok(HostResult::failed(
+                    operation.operation_id.clone(),
+                    TARGET_JOURNAL_CAPACITY,
+                    "unsettled operations fill the journal admission budget; resume those operations before starting another",
+                ));
+            }
+            self.append(&path, &pending)?;
             self.compact_if_needed(&path)?;
         }
         let result = execute(operation);
@@ -371,7 +390,7 @@ impl TargetJournal {
     }
 
     fn remove_operation(&self, path: &Path, operation_id: &str) -> anyhow::Result<()> {
-        let lines = read_lines_with(path, self.bounds.read_cap)?;
+        let lines = read_lines_with(path, self.bounds.read_cap, true)?;
         let mut bytes = Vec::new();
         for line in lines
             .into_iter()
@@ -430,7 +449,7 @@ impl TargetJournal {
         if metadata.len() <= self.bounds.max_bytes {
             return Ok(None);
         }
-        let mut lines = read_lines_with(path, self.bounds.read_cap)?;
+        let mut lines = read_lines_with(path, self.bounds.read_cap, true)?;
         let bytes = compact_lines(&mut lines, &self.bounds)
             .with_context(|| format!("failed to re-encode the journal {}", path.display()))?;
         filesystem::atomic_write(path, &bytes, 0o600)
@@ -453,7 +472,7 @@ impl TargetJournal {
     }
 
     fn project_log(&self, path: &Path) -> anyhow::Result<Vec<OperationLogEntry>> {
-        let lines = read_lines_with(path, self.bounds.read_cap)?;
+        let lines = read_lines_with(path, self.bounds.read_cap, false)?;
         Ok(lines.into_iter().map(project_entry).collect())
     }
 }
@@ -490,7 +509,7 @@ fn project_entry(line: JournalLine) -> OperationLogEntry {
 /// * the newest `pending` line for an operation only when no newer terminal
 ///   line settles it;
 /// * terminal lines while the retained byte budget lasts, plus at least
-///   `bounds.min_terminal_retained` newest terminal lines regardless of size.
+///   `bounds.min_terminal_retained` newest terminal lines within the hard cap.
 ///
 /// Superseded and duplicate pending lines carry no recovery information. If
 /// retained forever, every successful operation permanently consumes journal
@@ -511,6 +530,18 @@ fn compact_lines(
     let mut budget = bounds.target_bytes;
     let mut retained_terminals = 0usize;
     let mut seen = HashSet::new();
+    let mut hard_budget = bounds.max_bytes;
+    // Unsettled operations own their resume record; reserve their space before
+    // selecting terminal history, including the preferred minimum count.
+    for index in (0..lines.len()).rev() {
+        if seen.insert(lines[index].operation_id.as_str())
+            && matches!(lines[index].status, JournalStatus::Pending)
+        {
+            mask[index] = true;
+            hard_budget = hard_budget.saturating_sub(ranges[index].len() as u64);
+        }
+    }
+    seen.clear();
     for index in (0..lines.len()).rev() {
         let newest = seen.insert(lines[index].operation_id.as_str());
         if matches!(lines[index].status, JournalStatus::Pending) {
@@ -518,10 +549,13 @@ fn compact_lines(
             continue;
         }
         let size = ranges[index].len() as u64;
-        if retained_terminals < bounds.min_terminal_retained || budget >= size {
+        if hard_budget >= size
+            && (retained_terminals < bounds.min_terminal_retained || budget >= size)
+        {
             mask[index] = true;
             retained_terminals += 1;
             budget = budget.saturating_sub(size);
+            hard_budget -= size;
         }
     }
     let mut retained_bytes = 0;
@@ -571,8 +605,12 @@ fn scope_slug(deployment_id: Option<&str>) -> anyhow::Result<&str> {
 /// Journal scope for host-level operations that carry no deployment binding.
 const HOST_SCOPE: &str = "host";
 
-fn read_lines_with(path: &Path, read_cap: u64) -> anyhow::Result<Vec<JournalLine>> {
-    let bytes = match filesystem::read_secure_regular_file(
+fn read_lines_with(
+    path: &Path,
+    read_cap: u64,
+    repair_tail: bool,
+) -> anyhow::Result<Vec<JournalLine>> {
+    let mut bytes = match filesystem::read_secure_regular_file(
         path,
         "target operation journal",
         false,
@@ -588,19 +626,25 @@ fn read_lines_with(path: &Path, read_cap: u64) -> anyhow::Result<Vec<JournalLine
         }
         Err(error) => return Err(error),
     };
+    let mut tail_changed = false;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        let start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        match serde_json::from_slice::<JournalLine>(&bytes[start..]) {
+            Ok(_) => bytes.push(b'\n'),
+            Err(error) if error.is_eof() => bytes.truncate(start),
+            Err(error) => bail!("{TARGET_JOURNAL_INVALID}: invalid final journal record ({error})"),
+        }
+        tail_changed = true;
+    }
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         anyhow::anyhow!(
             "{TARGET_JOURNAL_INVALID}: journal is not UTF-8 ({})",
             path.display()
         )
     })?;
-    if !text.is_empty() && !text.ends_with('\n') {
-        bail!(
-            "{TARGET_JOURNAL_INVALID}: journal ends mid-line after an interrupted append; \
-             inspect and truncate {} before retrying",
-            path.display()
-        );
-    }
     let mut lines = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.is_empty() {
@@ -618,6 +662,11 @@ fn read_lines_with(path: &Path, read_cap: u64) -> anyhow::Result<Vec<JournalLine
         })?;
         validate_entry(&entry, index + 1)?;
         lines.push(entry);
+    }
+    if tail_changed && repair_tail {
+        // Only the exclusive writer repairs, and only after validating every
+        // complete record. Read-only status never mutates the journal.
+        filesystem::atomic_write(path, &bytes, 0o600)?;
     }
     Ok(lines)
 }
@@ -748,6 +797,36 @@ mod tests {
                 )),
             },
         }
+    }
+
+    #[test]
+    fn pending_capacity_rejects_new_work_but_allows_recovery() -> anyhow::Result<()> {
+        let temp = filesystem::PrivateTempDir::new("nazoauthctl-journal-capacity")?;
+        let mut journal = TargetJournal::open(temp.path().join("state"))?;
+        let first = ping_operation("first");
+        let second = ping_operation("second");
+        journal.run_journaled(&first, |op| {
+            HostResult::failed(op.operation_id.clone(), "OUTCOME_UNKNOWN", "interrupted")
+        })?;
+        let path = journal.path_for(HOST_SCOPE);
+        let before = fs::read(&path)?;
+        journal.bounds.max_pending_bytes = before.len() as u64;
+        let rejected =
+            journal.run_journaled(&second, |_| panic!("capacity must precede execution"))?;
+        assert!(
+            matches!(rejected.outcome, super::super::wire::HostOutcome::Failed { code, .. }
+            if code == TARGET_JOURNAL_CAPACITY)
+        );
+        assert_eq!(fs::read(&path)?, before);
+        assert_eq!(
+            journal.run_journaled(&first, echo_result)?,
+            echo_result(&first)
+        );
+        assert_eq!(
+            journal.run_journaled(&second, echo_result)?,
+            echo_result(&second)
+        );
+        Ok(())
     }
 
     #[test]
@@ -1037,7 +1116,17 @@ mod tests {
         let error = journal
             .run_journaled(&ping_operation("x"), echo_result)
             .expect_err("torn");
-        assert!(error.to_string().contains("mid-line"), "{error}");
+        assert!(
+            error.to_string().contains(TARGET_JOURNAL_INVALID),
+            "{error}"
+        );
+        // An incomplete final JSON record is a recoverable interrupted append.
+        filesystem::atomic_write(&path, b"{\"schema\":", 0o600)?;
+        let operation = ping_operation("recovered-tail");
+        let result = journal.run_journaled(&operation, echo_result)?;
+        assert_eq!(result, echo_result(&operation));
+        let replay = journal.run_journaled(&operation, |_| panic!("must replay receipt"))?;
+        assert_eq!(replay, result);
 
         // A foreign schema version is rejected instead of interpreted.
         let stale = format!(
@@ -1125,6 +1214,7 @@ mod tests {
     fn tiny_bounds() -> JournalBounds {
         JournalBounds {
             max_bytes: 1_400,
+            max_pending_bytes: 1_400,
             target_bytes: 500,
             min_terminal_retained: 2,
             read_cap: 64 * 1024,
@@ -1177,6 +1267,7 @@ mod tests {
         ];
         let bounds = JournalBounds {
             max_bytes: 10_000,
+            max_pending_bytes: 10_000,
             target_bytes: 0,
             min_terminal_retained: 2,
             read_cap: 64 * 1024,
@@ -1186,6 +1277,7 @@ mod tests {
         // A generous budget keeps everything terminal as well.
         let generous = JournalBounds {
             max_bytes: 10_000,
+            max_pending_bytes: 10_000,
             target_bytes: u64::MAX,
             min_terminal_retained: 0,
             read_cap: 64 * 1024,
@@ -1201,6 +1293,25 @@ mod tests {
             synthetic_line(unresolved_id, JournalStatus::Pending),
         ];
         assert_compaction(&lines, &generous, &[1, 3]);
+    }
+
+    #[test]
+    fn terminal_count_floor_never_overrides_the_byte_cap() {
+        let lines = (0..128)
+            .map(|_| synthetic_line(Uuid::now_v7().to_string(), JournalStatus::Completed))
+            .collect::<Vec<_>>();
+        let mut retained = lines.clone();
+        let bounds = JournalBounds {
+            max_bytes: 2000,
+            max_pending_bytes: 2000,
+            target_bytes: 500,
+            min_terminal_retained: 128,
+            read_cap: 4000,
+        };
+        let bytes = compact_lines(&mut retained, &bounds).unwrap();
+        assert!(bytes.len() as u64 <= bounds.max_bytes);
+        assert!(retained.len() < 128);
+        assert_eq!(retained.last(), lines.last());
     }
 
     #[test]

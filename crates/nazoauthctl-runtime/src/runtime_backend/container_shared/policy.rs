@@ -295,21 +295,26 @@ pub(crate) fn assert_managed_container_policy(
     {
         bail!("{backend_name} managed container read-only root policy drifted");
     }
-    if policy.no_new_privileges
-        && !host_config
+    if policy.no_new_privileges {
+        let mut enabled = false;
+        for value in host_config
             .get("SecurityOpt")
             .and_then(serde_json::Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(serde_json::Value::as_str)
-            .any(|value| {
-                value.eq_ignore_ascii_case("no-new-privileges")
-                    || value
-                        .split_once('=')
-                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("no-new-privileges"))
-            })
-    {
-        bail!("{backend_name} managed container no-new-privileges policy drifted");
+        {
+            let (name, setting) = value.split_once(['=', ':']).unwrap_or((value, "true"));
+            if name.eq_ignore_ascii_case("no-new-privileges") {
+                if !setting.eq_ignore_ascii_case("true") {
+                    bail!("{backend_name} managed container no-new-privileges policy drifted");
+                }
+                enabled = true;
+            }
+        }
+        if !enabled {
+            bail!("{backend_name} managed container no-new-privileges policy drifted");
+        }
     }
     if policy.drop_all_capabilities {
         let dropped = host_config
@@ -756,7 +761,34 @@ mod tests {
             );
             match error {
                 Some(error) => assert!(result.unwrap_err().to_string().contains(error)),
-                None => result.unwrap(),
+                None => {
+                    result.unwrap();
+                    for (options, accepted) in [
+                        (vec!["no-new-privileges=true"], true),
+                        (vec!["no-new-privileges:true"], true),
+                        (vec!["no-new-privileges=false"], false),
+                        (vec!["no-new-privileges", "no-new-privileges=false"], false),
+                        (vec!["no-new-privileges=unknown"], false),
+                        (vec![], false),
+                    ] {
+                        let mut candidate = document.clone();
+                        candidate["HostConfig"]["SecurityOpt"] = serde_json::json!(options);
+                        assert_eq!(
+                            assert_managed_container_policy(
+                                &candidate,
+                                "test",
+                                &policy,
+                                "managed",
+                                &[],
+                                &[("MODE", "managed"), ("API_SECRET", "approved")],
+                                &image,
+                            )
+                            .is_ok(),
+                            accepted,
+                            "{options:?}"
+                        );
+                    }
+                }
             }
         }
     }

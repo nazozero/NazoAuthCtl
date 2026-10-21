@@ -226,6 +226,7 @@ pub(crate) fn snapshot(
         backup::write_manifest_at(&partial_dir.join(IMMUTABLE_MANIFEST_FILE), &manifest)?;
         fs::rename(&partial_dir, &final_dir)
             .context("failed to atomically publish completed snapshot directory")?;
+        crate::filesystem::sync_parent(&final_dir)?;
         backup::write_manifest(scope_dir, &manifest)?;
         remove_receipt_if_present(scope_dir)?;
         Ok(manifest)
@@ -699,6 +700,7 @@ pub(crate) fn finalize_import(
         )
         .map_err(backup_failure)?;
         fs::rename(&incoming, &final_dir).map_err(|error| backup_failure(error.into()))?;
+        crate::filesystem::sync_parent(&final_dir).map_err(backup_failure)?;
     }
     crate::filesystem::sync_parent(&final_dir).map_err(backup_failure)?;
     crate::filesystem::sync_parent(&incoming).map_err(backup_failure)?;
@@ -1443,6 +1445,7 @@ pub(crate) fn activate_recovered_runtime(
         &state.deployment_id,
         state.config.revision,
         super::deployment_state::UpdateCommit {
+            config_snapshot: None,
             artifact: super::deployment_state::canonical_recovery_artifact(
                 &candidate_facts.artifact,
             )?,
@@ -1965,10 +1968,29 @@ fn create_deployment_archive(
         &mut files,
     )?;
     archive.finish()?;
+    archive.into_inner()?.sync_all()?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 
+#[cfg(unix)]
+fn append_tree(
+    archive: &mut TarBuilder<fs::File>,
+    source: &Path,
+    archive_path: &Path,
+    files: &mut Vec<SnapshotFile>,
+) -> anyhow::Result<()> {
+    crate::filesystem::visit_directory_tree(source, &mut |relative, file| {
+        let path = archive_path.join(relative);
+        if file.metadata()?.is_dir() {
+            append_directory(archive, &path)
+        } else {
+            append_open_regular(archive, file, &path, files)
+        }
+    })
+}
+
+#[cfg(not(unix))]
 fn append_tree(
     archive: &mut TarBuilder<fs::File>,
     source: &Path,
@@ -2018,14 +2040,20 @@ fn append_regular(
     archive_path: &Path,
     files: &mut Vec<SnapshotFile>,
 ) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_SNAPSHOT_FILE_BYTES
-    {
+    let mut file = crate::filesystem::open_secure_regular_file(source, "snapshot source", false)?;
+    append_open_regular(archive, &mut file, archive_path, files)
+}
+
+fn append_open_regular(
+    archive: &mut TarBuilder<fs::File>,
+    file: &mut fs::File,
+    archive_path: &Path,
+    files: &mut Vec<SnapshotFile>,
+) -> anyhow::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
         bail!("snapshot source is not an allowed regular file");
     }
-    let mut file = fs::File::open(source)?;
     let mut header = TarHeader::new_gnu();
     header.set_metadata(&metadata);
     // EntryWriter records the size actually copied. The manifest hashes those
@@ -2128,6 +2156,11 @@ fn prepare_recovery_archive(
     }
     fs::create_dir(&partial)?;
     extract_deployment_archive(archive, &partial, expected)?;
+    #[cfg(unix)]
+    crate::filesystem::visit_directory_tree(&partial, &mut |_, file| {
+        file.sync_all().map_err(Into::into)
+    })?;
+    #[cfg(not(unix))]
     for file in expected {
         fs::OpenOptions::new()
             .read(true)
@@ -2527,6 +2560,7 @@ fn switch_recovery_path(
     match (target.exists(), staged.exists(), rollback.exists()) {
         (true, true, false) => {
             fs::rename(target, &rollback)?;
+            crate::filesystem::sync_parent(target)?;
             fs::rename(staged, target)?;
         }
         (false, true, true) => fs::rename(staged, target)?,
@@ -2536,7 +2570,7 @@ fn switch_recovery_path(
         ),
         _ => bail!("recovery {label} path state is not forward-resumable"),
     }
-    Ok(())
+    crate::filesystem::sync_parent(target)
 }
 
 fn recovery_path_switched(target: &Path, operation: Uuid, label: &str) -> anyhow::Result<bool> {

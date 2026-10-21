@@ -36,6 +36,53 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
+fn failed_public_verification_prints_report_and_exits_unsuccessfully() {
+    let sandbox = Sandbox::new();
+    let store = nazoauthctl_core::registry::RegistryStore::open(
+        sandbox.0.path().join("nazoauthctl/registry"),
+    )
+    .unwrap();
+    let host = store
+        .add_host(nazoauthctl_core::registry::HostRecord::new_local(
+            uuid::Uuid::now_v7(),
+        ))
+        .unwrap();
+    let record = nazoauthctl_core::registry::InstanceRecord::new(
+        "verify-trial",
+        "trial",
+        host.host_id,
+        "http://127.0.0.1:18000",
+    )
+    .unwrap();
+    let path = store.root().join("instances/verify-trial.json");
+    nazoauthctl_runtime::filesystem::ensure_private_directory(
+        path.parent().unwrap(),
+        "fixture instances",
+    )
+    .unwrap();
+    nazoauthctl_runtime::filesystem::atomic_write(
+        &path,
+        &serde_json::to_vec(&record).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let output = sandbox.run(&["verify", "trial"], "en_US.UTF-8");
+    assert!(!output.status.success());
+    assert!(
+        stdout(&output).contains("HTTP is not accepted"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("public verification failed"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
 fn all_command_families_have_bilingual_help_without_state_or_network() {
     let sandbox = Sandbox::new();
     for command in [

@@ -46,11 +46,16 @@ CI runs the executable against frozen v0.2.27/v0.2.28 persistence fixtures and
 asserts that reading does not alter their bytes. Those fixtures must accumulate,
 not be replaced with the newest schema when a version changes.
 
-Rollback after a migration is governed by recorded execution facts. A pending
-applied migration fences artifact rollback, and a successful migrated update
-clears the previous-artifact reference. Database recovery also clears that
-reference. Updates without migration retain the previous-artifact rollback
-path. Recovery still uses an independently verified snapshot, without trusting
+Rollback after migration is governed by the signed operation's durable result.
+A receipt proving the schema unchanged preserves the previous artifact and its
+configuration. Changed schemas, older receipts without this proof, and unknown
+outcomes retain the database recovery fence. Database recovery clears the old
+rollback generation. Configuration snapshots belong to individual operations;
+a successful update commits its previous artifact and snapshot pointer together,
+and rollback saves the current configuration before swapping the pair. Failed
+updates cannot replace the last committed rollback configuration. Legacy states
+without a paired snapshot require a verified backup rather than guessing from
+a matching schema name. Recovery still uses an independently verified snapshot, without trusting
 the currently running server.
 
 ## Database backup sentinel compatibility

@@ -159,3 +159,10 @@ can finish cleanup after the runtime or key directory has disappeared. Stored
 health retains its original observation time; loading it does not constitute a
 new health check. A confirmed privilege failure before admission is retryable
 rather than a completed host-operation result.
+
+Target operation journals admit new work while unsettled records occupy at most
+8 MiB. At that limit, resume existing operations before starting another.
+Compaction retains pending recovery facts and bounds terminal history by bytes;
+the preferred 128 terminal records never override the 16 MiB cap. Backup evidence
+has a 4 MiB read/write limit, and host-result transport reserves that size plus
+64 KiB for its envelope.

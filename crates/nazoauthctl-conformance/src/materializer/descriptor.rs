@@ -140,10 +140,17 @@ pub(super) fn validate_descriptor(
     }
     validate_name(&descriptor.source.release, "source.release")?;
     validate_digest(&descriptor.source.digest, "source.digest")?;
-    validate_single_mdoc_trust_anchor(
-        &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
-        "openid4vc_suite_mdoc_trust_anchor_pem",
-    )?;
+    if descriptor.groups.iter().any(|group| {
+        group
+            .plans
+            .iter()
+            .any(|plan| plan.plan.starts_with("oid4vci-") || plan.plan.starts_with("oid4vp-"))
+    }) {
+        validate_single_mdoc_trust_anchor(
+            &descriptor.openid4vc_suite_mdoc_trust_anchor_pem,
+            "openid4vc_suite_mdoc_trust_anchor_pem",
+        )?;
+    }
     if descriptor.groups.is_empty() {
         return Err(MaterializerError::InvalidField("groups"));
     }

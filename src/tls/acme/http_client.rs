@@ -10,13 +10,16 @@ use std::{collections::BTreeSet, future::Future, io, pin::Pin};
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use http::Request;
-use hyper_rustls::HttpsConnectorBuilder;
+use http_body_util::Limited;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::{client::legacy::Client as HyperClient, rt::TokioExecutor};
 use instant_acme::{BodyWrapper, BytesResponse, Error as AcmeError, HttpClient};
 use rustls::RootCertStore;
 use url::Url;
 
 const MAX_ALLOWED_ORIGINS: usize = 8;
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(super) struct AuthorityPolicy {
@@ -77,10 +80,7 @@ pub(super) fn build_http_client(
     .build();
     let inner: HyperClient<_, BodyWrapper<Bytes>> =
         HyperClient::builder(TokioExecutor::new()).build(connector);
-    Ok(Box::new(AuthorityBoundHttpClient {
-        policy,
-        inner: Box::new(inner),
-    }))
+    Ok(Box::new(AuthorityBoundHttpClient { policy, inner }))
 }
 
 pub(super) fn validate_https_url(value: &str, label: &str) -> anyhow::Result<Url> {
@@ -98,7 +98,7 @@ pub(super) fn validate_https_url(value: &str, label: &str) -> anyhow::Result<Url
 
 struct AuthorityBoundHttpClient {
     policy: AuthorityPolicy,
-    inner: Box<dyn HttpClient>,
+    inner: HyperClient<HttpsConnector<HttpConnector>, BodyWrapper<Bytes>>,
 }
 
 impl HttpClient for AuthorityBoundHttpClient {
@@ -113,36 +113,21 @@ impl HttpClient for AuthorityBoundHttpClient {
             let error = io::Error::new(io::ErrorKind::PermissionDenied, error.to_string());
             return Box::pin(async move { Err(AcmeError::Other(Box::new(error))) });
         }
-        self.inner.request(request)
+        let response = self.inner.request(request);
+        Box::pin(async move {
+            let response = response
+                .await
+                .map_err(|error| AcmeError::Other(Box::new(error)))?;
+            Ok(BytesResponse::from(
+                response.map(|body| Limited::new(body, MAX_RESPONSE_BYTES)),
+            ))
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
     use super::*;
-
-    struct RecordingClient {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl HttpClient for RecordingClient {
-        fn request(
-            &self,
-            _request: Request<BodyWrapper<Bytes>>,
-        ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, AcmeError>> + Send>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Err(AcmeError::Other(Box::new(io::Error::other(
-                    "recording client stop",
-                ))))
-            })
-        }
-    }
 
     #[test]
     fn authority_policy_is_canonical_and_supports_explicit_multi_origin_acme() {
@@ -192,13 +177,11 @@ mod tests {
 
     #[test]
     fn denied_request_never_reaches_the_http_transport() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let client = AuthorityBoundHttpClient {
-            policy: AuthorityPolicy::from_config(&["https://acme.example".to_owned()]).unwrap(),
-            inner: Box::new(RecordingClient {
-                calls: calls.clone(),
-            }),
-        };
+        let client = build_http_client(
+            AuthorityPolicy::from_config(&["https://acme.example".to_owned()]).unwrap(),
+            Some(RootCertStore::empty()),
+        )
+        .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -207,14 +190,29 @@ mod tests {
             .uri("https://127.0.0.1/internal")
             .body(BodyWrapper::default())
             .unwrap();
-        assert!(runtime.block_on(client.request(denied)).is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let error = runtime.block_on(client.request(denied)).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("outside the operator-declared ACME authority")
+        );
+    }
 
-        let allowed = Request::builder()
-            .uri("https://acme.example/order/1")
-            .body(BodyWrapper::default())
+    #[test]
+    fn acme_response_body_is_bounded_before_collection() {
+        use http_body_util::Full;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
             .unwrap();
-        assert!(runtime.block_on(client.request(allowed)).is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for (size, accepted) in [(MAX_RESPONSE_BYTES, true), (MAX_RESPONSE_BYTES + 1, false)] {
+            let mut response = BytesResponse::from(http::Response::new(Limited::new(
+                Full::new(Bytes::from(vec![0; size])),
+                MAX_RESPONSE_BYTES,
+            )));
+            assert_eq!(
+                runtime.block_on(response.body.into_bytes()).is_ok(),
+                accepted
+            );
+        }
     }
 }
