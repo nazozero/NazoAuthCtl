@@ -814,7 +814,7 @@ pub fn ensure_service_directory_chain(path: &Path) -> anyhow::Result<()> {
 /// symlink substitution cannot redirect creation between a path check and
 /// `mkdir`.
 #[cfg(unix)]
-fn ensure_directory_chain_at(path: &Path, new_mode: u32) -> anyhow::Result<()> {
+fn ensure_directory_chain_at(path: &Path, new_mode: rustix::fs::RawMode) -> anyhow::Result<()> {
     use rustix::fs::{Mode, OFlags, fchmod, fsync, mkdirat, openat};
 
     let start = if path.is_absolute() {
