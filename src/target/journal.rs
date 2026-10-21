@@ -810,7 +810,11 @@ mod tests {
         })?;
         let path = journal.path_for(HOST_SCOPE);
         let before = fs::read(&path)?;
-        journal.bounds.max_pending_bytes = before.len() as u64;
+        // RFC 3339 timestamps omit trailing fractional zeroes. Budget for
+        // one full-precision entry, not the first wall-clock sample's size.
+        let mut longest_pending: JournalLine = serde_json::from_slice(&before)?;
+        longest_pending.recorded_at = DateTime::from_timestamp(0, 1).expect("valid timestamp");
+        journal.bounds.max_pending_bytes = serde_json::to_vec(&longest_pending)?.len() as u64 + 1;
         let rejected =
             journal.run_journaled(&second, |_| panic!("capacity must precede execution"))?;
         assert!(
