@@ -155,7 +155,8 @@ for issuance and `--from-acme-current` for installation. The consumer must be
 able to activate `current`; no-op hooks do not bootstrap a service or adopt an
 arbitrary existing pointer. On interruption, recover the same binding before
 another apply. A failed first install without a provable prior TLS identity
-remains pending; an unreachable endpoint is not proof of rollback.
+remains pending until the prior TLS identity is verified. Endpoint reachability
+failures keep recovery pending.
 
 Run `tls certificate check` periodically with a warning window larger than
 expected renewal/recovery time, and alert on nonzero exit. Validate the actual

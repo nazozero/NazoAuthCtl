@@ -43,8 +43,7 @@ plan selection is not a new run of the entire 44-plan matrix.
 There are **41 filled HTML review entries, 35 image obligations explicitly
 marked `image_no_longer_required`, 0 unfilled placeholders and 0 local PNGs**.
 The four runs sampled only ctl and its descendants every 250 ms; no local browser
-or WebDriver process was observed. This corroborates the removal in source; a
-process sample alone is not a proof about all processes on the host.
+or WebDriver process was observed within that sampled process tree.
 
 The [sanitized evidence ledger](oidf-no-webdriver-20261011.json) records commands,
 exit codes, source identities, Suite outcomes, manifest hashes, HTML hashes,
@@ -103,8 +102,7 @@ OIDC modules and all 24 VP REVIEW modules produce filled HTML evidence without
 local WebDriver. HTML is retained as HTML; no reconstructed image is labeled a
 real screenshot. Earlier records and the 24 historical PNGs are preserved.
 
-This closes the local-browser dependency and the blanket PNG-only objection.
-It does not turn official REVIEW into PASSED or grant certification approval.
+This completes the local-browser removal. Official REVIEW results remain REVIEW.
 
 ## Remaining issues and boundaries
 
@@ -112,9 +110,9 @@ Seven official WARNING modules remain: four discovery-scope warnings and three
 mdoc batch-time privacy warnings (p029, p031, p033). Relative to the preceding
 397-module OpenID4VC run, p033 batch issuance changed from PASSED to WARNING;
 its condition is `VCIEnsureBatchTimeClaimsNotLinkable`, like the existing p029
-and p031 warnings. The extra observation is retained rather than hidden. This
-revision does not change server timestamp issuance or claim the privacy issue
-is resolved. All other corresponding OpenID4VC official outcomes are unchanged.
+and p031 warnings. Server timestamp issuance is unchanged, and the privacy
+issue remains open in this revision. All other corresponding OpenID4VC official
+outcomes are unchanged.
 
 `local_success=true`, while `suite_pass=false` and `acceptance_pass=false` retain
 their existing meaning. No performance claim is made. The installed signed ctl,

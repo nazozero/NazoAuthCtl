@@ -95,16 +95,17 @@ need the relevant repeated-request, conflict, interruption, recovery, migration
 fence and resource-isolation cases.
 
 [CI](../.github/workflows/ci.yml) defines Linux, Windows and both macOS
-architecture jobs, plus platform-specific installer checks. Evidence from one
-platform does not establish another platform's filesystem, process or runtime
-behavior. Use isolated fixtures and test credentials; a development task does
+architecture jobs, plus platform-specific installer checks. Each platform job
+validates its own filesystem, process and runtime behavior.
+Use isolated fixtures and test credentials; a development task does
 not authorize operations against registered real deployments.
 
 The [signed-server gate](../.github/workflows/server-compatibility.yml) fixes a
 controller commit and resolves the selected server release once. It verifies
 host/OCI attestations and invokes production `VerifiedRelease::verify`; the
 ignored external test requires the workflow's explicit artifact inputs.
-Ordinary workspace tests do not prove this gate or real SSH/backup recovery.
+Validate real SSH transport and backup recovery with their dedicated integration
+fixtures and deployments.
 
 For documentation-only changes, validate references, command names and changed
 claims against their owners. Do not build the workspace or invoke deployment
@@ -156,8 +157,8 @@ approval is needed.
 Uninstall persists its exact operation beside the deployment key directory
 until remote removal and local cleanup both complete. Retrying that operation
 can finish cleanup after the runtime or key directory has disappeared. Stored
-health retains its original observation time; loading it does not constitute a
-new health check. A confirmed privilege failure before admission is retryable
+health retains its original observation time. Run a health check to obtain a
+fresh observation. A confirmed privilege failure before admission is retryable
 rather than a completed host-operation result.
 
 Target operation journals admit new work while unsettled records occupy at most

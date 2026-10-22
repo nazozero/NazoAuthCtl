@@ -53,7 +53,7 @@ locale, otherwise English, using the first nonempty `LC_ALL`, `LC_MESSAGES`, or
 codes. For example, `LANG=zh_CN.UTF-8 nazoauthctl status --all` selects Chinese
 unless an `LC_*` override takes precedence. Text failures include the underlying
 reason; JSON field names and codes do not change with locale.
-See [v0.3.0 release notes](docs/release-notes-0.3.0.md) and the
+See the [changelog](CHANGELOG.md), [v0.3.0 release notes](docs/release-notes-0.3.0.md) and the
 [CLI presentation guide](docs/cli-presentation.md).
 
 Read-only inspection works before controller binding. Mutations use signed

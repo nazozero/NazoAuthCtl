@@ -184,7 +184,7 @@ reloads it and verifies the previous public identity. A failed restoration keeps
 the pending journal for `tls certificate recover`; a crash does not release the
 binding. For a first native generation with no previous configuration, rollback
 requires the dedicated public port to refuse connections after the stop hook;
-a timeout does not prove successful removal. Keep the previous generation and its service dependencies until that
+a timeout keeps recovery pending. Keep the previous generation and its service dependencies until that
 recovery completes. Switching an existing externally managed proxy to this
 layout requires explicit service wiring; ctl does not rewrite a shared proxy
 configuration or infer its ownership.
@@ -286,10 +286,9 @@ after those checks succeed.
 An interrupted first installation has no previous receipt to prove. In that case,
 rollback removes the activation link and reloads, but it is considered complete
 only if every bounded public address successfully serves an accepted, trust-valid
-TLS endpoint whose leaf is not the candidate. An unavailable endpoint is not proof
-of absence: ctl retains the pending journal and inactive candidate for a later
-`tls certificate recover` attempt or explicit operator review instead of claiming
-that rollback succeeded.
+TLS endpoint whose leaf is not the candidate. If an endpoint is unavailable,
+ctl retains the pending journal and inactive candidate for a later
+`tls certificate recover` attempt or explicit operator review.
 
 `tls certificate show` prints the authoritative current receipt. Completed
 transaction journals and revision receipts remain under the deployment state
@@ -316,8 +315,8 @@ binary. Ctl does not infer routes or runtime tenant/SNI selection.
 
 Compatibility uses the existing target-helper handshake, deployment config schema,
 explicit provider protocol, native validation and actual endpoint verification.
-The helper handshake does not attest a server transport capability. There is no
-additional TLS capability endpoint or NazoAuth version table. A server that cannot
+The helper handshake verifies the remote execution contract; native validation
+and endpoint checks verify the selected transport configuration. A server that cannot
 load the selected configuration fails readiness and follows ordinary recovery.
 No HTTP fallback is implemented or permitted here.
 

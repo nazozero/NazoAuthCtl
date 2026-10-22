@@ -16,4 +16,4 @@ version numbers do not replace compatibility verification.
 
 See [security verification and remaining boundaries](security-cloud-20261011.md),
 [compatibility](compatibility.md), and [OIDF evidence](oidf-no-webdriver-20261011.md).
-Prior Suite results are historical evidence, not new certification approval.
+The linked Suite records identify their tested revisions and original outcomes.

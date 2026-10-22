@@ -53,8 +53,8 @@ directly; group selection, exclusions and bounded execution remain supported.
 
 Evidence schema 5 records the controller version, Matrix and driver digests,
 the combined input identity, and the reference Suite release, source revision
-and image digest. The reference is release-v5.3.3; it describes the version
-against which these inputs are checked, not an attestation of a remote server.
+and image digest. The reference is release-v5.3.3, the version against which
+these inputs are checked.
 The actual configured Suite origin and its reported module outcomes are recorded
 separately. Official, self-hosted and third-party Suite origins use the same path.
 

@@ -133,18 +133,16 @@ The certificate transaction refuses a pending issuance, a stale declaration
 revision, provider/trust digest drift, receipt or private-artifact tampering, or
 any mismatch between the receipt and its independent offline PKI validation.
 The issuance receipt identity is then carried through the installation plan,
-journal, public-verification receipt, and recovery checks. Issuance itself does
-not claim that any live endpoint changed certificates.
+journal, public-verification receipt, and recovery checks. The certificate
+transaction activates issued material and verifies the live endpoint.
 
 ## Verification boundary
 
-The ACME server performs the authoritative public HTTP-01 fetch. This phase does
-not claim a local loopback request proves public reachability. It also does not
-configure Direct TLS, Nginx/Angie, trusted proxy headers, or NazoAuth transport
-capabilities. Install and activate issued material through the existing
-[certificate transaction](tls-certificate-provider.md) and
-[deployment lifecycle](tls-deployment.md); issuance does not configure the
-consumer or prove that a live endpoint uses the new certificate.
+The ACME server verifies public reachability through its HTTP-01 fetch.
+Configure Direct TLS, Nginx/Angie and trusted proxy headers through the
+[deployment lifecycle](tls-deployment.md). Install and activate issued material
+through the [certificate transaction](tls-certificate-provider.md), which
+verifies that the live endpoint uses the new certificate.
 
 The deployment reuses one account per CA directory across hostname, webroot,
 polling and contact changes. Contact changes update that account. The current

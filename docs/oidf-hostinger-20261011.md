@@ -47,8 +47,8 @@ nazoauthctl-selected --instance production oidf run openid4vc --json --jobs 4 --
 All positive commands exited 0. The regular suite has 269 passing tests and one
 fixture-dependent ignored test; that test passed separately against the actual
 host library executable. Pre-fix behavior failed the offer-phase, VP and HAIP
-regressions. Earlier wrong-target/zero-test fixture attempts are INVALID and are
-not counted as negative behavioral proof or positive acceptance.
+regressions. Earlier wrong-target/zero-test fixture attempts are recorded
+separately as INVALID.
 
 The final official rerun settled all 397 modules across 17 plans in 671.742 s:
 **364 PASS, 24 REVIEW, 6 WARNING, 3 expected SKIPPED, 0 FAIL, 0 incomplete**.
@@ -85,9 +85,8 @@ The 12 scope warnings are acceptable: the omitted application/credential scopes
 are actually granted by successful token responses, and RFC 8414 permits their
 omission from discovery.
 
-The first run's 17 OIDC REVIEW entries contain page source, not screenshots;
-the initial evidence manifest contains no screenshot records. Placeholder-filled
-messages must not be treated as proof of rendered image evidence. Six second-login,
+The first run's 17 OIDC REVIEW entries contain page source;
+the initial evidence manifest contains no screenshot records. Six second-login,
 three redirect-rejection and eight logout obligations require fresh targeted
 browser captures; the old tenant has been cleaned. Do not render retained HTML
 and present it as an original screenshot. For invalid logout inputs, capture the
@@ -95,10 +94,9 @@ local confirmation and final result plus no-RP-redirect evidence: the specificat
 allows local confirmation instead of requiring a particular error-page message.
 
 Both mdoc warnings involve ten credentials sharing the same certificate's exact
-notBefore time. This explains the precision without a per-request timestamp,
-but does not establish a sufficient independent-holder cohort or a privacy-rule
-exception. They remain open. Do not weaken validity checks or simply wait for the
-Suite freshness heuristic to disappear.
+notBefore time. This explains the observed precision. Independent-holder cohort
+validation remains outstanding, and both privacy warnings remain open.
+Retain validity checks and evaluate the warnings against the privacy requirements.
 
 [Complete review and 55-module evidence ledger](https://github.com/nazozero/NazoAuth/blob/b399fb67f97a27ba5f30576f11d2dd9c9e0d5927/docs/operations/reports/oidf-review-2026-10-11.md)
 records source identities, hashes, standards and closure criteria. The review

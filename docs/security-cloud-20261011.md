@@ -1,6 +1,6 @@
 # Security Cloud verification — 2026-10-11
 
-Source baseline: `e2525b4bd7b6a9fbaca4cade6798be264c924562`. The source revision is the commit containing this report; later evidence-only commits do not change these results. This is code and regression verification, not a deployment or a fresh official OIDF certification run.
+Source baseline: `e2525b4bd7b6a9fbaca4cade6798be264c924562`. Verification covers code changes and regression tests at the commit containing this report.
 
 ## Results
 
@@ -50,7 +50,7 @@ The repairs preserve the existing host/controller boundary: credentials leave ar
 
 The pre-repair regression run compiled and exited 101: argv token acceptance, lost libpq connection policy, curl config injection and stderr disclosure assertions failed. The same four tests passed after repair (exit 0). Additional real subprocess fixtures verified secret-free OCI argv with environment delivery and structured nonzero operator receipts. The installer regression used a fake attestation executor and an isolated install root: baseline staging followed attacker `TMPDIR`; repaired staging stayed below the protected install parent. It did not install or upgrade a system binary.
 
-Full suites also cover descriptor traversal refusing symlinks and hard links, client-bound CIBA callbacks, materialized VP-only mdoc country and critical EKU, unowned/running container replacement rejection, matching install ownership/mounts/environment, default forwarded-certificate trust disabled, and persistent port conflict rejection. Process argument hardening does not claim secrecy from host root or the container engine. Native Windows execution was not performed; the shared curl argument rule is tested on Linux.
+Full suites also cover descriptor traversal refusing symlinks and hard links, client-bound CIBA callbacks, materialized VP-only mdoc country and critical EKU, unowned/running container replacement rejection, matching install ownership/mounts/environment, default forwarded-certificate trust disabled, and persistent port conflict rejection. Host root and the container engine remain trusted administrators with access to process secrets. The shared curl argument rule was tested on Linux; native Windows execution remained untested in this report.
 
 ## Findings that must not be blindly restored
 
@@ -58,4 +58,6 @@ Full suites also cover descriptor traversal refusing symlinks and hard links, cl
 
 ## Delivery boundary
 
-No merge, deployment, production database mutation or local WebDriver was performed. Existing OIDF and mdoc privacy conclusions remain scoped to their historical reports. Security Cloud closure references this source commit and the tests above, not CI color alone.
+Delivery consisted of source changes and the regression checks above. OIDF and
+mdoc privacy results are recorded in their dated reports. Security Cloud closure
+references this source commit and the tests above.

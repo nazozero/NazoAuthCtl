@@ -4,9 +4,8 @@ The four workspace manifests declare the current supported stable dependency
 lines. `Cargo.lock` fixes the resolved graph and registry checksums;
 `nazo-operator-protocol` and the Ed25519-only `nazo-crypto` primitive backend
 share one immutable Git revision. Their published wire and persistence contracts
-must be reviewed before advancing it. Raising a
-manifest's version floor does not mean the locked executable previously used
-that older version.
+must be reviewed before advancing it. The manifest sets version requirements;
+Cargo.lock records the resolved versions used to build the executable.
 
 The workspace pins a `serde_json` fork in `[patch.crates-io]` for immutable chunk
 input. Admin responses retain HTTP frames; strings contained in one frame borrow
@@ -113,5 +112,5 @@ The [four-platform CI](../.github/workflows/ci.yml) runs formatting, workspace
 tests, Clippy, release builds and help smoke checks; Linux and macOS also check
 published persistence fixtures. The
 [signed-server workflow](../.github/workflows/server-compatibility.yml) separately
-checks the production signed-release path. New dependency commits need their own
-results: a previous commit's successful run is not evidence for an upgraded graph.
+checks the production signed-release path. Run these checks on each dependency
+update commit to validate its resolved graph.
