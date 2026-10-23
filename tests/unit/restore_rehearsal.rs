@@ -19,7 +19,7 @@ fn interrupted_rehearsal_reuses_its_snapshot_and_isolated_resources() -> anyhow:
         let result = restore_test(&root.join("scope"), &state, &operation);
         assert!(
             std::env::var("REHEARSAL_TEST_PHASE")? == "resume",
-            "first process must be killed at migration"
+            "first process must be killed at migration, got {result:?}"
         );
         let error = result.unwrap_err();
         assert!(
@@ -32,7 +32,8 @@ fn interrupted_rehearsal_reuses_its_snapshot_and_isolated_resources() -> anyhow:
     let root = temp.path();
     let mut state: DeploymentState =
         serde_json::from_slice(include_bytes!("../fixtures/persistence/v0.2.28/state.json"))?;
-    state.runtime.kind = RuntimeBackendKind::Docker;
+    // Podman preserves caller ownership for unprivileged CI runners.
+    state.runtime.kind = RuntimeBackendKind::Podman;
     let operation = Uuid::now_v7();
     let database = format!("nazo_restore_{}", operation.simple());
     write(&root.join("state.json"), serde_json::to_vec(&state)?)?;
@@ -133,7 +134,7 @@ elif name=='psql':
     sys.stdin.read(); print('fixture-fact')
 elif name=='valkey-cli':
     assert os.environ['REDISCLI_AUTH']=='p@ss:/%?+'
-elif name=='docker':
+elif name=='podman':
     if args[0]=='container':
         print('Error: No such container', file=sys.stderr); sys.exit(1)
     assert args[0]=='run' and args[-1]=='migrate', args
@@ -143,7 +144,7 @@ elif name=='docker':
 elif name!='pg_restore': raise AssertionError(name)
 "#;
     for name in [
-        "docker",
+        "podman",
         "createdb",
         "dropdb",
         "pg_restore",
@@ -220,7 +221,7 @@ elif name!='pg_restore': raise AssertionError(name)
         ["createdb", "dropdb", "createdb", "dropdb"]
     );
     assert!(db_calls.iter().all(|args| args.last() == Some(&database)));
-    assert!(calls.iter().any(|args| args[0] == "docker"
+    assert!(calls.iter().any(|args| args[0] == "podman"
         && args.get(1).is_some_and(|arg| arg == "container")
         && args.contains(&candidate_name(&state.deployment_id, operation))));
     Ok(())
