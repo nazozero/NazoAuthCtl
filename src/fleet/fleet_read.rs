@@ -183,33 +183,13 @@ pub(crate) fn status_job(
     ))
 }
 
-/// Doctor adds observational diagnostics on top of the status document. No
-/// gate, no mutation: diagnostics only describe.
+/// Doctor renders the live health and diagnostics carried by status.
 pub(crate) fn doctor_job(
     record: &InstanceRecord,
     host: &HostRecord,
     target: &dyn ExecutionTarget,
 ) -> anyhow::Result<Value> {
-    let mut document = status_job(record, host, target)?;
-    let mut diagnostics: Vec<String> = Vec::new();
-
-    match record.last_observation.as_ref() {
-        None => diagnostics.push("observation cache: never observed".to_owned()),
-        Some(observation) if !observation.reachable => {
-            diagnostics.push("observation cache: last contact FAILED".to_owned());
-        }
-        Some(_) => diagnostics.push("observation cache: fresh contact recorded".to_owned()),
-    }
-
-    diagnostics.push(
-        "backup/public checks are independent observations; they never gate install/update"
-            .to_owned(),
-    );
-
-    if let Some(object) = document.as_object_mut() {
-        object.insert("diagnostics".to_owned(), json!(diagnostics));
-    }
-    Ok(document)
+    status_job(record, host, target)
 }
 
 /// Project one inspection into the stable status document shape.
@@ -233,6 +213,7 @@ pub(crate) fn status_document(
         "artifact": {"current": inspection.artifact.current, "previous": inspection.artifact.previous},
         "health": {"state": if inspection.healthy { "ok" } else { "down" }, "summary": inspection.health_summary},
         "backup": inspection.backup,
+        "diagnostics": inspection.diagnostics,
         "controller": controller_fact_line(record),
     })
 }
@@ -473,7 +454,7 @@ pub(crate) fn run_status_like(
     }
 }
 
-fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Value, _doctor: bool) {
+fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Value, doctor: bool) {
     let title = crate::ui::message!("Diagnostics for '{}'", "实例“{}”诊断", record.alias);
     println!(
         "\n{}",
@@ -517,6 +498,19 @@ fn print_single_status(record: &InstanceRecord, host_alias: &str, payload: &Valu
             ]
         )
     );
+    if doctor {
+        println!(
+            "{}: {} — {}",
+            crate::ui::text("Health", "健康状态"),
+            value_str(payload.pointer("/health/state")),
+            value_str(payload.pointer("/health/summary"))
+        );
+        if let Some(diagnostics) = payload.get("diagnostics").and_then(Value::as_array) {
+            for diagnostic in diagnostics {
+                println!("{}", value_str(Some(diagnostic)));
+            }
+        }
+    }
     crate::ui::human!(
         "Public access and backup recovery are verified separately: verify / backup restore-test.",
         "公网访问和备份恢复需分别验证：verify / backup restore-test。"

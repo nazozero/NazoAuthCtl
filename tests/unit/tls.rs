@@ -393,6 +393,18 @@ fn certificate_source_binding_is_persistently_verifiable() {
         1_800_000_000,
         1_900_000_000,
     ));
+    assert!(valid_certificate_source_binding(
+        &binding,
+        8,
+        1_800_000_000,
+        1_900_000_000
+    ));
+    assert!(!valid_certificate_source_binding(
+        &binding,
+        6,
+        1_800_000_000,
+        1_900_000_000
+    ));
 
     let mut changed = source;
     changed.material_sha256 = "f".repeat(64);

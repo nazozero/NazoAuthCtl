@@ -129,12 +129,15 @@ nazoauthctl tls certificate apply \
   --tenant tenant-a --hostname auth.example --from-acme-current
 ```
 
-The certificate transaction refuses a pending issuance, a stale declaration
-revision, provider/trust digest drift, receipt or private-artifact tampering, or
+The certificate transaction refuses a pending issuance, provider/trust digest
+drift, receipt or private-artifact tampering, or
 any mismatch between the receipt and its independent offline PKI validation.
 The issuance receipt identity is then carried through the installation plan,
 journal, public-verification receipt, and recovery checks. The certificate
 transaction activates issued material and verifies the live endpoint.
+An unrelated deployment configuration update does not invalidate issued material:
+the provider and trust digests, tenant, hostname and issuance identity remain the
+authority. The recorded deployment revision describes when issuance occurred.
 
 ## Verification boundary
 

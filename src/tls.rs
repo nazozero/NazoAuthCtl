@@ -2083,7 +2083,7 @@ fn validate_transaction_binding(
     };
     if transaction.schema != TRANSACTION_SCHEMA
         || transaction.deployment_id != record.deployment_id
-        || transaction.declaration_revision != record.declaration_revision
+        || transaction.declaration_revision > record.declaration_revision
         || transaction.tenant != tenant
         || transaction.hostname != hostname
         || transaction.provider.protocol != PROVIDER_PROTOCOL
@@ -2169,7 +2169,7 @@ fn valid_certificate_source_binding(
                 && valid_sha256(certificate_sha256)
                 && valid_sha256(private_key_sha256)
                 && acme_protocol == acme::CONFIG_PROTOCOL
-                && *issuance_declaration_revision == declaration_revision
+                && *issuance_declaration_revision <= declaration_revision
                 && *issuance_revision > 0
                 && *issued_at <= consumed_at
                 && *issued_at < certificate_not_after

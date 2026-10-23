@@ -55,6 +55,47 @@ const PENDING_BIND_RECOVERY_SCHEMA: u32 = 1;
 const PENDING_BIND_RECOVERY_FILE: &str = "bind-recovery-pending.json";
 const MAX_PENDING_BIND_RECOVERY_BYTES: u64 = 4 * 1024;
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingAdd {
+    deployment_id: String,
+    kid: String,
+    label: String,
+}
+
+fn pending_add_path(
+    keys: &ControllerKeyStore,
+    deployment: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(keys.instance_dir(deployment)?.join("add-pending.json"))
+}
+
+fn load_pending_add(
+    keys: &ControllerKeyStore,
+    deployment: &str,
+) -> anyhow::Result<Option<PendingAdd>> {
+    let path = pending_add_path(keys, deployment)?;
+    let bytes =
+        match filesystem::read_secure_regular_file(&path, "pending controller add", true, 4096) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+    let pending: PendingAdd = serde_json::from_slice(&bytes)?;
+    if pending.deployment_id != deployment {
+        bail!("pending controller add belongs to another deployment");
+    }
+    validate_label(&pending.label)?;
+    keys.public_key(deployment, &pending.kid)?;
+    Ok(Some(pending))
+}
+
 /// The only temporarily persisted Recovery Secret: the one already delivered
 /// for a first-bind proposal whose server commit has not yet completed. It is
 /// scoped to the controller-key directory, never copied into Registry or the
@@ -679,7 +720,33 @@ pub fn add_flow<A: ControllerRegistryApi>(
     validate_label(label)?;
     require_bound(&record)?;
     let deployment = record.deployment_id.as_str();
+    let instance_dir = keys.instance_dir(deployment)?;
+    filesystem::ensure_private_directory(&instance_dir, "controller key directory")?;
+    let _add_lock = FileLock::acquire(&instance_dir.join("add.lock"))?;
     let snapshot = api.list_slots(deployment)?;
+
+    let pending = load_pending_add(keys, deployment)?;
+    if let Some(pending) = &pending {
+        if let Some(slot) = snapshot.items.iter().find(|slot| slot.kid == pending.kid) {
+            verify_committed_slot(slot, deployment, &pending.kid, "add")?;
+            let report = finish_activation(
+                registry,
+                keys,
+                &record.alias,
+                deployment,
+                &pending.kid,
+                slot.clone(),
+            )?;
+            filesystem::remove_file_durable(&pending_add_path(keys, deployment)?)?;
+            return Ok(report);
+        }
+        if pending.label != label {
+            bail!(
+                "resume the pending controller add with its original label '{}'",
+                pending.label
+            );
+        }
+    }
 
     if let Some(report) = reconcile_from_snapshot(registry, keys, &record, &snapshot)? {
         return Ok(crate::ui::message!(
@@ -713,11 +780,18 @@ pub fn add_flow<A: ControllerRegistryApi>(
         bail!("{message}");
     }
 
-    let ControllerKeySummary {
-        kid, public_key, ..
-    } = match select_pending_candidate(keys, deployment, &snapshot)? {
-        Some(pending) => pending,
-        None => keys.generate_candidate(deployment)?,
+    let (kid, public_key) = match pending {
+        Some(pending) => {
+            let public_key = keys.public_key(deployment, &pending.kid)?;
+            (pending.kid, public_key)
+        }
+        None => {
+            let candidate = match select_pending_candidate(keys, deployment, &snapshot)? {
+                Some(pending) => pending,
+                None => keys.generate_candidate(deployment)?,
+            };
+            (candidate.kid, candidate.public_key)
+        }
     };
 
     let presentation = ProposalPresentation {
@@ -733,6 +807,15 @@ pub fn add_flow<A: ControllerRegistryApi>(
     };
     let token = approval(&presentation)?;
 
+    filesystem::atomic_write(
+        &pending_add_path(keys, deployment)?,
+        &serde_json::to_vec(&PendingAdd {
+            deployment_id: deployment.to_owned(),
+            kid: kid.clone(),
+            label: label.to_owned(),
+        })?,
+        0o600,
+    )?;
     let slot = api.commit_slot(&SlotCommitBody {
         approval_token: token,
         action: "add",
@@ -748,6 +831,7 @@ pub fn add_flow<A: ControllerRegistryApi>(
     // This ctl adopts its NEW slot as the identity it signs with; the
     // previous key stays enrolled until its own expiry or explicit revocation.
     let report = finish_activation(registry, keys, &record.alias, deployment, &kid, slot)?;
+    filesystem::remove_file_durable(&pending_add_path(keys, deployment)?)?;
     Ok(crate::ui::message!(
         "{report}note: the previous controller key remains enrolled and valid until its own \
          expiry or explicit revocation\n",
@@ -2038,6 +2122,58 @@ mod tests {
                 .iter()
                 .any(|s| s.kid == original.kid())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn add_recovers_lost_commit_response_even_when_all_slots_are_full() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let original = f.keys.get_or_create_active("deploy-alpha")?;
+        f.mark_bound(CONTROLLER_A)?;
+        let api = FakeApi::default();
+        api.push_snapshot(vec![slot_view(
+            CONTROLLER_A,
+            original.kid(),
+            SlotStatus::Active,
+            20,
+        )]);
+        api.fail_next_commit(AdminApiError::OutcomeUnknown { status: 502 });
+        assert!(
+            add_flow(
+                &api,
+                &f.registry,
+                &f.keys,
+                f.record(),
+                "backup",
+                fixed_approval("add-token-000001")
+            )
+            .is_err()
+        );
+        let pending = load_pending_add(&f.keys, "deploy-alpha")?.unwrap();
+        let attempts = api.commit_attempts.borrow().len();
+        api.push_snapshot(vec![
+            slot_view(CONTROLLER_A, original.kid(), SlotStatus::Active, 20),
+            slot_view(CONTROLLER_B, &pending.kid, SlotStatus::Active, 20),
+            slot_view("other", KID_A, SlotStatus::Active, 20),
+        ]);
+        add_flow(&api, &f.registry, &f.keys, f.record(), "backup", |_| {
+            panic!("already committed")
+        })?;
+        assert_eq!(api.commit_attempts.borrow().len(), attempts);
+        assert_eq!(
+            f.keys.load_active("deploy-alpha")?.unwrap().kid(),
+            pending.kid
+        );
+        assert_eq!(
+            f.registry
+                .instance_by_deployment("deploy-alpha")?
+                .unwrap()
+                .controller_id
+                .as_deref(),
+            Some(CONTROLLER_B)
+        );
+        assert_eq!(f.keys.list_keys("deploy-alpha")?.len(), 2);
+        assert!(load_pending_add(&f.keys, "deploy-alpha")?.is_none());
         Ok(())
     }
 

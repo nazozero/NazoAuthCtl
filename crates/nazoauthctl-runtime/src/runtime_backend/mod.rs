@@ -423,12 +423,6 @@ pub trait RuntimeBackend {
     ) -> anyhow::Result<()>;
     fn run_one_shot(&self, task: &OneShotTask) -> anyhow::Result<String>;
     fn pull_image(&self, image_reference: &str) -> anyhow::Result<()>;
-    /// Whether the local image store already holds an image whose repository
-    /// digests contain exactly the digest embedded in `image_reference`.
-    /// Digest-pinned installs fall back to this when the registry is
-    /// unreachable: a locally cached exact-digest image is equally
-    /// trustworthy because the signed Release manifest anchors that digest.
-    fn local_image_matches_digest(&self, image_reference: &str) -> bool;
     fn export_image(&self, image_reference: &str, archive: &std::path::Path) -> anyhow::Result<()>;
     fn import_image(&self, archive: &std::path::Path) -> anyhow::Result<()>;
     fn install_host_service(&self, install: &HostServiceInstall) -> anyhow::Result<()>;

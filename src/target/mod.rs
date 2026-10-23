@@ -496,7 +496,8 @@ fn dispatch_validated_host_operation(
             let answered = (|| -> Result<HostResult, Failure> {
                 let state = store.load_existing(deployment_id)?;
                 let scope_dir = store.scope_dir(deployment_id)?;
-                let receipt = backup_exec::restore_test(&scope_dir, &state)?;
+                let receipt =
+                    backup_exec::restore_test(&scope_dir, &state, &operation.operation_id)?;
                 Ok(HostResult::completed(
                     &operation.operation_id,
                     HostCompletionBody::BackupRestoreTested { receipt },
@@ -1370,6 +1371,30 @@ fn answer_rollback(
         .as_deref()
         .expect("validated deployment binding");
     let state = store.load_existing(deployment_id)?;
+    // The state commit can precede the journal's terminal append. Resolve
+    // that accepted operation before interpreting the swapped rollback pair.
+    if state
+        .active_host_operation
+        .as_ref()
+        .is_some_and(|active| active.operation_id == operation.operation_id)
+    {
+        return Ok(HostResult::completed(
+            &operation.operation_id,
+            HostCompletionBody::StateMutateApplied {
+                revision: state.config.revision,
+                control_result: None,
+            },
+        ));
+    }
+    if state.config.revision != expected_revision {
+        return Err(Failure::new(
+            CONFIG_REVISION_MISMATCH,
+            format!(
+                "expected config revision {expected_revision} but target holds revision {}",
+                state.config.revision
+            ),
+        ));
+    }
     if state.applied_migration.is_some() {
         return Err(Failure::new(
             deployment_state::ROLLBACK_RECOVERY_REQUIRED,
@@ -2327,6 +2352,110 @@ mod tests {
     #[derive(Default)]
     struct CrashAfterUninstallStateRemoval {
         calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct CrashAfterRollbackCommit {
+        calls: std::sync::atomic::AtomicUsize,
+        running_artifact: std::sync::Mutex<Option<String>>,
+    }
+
+    impl update_exec::LifecycleExecutor for CrashAfterRollbackCommit {
+        fn execute_update(
+            &self,
+            _: &update_exec::UpdateJob<'_>,
+        ) -> Result<update_exec::UpdateExecution, Failure> {
+            panic!("rollback must not execute an update")
+        }
+
+        fn execute_rollback(
+            &self,
+            job: &update_exec::RollbackJob<'_>,
+        ) -> Result<update_exec::LifecycleFacts, Failure> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.running_artifact.lock().unwrap() = job.previous_artifact.map(str::to_owned);
+            job.store.apply_rollback_healthy(
+                job.deployment_id,
+                job.expected_revision,
+                Some((
+                    job.config_reference.to_owned(),
+                    job.config_schema.to_owned(),
+                )),
+                job.operation_id,
+            )?;
+            panic!("simulated process loss after rollback state commit")
+        }
+    }
+
+    #[test]
+    fn interrupted_rollback_returns_committed_state_without_swapping_runtime_again()
+    -> anyhow::Result<()> {
+        let (_temp, _, journal) = temp_target()?;
+        let store = TargetStateStore::open(journal.root())?;
+        let previous = format!("sha256:{}", "a".repeat(64));
+        let current = format!("sha256:{}", "b".repeat(64));
+        store.bootstrap(
+            "deploy-rollback",
+            BootstrapParams {
+                issuer: "https://auth.example.com".to_owned(),
+                runtime: RuntimeSurface::new("podman", "nazoauth-main", 8000)?,
+                artifact: ArtifactRefs {
+                    current: Some(current.clone()),
+                    previous: Some(previous.clone()),
+                },
+                config_reference: "/etc/nazoauth/config.yaml".to_owned(),
+                config_schema: "nazoauth-config-v1".to_owned(),
+                resources: vec![],
+                current_release: None,
+            },
+            &Uuid::now_v7().to_string(),
+        )?;
+        let crash = Arc::new(CrashAfterRollbackCommit::default());
+        let target =
+            LocalTarget::with_state_root(journal.root()).with_lifecycle_executor(crash.clone());
+        let operation = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-rollback",
+            Some(1),
+            StateMutationPayload::Rollback {},
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = target.execute_journaled_validated(&operation, &journal);
+            }))
+            .is_err()
+        );
+        for _ in 0..2 {
+            let result = target.execute_journaled_validated(&operation, &journal)?;
+            assert!(matches!(
+                result.outcome,
+                HostOutcome::Completed {
+                    body: HostCompletionBody::StateMutateApplied { revision: 2, .. },
+                    ..
+                }
+            ));
+        }
+        let state = store.load_existing("deploy-rollback")?;
+        assert_eq!(state.artifact.current.as_deref(), Some(previous.as_str()));
+        assert_eq!(state.artifact.previous.as_deref(), Some(current.as_str()));
+        assert_eq!(
+            crash.running_artifact.lock().unwrap().as_deref(),
+            Some(previous.as_str())
+        );
+        assert_eq!(crash.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let stale = HostOperation::state_mutate(
+            Uuid::now_v7().to_string(),
+            "deploy-rollback",
+            Some(1),
+            StateMutationPayload::Rollback {},
+        );
+        let result = target.execute_journaled_validated(&stale, &journal)?;
+        assert!(
+            matches!(result.outcome, HostOutcome::Failed { code, .. } if code == CONFIG_REVISION_MISMATCH)
+        );
+        assert_eq!(crash.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        Ok(())
     }
 
     impl uninstall_exec::DeletionExecutor for CrashAfterUninstallStateRemoval {

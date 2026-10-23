@@ -127,6 +127,12 @@ A snapshot records the database dump, data, secrets, configuration, and
 artifact identity. A restore test executes against an isolated target.
 Off-host copies provide a separate recovery location.
 
+Snapshot creation and restore rehearsal currently require Docker or Podman.
+Host/systemd deployments are rejected before backup execution; policies requiring
+a restore-tested backup cannot be satisfied by that backend. Restore rehearsal
+binds its snapshot and temporary resources to the accepted operation ID, including
+after interruption, and uses an isolated database and Valkey epoch.
+
 Interrupted operations retain their identity. The operation journal replays
 the original signed request, including after controller-key retirement; it
 does not sign the same operation with a replacement key. A request the server
