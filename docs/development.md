@@ -161,6 +161,12 @@ health retains its original observation time. Run a health check to obtain a
 fresh observation. A confirmed privilege failure before admission is retryable
 rather than a completed host-operation result.
 
+Journal replay moves the final decoded receipt out of its owned record after
+checking every matching operation hash. It does not clone historical receipts
+or execute an already completed operation. Windows variable-length native
+structures use aligned word storage; SID buffers use DWORD storage, and API
+lengths remain byte counts.
+
 Target operation journals admit new work while unsettled records occupy at most
 8 MiB. At that limit, resume existing operations before starting another.
 Compaction retains pending recovery facts and bounds terminal history by bytes;

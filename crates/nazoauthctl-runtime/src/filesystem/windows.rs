@@ -81,7 +81,20 @@ fn check_code(code: u32, context: &str) -> anyhow::Result<()> {
     }
 }
 
-fn current_user_sid() -> anyhow::Result<Vec<u8>> {
+// Win32 variable-length structures still require their header's alignment.
+// A byte vector does not express that requirement to the Rust allocator.
+fn aligned_buffer(byte_len: usize) -> Vec<usize> {
+    vec![0; byte_len.div_ceil(size_of::<usize>())]
+}
+
+const _: () = {
+    assert!(align_of::<usize>() >= align_of::<TOKEN_USER>());
+    assert!(align_of::<usize>() >= align_of::<FILE_RENAME_INFO>());
+    assert!(align_of::<usize>() >= align_of::<ACL>());
+    assert!(align_of::<usize>() >= align_of::<SECURITY_DESCRIPTOR>());
+};
+
+fn current_user_sid() -> anyhow::Result<Vec<u32>> {
     let mut token: HANDLE = null_mut();
     check_bool(
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
@@ -96,7 +109,7 @@ fn current_user_sid() -> anyhow::Result<Vec<u8>> {
         {
             return Err(win_error("GetTokenInformation(TokenUser size)"));
         }
-        let mut buffer = vec![0u8; needed as usize];
+        let mut buffer = aligned_buffer(needed as usize);
         check_bool(
             unsafe {
                 GetTokenInformation(
@@ -114,9 +127,9 @@ fn current_user_sid() -> anyhow::Result<Vec<u8>> {
         if sid_len == 0 || unsafe { windows_sys::Win32::Security::IsValidSid(user.User.Sid) } == 0 {
             bail!("current TokenUser SID is invalid");
         }
-        let mut sid = vec![0u8; sid_len];
+        let mut sid = vec![0u32; sid_len.div_ceil(size_of::<u32>())];
         unsafe {
-            ptr::copy_nonoverlapping(user.User.Sid.cast::<u8>(), sid.as_mut_ptr(), sid_len);
+            ptr::copy_nonoverlapping(user.User.Sid.cast::<u8>(), sid.as_mut_ptr().cast(), sid_len);
         }
         Ok(sid)
     })();
@@ -126,7 +139,7 @@ fn current_user_sid() -> anyhow::Result<Vec<u8>> {
     result
 }
 
-fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> anyhow::Result<Vec<u8>> {
+fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> anyhow::Result<Vec<u32>> {
     let mut needed = 0u32;
     let first = unsafe { CreateWellKnownSid(kind, null_mut(), null_mut(), &mut needed) };
     if first != 0
@@ -134,16 +147,16 @@ fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> anyhow::Result<Vec<u8>> {
     {
         return Err(win_error("CreateWellKnownSid size"));
     }
-    let mut sid = vec![0u8; needed as usize];
+    let mut sid = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
     check_bool(
         unsafe { CreateWellKnownSid(kind, null_mut(), sid.as_mut_ptr().cast(), &mut needed) },
         "CreateWellKnownSid",
     )?;
-    sid.truncate(needed as usize);
+    sid.truncate((needed as usize).div_ceil(size_of::<u32>()));
     Ok(sid)
 }
 
-fn trusted_sids() -> anyhow::Result<[Vec<u8>; 3]> {
+fn trusted_sids() -> anyhow::Result<[Vec<u32>; 3]> {
     Ok([
         current_user_sid()?,
         well_known_sid(WinLocalSystemSid)?,
@@ -198,9 +211,12 @@ fn with_acl<T>(
     // Unix service-group/world read bits do not identify a Windows service
     // identity. Keep every controller-created object within this allowlist,
     // including secret files whose Unix mode is 0440 or 0444.
-    let acl_size =
-        (size_of::<ACL>() + sids.iter().map(|sid| 8usize + sid.len()).sum::<usize>()) as u32;
-    let mut acl_bytes = vec![0u8; acl_size as usize];
+    let acl_size = (size_of::<ACL>()
+        + sids
+            .iter()
+            .map(|sid| 8usize + size_of_val(sid.as_slice()))
+            .sum::<usize>()) as u32;
+    let mut acl_bytes = aligned_buffer(acl_size as usize);
     let acl = acl_bytes.as_mut_ptr().cast::<ACL>();
     check_bool(
         unsafe { InitializeAcl(acl, acl_size, ACL_REVISION) },
@@ -292,7 +308,7 @@ fn with_security_attributes<T>(
         {
             return Err(win_error("MakeSelfRelativeSD size"));
         }
-        let mut relative = vec![0u8; relative_len as usize];
+        let mut relative = aligned_buffer(relative_len as usize);
         check_bool(
             unsafe {
                 MakeSelfRelativeSD(absolute, relative.as_mut_ptr().cast(), &mut relative_len)
@@ -790,7 +806,7 @@ fn rename_file(
         }
         let filename_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
         let bytes_len = filename_offset + (name.len() + 1) * size_of::<u16>();
-        let mut bytes = vec![0u8; bytes_len];
+        let mut bytes = aligned_buffer(bytes_len);
         let info = bytes.as_mut_ptr().cast::<FILE_RENAME_INFO>();
         unsafe {
             (*info).Anonymous = FILE_RENAME_INFO_0 {
@@ -805,7 +821,7 @@ fn rename_file(
                 file.as_raw_handle(),
                 FileRenameInfo,
                 info.cast(),
-                bytes.len() as u32,
+                bytes_len as u32,
             )
         };
         if ok != 0 {
