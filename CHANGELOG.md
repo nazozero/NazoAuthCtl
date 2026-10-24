@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.3.8 - 2026-10-24
+
+### Fixed
+
+- Prevent rollback from repeating a runtime switch when state was committed but
+  journal completion was interrupted.
+- Isolate restored rehearsal configuration from the source database and preserve
+  temporary-resource ownership and snapshot selection across process loss.
+- Preserve pending controller-add identity, bind off-host receipts to their
+  immutable snapshots, and retain TLS authority across unrelated revisions.
+- Decode Valkey credentials correctly and pass ACL usernames separately. Reject
+  unsupported host backup and rehearsal operations before side effects.
+- Correct Windows native structure and SID buffer alignment.
+
+### Maintenance
+
+- Borrow Base64 strings during backup and secret decoding and move selected
+  journal receipts instead of cloning historical payloads.
+- Update ctutils to address RUSTSEC-2026-0385.
 
 ### Documentation
 
