@@ -13,17 +13,17 @@ it, and strings spanning frames or requiring unescaping use parser storage.
 Owned string consumers take that storage directly. Keep chunk-boundary, UTF-8,
 escape, raw-value and upstream parser tests when advancing this revision.
 
-Use Rust 1.99.0 from `rust-toolchain.toml`, including rustfmt and Clippy. The Linux
+Use Rust 1.99.1 from `rust-toolchain.toml`, including rustfmt and Clippy. The Linux
 release build uses the same version in the digest-pinned official
-`rust:1.99.0-bookworm` image, retaining the Debian 12 compatibility baseline.
+`rust:1.99.1-bookworm` image, retaining the Debian 12 compatibility baseline.
 GitHub Actions remain pinned to the commits behind their current stable releases.
 The Python maintenance scripts use the standard library; this repository has no
 separate Cargo tool, pip environment, Node package manifest, or Dockerfile.
 
 ## Compatibility and useful changes
 
-The shared protocol and Ed25519 backend use the released NazoAuth 0.3.3 commit;
-the protocol source is unchanged from the previous 0.3.1 pin. The controller
+The shared protocol and Ed25519 backend use the released NazoAuth 0.3.6 commit;
+their source is unchanged from the previous 0.3.5 pin. The controller
 still builds only the Ed25519 primitive feature, not the server runtime.
 
 - [Serde JSON 1.0.154](https://github.com/serde-rs/json/releases/tag/v1.0.154)
@@ -31,16 +31,15 @@ still builds only the Ed25519 primitive feature, not the server runtime.
   edge cases and invalid UTF-8 error positions. The pinned fork merges these
   releases while retaining immutable chunk input and owned-string transfer.
   This application uses `std`, so no new feature flag is needed.
-- [Tokio 1.53.3](https://github.com/tokio-rs/tokio/releases/tag/tokio-1.53.3)
-  moves semaphore and duplex-stream wakeups outside internal locks and fixes
-  paused-time advancement. The new `AsyncFd::register` APIs have no current
-  controller caller.
+- [Tokio 1.54.1](https://github.com/tokio-rs/tokio/releases/tag/tokio-1.54.1)
+  reverts the removal of runtime handles from timers. Existing runtime features
+  and ownership remain unchanged.
 - [Zeroize 1.9.1](https://github.com/RustCrypto/utils/blob/master/zeroize/CHANGELOG.md)
   avoids double-zeroizing initialized vector elements and makes `Zeroizing`'s
   debug output opaque. Existing secret owners benefit without new wrappers.
-- [UUID 1.28](https://github.com/uuid-rs/uuid/releases/tag/v1.28.0) adds optional
-  Serde format adapters. Existing persisted and signed UUID representations
-  remain unchanged; the adapters are not enabled merely because they exist.
+- [UUID 1.29](https://github.com/uuid-rs/uuid/releases/tag/v1.29.0) is the current
+  stable dependency. Existing persisted and signed UUID representations and
+  enabled features remain unchanged.
 
 The controller identity owner prepares an opaque Ed25519 key once when loading
 or creating it. Signing and verification use that object directly, retaining
@@ -69,8 +68,8 @@ local wire model and validation remain in the conformance owner.
   fixes proxy credential selection and reduces internal copies and timeout-timer
   work. Its new DNS-error classification and TLS-version diagnostics are useful
   future diagnostics, but do not require additional protocol exchanges or retries.
-- [Cosign 3.1.3](https://github.com/sigstore/cosign/releases/tag/v3.1.3) fixes
-  GHSA-fx35-mq7g-6g98, a public-key verification bypass in legacy bundles. The
+- [Cosign 3.1.4](https://github.com/sigstore/cosign/releases/tag/v3.1.4) fixes
+  a verifier panic for bundle entries without a hash. The
   signed-server workflow specifies this version explicitly, verifies the actual
   Linux binary's SHA-256 and version, then uses the existing signer identity,
   issuer, source-ref and attestation checks. Installer version and installed

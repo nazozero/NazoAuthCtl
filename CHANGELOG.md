@@ -19,6 +19,8 @@
 - Borrow Base64 strings during backup and secret decoding and move selected
   journal receipts instead of cloning historical payloads.
 - Update ctutils to address RUSTSEC-2026-0385.
+- Refresh the dependency lockfile, use the NazoAuth 0.3.6 protocol packages,
+  and update Tokio, UUID, Rust 1.99.1 and the pinned Cosign verifier.
 
 ### Documentation
 
