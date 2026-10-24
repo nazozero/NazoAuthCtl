@@ -111,7 +111,12 @@ fn status_summary_uses_release_facts_and_keeps_failed_instances() -> anyhow::Res
     };
     let mut inspection = target.inspection(&record.deployment_id)?;
     inspection.current_release = Some(crate::target::ReleaseVersion::new("0.2.27")?);
+    inspection.diagnostics = vec!["restore-test receipt is missing".into()];
     let payload = status_document(&record, "helper", &inspection);
+    assert_eq!(
+        payload["diagnostics"],
+        json!(["restore-test receipt is missing"])
+    );
     assert_eq!(payload["version"], "0.2.27");
     assert!(payload.get("artifact").is_some());
     let mut outcomes = vec![FleetItemOutcome {

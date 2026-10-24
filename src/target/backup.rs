@@ -427,11 +427,13 @@ pub(crate) fn load_manifest_at(path: &Path) -> anyhow::Result<Option<SnapshotMan
 }
 
 pub fn load_receipt(scope_dir: &Path) -> anyhow::Result<Option<RestoreTestReceipt>> {
-    load_evidence(
-        &receipt_path(scope_dir),
-        "backup restore-test receipt",
-        |bytes| Ok(serde_json::from_slice(bytes)?),
-    )
+    load_receipt_at(&receipt_path(scope_dir))
+}
+
+pub(crate) fn load_receipt_at(path: &Path) -> anyhow::Result<Option<RestoreTestReceipt>> {
+    load_evidence(path, "backup restore-test receipt", |bytes| {
+        Ok(serde_json::from_slice(bytes)?)
+    })
 }
 
 pub fn load_off_host_receipt(scope_dir: &Path) -> anyhow::Result<Option<OffHostCopyReceipt>> {
@@ -453,7 +455,11 @@ pub(crate) fn write_manifest_at(path: &Path, manifest: &SnapshotManifest) -> any
 }
 
 pub fn write_receipt(scope_dir: &Path, receipt: &RestoreTestReceipt) -> anyhow::Result<()> {
-    write_evidence(&receipt_path(scope_dir), receipt)
+    write_receipt_at(&receipt_path(scope_dir), receipt)
+}
+
+pub(crate) fn write_receipt_at(path: &Path, receipt: &RestoreTestReceipt) -> anyhow::Result<()> {
+    write_evidence(path, receipt)
 }
 
 pub fn write_off_host_receipt(

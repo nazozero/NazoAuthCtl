@@ -126,7 +126,7 @@ nazoauthctl tls certificate apply \
 For the exact current ctl-managed ACME issuance receipt, replace the two material
 paths with `--from-acme-current`. The receipt and its private artifacts are
 revalidated and bound into the certificate plan, journal, and receipt; an
-in-progress issuance, stale deployment declaration, or provider/trust digest
+in-progress issuance or provider/trust digest
 change fails closed. External paths and `--from-acme-current` are mutually
 exclusive.
 
@@ -243,11 +243,11 @@ nazoauthctl tls certificate recover \
   --tenant tenant-a --hostname auth.example
 ```
 
-Recovery accepts only the exact deployment declaration revision and the exact
-previous or committed receipt recorded by the journal. If either changed while
-ctl was interrupted, recovery fails closed without invoking an obsolete
-provider task; the deployment declaration must first be reconciled by an
-operator.
+Recovery requires the exact previous or committed TLS receipt and the provider
+authority recorded by the journal. Unrelated deployment configuration revisions
+may advance while ctl is interrupted; they do not invalidate these TLS facts.
+The TLS revision and provider/material digest checks still reject conflicting
+TLS changes before executing a provider task.
 
 Each committed certificate receipt is written first to an immutable
 `receipts/REVISION.json` archive and then to the binding's `receipt.json`

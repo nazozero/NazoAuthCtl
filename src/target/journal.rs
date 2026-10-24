@@ -257,14 +257,14 @@ impl TargetJournal {
         // and compaction must shrink before strict parsing, never wedge.
         let compacted = self.compact_if_needed(&path)?;
         let operation_hash = canonical_operation_hash(operation)?;
-        let lines = match compacted {
+        let mut lines = match compacted {
             Some(lines) => lines,
             None => read_lines_with(&path, self.bounds.read_cap, true)?,
         };
 
-        let mut latest: Option<JournalLine> = None;
+        let mut latest: Option<&mut JournalLine> = None;
         for line in lines
-            .iter()
+            .iter_mut()
             .filter(|line| line.operation_id == operation.operation_id)
         {
             if line.operation_hash != operation_hash {
@@ -278,7 +278,7 @@ impl TargetJournal {
                     ),
                 ));
             }
-            latest = Some(line.clone());
+            latest = Some(line);
         }
 
         let resumed = latest
@@ -310,7 +310,7 @@ impl TargetJournal {
         if let Some(line) = latest
             && !matches!(line.status, JournalStatus::Pending)
             && !retry_failed_phase
-            && let Some(result) = line.result
+            && let Some(result) = line.result.take()
         {
             return Ok(result);
         }

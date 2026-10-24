@@ -214,6 +214,12 @@ pub(crate) fn snapshot(
         remove_receipt_if_present(scope_dir).map_err(backup_failure)?;
         return Ok(existing);
     }
+    if !state.runtime.kind.is_container() {
+        return Err(Failure::new(
+            BACKUP_EXECUTION_FAILED,
+            "backup snapshot requires a Docker or Podman deployment; host runtime is not supported",
+        ));
+    }
     crate::filesystem::ensure_private_directory(&snapshots_root, "snapshot root")
         .map_err(backup_failure)?;
     if partial_dir.exists() {
@@ -306,10 +312,29 @@ fn create_snapshot(
 pub(crate) fn restore_test(
     scope_dir: &Path,
     state: &DeploymentState,
+    operation_id: &str,
 ) -> Result<RestoreTestReceipt, Failure> {
-    let manifest = backup::load_manifest(scope_dir)
-        .map_err(restore_failure)?
-        .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?;
+    if !state.runtime.kind.is_container() {
+        return Err(Failure::new(
+            RESTORE_TEST_FAILED,
+            "backup restore-test requires a Docker or Podman deployment; host runtime is not supported",
+        ));
+    }
+    let rehearsal_id =
+        Uuid::parse_str(operation_id).map_err(|error| restore_failure(error.into()))?;
+    let operation_root = scope_dir
+        .join("backup")
+        .join("restore-tests")
+        .join(rehearsal_id.to_string());
+    let manifest_path = operation_root.join(IMMUTABLE_MANIFEST_FILE);
+    let saved = backup::load_manifest_at(&manifest_path).map_err(restore_failure)?;
+    let resuming = saved.is_some();
+    let manifest = match saved {
+        Some(manifest) => manifest,
+        None => backup::load_manifest(scope_dir)
+            .map_err(restore_failure)?
+            .ok_or_else(|| Failure::new(RESTORE_TEST_FAILED, "no snapshot manifest exists"))?,
+    };
     if manifest.deployment_id != state.deployment_id {
         return Err(Failure::new(
             RESTORE_TEST_FAILED,
@@ -322,14 +347,39 @@ pub(crate) fn restore_test(
         .join("snapshots")
         .join(&manifest.snapshot_id);
     verify_snapshot_files(&snapshot_dir, &manifest).map_err(restore_failure)?;
-    let rehearsal_id = Uuid::now_v7();
-    let restore_root = scope_dir
-        .join("backup")
-        .join("restore-tests")
-        .join(rehearsal_id.to_string());
-    let candidate = candidate_name(&state.runtime.object, rehearsal_id);
+    // The journal operation owns this exact snapshot and every temporary resource.
+    // Keep the pin after cleanup so a lost terminal append cannot select a newer snapshot.
+    backup::write_manifest_at(&manifest_path, &manifest).map_err(restore_failure)?;
+    let receipt_path = operation_root.join("receipt.json");
+    if let Some(receipt) = backup::load_receipt_at(&receipt_path).map_err(restore_failure)? {
+        receipt
+            .validate_against(&manifest)
+            .map_err(restore_failure)?;
+        if backup::load_manifest(scope_dir)
+            .map_err(restore_failure)?
+            .is_some_and(|latest| latest.manifest_sha256 == manifest.manifest_sha256)
+        {
+            backup::write_receipt(scope_dir, &receipt).map_err(restore_failure)?;
+        }
+        return Ok(receipt);
+    }
+    let restore_root = operation_root.join("work");
+    let candidate = candidate_name(&state.deployment_id, rehearsal_id);
     let database = format!("nazo_restore_{}", rehearsal_id.simple());
-    let valkey_epoch = Uuid::now_v7().to_string();
+    let valkey_epoch = rehearsal_id.to_string();
+    if resuming {
+        let backend = runtime_backend::backend(state.runtime.kind);
+        if backend
+            .inspect_optional(&candidate)
+            .map_err(restore_failure)?
+            .is_some()
+        {
+            backend.remove(&candidate).map_err(restore_failure)?;
+        }
+        if restore_root.exists() {
+            fs::remove_dir_all(&restore_root).map_err(|error| restore_failure(error.into()))?;
+        }
+    }
     fs::create_dir_all(&restore_root).map_err(|error| restore_failure(error.into()))?;
     crate::filesystem::ensure_private_directory(&restore_root, "restore-test directory")
         .map_err(restore_failure)?;
@@ -341,15 +391,15 @@ pub(crate) fn restore_test(
         &candidate,
         &database,
         &valkey_epoch,
+        resuming,
     );
-    let tree_cleanup =
-        fs::remove_dir_all(&restore_root).context("failed to remove restore-test tree");
     if let Err(error) = result {
         write_restore_failure(scope_dir, &manifest, rehearsal_id, &error.to_string());
-        let _ = tree_cleanup;
         return Err(restore_failure(error));
     }
-    tree_cleanup.map_err(restore_failure)?;
+    fs::remove_dir_all(&restore_root)
+        .context("failed to remove restore-test tree")
+        .map_err(restore_failure)?;
     remove_file_if_present(&scope_dir.join("backup").join("restore-test-failure.json"))
         .map_err(restore_failure)?;
     let receipt = RestoreTestReceipt {
@@ -367,7 +417,13 @@ pub(crate) fn restore_test(
     receipt
         .validate_against(&manifest)
         .map_err(restore_failure)?;
-    backup::write_receipt(scope_dir, &receipt).map_err(restore_failure)?;
+    backup::write_receipt_at(&receipt_path, &receipt).map_err(restore_failure)?;
+    if backup::load_manifest(scope_dir)
+        .map_err(restore_failure)?
+        .is_some_and(|latest| latest.manifest_sha256 == manifest.manifest_sha256)
+    {
+        backup::write_receipt(scope_dir, &receipt).map_err(restore_failure)?;
+    }
     Ok(receipt)
 }
 
@@ -720,13 +776,34 @@ pub(crate) fn record_off_host_copy(
     scope_dir: &Path,
     receipt: &backup::OffHostCopyReceipt,
 ) -> Result<(), Failure> {
-    let manifest = backup::load_manifest(scope_dir)
+    let snapshot_id =
+        Uuid::parse_str(&receipt.snapshot_id).map_err(|error| backup_failure(error.into()))?;
+    let snapshot_dir = scope_dir
+        .join("backup")
+        .join("snapshots")
+        .join(snapshot_id.to_string());
+    let manifest = backup::load_manifest_at(&snapshot_dir.join(IMMUTABLE_MANIFEST_FILE))
         .map_err(backup_failure)?
         .ok_or_else(|| Failure::new(BACKUP_EXECUTION_FAILED, "no snapshot manifest exists"))?;
     receipt
         .validate_against(&manifest)
         .map_err(backup_failure)?;
-    backup::write_off_host_receipt(scope_dir, receipt).map_err(backup_failure)
+    crate::filesystem::atomic_write(
+        &snapshot_dir.join("off-host-copy-receipt.json"),
+        &serde_json::to_vec_pretty(receipt).map_err(|error| backup_failure(error.into()))?,
+        0o600,
+    )
+    .map_err(backup_failure)?;
+    if backup::load_manifest(scope_dir)
+        .map_err(backup_failure)?
+        .is_some_and(|latest| {
+            latest.snapshot_id == manifest.snapshot_id
+                && latest.manifest_sha256 == manifest.manifest_sha256
+        })
+    {
+        backup::write_off_host_receipt(scope_dir, receipt).map_err(backup_failure)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn cleanup_transfer(scope_dir: &Path, operation_id: &str) -> Result<(), Failure> {
@@ -1493,6 +1570,7 @@ fn run_restore_rehearsal(
     candidate: &str,
     database: &str,
     valkey_epoch: &str,
+    resuming: bool,
 ) -> anyhow::Result<()> {
     extract_deployment_archive(
         &snapshot_dir.join("deployment.tar"),
@@ -1536,13 +1614,21 @@ fn run_restore_rehearsal(
     )?;
     let runtime_url_path = secrets.join("database-runtime-url");
     let runtime_connection = postgres_connection(&runtime_url_path)?;
-    write_secret(
-        &runtime_url_path,
-        &runtime_connection
-            .with_database(database)
-            .with_password_url()?,
-    )?;
+    let runtime_database_url = runtime_connection
+        .with_database(database)
+        .with_password_url()?;
+    write_secret(&runtime_url_path, &runtime_database_url)?;
+    let restored_config = rewrite_recovery_config(&config, &runtime_database_url, valkey_epoch)?;
+    crate::filesystem::atomic_write(&config, &restored_config, 0o600)?;
     prepare_runtime_ownership(state.runtime.kind, &data, &secrets, &config)?;
+    if resuming {
+        cleanup_valkey_namespace(
+            &secrets.join("valkey-url"),
+            &state.deployment_id,
+            valkey_epoch,
+        )?;
+        drop_database(&original_connection, database)?;
+    }
     create_database(&original_connection, database)?;
     let backend_kind = state.runtime.kind;
     let backend = runtime_backend::backend(backend_kind);
@@ -3006,16 +3092,26 @@ fn cleanup_valkey_namespace(
         matches!(url.scheme(), "redis" | "rediss" | "valkey"),
         "Valkey URL has an invalid scheme"
     );
-    let password = url
-        .password()
-        .context("Valkey URL has no password")?
-        .to_owned();
+    let password = urlencoding::decode(url.password().context("Valkey URL has no password")?)
+        .context("Valkey URL password is not valid percent-encoding")?
+        .into_owned();
+    let username = if url.username().is_empty() {
+        "default".to_owned()
+    } else {
+        urlencoding::decode(url.username())?.into_owned()
+    };
     url.set_password(None)
         .map_err(|_| anyhow::anyhow!("cannot remove Valkey password"))?;
+    // A username in -u makes valkey-cli use an empty URL password instead of
+    // REDISCLI_AUTH. Pass the ACL identity separately from the endpoint URL.
+    url.set_username("")
+        .map_err(|_| anyhow::anyhow!("cannot remove Valkey username"))?;
     let prefix = format!("nazo:state:v1:{deployment_id}:{epoch}:");
     let output = crate::process::Process::new("valkey-cli")
         .args([
             "--no-auth-warning",
+            "--user",
+            &username,
             "-u",
             url.as_str(),
             "--scan",
@@ -3041,7 +3137,14 @@ fn cleanup_valkey_namespace(
     );
     for batch in keys.chunks(256) {
         let output = crate::process::Process::new("valkey-cli")
-            .args(["--no-auth-warning", "-u", url.as_str(), "UNLINK"])
+            .args([
+                "--no-auth-warning",
+                "--user",
+                &username,
+                "-u",
+                url.as_str(),
+                "UNLINK",
+            ])
             .args(batch)
             .env("REDISCLI_AUTH", &password)
             .output()?;
@@ -3890,6 +3993,67 @@ cat "$BACKUP_REPLAY_TEST_ROOT/sentinel""#,
         )?;
         assert_eq!(first.manifest_sha256, replay.manifest_sha256);
         assert_eq!(first.snapshot_id, replay.snapshot_id);
+        // A slow off-host transfer still acknowledges its immutable snapshot
+        // after a newer snapshot becomes current.
+        let mut newer = manifest.clone();
+        newer.snapshot_id = Uuid::now_v7().to_string();
+        newer.manifest_sha256 = newer.computed_sha256()?;
+        backup::write_manifest(&scope_dir, &newer)?;
+        record_off_host_copy(&scope_dir, &first)?;
+        assert!(!backup::off_host_receipt_path(&scope_dir).exists());
+        assert!(final_dir.join("off-host-copy-receipt.json").exists());
+        backup::write_manifest(&scope_dir, &manifest)?;
+        record_off_host_copy(&scope_dir, &first)?;
+        assert_eq!(backup::load_off_host_receipt(&scope_dir)?.unwrap(), first);
+
+        // Receipt publication and journal completion can be interrupted separately.
+        let restore_operation = Uuid::now_v7();
+        let operation_root = scope_dir
+            .join("backup/restore-tests")
+            .join(restore_operation.to_string());
+        backup::write_manifest_at(&operation_root.join(IMMUTABLE_MANIFEST_FILE), &manifest)?;
+        let restore_receipt = RestoreTestReceipt {
+            schema: backup::RESTORE_TEST_RECEIPT_SCHEMA,
+            deployment_id: deployment_id.into(),
+            snapshot_id: manifest.snapshot_id.clone(),
+            manifest_sha256: manifest.manifest_sha256.clone(),
+            restored_at: Utc::now(),
+            isolated_database: format!("nazo_restore_{}", restore_operation.simple()),
+            candidate_runtime_object: candidate_name(deployment_id, restore_operation),
+            runtime_instance_key_id: manifest.runtime_instance_key_id.clone(),
+            database_sentinel_sha256: manifest.database_sentinel_sha256.clone(),
+            environment: RestoreTestEnvironment::SameHostIsolated,
+        };
+        backup::write_receipt_at(&operation_root.join("receipt.json"), &restore_receipt)?;
+        let mut container_state = state.clone();
+        container_state.runtime.kind = RuntimeBackendKind::Docker;
+        assert_eq!(
+            restore_test(&scope_dir, &container_state, &restore_operation.to_string())?,
+            restore_receipt
+        );
+        assert_eq!(backup::load_receipt(&scope_dir)?.unwrap(), restore_receipt);
+        backup::write_manifest(&scope_dir, &newer)?;
+        remove_receipt_if_present(&scope_dir)?;
+        assert_eq!(
+            restore_test(&scope_dir, &container_state, &restore_operation.to_string())?,
+            restore_receipt
+        );
+        assert!(!backup::receipt_path(&scope_dir).exists());
+        backup::write_manifest(&scope_dir, &manifest)?;
+
+        // Unsupported host execution is rejected before creating any resources.
+        assert!(
+            snapshot(&scope_dir, &state, &Uuid::now_v7().to_string())
+                .unwrap_err()
+                .detail
+                .contains("Docker or Podman")
+        );
+        assert!(
+            restore_test(&scope_dir, &state, &Uuid::now_v7().to_string())
+                .unwrap_err()
+                .detail
+                .contains("Docker or Podman")
+        );
         assert!(
             finalize_import(
                 destination.path(),
@@ -4372,3 +4536,7 @@ cat "$BACKUP_REPLAY_TEST_ROOT/sentinel""#,
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "../../tests/unit/restore_rehearsal.rs"]
+mod restore_rehearsal_tests;

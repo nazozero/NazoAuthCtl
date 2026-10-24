@@ -1237,14 +1237,18 @@ impl<'de> Deserialize<'de> for BackupTransferBytes {
     where
         D: Deserializer<'de>,
     {
-        let encoded = String::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct Encoded<'a>(#[serde(borrow)] std::borrow::Cow<'a, str>);
+        let encoded = Encoded::deserialize(deserializer)?.0;
         let maximum_encoded = MAX_BACKUP_TRANSFER_CHUNK_BYTES.div_ceil(3) * 4;
         if encoded.len() > maximum_encoded {
             return Err(serde::de::Error::custom(
                 "backup transfer chunk exceeds 256 KiB",
             ));
         }
-        let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
+        let bytes = STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)?;
         Self::try_new(bytes).map_err(|error| serde::de::Error::custom(error.detail))
     }
 }
@@ -1311,14 +1315,18 @@ impl<'de> Deserialize<'de> for SecretMaterial {
     where
         D: Deserializer<'de>,
     {
-        let encoded = String::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct Encoded<'a>(#[serde(borrow)] std::borrow::Cow<'a, str>);
+        let encoded = Encoded::deserialize(deserializer)?.0;
         let maximum_encoded = MAX_CONTROL_CHANGE_SET_BYTES.div_ceil(3) * 4;
         if encoded.len() > maximum_encoded {
             return Err(serde::de::Error::custom(
                 "secret material exceeds the 4 MiB limit",
             ));
         }
-        let bytes = STANDARD.decode(encoded).map_err(serde::de::Error::custom)?;
+        let bytes = STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)?;
         Self::try_new(bytes).map_err(|error| serde::de::Error::custom(error.detail))
     }
 }
@@ -2227,6 +2235,34 @@ mod tests {
 
     #[test]
     fn control_change_set_round_trips_exact_bytes_and_obeys_the_raw_limit() -> anyhow::Result<()> {
+        // Slice/string inputs can borrow ordinary JSON strings; escaped JSON,
+        // readers and owned Values must still decode through owned strings.
+        for encoded in [r#""YWJj""#, r#""\u0059WJj""#] {
+            assert_eq!(
+                serde_json::from_str::<SecretMaterial>(encoded)?.as_bytes(),
+                b"abc"
+            );
+            assert_eq!(
+                serde_json::from_str::<BackupTransferBytes>(encoded)?.as_bytes(),
+                b"abc"
+            );
+        }
+        assert_eq!(
+            serde_json::from_reader::<_, SecretMaterial>(br#""YWJj""#.as_slice())?.as_bytes(),
+            b"abc"
+        );
+        assert_eq!(
+            serde_json::from_reader::<_, BackupTransferBytes>(br#""YWJj""#.as_slice())?.as_bytes(),
+            b"abc"
+        );
+        assert_eq!(
+            serde_json::from_value::<SecretMaterial>(serde_json::json!("YWJj"))?.as_bytes(),
+            b"abc"
+        );
+        assert_eq!(
+            serde_json::from_value::<BackupTransferBytes>(serde_json::json!("YWJj"))?.as_bytes(),
+            b"abc"
+        );
         let jws = format!("{}.{}.{}", "a".repeat(40), "b".repeat(40), "c".repeat(64));
         let material = vec![0x5a; MAX_CONTROL_CHANGE_SET_BYTES];
         let operation = HostOperation::control_operation(

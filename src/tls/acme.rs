@@ -274,8 +274,8 @@ fn validate_install_authority(
     provider_config_sha256: &str,
     trust_anchors_sha256: &str,
 ) -> anyhow::Result<()> {
-    if receipt.declaration_revision != declaration_revision {
-        bail!("current ACME receipt declaration revision differs from the deployment");
+    if receipt.declaration_revision > declaration_revision {
+        bail!("current ACME receipt refers to a future deployment revision");
     }
     if receipt.provider_config_sha256 != provider_config_sha256
         || receipt.trust_anchors_sha256 != trust_anchors_sha256
@@ -1247,7 +1247,7 @@ fn validate_transaction_binding(
 ) -> anyhow::Result<()> {
     if transaction.schema != TRANSACTION_SCHEMA
         || transaction.deployment_id != record.deployment_id
-        || transaction.declaration_revision != record.declaration_revision
+        || transaction.declaration_revision > record.declaration_revision
         || transaction.tenant != canonical_tenant(tenant)?
         || transaction.hostname != canonical_hostname(hostname)?
         || transaction.target_revision
@@ -2255,7 +2255,7 @@ mod tests {
     }
 
     #[test]
-    fn install_consumption_requires_exact_declaration_and_provider_authority() {
+    fn install_consumption_survives_unrelated_updates_but_requires_provider_authority() {
         let transaction = test_transaction(Path::new("/private/state"));
         let mut receipt = test_receipt(&transaction);
         assert!(
@@ -2268,15 +2268,14 @@ mod tests {
             .is_ok()
         );
 
-        receipt.declaration_revision += 1;
         assert!(
             validate_install_authority(
                 &receipt,
-                transaction.declaration_revision,
+                transaction.declaration_revision + 1,
                 &transaction.provider_config_sha256,
                 &transaction.trust_anchors_sha256,
             )
-            .is_err()
+            .is_ok()
         );
         receipt.declaration_revision = transaction.declaration_revision;
         receipt.provider_config_sha256 = "f".repeat(64);
