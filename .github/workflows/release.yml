@@ -19,33 +19,21 @@ permissions:
 jobs:
   policy:
     runs-on: ubuntu-24.04
+    outputs:
+      ci_run_id: ${{ steps.ci.outputs.run_id }}
+      artifact_ids: ${{ steps.ci.outputs.artifact_ids }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Require successful controller CI for exact tag commit
-        if: github.ref_type == 'tag'
+        id: ci
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          response="$(gh api \
-            --header 'Accept: application/vnd.github+json' \
-            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&head_sha=${RELEASE_SHA}&per_page=100")"
-          successful_run="$(printf '%s' "$response" | jq -r --arg sha "$RELEASE_SHA" '
-            [
-              .workflow_runs[]
-              | select(.head_sha == $sha and .head_branch == "main" and .event == "push")
-              | select(.status == "completed" and .conclusion == "success")
-              | .id
-            ] | .[0] // empty
-          ')"
-          if [ -z "$successful_run" ]; then
-            echo "no completed successful controller-ci run exists for tag commit $RELEASE_SHA" >&2
-            exit 1
-          fi
-          echo "controller-ci run $successful_run completed successfully for $RELEASE_SHA"
+          python3 scripts/resolve_ci_run.py "$RELEASE_SHA" --require-main >> "$GITHUB_OUTPUT"
       - name: Validate immutable controller release input
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -104,15 +92,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, extension: '' }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, extension: '' }
-          - { runner: windows-2025, target: x86_64-pc-windows-msvc, extension: .exe }
-          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, extension: .exe }
-          - { runner: macos-15-intel, target: x86_64-apple-darwin, extension: '' }
-          - { runner: macos-15, target: aarch64-apple-darwin, extension: '' }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, extension: '', reuse_ci: false }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, extension: '', reuse_ci: false }
+          - { runner: windows-2025, target: x86_64-pc-windows-msvc, extension: .exe, reuse_ci: true }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, extension: .exe, reuse_ci: false }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, extension: '', reuse_ci: true }
+          - { runner: macos-15, target: aarch64-apple-darwin, extension: '', reuse_ci: true }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reuse the tested native CI binary
+        if: matrix.reuse_ci
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ fromJSON(needs.policy.outputs.artifact_ids)[matrix.target] }}
+          run-id: ${{ needs.policy.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+          path: release
       - name: Test and build Linux asset on the Debian 12 compatibility baseline
         if: runner.os == 'Linux'
         shell: bash
@@ -128,12 +124,13 @@ jobs:
               "target/${{ matrix.target }}/release/nazoauthctl" --help >/dev/null
             '
       - name: Test non-Linux asset
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' && !matrix.reuse_ci
         run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
       - name: Build non-Linux asset
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' && !matrix.reuse_ci
         run: cargo build --locked -p nazoauthctl --bin nazoauthctl --all-features --release --target ${{ matrix.target }}
       - name: Stage controller binary
+        if: '!matrix.reuse_ci'
         shell: bash
         run: |
           mkdir -p release

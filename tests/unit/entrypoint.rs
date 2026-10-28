@@ -34,11 +34,10 @@ fn release_workflow_requires_successful_ci_for_the_exact_tag_commit() {
     assert!(gate < build, "tag CI gate must precede the build job");
     for required in [
         "actions: read",
-        "/actions/workflows/ci.yml/runs?event=push&head_sha=",
-        ".head_sha == $sha",
-        ".head_branch == \"main\"",
-        ".status == \"completed\"",
-        ".conclusion == \"success\"",
+        "python3 scripts/resolve_ci_run.py \"$RELEASE_SHA\" --require-main",
+        "ci_run_id: ${{ steps.ci.outputs.run_id }}",
+        "artifact_ids: ${{ steps.ci.outputs.artifact_ids }}",
+        "artifact-ids: ${{ fromJSON(needs.policy.outputs.artifact_ids)[matrix.target] }}",
     ] {
         assert!(
             workflow.contains(required),
@@ -86,7 +85,7 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(workflow.contains("SERVER_RELEASE: ${{ steps.server_release.outputs.version }}"));
     assert!(!workflow.contains("v0.2.2"));
     assert!(!workflow.contains("previous-v"));
-    assert!(!workflow.contains("python3"));
+    assert!(workflow.contains("python3 scripts/resolve_ci_run.py"));
     assert!(!workflow.contains("- name: Recover"));
     assert!(!workflow.contains("provider"));
     assert!(!workflow.contains("rollback"));
@@ -118,7 +117,9 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
         .0;
     assert!(current_controller.contains("permissions:\n      contents: read"));
     assert!(current_controller.contains("persist-credentials: false"));
-    assert!(!current_controller.contains("GH_TOKEN"));
+    assert!(!current_controller.contains("\n    env:\n      GH_TOKEN:"));
+    assert!(!current_controller.contains("cargo build"));
+    assert!(current_controller.contains("artifact-ids:"));
 
     let signed_current_server = workflow.split_once("\n  signed-current-server:").unwrap().1;
     assert!(!signed_current_server.contains("\n    env:\n      GH_TOKEN:"));
@@ -178,6 +179,37 @@ fn release_does_not_treat_pre_cut_controller_as_an_update_source() {
     assert!(!workflow.contains("self_update_matrix"));
     assert!(!workflow.contains("PREVIOUS_RELEASE"));
     assert!(!workflow.contains("self-update-rollback:"));
+}
+
+#[test]
+fn release_reuses_native_ci_assets_but_tests_new_platform_environments() {
+    let workflow = include_str!("../../.github/workflows/release.yml");
+    for target in [
+        "x86_64-pc-windows-msvc",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+    ] {
+        let entry = workflow
+            .lines()
+            .find(|line| line.contains(&format!("target: {target},")))
+            .unwrap();
+        assert!(entry.contains("reuse_ci: true"), "{target}");
+    }
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc",
+    ] {
+        let entry = workflow
+            .lines()
+            .find(|line| line.contains(&format!("target: {target},")))
+            .unwrap();
+        assert!(entry.contains("reuse_ci: false"), "{target}");
+    }
+    assert!(workflow.contains("if: runner.os != 'Linux' && !matrix.reuse_ci"));
+    assert!(
+        workflow.contains("Test and build Linux asset on the Debian 12 compatibility baseline")
+    );
 }
 
 #[test]

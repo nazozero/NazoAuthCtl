@@ -35,6 +35,7 @@ jobs:
   current-controller:
     permissions:
       contents: read
+      actions: read
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,11 +50,21 @@ jobs:
           set -euo pipefail
           [[ "$EXPECTED_CONTROLLER_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$EXPECTED_CONTROLLER_REF"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Resolve CI artifacts for the exact controller
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_CONTROLLER_REF: ${{ inputs.controller_ref }}
+        run: python3 scripts/resolve_ci_run.py "$EXPECTED_CONTROLLER_REF" >> "$GITHUB_OUTPUT"
+      - name: Download the tested controller
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          shared-key: controller-workspace
-      - name: Build current controller once
-        run: cargo build --locked -p nazoauthctl --bin nazoauthctl --all-features --release
+          artifact-ids: ${{ fromJSON(steps.ci.outputs.artifact_ids)['x86_64-unknown-linux-gnu'] }}
+          run-id: ${{ steps.ci.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: controller-ci
+      - name: Stage the tested controller
+        run: install -Dm755 controller-ci/nazoauthctl-x86_64-unknown-linux-gnu target/release/nazoauthctl
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: current-controller
