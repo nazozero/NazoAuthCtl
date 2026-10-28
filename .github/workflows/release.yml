@@ -124,7 +124,7 @@ jobs:
             bash -euo pipefail -c '
               umask 0022
               cargo test --locked --workspace --all-targets --all-features --target "${{ matrix.target }}"
-              cargo build --locked --workspace --all-targets --all-features --release --target "${{ matrix.target }}"
+              cargo build --locked -p nazoauthctl --bin nazoauthctl --all-features --release --target "${{ matrix.target }}"
               "target/${{ matrix.target }}/release/nazoauthctl" --help >/dev/null
             '
       - name: Test non-Linux asset
@@ -132,7 +132,7 @@ jobs:
         run: cargo test --locked --workspace --all-targets --all-features --target ${{ matrix.target }}
       - name: Build non-Linux asset
         if: runner.os != 'Linux'
-        run: cargo build --locked --workspace --all-targets --all-features --release --target ${{ matrix.target }}
+        run: cargo build --locked -p nazoauthctl --bin nazoauthctl --all-features --release --target ${{ matrix.target }}
       - name: Stage controller binary
         shell: bash
         run: |

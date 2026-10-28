@@ -18,6 +18,7 @@
 //! No provider/DR gates exist anywhere here, and there is no `--all`.
 
 use anyhow::{Context as _, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use nazo_operator_protocol::ControlOperationPayload;
 use sha2::{Digest as _, Sha256};
@@ -84,55 +85,61 @@ pub(crate) fn run_update(
         resolve_live_instance(context, instance.as_deref(), action)?;
     let deployment_id = &inspection.deployment_id;
     let revision = inspection.revision;
+    let intent = super::HostIntent::open(&context.registry, keys, deployment_id, "update")?;
+    let pending = intent.load()?;
     if inspection.artifact.current.is_none() {
         bail!(
             "{action}: deployment '{deployment_id}' records no current artifact reference; \
              adopt or install it first"
         );
     }
-    let backup_precondition = match &record.backup_before_update {
-        BackupBeforeUpdatePolicy::Off => UpdateBackupPrecondition::NotRequired,
-        BackupBeforeUpdatePolicy::Warn => {
-            if restore_test_age_seconds(&inspection).is_none() {
-                crate::ui::warning!(
-                    "nazoauthctl: warning: update proceeds without a current restore-tested snapshot for '{}'",
-                    "注意：实例“{}”没有经过恢复验证的当前备份；按现有策略继续更新。",
-                    record.alias
-                );
+    let backup_precondition = if pending.is_some() {
+        UpdateBackupPrecondition::NotRequired
+    } else {
+        match &record.backup_before_update {
+            BackupBeforeUpdatePolicy::Off => UpdateBackupPrecondition::NotRequired,
+            BackupBeforeUpdatePolicy::Warn => {
+                if restore_test_age_seconds(&inspection).is_none() {
+                    crate::ui::warning!(
+                        "nazoauthctl: warning: update proceeds without a current restore-tested snapshot for '{}'",
+                        "注意：实例“{}”没有经过恢复验证的当前备份；按现有策略继续更新。",
+                        record.alias
+                    );
+                }
+                UpdateBackupPrecondition::NotRequired
             }
-            UpdateBackupPrecondition::NotRequired
-        }
-        BackupBeforeUpdatePolicy::Require { max_age_seconds } => {
-            let Some(snapshot) = inspection.backup.snapshot.as_ref() else {
-                bail!(
-                    "update: backup-before-update=require for '{}' needs a restore-tested snapshot",
-                    record.alias
-                );
-            };
-            let Some(restore_tested_at) = snapshot.restore_tested_at else {
-                bail!(
-                    "update: backup-before-update=require for '{}' needs a restore-tested snapshot",
-                    record.alias
-                );
-            };
-            let Some(age_seconds) = restore_test_age_seconds(&inspection) else {
-                bail!(
-                    "update: backup-before-update=require for '{}' has a restore-test timestamp in the future",
-                    record.alias
-                );
-            };
-            if age_seconds > *max_age_seconds {
-                bail!(
-                    "update: backup-before-update=require for '{}' needs a restore-test no older than {} seconds (current age {} seconds)",
-                    record.alias,
-                    max_age_seconds,
-                    age_seconds
-                );
-            }
-            UpdateBackupPrecondition::Require {
-                manifest_sha256: snapshot.manifest_sha256.clone(),
-                restore_tested_at,
-                max_age_seconds: *max_age_seconds,
+            BackupBeforeUpdatePolicy::Require { max_age_seconds } => {
+                let Some(snapshot) = inspection.backup.snapshot.as_ref() else {
+                    bail!(
+                        "update: backup-before-update=require for '{}' needs a restore-tested snapshot",
+                        record.alias
+                    );
+                };
+                let Some(restore_tested_at) = snapshot.restore_tested_at else {
+                    bail!(
+                        "update: backup-before-update=require for '{}' needs a restore-tested snapshot",
+                        record.alias
+                    );
+                };
+                let Some(age_seconds) = restore_test_age_seconds(&inspection) else {
+                    bail!(
+                        "update: backup-before-update=require for '{}' has a restore-test timestamp in the future",
+                        record.alias
+                    );
+                };
+                if age_seconds > *max_age_seconds {
+                    bail!(
+                        "update: backup-before-update=require for '{}' needs a restore-test no older than {} seconds (current age {} seconds)",
+                        record.alias,
+                        max_age_seconds,
+                        age_seconds
+                    );
+                }
+                UpdateBackupPrecondition::Require {
+                    manifest_sha256: snapshot.manifest_sha256.clone(),
+                    restore_tested_at,
+                    max_age_seconds: *max_age_seconds,
+                }
             }
         }
     };
@@ -151,14 +158,62 @@ pub(crate) fn run_update(
     // config_revision is the target's marker content verbatim: the operator admission compares the envelope against the
     // mounted marker byte-for-byte. A missing marker fails closed — guessing
     // the CAS counter would sign an operation that can never be admitted.
-    let config_revision = inspection.config_revision_marker.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{action}: deployment '{deployment_id}' has no config-revision marker on its \
+    let journal = OperationJournal::open(keys.instance_dir(&record.deployment_id)?)?;
+    let config_revision = if let Some(operation) = pending.as_ref() {
+        let crate::target::HostOperationBody::StateMutate {
+            mutation:
+                StateMutationPayload::Update {
+                    artifact,
+                    config,
+                    migration_jws: Some(jws),
+                    migration_request_hash: Some(hash),
+                    ..
+                },
+        } = &operation.operation
+        else {
+            bail!("pending update has an invalid payload")
+        };
+        if operation.deployment_id.as_deref() != Some(deployment_id.as_str())
+            || artifact != &pinned
+            || config != &staged_config
+        {
+            bail!("a different update is pending; retry its original inputs");
+        }
+        let payload = jws
+            .split('.')
+            .nth(1)
+            .context("pending update JWS has no payload")?;
+        let bytes = URL_SAFE_NO_PAD.decode(payload)?;
+        let signed: nazo_operator_protocol::ControlOperation = serde_json::from_slice(&bytes)?;
+        let canonical = nazo_operator_protocol::canonical_control_operation_bytes(&signed)?;
+        if bytes != canonical
+            || signed.operation_id != operation.operation_id
+            || signed.deployment_id != *deployment_id
+            || signed.operation != ControlOperationPayload::MigrateApply
+            || nazo_operator_protocol::control_operation_request_hash(&canonical) != *hash
+        {
+            bail!("pending update signature payload does not match its host operation");
+        }
+        if journal.load()?.is_none() {
+            journal.record_dispatched(
+                &crate::controller_identity::journal::OperationJournalEntry::new(
+                    signed.operation_id.clone(),
+                    hash.clone(),
+                    signed.kid.clone(),
+                    jws.clone(),
+                ),
+            )?;
+        }
+        signed.config_revision
+    } else {
+        inspection.config_revision_marker.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{action}: deployment '{deployment_id}' has no config-revision marker on its \
              scope directory; the operator would reject any signed operation, so refusing \
              to sign one"
-        )
-    })?;
-    let journal = OperationJournal::open(keys.instance_dir(&record.deployment_id)?)?;
+            )
+        })?
+    };
     let prepared = prepare_control_operation(
         &context.registry,
         keys,
@@ -170,22 +225,48 @@ pub(crate) fn run_update(
         },
     )
     .context("preparing the migration operation failed; the update changed nothing")?;
+    if let Some(operation) = pending.as_ref() {
+        let StateMutationPayload::Update {
+            migration_jws: Some(jws),
+            migration_request_hash: Some(hash),
+            ..
+        } = (match &operation.operation {
+            crate::target::HostOperationBody::StateMutate { mutation } => mutation,
+            _ => bail!("pending update has an invalid payload"),
+        })
+        else {
+            bail!("pending update has no signed migration")
+        };
+        if prepared.signed.operation.operation_id != operation.operation_id
+            || prepared.signed.compact_jws != *jws
+            || prepared.signed.request_hash != *hash
+        {
+            bail!("pending update does not match the control operation journal");
+        }
+    }
     let lifecycle_id = &prepared.signed.operation.operation_id;
 
     // 5.-7. Stage + activate + local health + commit inside ONE journaled
     // HostOperation carrying the single lifecycle operation id and signed migration.
-    let operation = HostOperation::state_mutate(
-        lifecycle_id.clone(),
-        deployment_id.clone(),
-        Some(revision),
-        StateMutationPayload::Update {
-            artifact: pinned,
-            backup_precondition,
-            config: staged_config,
-            migration_jws: Some(prepared.signed.compact_jws.clone()),
-            migration_request_hash: Some(prepared.signed.request_hash.clone()),
-        },
-    );
+    let operation = match pending {
+        Some(operation) => operation,
+        None => {
+            let operation = HostOperation::state_mutate(
+                lifecycle_id.clone(),
+                deployment_id.clone(),
+                Some(revision),
+                StateMutationPayload::Update {
+                    artifact: pinned,
+                    backup_precondition,
+                    config: staged_config,
+                    migration_jws: Some(prepared.signed.compact_jws.clone()),
+                    migration_request_hash: Some(prepared.signed.request_hash.clone()),
+                },
+            );
+            intent.save(&operation)?;
+            operation
+        }
+    };
     let result = target.execute_host_operation(&operation)?;
     let applied_revision = match result.outcome {
         HostOutcome::Completed {
@@ -197,6 +278,7 @@ pub(crate) fn run_update(
             // its write-ahead slot directly and report the target's explicit
             // no-op.
             journal.clear()?;
+            intent.clear()?;
             record_observation(context, deployment_id, &inspection);
             return Ok(crate::ui::message!(
                 "instance '{}' already runs the target-verified artifact; no migration or target mutation was needed (revision {})\n",
@@ -216,6 +298,7 @@ pub(crate) fn run_update(
                     &DispatchVerdict::Terminal(control_result),
                     |_| Ok(()),
                 )?;
+                intent.clear()?;
                 revision.to_string()
             }
             HostCompletionBody::StateMutateMigrationFailed { result } => {
@@ -225,6 +308,7 @@ pub(crate) fn run_update(
                     &DispatchVerdict::Terminal(result),
                     |_| Ok(()),
                 )?;
+                intent.clear()?;
                 bail!(
                     "the application migration failed durably (operation {lifecycle_id}); target artifact/config were NOT activated"
                 );
@@ -236,6 +320,7 @@ pub(crate) fn run_update(
                     &DispatchVerdict::Terminal(result),
                     |_| Ok(()),
                 )?;
+                intent.clear()?;
                 bail!(
                     "{}: migration succeeded but activation/readiness could not commit safely; {detail}",
                     crate::target::ROLLBACK_RECOVERY_REQUIRED
@@ -281,6 +366,9 @@ pub(crate) fn run_update(
                      same update to resume operation {lifecycle_id} instead of starting over ({code}: {detail})"
                 );
             }
+            if code == crate::error_codes::OPERATION_ID_CONFLICT {
+                bail!("update operation identity conflicts with the target journal: {detail}");
+            }
             settle_journal(
                 &journal,
                 &prepared,
@@ -289,6 +377,7 @@ pub(crate) fn run_update(
                 },
                 |_| Ok(()),
             )?;
+            intent.clear()?;
             bail!("update failed on the target: {code}: {detail}");
         }
     };

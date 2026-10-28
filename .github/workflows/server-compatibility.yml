@@ -50,7 +50,7 @@ jobs:
           [[ "$EXPECTED_CONTROLLER_REF" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$EXPECTED_CONTROLLER_REF"
       - name: Build current controller once
-        run: cargo build --locked --workspace --all-targets --all-features --release
+        run: cargo build --locked -p nazoauthctl --bin nazoauthctl --all-features --release
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: current-controller

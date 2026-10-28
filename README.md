@@ -53,6 +53,10 @@ locale, otherwise English, using the first nonempty `LC_ALL`, `LC_MESSAGES`, or
 codes. For example, `LANG=zh_CN.UTF-8 nazoauthctl status --all` selects Chinese
 unless an `LC_*` override takes precedence. Text failures include the underlying
 reason; JSON field names and codes do not change with locale.
+Fleet read jobs share a 60-second SSH budget per target, including the live
+verification and subsequent inspection. The worker terminates and reaps a timed-out
+SSH process before continuing. Local targets use synchronous filesystem reads;
+those reads cannot be interrupted by this deadline.
 See the [changelog](CHANGELOG.md), [v0.3.0 release notes](docs/release-notes-0.3.0.md) and the
 [CLI presentation guide](docs/cli-presentation.md).
 
@@ -137,6 +141,17 @@ Interrupted operations retain their identity. The operation journal replays
 the original signed request, including after controller-key retirement; it
 does not sign the same operation with a replacement key. A request the server
 has never accepted still needs current authorization.
+
+If an update, rollback, snapshot, or restore test loses its response, rerun the
+same command to resolve its original target operation. A pending operation must
+be resolved before starting another of these actions or uninstalling. A completed
+operation is cleared locally, so a later command starts a new operation.
+
+After uninstall succeeds on the target, its saved completion record allows local
+key and registry cleanup to continue even if the target is offline. If the
+registry entry was already removed, rerun uninstall with the deployment ID to
+finish local cleanup. An interrupted uninstall without that completion record
+still needs the target to confirm the original operation.
 
 Artifact rollback is available only when recorded schema and migration facts
 allow it. Database recovery uses a verified snapshot; switching a binary alone

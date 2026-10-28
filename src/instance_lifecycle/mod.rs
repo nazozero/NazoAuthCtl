@@ -22,6 +22,73 @@ use crate::target::{
     ExecutionTarget, HostCompletionBody, HostOutcome, HostResult, InstanceInspection,
 };
 
+/// Durable exact request for a lifecycle action whose response may be lost.
+pub(crate) struct HostIntent {
+    path: std::path::PathBuf,
+    _lock: crate::file_lock::FileLock,
+}
+
+impl HostIntent {
+    pub(crate) fn open(
+        registry: &RegistryStore,
+        keys: &crate::controller_identity::store::ControllerKeyStore,
+        deployment_id: &str,
+        action: &str,
+    ) -> anyhow::Result<Self> {
+        crate::registry::validate_identifier(deployment_id, 128, "deployment id")?;
+        let directory = registry
+            .root()
+            .join("lifecycle-intents")
+            .join(deployment_id);
+        crate::filesystem::ensure_private_directory(&directory, "lifecycle intent directory")?;
+        let lock = crate::file_lock::FileLock::acquire(&directory.join("lifecycle.lock"))?;
+        if action != "uninstall" {
+            let pending = keys
+                .instance_dir(deployment_id)?
+                .with_extension("uninstall.json");
+            if pending.try_exists()?
+                && !uninstall::clear_completed_for_existing_deployment(&pending, deployment_id)?
+            {
+                anyhow::bail!(
+                    "an uninstall operation is pending; retry it before starting {action}"
+                );
+            }
+        }
+        for other in ["update", "rollback", "backup"] {
+            if other != action && directory.join(format!("{other}.json")).try_exists()? {
+                anyhow::bail!("a {other} operation is pending; retry it before starting {action}");
+            }
+        }
+        let path = directory.join(format!("{action}.json"));
+        Ok(Self { path, _lock: lock })
+    }
+
+    pub(crate) fn load(&self) -> anyhow::Result<Option<crate::target::HostOperation>> {
+        if !self.path.try_exists()? {
+            return Ok(None);
+        }
+        let bytes = crate::filesystem::read_secure_regular_file(
+            &self.path,
+            "pending lifecycle operation",
+            false,
+            crate::target::MAX_HOST_OPERATION_BYTES as u64,
+        )?;
+        Ok(Some(crate::target::parse_host_operation(&bytes)?))
+    }
+
+    pub(crate) fn save(&self, operation: &crate::target::HostOperation) -> anyhow::Result<()> {
+        crate::filesystem::atomic_write(
+            &self.path,
+            &crate::target::encode_host_operation(operation)?,
+            0o600,
+        )
+    }
+
+    pub(crate) fn clear(&self) -> anyhow::Result<()> {
+        crate::filesystem::remove_file_durable(&self.path)
+    }
+}
+
 /// The official server release repository pinned for lifecycle operations.
 pub(crate) const SERVER_REPOSITORY: &str = "nazozero/NazoAuth";
 

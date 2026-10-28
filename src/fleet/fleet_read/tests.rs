@@ -264,9 +264,12 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
     let aliases: Vec<String> = items.iter().map(|(i, _)| i.alias.clone()).collect();
     assert_eq!(aliases, ["prod-a", "prod-b", "prod-c"]);
 
-    type Factory =
-        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
-    let factory: Factory = Arc::new(|record: &HostRecord| {
+    type Factory = Arc<
+        dyn Fn(&HostRecord, Instant) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>
+            + Send
+            + Sync,
+    >;
+    let factory: Factory = Arc::new(|record: &HostRecord, _deadline: Instant| {
         let scenario = if record.alias == "server-c" {
             Scenario::Offline("HOST_UNREACHABLE: ssh to 'x' exited 255 (Connection refused)")
         } else {
@@ -295,7 +298,7 @@ fn partial_failure_is_isolated_and_order_is_stable() -> anyhow::Result<()> {
 fn panicked_worker_keeps_one_outcome_per_input() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
     let runner = FleetReadRunner::new(
-        Arc::new(|host| {
+        Arc::new(|host, _deadline| {
             Ok(Box::new(ScriptedTarget {
                 scenario: Scenario::Online,
                 target_id: host.host_id,
@@ -379,9 +382,12 @@ fn concurrency_is_bounded_by_the_cap() -> anyhow::Result<()> {
     }
     let in_flight_clone = in_flight.clone();
     let max_clone = max_seen.clone();
-    type Factory =
-        Arc<dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync>;
-    let factory: Factory = Arc::new(move |_record: &HostRecord| {
+    type Factory = Arc<
+        dyn Fn(&HostRecord, Instant) -> anyhow::Result<Box<dyn ExecutionTarget + Send>>
+            + Send
+            + Sync,
+    >;
+    let factory: Factory = Arc::new(move |_record: &HostRecord, _deadline: Instant| {
         Ok(Box::new(GateTarget {
             in_flight: in_flight_clone.clone(),
             max_seen: max_clone.clone(),

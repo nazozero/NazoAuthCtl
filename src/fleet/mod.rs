@@ -61,18 +61,22 @@ impl FleetContext {
 pub(crate) fn production_target(
     record: &HostRecord,
 ) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
-    production_target_with_ssh_timeout(record, crate::target::ssh::DEFAULT_EXEC_TIMEOUT)
+    production_target_with_deadline(record, None)
 }
 
-pub(crate) fn production_target_with_ssh_timeout(
+pub(crate) fn production_target_with_deadline(
     record: &HostRecord,
-    timeout: std::time::Duration,
+    deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> {
     match record.transport {
         HostTransport::Local => Ok(Box::new(LocalTarget::new()?)),
-        HostTransport::Ssh => Ok(Box::new(
-            SshTarget::from_record(record)?.with_timeout(timeout),
-        )),
+        HostTransport::Ssh => {
+            let target = SshTarget::from_record(record)?;
+            Ok(Box::new(match deadline {
+                Some(deadline) => target.with_deadline(deadline),
+                None => target,
+            }))
+        }
     }
 }
 

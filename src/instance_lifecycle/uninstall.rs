@@ -24,6 +24,96 @@ use crate::target::{
     ResourceScope, StateMutationPayload,
 };
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedUninstall {
+    schema: u32,
+    operation: HostOperation,
+    alias: String,
+}
+
+fn read_pending(path: &std::path::Path) -> anyhow::Result<(HostOperation, Option<String>)> {
+    let bytes = crate::filesystem::read_secure_regular_file(
+        path,
+        "pending uninstall",
+        false,
+        crate::target::MAX_HOST_OPERATION_BYTES as u64 + 1024,
+    )?;
+    // TODO: remove the bare HostOperation reader when all pre-completion-marker
+    // controller versions and their pending uninstall files are retired.
+    if let Ok(operation) = crate::target::parse_host_operation(&bytes) {
+        return Ok((operation, None));
+    }
+    let completed: CompletedUninstall = serde_json::from_slice(&bytes)?;
+    if completed.schema != 1 {
+        bail!("unsupported completed uninstall schema");
+    }
+    let operation = crate::target::parse_host_operation(&crate::target::encode_host_operation(
+        &completed.operation,
+    )?)?;
+    Ok((operation, Some(completed.alias)))
+}
+
+pub(super) fn clear_completed_for_existing_deployment(
+    path: &std::path::Path,
+    deployment_id: &str,
+) -> anyhow::Result<bool> {
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let (operation, completed) = read_pending(path)?;
+    if completed.is_some()
+        && operation.deployment_id.as_deref() == Some(deployment_id)
+        && matches!(
+            operation.operation,
+            HostOperationBody::StateMutate {
+                mutation: StateMutationPayload::Uninstall {}
+            }
+        )
+    {
+        crate::filesystem::remove_file_durable(path)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn finish_local_cleanup(
+    registry: &crate::registry::RegistryStore,
+    keys: &ControllerKeyStore,
+    deployment_id: &str,
+    pending_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    keys.remove_instance(deployment_id)?;
+    if registry.instance_by_deployment(deployment_id)?.is_some() {
+        registry.forget_instance_by_deployment(deployment_id)?;
+    }
+    crate::filesystem::remove_file_durable(pending_path)
+}
+
+struct LifecycleLocks {
+    _bind: FileLock,
+    _controller_recovery: FileLock,
+    _data_recovery: FileLock,
+    _transfer: FileLock,
+}
+
+impl LifecycleLocks {
+    fn acquire(instance_dir: &std::path::Path) -> anyhow::Result<Self> {
+        crate::filesystem::ensure_private_directory(
+            instance_dir,
+            "controller instance lifecycle directory",
+        )?;
+        let locks = Self {
+            _bind: FileLock::acquire(&instance_dir.join("bind.lock"))?,
+            _controller_recovery: FileLock::acquire(&instance_dir.join("recovery.lock"))?,
+            _data_recovery: FileLock::acquire(&instance_dir.join("recovery-plan.lock"))?,
+            _transfer: FileLock::acquire(&instance_dir.join("backup-transfer.lock"))?,
+        };
+        ensure_no_pending_remote_cleanup(instance_dir)?;
+        Ok(locks)
+    }
+}
+
 /// One uninstall plan: exact deletions plus everything deliberately kept.
 pub(crate) struct UninstallPlan {
     pub(crate) deployment_id: String,
@@ -144,19 +234,102 @@ pub(crate) fn run_uninstall(
     confirmed: bool,
 ) -> anyhow::Result<String> {
     let action = "uninstall";
-    let (record, host, target) = resolve_instance_target(context, selector, action)?;
+    // A committed target receipt is enough to finish local cleanup even when
+    // the target is no longer reachable. Keep the existing registry record
+    // until the key material and marker have been handled.
+    if let Ok(record) = crate::fleet::resolve_instance(&context.registry, selector, action) {
+        let _guard = super::HostIntent::open(
+            &context.registry,
+            controller_keys,
+            &record.deployment_id,
+            action,
+        )?;
+        let path = controller_keys
+            .instance_dir(&record.deployment_id)?
+            .with_extension("uninstall.json");
+        if path.try_exists()? {
+            let (operation, completed) = read_pending(&path)?;
+            if completed.is_some()
+                && operation.deployment_id.as_deref() == Some(record.deployment_id.as_str())
+                && matches!(
+                    operation.operation,
+                    HostOperationBody::StateMutate {
+                        mutation: StateMutationPayload::Uninstall {}
+                    }
+                )
+            {
+                let _locks =
+                    LifecycleLocks::acquire(&controller_keys.instance_dir(&record.deployment_id)?)?;
+                finish_local_cleanup(
+                    &context.registry,
+                    controller_keys,
+                    &record.deployment_id,
+                    &path,
+                )?;
+                return Ok(format!(
+                    "uninstall of '{}' ({}) was completed; remaining local cleanup is complete",
+                    record.alias, record.deployment_id
+                ));
+            }
+        }
+    }
+    let resolved = resolve_instance_target(context, selector, action);
+    let (record, host, target) = match resolved {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(deployment_id) = selector
+                && let Ok(instance_dir) = controller_keys.instance_dir(deployment_id)
+                && context
+                    .registry
+                    .instance_by_deployment(deployment_id)?
+                    .is_none()
+            {
+                let _guard = super::HostIntent::open(
+                    &context.registry,
+                    controller_keys,
+                    deployment_id,
+                    action,
+                )?;
+                let path = instance_dir.with_extension("uninstall.json");
+                if path.try_exists()? {
+                    let (operation, completed) = read_pending(&path)?;
+                    if let Some(alias) = completed
+                        && operation.deployment_id.as_deref() == Some(deployment_id)
+                        && matches!(
+                            operation.operation,
+                            HostOperationBody::StateMutate {
+                                mutation: StateMutationPayload::Uninstall {}
+                            }
+                        )
+                    {
+                        let _locks = LifecycleLocks::acquire(&instance_dir)?;
+                        finish_local_cleanup(
+                            &context.registry,
+                            controller_keys,
+                            deployment_id,
+                            &path,
+                        )?;
+                        return Ok(format!(
+                            "uninstall of '{alias}' ({deployment_id}) was completed; remaining local cleanup is complete"
+                        ));
+                    }
+                }
+            }
+            return Err(error.context("if uninstall completed but local cleanup was interrupted, retry using the deployment id"));
+        }
+    };
+    let _intent_guard = super::HostIntent::open(
+        &context.registry,
+        controller_keys,
+        &record.deployment_id,
+        action,
+    )?;
     let instance_dir = controller_keys.instance_dir(&record.deployment_id)?;
     // Outside the key directory: this exact confirmed operation must survive
     // key cleanup if forgetting the local registry record subsequently fails.
     let pending_path = instance_dir.with_extension("uninstall.json");
     let pending = if pending_path.try_exists()? {
-        let bytes = crate::filesystem::read_secure_regular_file(
-            &pending_path,
-            "pending uninstall",
-            false,
-            crate::target::MAX_HOST_OPERATION_BYTES as u64,
-        )?;
-        let operation = crate::target::parse_host_operation(&bytes)?;
+        let (operation, _) = read_pending(&pending_path)?;
         if operation.deployment_id.as_deref() != Some(record.deployment_id.as_str())
             || !matches!(
                 operation.operation,
@@ -211,29 +384,16 @@ pub(crate) fn run_uninstall(
             StateMutationPayload::Uninstall {},
         )
     };
-    crate::filesystem::ensure_private_directory(
-        &instance_dir,
-        "controller instance lifecycle directory",
-    )?;
     // All instance-scoped long-running flows take one of these outer locks
     // before entering the shared key/journal lock. Holding them in that same
     // order makes uninstall a single linearized lifecycle action without a
     // second recovery framework.
-    let _bind_lock = FileLock::acquire(&instance_dir.join("bind.lock"))?;
-    let _controller_recovery_lock = FileLock::acquire(&instance_dir.join("recovery.lock"))?;
-    let _data_recovery_lock = FileLock::acquire(&instance_dir.join("recovery-plan.lock"))?;
-    let _transfer_lock = FileLock::acquire(&instance_dir.join("backup-transfer.lock"))?;
-    ensure_no_pending_remote_cleanup(&instance_dir)?;
+    let _locks = LifecycleLocks::acquire(&instance_dir)?;
 
     // Another confirmed invocation may have acquired these same lifecycle
     // locks first. Reuse its saved operation rather than replacing its identity.
     let operation = if pending_path.try_exists()? {
-        crate::target::parse_host_operation(&crate::filesystem::read_secure_regular_file(
-            &pending_path,
-            "pending uninstall",
-            false,
-            crate::target::MAX_HOST_OPERATION_BYTES as u64,
-        )?)?
+        read_pending(&pending_path)?.0
     } else {
         crate::filesystem::atomic_write(
             &pending_path,
@@ -255,28 +415,21 @@ pub(crate) fn run_uninstall(
         }
     }
 
+    crate::filesystem::atomic_write(
+        &pending_path,
+        &serde_json::to_vec(&CompletedUninstall {
+            schema: 1,
+            operation,
+            alias: record.alias.clone(),
+        })?,
+        0o600,
+    )?;
+
     // Completion removes this instance's two local ownership records. HostRecord
     // and siblings stay. Controller Slot rows are part of an external database
     // and therefore follow the plan's explicit keep decision.
-    controller_keys
-        .remove_instance(&record.deployment_id)
-        .with_context(|| {
-            format!(
-                "instance '{}' was uninstalled, but its local controller key cleanup failed; the InstanceRecord was retained so cleanup can be retried",
-                record.alias
-            )
-        })?;
-    context
-        .registry
-        .forget_instance_by_deployment(&record.deployment_id)
-        .with_context(|| {
-            format!(
-                "instance '{}' was uninstalled and its local controller keys were removed, but its stale InstanceRecord could not be forgotten",
-                record.alias
-            )
-        })?;
-
-    crate::filesystem::remove_file_durable(&pending_path)?;
+    finish_local_cleanup(&context.registry, controller_keys, &record.deployment_id, &pending_path)
+        .with_context(|| format!("instance '{}' was uninstalled but local cleanup remains pending; retry using deployment id '{}'", record.alias, record.deployment_id))?;
     Ok(crate::ui::message!(
         "uninstalled instance '{}' (deployment {})\n\
          managed resources removed per plan; external/shared resources were never touched\n\

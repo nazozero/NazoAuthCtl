@@ -106,7 +106,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Rollback { selector } => {
             let merged = selector.merge_global(instance_flag, "rollback")?;
             let context = LifecycleContext::production()?;
-            let report = crate::instance_lifecycle::run_rollback(&context, merged)?;
+            let keys = ControllerKeyStore::open_default()?;
+            let report = crate::instance_lifecycle::run_rollback(&context, &keys, merged)?;
             crate::ui::print_report(&report);
             Ok(())
         }
@@ -166,21 +167,22 @@ fn run_backup(args: BackupArgs, global: Option<&str>, json_mode: bool) -> anyhow
             &to_host,
         );
     }
-    let operation = match args.command {
+    let proposed = match args.command {
         BackupCommand::Snapshot => crate::target::HostOperation::backup_snapshot(
             uuid::Uuid::now_v7(),
-            inspection.deployment_id,
+            &inspection.deployment_id,
         ),
         BackupCommand::RestoreTest => crate::target::HostOperation::backup_restore_test(
             uuid::Uuid::now_v7(),
-            inspection.deployment_id,
+            &inspection.deployment_id,
         ),
         BackupCommand::Show => unreachable!(),
         BackupCommand::Copy { .. } => {
             unreachable!("copy returned before constructing a single-target operation")
         }
     };
-    let result = target.execute_host_operation(&operation)?;
+    let keys = ControllerKeyStore::open_default()?;
+    let result = execute_backup_intent(&context.registry, &keys, target.as_ref(), proposed)?;
     match result.outcome {
         crate::target::HostOutcome::Completed {
             body: crate::target::HostCompletionBody::BackupSnapshotCreated { manifest },
@@ -208,6 +210,56 @@ fn run_backup(args: BackupArgs, global: Option<&str>, json_mode: bool) -> anyhow
     Ok(())
 }
 
+fn execute_backup_intent(
+    registry: &RegistryStore,
+    keys: &ControllerKeyStore,
+    target: &dyn crate::target::ExecutionTarget,
+    proposed: crate::target::HostOperation,
+) -> anyhow::Result<crate::target::HostResult> {
+    let deployment = proposed
+        .deployment_id
+        .as_deref()
+        .context("backup operation has no deployment")?;
+    let intent = crate::instance_lifecycle::HostIntent::open(registry, keys, deployment, "backup")?;
+    let operation = match intent.load()? {
+        Some(operation) => {
+            if operation.deployment_id != proposed.deployment_id
+                || std::mem::discriminant(&operation.operation)
+                    != std::mem::discriminant(&proposed.operation)
+            {
+                bail!("a different backup operation is pending; retry it first");
+            }
+            operation
+        }
+        None => {
+            intent.save(&proposed)?;
+            proposed
+        }
+    };
+    let result = target.execute_host_operation(&operation)?;
+    match (&operation.operation, &result.outcome) {
+        (
+            crate::target::HostOperationBody::BackupSnapshot {},
+            crate::target::HostOutcome::Completed {
+                body: crate::target::HostCompletionBody::BackupSnapshotCreated { .. },
+            },
+        )
+        | (
+            crate::target::HostOperationBody::BackupRestoreTest {},
+            crate::target::HostOutcome::Completed {
+                body: crate::target::HostCompletionBody::BackupRestoreTested { .. },
+            },
+        ) => {}
+        (_, crate::target::HostOutcome::Failed { code, .. })
+            if code != crate::error_codes::OPERATION_ID_CONFLICT => {}
+        _ => bail!(
+            "backup returned an unexpected or conflicting result; the pending operation was retained"
+        ),
+    }
+    intent.clear()?;
+    Ok(result)
+}
+
 /// Copy one immutable snapshot strictly through the two targets' journaled
 /// HostOperation channels.  The controller never receives a remote path and
 /// cannot invoke a second transfer protocol.
@@ -221,6 +273,7 @@ fn run_backup_copy(
 ) -> anyhow::Result<()> {
     let keys = ControllerKeyStore::open_default()?;
     let journal = TransferJournal::open(&keys.instance_dir(deployment_id)?)?;
+    validate_lifecycle_binding(registry, &keys, record, source_host)?;
     let existing = journal.load()?;
     let destination_host = registry.host_by_alias(destination_alias)?.with_context(|| {
         if let Some(existing) = &existing {
@@ -276,6 +329,29 @@ fn run_backup_copy(
         "snapshot_id": receipt.snapshot_id, "source": record.alias,
         "destination": destination_host.alias, "verified_at": receipt.verified_at.to_rfc3339(),
     }));
+    Ok(())
+}
+
+/// Called only after holding the relevant recovery or transfer lock, which
+/// uninstall also acquires before removing the registry and local state.
+fn validate_lifecycle_binding(
+    registry: &RegistryStore,
+    keys: &ControllerKeyStore,
+    record: &crate::registry::InstanceRecord,
+    host: &crate::registry::HostRecord,
+) -> anyhow::Result<()> {
+    let current = registry
+        .instance_by_deployment(&record.deployment_id)?
+        .context("instance was removed while the operation was starting")?;
+    if current.host_id != host.host_id || registry.host_by_id(host.host_id)?.is_none() {
+        bail!("instance host binding changed while the operation was starting");
+    }
+    let pending = keys
+        .instance_dir(&record.deployment_id)?
+        .with_extension("uninstall.json");
+    if pending.try_exists()? {
+        bail!("an uninstall operation is pending; finish it before starting this operation");
+    }
     Ok(())
 }
 
@@ -650,6 +726,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
         crate::instance_lifecycle::resolve_live_instance(&context, merged, "recover")?;
     let keys = ControllerKeyStore::open_default()?;
     let journal = RecoveryJournal::open(&keys.instance_dir(&record.deployment_id)?)?;
+    validate_lifecycle_binding(&context.registry, &keys, &record, &host)?;
     let mut plan = match journal.load()? {
         Some(plan) => {
             if plan.deployment_id != record.deployment_id {
@@ -1552,6 +1629,106 @@ mod backup_transfer_tests {
     const DESTINATION: &str = "destination-host";
     const MANIFEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const FILE_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn stale_inspection_cannot_create_recovery_or_transfer_journal() -> anyhow::Result<()> {
+        for removed in [false, true] {
+            for recovery in [false, true] {
+                let temp = crate::filesystem::PrivateTempDir::new("stale-lifecycle")?;
+                let registry = RegistryStore::open(temp.path().join("registry"))?;
+                let keys = ControllerKeyStore::open(temp.path().join("keys"))?;
+                let host = registry.ensure_local_host()?;
+                let record = crate::registry::InstanceRecord::new(
+                    DEPLOYMENT,
+                    "instance",
+                    host.host_id,
+                    "https://auth.example.com",
+                )?;
+                registry.add_instance(record.clone())?;
+                let directory = keys.instance_dir(DEPLOYMENT)?;
+                if removed {
+                    registry.forget_instance_by_deployment(DEPLOYMENT)?;
+                } else {
+                    crate::filesystem::atomic_write(
+                        &directory.with_extension("uninstall.json"),
+                        b"pending",
+                        0o600,
+                    )?;
+                }
+                if recovery {
+                    let journal = RecoveryJournal::open(&directory)?;
+                    assert!(validate_lifecycle_binding(&registry, &keys, &record, &host).is_err());
+                    assert!(journal.load()?.is_none());
+                    assert!(!directory.join("recovery-plan.json").exists());
+                } else {
+                    let journal = TransferJournal::open(&directory)?;
+                    assert!(validate_lifecycle_binding(&registry, &keys, &record, &host).is_err());
+                    assert!(journal.load()?.is_none());
+                    assert!(!directory.join("backup-transfer.json").exists());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    struct InterruptedBackup {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl crate::target::ExecutionTarget for InterruptedBackup {
+        fn inspect_host(&self) -> anyhow::Result<crate::target::HostOverview> {
+            unreachable!()
+        }
+        fn inspect_instance(&self, _: &str) -> anyhow::Result<crate::target::InstanceInspection> {
+            unreachable!()
+        }
+        fn read_health(&self, _: &str) -> anyhow::Result<crate::target::HealthSnapshot> {
+            unreachable!()
+        }
+        fn execute_control_operation(
+            &self,
+            _: crate::target::ControlOperationRequest,
+        ) -> anyhow::Result<crate::target::ControlOperationReceipt> {
+            unreachable!()
+        }
+        fn execute_host_operation(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(operation.operation_id.clone());
+            if seen.len() == 1 {
+                anyhow::bail!("simulated interrupted backup");
+            }
+            Ok(HostResult::failed(
+                &operation.operation_id,
+                "TEST_TERMINAL",
+                "finished",
+            ))
+        }
+    }
+
+    #[test]
+    fn backup_intent_reuses_id_after_interruption() -> anyhow::Result<()> {
+        let temp = crate::filesystem::PrivateTempDir::new("backup-intent")?;
+        let registry = RegistryStore::open(temp.path().join("registry"))?;
+        let keys = ControllerKeyStore::open(temp.path().join("keys"))?;
+        for restore in [false, true] {
+            let target = InterruptedBackup {
+                seen: Mutex::new(Vec::new()),
+            };
+            let operation = || {
+                if restore {
+                    HostOperation::backup_restore_test(uuid::Uuid::now_v7(), DEPLOYMENT)
+                } else {
+                    HostOperation::backup_snapshot(uuid::Uuid::now_v7(), DEPLOYMENT)
+                }
+            };
+            assert!(execute_backup_intent(&registry, &keys, &target, operation()).is_err());
+            execute_backup_intent(&registry, &keys, &target, operation())?;
+            let seen = target.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0], seen[1]);
+        }
+        Ok(())
+    }
 
     #[derive(Clone, Copy)]
     enum Role {

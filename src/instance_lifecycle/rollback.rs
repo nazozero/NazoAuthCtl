@@ -23,29 +23,44 @@ use crate::target::{
 /// Restores the saved artifact and matching configuration generation.
 pub(crate) fn run_rollback(
     context: &LifecycleContext,
+    keys: &crate::controller_identity::store::ControllerKeyStore,
     selector: Option<&str>,
 ) -> anyhow::Result<String> {
     let action = "rollback";
     let (record, _host, target, inspection) = resolve_live_instance(context, selector, action)?;
     let deployment_id = &inspection.deployment_id;
     let revision = inspection.revision;
-    if inspection.artifact.previous.is_none() {
-        bail!(
-            "{ROLLBACK_UNAVAILABLE}: deployment '{deployment_id}' has no previous verified \
-             artifact reference saved; rollback restores saved facts only and never guesses"
-        );
-    }
-
-    // One lifecycle operation id per attempt. Retries after a drop re-execute
-    // idempotent steps under a fresh id or replay the stored result for the
-    // same id; the config/artifact CAS on the target makes double-apply
-    // impossible either way.
-    let operation = HostOperation::state_mutate(
-        uuid::Uuid::now_v7().to_string(),
-        deployment_id.clone(),
-        Some(revision),
-        StateMutationPayload::Rollback {},
-    );
+    let intent = super::HostIntent::open(&context.registry, keys, deployment_id, "rollback")?;
+    let operation = match intent.load()? {
+        Some(operation) => {
+            if operation.deployment_id.as_deref() != Some(deployment_id.as_str())
+                || !matches!(
+                    operation.operation,
+                    crate::target::HostOperationBody::StateMutate {
+                        mutation: StateMutationPayload::Rollback {}
+                    }
+                )
+            {
+                bail!("pending rollback does not match this deployment");
+            }
+            operation
+        }
+        None => {
+            if inspection.artifact.previous.is_none() {
+                bail!(
+                    "{ROLLBACK_UNAVAILABLE}: deployment '{deployment_id}' has no previous verified artifact reference saved"
+                );
+            }
+            let operation = HostOperation::state_mutate(
+                uuid::Uuid::now_v7().to_string(),
+                deployment_id.clone(),
+                Some(revision),
+                StateMutationPayload::Rollback {},
+            );
+            intent.save(&operation)?;
+            operation
+        }
+    };
     let result = target.execute_host_operation(&operation)?;
     let applied_revision = require_completed(
         &result,
@@ -54,7 +69,14 @@ pub(crate) fn run_rollback(
             _ => None,
         },
         action,
-    )?;
+    );
+    if matches!(&result.outcome, crate::target::HostOutcome::Failed { code, .. }
+        if code != crate::error_codes::OPERATION_ID_CONFLICT)
+    {
+        intent.clear()?;
+    }
+    let applied_revision = applied_revision?;
+    intent.clear()?;
 
     let fresh = target.inspect_instance(deployment_id)?;
     record_observation(context, deployment_id, &fresh);

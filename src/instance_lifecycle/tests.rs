@@ -236,6 +236,43 @@ struct Fixture {
     deletion: Arc<ScriptedDeletion>,
 }
 
+struct LoseFirstMutation {
+    target: LocalTarget,
+    lose: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExecutionTarget for LoseFirstMutation {
+    fn inspect_host(&self) -> anyhow::Result<crate::target::HostOverview> {
+        self.target.inspect_host()
+    }
+    fn inspect_instance(&self, id: &str) -> anyhow::Result<crate::target::InstanceInspection> {
+        self.target.inspect_instance(id)
+    }
+    fn execute_host_operation(
+        &self,
+        operation: &HostOperation,
+    ) -> anyhow::Result<crate::target::HostResult> {
+        let result = self.target.execute_host_operation(operation)?;
+        if matches!(
+            operation.operation,
+            crate::target::HostOperationBody::StateMutate { .. }
+        ) && self.lose.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated response loss");
+        }
+        Ok(result)
+    }
+    fn execute_control_operation(
+        &self,
+        request: crate::target::ControlOperationRequest,
+    ) -> anyhow::Result<crate::target::ControlOperationReceipt> {
+        self.target.execute_control_operation(request)
+    }
+    fn read_health(&self, id: &str) -> anyhow::Result<crate::target::HealthSnapshot> {
+        self.target.read_health(id)
+    }
+}
+
 impl Fixture {
     fn new() -> anyhow::Result<Self> {
         Self::with_current_release(Some(
@@ -404,6 +441,39 @@ fn update_dispatches_migration_once_and_commits_new_revision() -> anyhow::Result
     // F04: the monotonic CAS revision tracks CONFIG changes; an artifact-only
     // update swaps references without advancing it.
     assert_eq!(state.config.revision, 1);
+    Ok(())
+}
+
+#[test]
+fn update_with_config_replays_original_revision_after_response_loss() -> anyhow::Result<()> {
+    for dispatch_was_cleared in [false, true] {
+        let mut fixture = Fixture::new()?;
+        let lose = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let target = LocalTarget::with_state_root(&fixture.state_root)
+            .with_control_executor(fixture.control.clone())
+            .with_lifecycle_executor(fixture.lifecycle.clone());
+        fixture.context.factory = Box::new(move |_| {
+            Ok(Box::new(LoseFirstMutation {
+                target: target.clone(),
+                lose: lose.clone(),
+            }))
+        });
+        let request = || UpdateRequest {
+            config_content: Some("test-config".into()),
+            config_schema: Some("nazauth-v2".into()),
+            ..fixture.update_request()
+        };
+        assert!(run_update(&fixture.context, &fixture.keys, request()).is_err());
+        assert_eq!(
+            fixture.store()?.load_existing(DEPLOYMENT)?.config.revision,
+            2
+        );
+        if dispatch_was_cleared {
+            OperationJournal::open(fixture.keys.instance_dir(DEPLOYMENT)?)?.clear()?;
+        }
+        run_update(&fixture.context, &fixture.keys, request())?;
+        assert_eq!(*fixture.lifecycle.update_calls.lock().unwrap(), 1);
+    }
     Ok(())
 }
 
@@ -577,8 +647,12 @@ fn retry_with_same_operation(code: &'static str) -> anyhow::Result<()> {
 #[test]
 fn rollback_without_previous_reference_refuses_to_guess() -> anyhow::Result<()> {
     let fixture = Fixture::new()?;
-    let error = run_rollback(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")))
-        .expect_err("rollback without a saved previous artifact must refuse");
+    let error = run_rollback(
+        &fixture.context,
+        &fixture.keys,
+        Some(&format!("inst-{DEPLOYMENT}")),
+    )
+    .expect_err("rollback without a saved previous artifact must refuse");
     assert!(
         error.to_string().contains("ROLLBACK_UNAVAILABLE"),
         "{error}"
@@ -603,12 +677,246 @@ fn rollback_restores_the_previous_verified_reference() -> anyhow::Result<()> {
         },
     )?;
 
-    let report = run_rollback(&fixture.context, Some(&format!("inst-{DEPLOYMENT}")))?;
+    let report = run_rollback(
+        &fixture.context,
+        &fixture.keys,
+        Some(&format!("inst-{DEPLOYMENT}")),
+    )?;
     assert!(report.contains("previous verified"), "{report}");
     let state = fixture.store()?.load_existing(DEPLOYMENT)?;
     assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
     assert_eq!(state.artifact.previous.as_deref(), Some(NEW_REF));
     assert_eq!(state.config.revision, 1);
+    Ok(())
+}
+
+#[test]
+fn rollback_replays_the_exact_operation_after_a_lost_response() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.store()?.apply_update_healthy(
+        DEPLOYMENT,
+        1,
+        crate::target::deployment_state::UpdateCommit {
+            config_snapshot: Some("test-snapshot".to_owned()),
+            artifact: NEW_REF.to_owned(),
+            release: None,
+            config: None,
+            operation_id: "prior-update-op".to_owned(),
+        },
+    )?;
+    let lose = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let target = LocalTarget::with_state_root(&fixture.state_root)
+        .with_lifecycle_executor(fixture.lifecycle.clone());
+    fixture.context.factory = Box::new(move |_| {
+        Ok(Box::new(LoseFirstMutation {
+            target: target.clone(),
+            lose: lose.clone(),
+        }))
+    });
+    assert!(
+        run_rollback(
+            &fixture.context,
+            &fixture.keys,
+            Some(&format!("inst-{DEPLOYMENT}"))
+        )
+        .is_err()
+    );
+    run_rollback(
+        &fixture.context,
+        &fixture.keys,
+        Some(&format!("inst-{DEPLOYMENT}")),
+    )?;
+    let state = fixture.store()?.load_existing(DEPLOYMENT)?;
+    assert_eq!(state.artifact.current.as_deref(), Some(CURRENT_REF));
+    assert_eq!(*fixture.lifecycle.rollback_calls.lock().unwrap(), 1);
+    Ok(())
+}
+
+#[test]
+fn pending_lifecycle_intent_blocks_other_actions_and_uninstall() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let intent = super::HostIntent::open(
+        &fixture.context.registry,
+        &fixture.keys,
+        DEPLOYMENT,
+        "backup",
+    )?;
+    intent.save(&HostOperation::backup_restore_test(
+        uuid::Uuid::now_v7(),
+        DEPLOYMENT,
+    ))?;
+    drop(intent);
+    assert!(
+        super::HostIntent::open(
+            &fixture.context.registry,
+            &fixture.keys,
+            DEPLOYMENT,
+            "update"
+        )
+        .is_err()
+    );
+    assert!(
+        super::HostIntent::open(
+            &fixture.context.registry,
+            &fixture.keys,
+            DEPLOYMENT,
+            "rollback"
+        )
+        .is_err()
+    );
+    assert!(
+        run_uninstall(
+            &fixture.context,
+            &fixture.keys,
+            Some(&format!("inst-{DEPLOYMENT}")),
+            true
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn interrupted_uninstall_blocks_other_lifecycle_mutations() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let pending_path = fixture
+        .keys
+        .instance_dir(DEPLOYMENT)?
+        .with_extension("uninstall.json");
+    let operation = HostOperation::state_mutate(
+        uuid::Uuid::now_v7().to_string(),
+        DEPLOYMENT,
+        Some(1),
+        StateMutationPayload::Uninstall {},
+    );
+    crate::filesystem::atomic_write(
+        &pending_path,
+        &crate::target::encode_host_operation(&operation)?,
+        0o600,
+    )?;
+    for action in ["update", "rollback", "backup"] {
+        let error = match super::HostIntent::open(
+            &fixture.context.registry,
+            &fixture.keys,
+            DEPLOYMENT,
+            action,
+        ) {
+            Ok(_) => panic!("pending uninstall must block {action}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("uninstall operation is pending"));
+    }
+    Ok(())
+}
+
+#[test]
+fn completed_uninstall_cleanup_survives_forgotten_registry_record() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let operation = HostOperation::state_mutate(
+        uuid::Uuid::now_v7().to_string(),
+        DEPLOYMENT,
+        Some(1),
+        StateMutationPayload::Uninstall {},
+    );
+    let pending = fixture
+        .keys
+        .instance_dir(DEPLOYMENT)?
+        .with_extension("uninstall.json");
+    let completed = serde_json::json!({"schema": 1, "operation": operation, "alias": "test"});
+    crate::filesystem::atomic_write(&pending, &serde_json::to_vec(&completed)?, 0o600)?;
+    fixture
+        .context
+        .registry
+        .forget_instance_by_deployment(DEPLOYMENT)?;
+    let report = run_uninstall(&fixture.context, &fixture.keys, Some(DEPLOYMENT), true)?;
+    assert!(report.contains("remaining local cleanup is complete"));
+    assert!(!pending.exists());
+    Ok(())
+}
+
+#[test]
+fn completed_uninstall_finishes_local_cleanup_with_target_offline() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new()?;
+    let operation = HostOperation::state_mutate(
+        uuid::Uuid::now_v7().to_string(),
+        DEPLOYMENT,
+        Some(1),
+        StateMutationPayload::Uninstall {},
+    );
+    let pending = fixture
+        .keys
+        .instance_dir(DEPLOYMENT)?
+        .with_extension("uninstall.json");
+    let completed = serde_json::json!({"schema": 1, "operation": operation, "alias": "test"});
+    crate::filesystem::atomic_write(&pending, &serde_json::to_vec(&completed)?, 0o600)?;
+    fixture.context.factory = Box::new(|_| anyhow::bail!("target is offline"));
+    run_uninstall(&fixture.context, &fixture.keys, Some(DEPLOYMENT), true)?;
+    assert!(
+        fixture
+            .context
+            .registry
+            .instance_by_deployment(DEPLOYMENT)?
+            .is_none()
+    );
+    assert!(!pending.exists());
+    Ok(())
+}
+
+#[test]
+fn completed_uninstall_retains_pending_remote_cleanup_on_both_entry_paths() -> anyhow::Result<()> {
+    for absent_registry in [false, true] {
+        for journal in ["recovery-plan.json", "backup-transfer.json"] {
+            let fixture = Fixture::new()?;
+            let operation = HostOperation::state_mutate(
+                uuid::Uuid::now_v7().to_string(),
+                DEPLOYMENT,
+                Some(1),
+                StateMutationPayload::Uninstall {},
+            );
+            let directory = fixture.keys.instance_dir(DEPLOYMENT)?;
+            let pending = directory.with_extension("uninstall.json");
+            let completed =
+                serde_json::json!({"schema": 1, "operation": operation, "alias": "test"});
+            crate::filesystem::atomic_write(&pending, &serde_json::to_vec(&completed)?, 0o600)?;
+            let remote_journal = directory.join(journal);
+            crate::filesystem::atomic_write(&remote_journal, b"pending", 0o600)?;
+            if absent_registry {
+                fixture
+                    .context
+                    .registry
+                    .forget_instance_by_deployment(DEPLOYMENT)?;
+            }
+            assert!(
+                run_uninstall(&fixture.context, &fixture.keys, Some(DEPLOYMENT), true).is_err()
+            );
+            assert!(pending.exists());
+            assert!(remote_journal.exists());
+            assert!(fixture.keys.load_active(DEPLOYMENT)?.is_some());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn completed_uninstall_cannot_delete_keys_while_transfer_lock_is_held() -> anyhow::Result<()> {
+    let fixture = Fixture::new()?;
+    let operation = HostOperation::state_mutate(
+        uuid::Uuid::now_v7().to_string(),
+        DEPLOYMENT,
+        Some(1),
+        StateMutationPayload::Uninstall {},
+    );
+    let directory = fixture.keys.instance_dir(DEPLOYMENT)?;
+    let pending = directory.with_extension("uninstall.json");
+    let completed = serde_json::json!({"schema": 1, "operation": operation, "alias": "test"});
+    crate::filesystem::atomic_write(&pending, &serde_json::to_vec(&completed)?, 0o600)?;
+    let lock = crate::file_lock::FileLock::acquire(&directory.join("backup-transfer.lock"))?;
+    assert!(run_uninstall(&fixture.context, &fixture.keys, Some(DEPLOYMENT), true).is_err());
+    assert!(pending.exists());
+    assert!(fixture.keys.load_active(DEPLOYMENT)?.is_some());
+    drop(lock);
+    run_uninstall(&fixture.context, &fixture.keys, Some(DEPLOYMENT), true)?;
+    assert!(!pending.exists());
     Ok(())
 }
 

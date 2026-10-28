@@ -3,7 +3,7 @@
 //! One runner fans a read-only job out over every registered instance with:
 //!
 //! * bounded concurrency (std threads, hard cap [`MAX_CONCURRENCY`]);
-//! * a transport-owned per-target wall-clock timeout — OpenSSH is terminated
+//! * a shared per-target SSH deadline — OpenSSH is terminated
 //!   and reaped by [`crate::process::Process`] before its worker slot returns;
 //! * strict partial-failure isolation — one offline host never hides or
 //!   truncates another host's successful result;
@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serde_json::{Value, json};
@@ -32,7 +32,8 @@ use crate::target::{ExecutionTarget, InstanceInspection};
 /// Hard upper bound for concurrent targets (I03: cap ~8).
 pub(crate) const MAX_CONCURRENCY: usize = 8;
 
-/// Wall-clock budget for one target's whole read-only job.
+/// Shared SSH budget, starting when the worker takes a target. Local reads
+/// use synchronous filesystem access and cannot be interrupted by this deadline.
 pub(crate) const DEFAULT_PER_TARGET_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A read-only unit of work executed once per instance+host pair.
@@ -41,7 +42,7 @@ pub(crate) type ReadJob = dyn Fn(&InstanceRecord, &HostRecord, &dyn ExecutionTar
     + Sync;
 
 type SharedFactory =
-    dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync;
+    dyn Fn(&HostRecord, Instant) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync;
 
 /// One per-instance outcome in stable Registry order.
 pub(crate) struct FleetItemOutcome {
@@ -68,8 +69,8 @@ impl FleetReadRunner {
     /// per-target timeout.
     pub(crate) fn production() -> Self {
         Self::new(
-            Arc::new(|record| {
-                crate::fleet::production_target_with_ssh_timeout(record, DEFAULT_PER_TARGET_TIMEOUT)
+            Arc::new(|record, deadline| {
+                crate::fleet::production_target_with_deadline(record, Some(deadline))
             }),
             MAX_CONCURRENCY,
         )
@@ -144,14 +145,13 @@ impl FleetReadRunner {
 fn execute_one(
     instance: &InstanceRecord,
     host: &HostRecord,
-    factory: &(
-         dyn Fn(&HostRecord) -> anyhow::Result<Box<dyn ExecutionTarget + Send>> + Send + Sync
-     ),
+    factory: &SharedFactory,
     job: &ReadJob,
 ) -> Result<Value, (String, String)> {
     // Transport construction happens INSIDE the worker thread; the produced
     // target never crosses a thread boundary afterwards.
-    let target = match factory(host) {
+    let deadline = Instant::now() + DEFAULT_PER_TARGET_TIMEOUT;
+    let target = match factory(host, deadline) {
         Ok(target) => target,
         Err(error) => {
             let detail = format!("transport for host '{}' failed: {error:#}", host.alias);

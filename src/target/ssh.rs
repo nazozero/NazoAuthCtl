@@ -172,7 +172,7 @@ pub struct SshTarget {
     privilege: HostPrivilege,
     /// Test seam only. Production value: [`SSH_PROGRAM`].
     program: PathBuf,
-    timeout: Duration,
+    deadline: Option<Instant>,
     handshake: RefCell<Option<RemoteHello>>,
     transfer_session: RefCell<Option<nazoauthctl_runtime::process::LineSession>>,
 }
@@ -230,7 +230,7 @@ impl SshTarget {
             privilege: record.privilege,
             program: PathBuf::from(SSH_PROGRAM),
             profile,
-            timeout: DEFAULT_EXEC_TIMEOUT,
+            deadline: None,
             handshake: RefCell::new(None),
             transfer_session: RefCell::new(None),
         })
@@ -242,8 +242,8 @@ impl SshTarget {
         self
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub(crate) fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -252,7 +252,11 @@ impl SshTarget {
     }
 
     fn process(&self) -> Process {
-        ssh_process(self.program.clone()).timeout(self.timeout)
+        ssh_process(self.program.clone()).timeout(
+            self.deadline.map_or(DEFAULT_EXEC_TIMEOUT, |deadline| {
+                DEFAULT_EXEC_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()))
+            }),
+        )
     }
 
     /// The fixed remote command tokens. User input never joins this vector.
@@ -299,6 +303,15 @@ impl SshTarget {
 
     /// One bounded stdin→stdout round trip through the fixed argv.
     fn transmit(&self, operation: &HostOperation) -> anyhow::Result<HostResult> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            bail!(
+                "{}: fleet target timed out",
+                crate::error_codes::HOST_UNREACHABLE
+            );
+        }
         let payload = encode_host_operation(operation)?;
         let streaming = matches!(
             operation.operation,
@@ -720,6 +733,45 @@ mod tests {
             .env_remove("NAZOAUTHCTL_TESTING")
             .status().unwrap();
         assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_deadline_limits_sequential_ssh_processes() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = filesystem::PrivateTempDir::new("nazoauthctl-ssh-budget")?;
+        let program = dir.path().join("ssh");
+        let calls = dir.path().join("calls");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho call >> '{}'\nsleep 0.65\n",
+                calls.display()
+            ),
+        )?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+        let target = SshTarget::from_record(&HostRecord::new_ssh(
+            "server-a",
+            PROFILE,
+            HostPrivilege::Sudo,
+            Uuid::now_v7(),
+        )?)?
+        .with_program(program)
+        .with_deadline(Instant::now() + Duration::from_secs(1));
+        assert!(matches!(target.probe_sudo()?, SudoPreflight::Ready));
+        let operation = HostOperation::hello(Uuid::now_v7().to_string());
+        let error = target
+            .transmit(&operation)
+            .expect_err("second call must exhaust the shared deadline");
+        assert!(format!("{error:#}").contains(crate::error_codes::HOST_UNREACHABLE));
+        assert_eq!(fs::read_to_string(&calls)?.lines().count(), 2);
+        let error = target
+            .transmit(&operation)
+            .expect_err("expired deadline must reject before spawning");
+        assert!(format!("{error:#}").contains(crate::error_codes::HOST_UNREACHABLE));
+        assert_eq!(fs::read_to_string(&calls)?.lines().count(), 2);
+        Ok(())
     }
 
     // ---------- fixture stub transport ----------

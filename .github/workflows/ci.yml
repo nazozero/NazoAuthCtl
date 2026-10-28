@@ -24,6 +24,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify formatting
         run: cargo fmt --all -- --check
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Verify Linux installer syntax
         if: runner.os == 'Linux'
         run: sh -n scripts/install_nazoauthctl.sh
@@ -51,7 +52,7 @@ jobs:
       - name: Lint controller
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Build controller
-        run: cargo build --locked --workspace --all-targets --all-features --release
+        run: cargo build --locked -p nazoauthctl --bin nazoauthctl --all-features --release
       - name: Smoke controller
         shell: bash
         run: target/release/nazoauthctl${{ runner.os == 'Windows' && '.exe' || '' }} --help
