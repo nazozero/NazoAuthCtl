@@ -59,18 +59,18 @@ impl ExpiryStatus {
                 )
             }
             Self::Warning { seconds_remaining } => crate::ui::message!(
-                "WARNING: expires in {} — plan a rotation",
-                "将在 {} 后到期，请安排更换密钥",
+                "WARNING: expires in {} — management operations renew automatically on NazoAuth 0.3.8+",
+                "将在 {} 后到期，NazoAuth 0.3.8+ 会在管理操作时自动换钥",
                 human_duration(seconds_remaining)
             ),
             Self::Urgent { seconds_remaining } => crate::ui::message!(
-                "URGENT: expires in {} — rotate now",
-                "将在 {} 后到期，请立即更换密钥",
+                "URGENT: expires in {} — management operations renew automatically on NazoAuth 0.3.8+",
+                "将在 {} 后到期，NazoAuth 0.3.8+ 会在管理操作时自动换钥",
                 human_duration(seconds_remaining)
             ),
             Self::Expired { seconds_overdue } => crate::ui::message!(
-                "EXPIRED {} ago — new operations require rotation",
-                "已过期 {}，执行新操作前需更换密钥",
+                "EXPIRED {} ago — management operations renew automatically on NazoAuth 0.3.8+",
+                "已过期 {}，NazoAuth 0.3.8+ 会在管理操作时自动换钥",
                 human_duration(seconds_overdue)
             ),
         }
