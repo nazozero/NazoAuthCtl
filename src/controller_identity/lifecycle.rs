@@ -2419,7 +2419,7 @@ mod tests {
             "{report}"
         );
         assert!(
-            report.contains(crate::ui::text("EXPIRED", "执行新操作前需更换密钥")),
+            report.contains(crate::ui::text("renew automatically", "自动换钥")),
             "{report}"
         );
 

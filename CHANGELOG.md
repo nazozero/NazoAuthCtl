@@ -11,6 +11,7 @@
   business operations and local receipt-persistence failures.
 - Distinguish valid, expired and revoked keys; count occupied slots without
   revoked history and suppress approaching-expiry warnings for expired keys.
+- Expiry warnings describe automatic renewal instead of instructing manual rotation.
 - Use NazoAuth operator protocol 4. Upgrade the command host and SSH helper,
   then run update to NazoAuth 0.3.8 or later.
 
