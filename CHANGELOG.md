@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.3.9 - 2026-11-15
+## 0.3.10 - 2026-11-15
+
+- Validate signed server compatibility through the controller's protocol policy
+  and bind the verified manifest to the attested host/OCI protocol identity.
+  This replaces a stale protocol-3-only release assertion.
+- Includes the controller renewal changes below. The v0.3.9 release was blocked
+  by that assertion before publication; its tag remains unchanged.
+
+## 0.3.9 - Unpublished
 
 - Automatically propose and activate controller-key renewal during signed
   management operations, including update with an expired key. No recurring MFA,

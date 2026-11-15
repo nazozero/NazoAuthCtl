@@ -89,7 +89,9 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
     assert!(!workflow.contains("- name: Recover"));
     assert!(!workflow.contains("provider"));
     assert!(!workflow.contains("rollback"));
-    assert!(workflow.contains(".protocol == 3"));
+    assert!(
+        workflow.contains("EXPECTED_SERVER_PROTOCOL=\"$(jq -er '.protocol' host-identity.json)\"")
+    );
     assert!(workflow.contains("Execute VerifiedRelease current production verification"));
     assert!(workflow.contains("VerifiedRelease::verify"));
     assert!(!workflow.contains("SERVER_PEELED_COMMIT"));
@@ -129,7 +131,7 @@ fn server_compatibility_is_current_only_and_keeps_tokens_out_of_controller_steps
 
     for step in [
         "Execute the exact controller artifact through its production protocol path",
-        "Verify the protocol-3 host release identity",
+        "Verify the host release identity",
         "Verify the signed OCI identity at its immutable digest",
         "Execute VerifiedRelease current production verification",
     ] {
@@ -250,6 +252,9 @@ fn compatibility_executes_verified_release_for_the_current_server() {
 
     assert_eq!(required("NAZOAUTHCTL_COMPAT_VERIFY_RELEASE"), "1");
     let version = required("EXPECTED_SERVER_RELEASE");
+    let protocol: u32 = required("EXPECTED_SERVER_PROTOCOL")
+        .parse()
+        .expect("the attested host protocol must be an unsigned integer");
     let oci_index_digest = required("EXPECTED_OCI_INDEX_DIGEST");
     let oci_platform_digest = required("EXPECTED_OCI_PLATFORM_DIGEST");
 
@@ -274,6 +279,7 @@ fn compatibility_executes_verified_release_for_the_current_server() {
     .expect("the official current server release must pass VerifiedRelease::verify");
 
     assert_eq!(release.manifest.version, version);
+    assert_eq!(release.manifest.operator_protocol, protocol);
     assert_eq!(
         release
             .manifest
