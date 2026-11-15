@@ -55,6 +55,23 @@ pub(crate) fn temporary_exclusion(
     test_name: &str,
     variant: &BTreeMap<String, String>,
 ) -> Option<&'static str> {
+    // TODO: restore this exact mTLS module when the Suite accepts the OAuth
+    // 400 invalid_client response for authentication without an HTTP challenge.
+    // CIBA's open erratum does not justify inventing a Basic challenge for mTLS.
+    if plan_name == "fapi-ciba-id1-test-plan"
+        && test_name
+            == "fapi-ciba-id1-ensure-different-client-id-and-issuer-in-backchannel-authorization-request"
+        && variant.get("client_auth_type").map(String::as_str) == Some("mtls")
+        && variant.get("fapi_ciba_profile").map(String::as_str) == Some("plain_fapi")
+        && matches!(
+            variant.get("ciba_mode").map(String::as_str),
+            Some("poll" | "ping")
+        )
+    {
+        return Some(
+            "Suite requires HTTP 401 for mTLS invalid_client, which has no applicable HTTP challenge; not executed pending https://github.com/openid/modrna/issues/213 and the Suite correction.",
+        );
+    }
     (plan_name == "fapi-ciba-id1-test-plan"
         && variant.get("client_auth_type").map(String::as_str) == Some("private_key_jwt")
         && variant.get("fapi_ciba_profile").map(String::as_str) == Some("plain_fapi")
@@ -63,4 +80,36 @@ pub(crate) fn temporary_exclusion(
     .then_some(
         "RFC 10070 section 4: Suite CIBA sends endpoint audiences; not executed pending issuer-only upstream flows. https://gitlab.com/openid/conformance-suite/-/issues/1499",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mtls_challenge_exclusion_is_limited_to_confirmed_variants() {
+        let plan = "fapi-ciba-id1-test-plan";
+        let test = "fapi-ciba-id1-ensure-different-client-id-and-issuer-in-backchannel-authorization-request";
+        for mode in ["poll", "ping"] {
+            let variant = BTreeMap::from([
+                ("client_auth_type".into(), "mtls".into()),
+                ("fapi_ciba_profile".into(), "plain_fapi".into()),
+                ("ciba_mode".into(), mode.into()),
+            ]);
+            assert!(temporary_exclusion(plan, test, &variant).is_some());
+            assert!(temporary_exclusion("another-plan", test, &variant).is_none());
+            assert!(temporary_exclusion(plan, "fapi-ciba-id1", &variant).is_none());
+            for (key, value) in [
+                ("client_auth_type", "private_key_jwt"),
+                ("fapi_ciba_profile", "other"),
+                ("ciba_mode", "push"),
+            ] {
+                let mut other = variant.clone();
+                other.insert(key.into(), value.into());
+                assert!(temporary_exclusion(plan, test, &other).is_none());
+                other.remove(key);
+                assert!(temporary_exclusion(plan, test, &other).is_none());
+            }
+        }
+    }
 }
