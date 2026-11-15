@@ -5,7 +5,7 @@ default. Official failures remain recorded as `FAILED` and still make the run
 fail; continuation only allows later selected modules and plans to produce
 evidence.
 
-An OpenID4VCI callback HTTP error is an ordinary module failure when the Suite
+An OpenID4VCI callback HTTP error or OpenID4VP completion-endpoint failure is an ordinary module failure when the Suite
 already reports that module terminal with result `FAILED`. The runner records
 that result and continues the plan. Without that authoritative failure, the
 HTTP error remains an orchestration error; its status code is included in the
@@ -64,15 +64,17 @@ they omit the retired endpoint and multiple-audience exceptions. FAPI 2 plans
 retain their own assurance policy. The pinned Suite still uses endpoint audiences
 in CIBA client-authentication sequences. The exact known conflicting modules are
 temporarily excluded only for `private_key_jwt` / `plain_fapi` ping and poll,
-while discovery and mTLS tests continue. See the [exclusion inventory and removal
+while discovery and other mTLS tests continue. One exact mTLS client-identity mismatch module is also excluded for the open CIBA HTTP challenge conflict. See the [exclusion inventory and removal
 condition](oidf.md#test-inputs-and-evidence). Excluded modules are recorded as not
 executed, not as passes or official Suite skips. Successful setup or a successful
 executed subset is not evidence that the excluded tests passed. No assertion,
 official outcome or server security policy is rewritten.
 
 The official VP wallet may return a result page instead of an HTTP redirect.
-Positive VP flows still require the target transaction's completion endpoint to
-succeed. For the Suite's named negative tests, including wrong `vct`, revoked
+Positive VP flows require the target transaction's completion endpoint to
+succeed before they can pass. A completion error with an authoritative Suite
+terminal FAILED result is recorded as that failure and allows subsequent work
+unless --fail-fast is set. For the Suite's named negative tests, including wrong `vct`, revoked
 status-list credentials and revoked identifier-list credentials, an immediate
 target rejection can instead leave a Suite result page. The controller then
 collects the Suite's terminal result without requiring a successful target

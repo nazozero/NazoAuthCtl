@@ -1160,6 +1160,28 @@ impl ConformanceRunner {
                             };
                             match verifier.complete(&presentation, &presentation_delivery_url) {
                                 Ok(_) => {}
+                                Err(crate::browser::OpenId4VpError::CompletionFailed) => {
+                                    // A rejected positive presentation is a test failure when
+                                    // the Suite has already recorded that exact terminal result.
+                                    // Preserve normal failure collection and fail-fast handling.
+                                    match self.config.client.module_info(&instance.id) {
+                                        Ok(info)
+                                            if is_terminal(&info)
+                                                && info.get("result").and_then(Value::as_str)
+                                                    == Some("FAILED") =>
+                                        {
+                                            observed = Some(info);
+                                        }
+                                        _ => {
+                                            errors.push(
+                                                crate::browser::OpenId4VpError::CompletionFailed
+                                                    .to_string(),
+                                            );
+                                            groups[group_index].status = GroupStatus::Failed;
+                                            break 'execute;
+                                        }
+                                    }
+                                }
                                 Err(error) => {
                                     errors.push(error.to_string());
                                     groups[group_index].status = GroupStatus::Failed;
@@ -4493,6 +4515,150 @@ mod tests {
             std::fs::remove_dir_all(root).expect("remove temporary evidence root");
         }
     }
+    #[cfg(unix)]
+    struct FailedCompletionTransport {
+        inner: DeferredReviewTransport,
+        created: AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl Transport for FailedCompletionTransport {
+        fn send(&self, request: HttpRequest, max: usize) -> Result<HttpResponse, TransportError> {
+            let body = match (request.method(), request.url().path()) {
+                (HttpMethod::Post, "/api/plan") => Some(serde_json::json!({
+                    "id":"suite-plan", "name":"oid4vp-1final-verifier-test-plan",
+                    "modules":[{"testModule":"oid4vp-1final-verifier-happy-flow"}, {"testModule":"followup"}]
+                })),
+                (HttpMethod::Post, "/api/runner") => {
+                    let index = self.created.fetch_add(1, Ordering::SeqCst);
+                    Some(
+                        serde_json::json!({"id":if index == 0 {"module-a"} else {"module-b"},"alias":"vp-alias"}),
+                    )
+                }
+                (HttpMethod::Get, "/api/info/module-b") => {
+                    Some(serde_json::json!({"status":"FINISHED","result":"PASSED"}))
+                }
+                (HttpMethod::Get, "/api/log/module-b") => Some(serde_json::json!([])),
+                _ => None,
+            };
+            match body {
+                Some(body) => Ok(HttpResponse {
+                    status: if request.method() == HttpMethod::Post {
+                        201
+                    } else {
+                        200
+                    },
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(&body).unwrap().into(),
+                }),
+                None => self.inner.send(request, max),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct FailedCompletionVerifier;
+    #[cfg(unix)]
+    impl OpenId4VpVerifier for FailedCompletionVerifier {
+        fn start(
+            &mut self,
+            _: &OpenId4VpStartRequest,
+        ) -> Result<crate::browser::OpenId4VpPresentation, OpenId4VpError> {
+            Ok(crate::browser::OpenId4VpPresentation::test_presentation())
+        }
+        fn complete(
+            &mut self,
+            _: &crate::browser::OpenId4VpPresentation,
+            _: &Url,
+        ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
+            Err(OpenId4VpError::CompletionFailed)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vp_completion_error_continues_only_after_confirmed_suite_failure() {
+        for jobs in [1, 2] {
+            for (status, result, fail_fast, expected_modules) in [
+                ("FINISHED", "FAILED", false, 2),
+                ("FINISHED", "FAILED", true, 1),
+                ("FINISHED", "PASSED", false, 1),
+                ("RUNNING", "FAILED", false, 1),
+            ] {
+                let transport = Arc::new(FailedCompletionTransport {
+                    inner: DeferredReviewTransport {
+                        requests: Mutex::new(Vec::new()),
+                        suite_origin: "https://www.certification.openid.net",
+                        test_name: "oid4vp-1final-verifier-happy-flow",
+                        module_variant: BTreeMap::new(),
+                        info_after_capture: serde_json::json!({"status":status,"result":result}),
+                        wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
+                        info_calls: AtomicUsize::new(0),
+                        upload_review: false,
+                        uploaded: AtomicBool::new(false),
+                    },
+                    created: AtomicUsize::new(0),
+                });
+                let client = SuiteClient::with_transport(
+                    Origin::parse("https://www.certification.openid.net").unwrap(),
+                    Some(BearerToken::new("suite-token").unwrap()),
+                    transport.clone(),
+                    ClientConfig::default(),
+                )
+                .unwrap();
+                let mut matrix = one_plan_matrix(serde_json::json!({"alias":"vp-alias"}));
+                matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".into();
+                let runner = ConformanceRunner::new(ConformanceRunConfig {
+                    client,
+                    matrix,
+                    target_origin: Some(
+                        BrowserTargetOrigin::parse("https://issuer.example").unwrap(),
+                    ),
+                    binding: Some(test_binding()),
+                    poll_timeout: Duration::from_secs(1),
+                    control: RunControl::with_fail_fast(fail_fast),
+                    plan_lanes: BTreeMap::from([("p".into(), OidfDriverLane::Parallel)]),
+                    plan_resource_budgets: BTreeMap::from([("p".into(), budget(2, 1, 60))]),
+                    selected_resource_budget: budget(2, 1, 60),
+                    jobs,
+                    automation: (0..jobs)
+                        .map(|_| ConformanceAutomation {
+                            verifier: Some(Arc::new(Mutex::new(FailedCompletionVerifier))),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    suite_resource_observer: Some(Arc::new(RetainingObserver)),
+                })
+                .unwrap();
+                let report = runner.run(&mut ()).report;
+                assert_eq!(
+                    report.modules.len(),
+                    expected_modules,
+                    "jobs={jobs} {status} {result} fail_fast={fail_fast}: {:?}",
+                    report.errors
+                );
+                assert!(!report.suite_pass);
+                assert!(!report.acceptance_pass);
+                if status == "FINISHED" && result == "FAILED" {
+                    assert_eq!(report.modules[0].outcome, ModuleOutcome::Failed);
+                    assert!(report.modules[0].terminal);
+                    if !fail_fast {
+                        assert!(report.errors.is_empty(), "{:?}", report.errors);
+                        assert!(report.local_success);
+                        assert_eq!(report.modules[1].outcome, ModuleOutcome::Passed);
+                    }
+                } else {
+                    assert!(!report.errors.is_empty());
+                    assert!(!report.local_success);
+                }
+                assert_eq!(
+                    transport.created.load(Ordering::SeqCst),
+                    expected_modules.max(1)
+                );
+            }
+        }
+    }
+
     #[test]
     fn suite_html_evidence_accepts_official_snapshot_but_not_pending_or_empty_evidence() {
         let valid = serde_json::json!([{"result":"REVIEW","page_source":"<html>Login</html>","content_type":"text/html","matched_regexp":".*"}]);

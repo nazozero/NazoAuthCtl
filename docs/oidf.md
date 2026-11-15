@@ -78,9 +78,18 @@ tracks tests that fail against issuer-only client authentication.
 
 Until upstream fixes these flows, ctl does not instantiate the exact known
 CIBA `private_key_jwt` modules listed in `suite_compatibility.rs`, for the bundled
-`plain_fapi` ping/poll variants. Discovery, mTLS variants, other plans and unknown
+`plain_fapi` ping/poll variants. Discovery, other mTLS modules, other plans and unknown
 new modules still run. All 44 plans remain in the Matrix. The controller neither
 changes assertions nor enables a server exception.
+
+The exact mTLS module
+`fapi-ciba-id1-ensure-different-client-id-and-issuer-in-backchannel-authorization-request`
+is also temporarily excluded for `plain_fapi` ping/poll. It requires HTTP 401
+for authentication that has no applicable HTTP challenge, whereas NazoAuth
+returns OAuth `400 invalid_client`. [CIBA issue #213](https://github.com/openid/modrna/issues/213)
+tracks the specification conflict. Restore this module when the Suite accepts
+that response and rerun it against unchanged server policy. Other mTLS tests
+remain enabled.
 
 Each plan's `temporary_exclusions` records the unexecuted module name, effective
 variant and reason with the upstream issue. `defined_modules` on the plan still
