@@ -43,6 +43,7 @@ const NEW_REF: &str = "sha256:bbbb0000000000000000000000000000000000000000000000
 /// and answers either a durable succeeded result or an outcome-unknown
 /// refusal, driven by the current slot.
 struct ScriptedControl {
+    renewed_controller_kid: Mutex<Option<String>>,
     presented: Mutex<Vec<String>>,
     answer: Mutex<Result<(), &'static str>>,
     fail_business: Mutex<bool>, // Some(true) => durable Failed result
@@ -84,6 +85,7 @@ impl ControlOperationExecutor for ScriptedControl {
             // whose migration executed and failed (P0-5).
             let now = chrono::Utc::now().timestamp();
             return Ok(ControlResult {
+                renewed_controller_kid: self.renewed_controller_kid.lock().unwrap().clone(),
                 schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id: job.operation_id.to_owned(),
                 request_hash,
@@ -96,6 +98,7 @@ impl ControlOperationExecutor for ScriptedControl {
         }
         let now = chrono::Utc::now().timestamp();
         Ok(ControlResult {
+            renewed_controller_kid: self.renewed_controller_kid.lock().unwrap().clone(),
             schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
             operation_id: job.operation_id.to_owned(),
             request_hash,
@@ -371,6 +374,7 @@ impl Fixture {
         registry.update_controller_binding(DEPLOYMENT, None, Some(key_ref.as_str()))?;
 
         let control = Arc::new(ScriptedControl {
+            renewed_controller_kid: Mutex::new(None),
             presented: Mutex::new(Vec::new()),
             answer: Mutex::new(Ok(())),
             fail_business: Mutex::new(false),
@@ -419,6 +423,36 @@ impl Fixture {
 }
 
 // -------------------------------------------------------------------- G03
+
+#[test]
+fn update_activates_confirmed_renewal_even_when_migration_fails() -> anyhow::Result<()> {
+    for fail_business in [false, true] {
+        let fixture = Fixture::new()?;
+        let old = fixture.keys.load_active(DEPLOYMENT)?.unwrap();
+        let next = fixture.keys.generate_candidate(DEPLOYMENT)?;
+        *fixture.control.renewed_controller_kid.lock().unwrap() = Some(next.kid.clone());
+        *fixture.control.fail_business.lock().unwrap() = fail_business;
+        let result = run_update(&fixture.context, &fixture.keys, fixture.update_request());
+        assert_eq!(result.is_err(), fail_business);
+        assert_eq!(
+            fixture.keys.load_active(DEPLOYMENT)?.unwrap().kid(),
+            next.kid
+        );
+        assert!(
+            !fixture
+                .keys
+                .list_keys(DEPLOYMENT)?
+                .iter()
+                .any(|key| key.kid == old.kid())
+        );
+        assert!(
+            OperationJournal::open(fixture.keys.instance_dir(DEPLOYMENT)?)?
+                .load()?
+                .is_none()
+        );
+    }
+    Ok(())
+}
 
 #[test]
 fn update_dispatches_migration_once_and_commits_new_revision() -> anyhow::Result<()> {

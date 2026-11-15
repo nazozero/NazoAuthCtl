@@ -262,10 +262,12 @@ a slot is `controller revoke`."
   nazoauthctl [--instance SEL] controller recover [--label NAME]
   nazoauthctl [--instance SEL] controller recover --rotate-secret
 
-Every identity change needs a single-use approval backed by fresh administrator
+Explicit controller identity changes need a single-use approval backed by fresh administrator
 MFA. Without an explicit approval token, ctl authenticates the administrator,
 completes MFA, and requests approval for its exact in-memory proposal. An
 owner-only `--credentials-file` avoids retyping the email and password.
+Signed management operations automatically renew current, non-revoked keys when
+seven days or less remain, including expired keys, through the local/SSH operator.
 Keys expire 30 days after enrollment. `controller revoke <id>` revokes exactly one
 NazoAuth Controller Slot; it never forgets the local instance record and
 never deletes artifacts or other resources. `controller recover`

@@ -65,6 +65,19 @@ control operations, with the first administrator created through the target's
 local deployment authority. Binding a Controller Key requires administrator
 approval with fresh MFA.
 
+`controller list` displays key expiry separately from revocation. Occupied slots
+count all non-revoked controllers, including expired keys; revoked history stays
+in the table but does not consume the three-controller limit. Expired keys are
+shown as expired, without an approaching-expiry warning. Expiry display uses the
+local clock; the server clock remains authoritative for operation admission.
+
+Signed management operations automatically replace a controller key when the
+server reports seven days or less remaining, including an expired key. Renewal
+uses the existing local/SSH operator channel and needs no administrator MFA.
+Revoked or superseded keys cannot renew. The same signed request retains its
+candidate key across retries; local activation follows the confirmed receipt.
+Upgrade both controller installations before updating to NazoAuth 0.3.8 or later.
+
 ## Start a deployment
 
 Download a [release](https://github.com/nazozero/NazoAuthCtl/releases) for your

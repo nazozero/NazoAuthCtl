@@ -32,7 +32,7 @@ use crate::controller_identity::operation::{
     ControlOperationInput, SignedControlOperation, build_control_operation_with_id_and_kid,
     build_signed_control_operation_for_record,
 };
-use crate::registry::{InstanceRecord, RegistryStore};
+use crate::registry::RegistryStore;
 use crate::target::{
     ControlOperationReceipt, ControlOperationRequest, ExecutionTarget, SecretMaterial,
 };
@@ -133,7 +133,7 @@ pub fn prepare_control_operation(
 
     let journaled = journal.load()?;
     if let Some(entry) = &journaled {
-        if let Some(prepared) = prepare_entry_resume(entry, &record, input)? {
+        if let Some(prepared) = prepare_entry_resume(entry, &record.deployment_id, input)? {
             return Ok(prepared);
         }
         // P1-2: the journal slot is single-occupancy. A changed payload under
@@ -183,23 +183,33 @@ pub fn prepare_pending_control_operation(
             expected.operation_id
         );
     }
-    prepare_entry_resume(&entry, &record, input)
+    prepare_entry_resume(&entry, &record.deployment_id, input)
 }
 
 /// Prove current command mapping against an existing journal record, then
 /// construct the exact request that may be resent. The stored JWS is immutable
 /// recovery data, so resuming never loads a signing key.
-fn prepare_entry_resume(
+pub(crate) fn prepare_entry_resume(
     entry: &OperationJournalEntry,
-    record: &InstanceRecord,
+    deployment_id: &str,
     input: ControlOperationInput,
 ) -> anyhow::Result<Option<PreparedOperation>> {
-    let operation = build_control_operation_with_id_and_kid(
-        &record.deployment_id,
+    let mut operation = build_control_operation_with_id_and_kid(
+        deployment_id,
         input,
         entry.operation_id.clone(),
         entry.kid.clone(),
     );
+    // The successor is part of the original signed request, not a new choice
+    // made during retry. Recover it before proving the canonical request hash.
+    let payload = entry
+        .compact_jws
+        .split('.')
+        .nth(1)
+        .context("journaled JWS has no payload")?;
+    let original: nazo_operator_protocol::ControlOperation =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
+    operation.renewal_public_key = original.renewal_public_key;
     let canonical = canonical_control_operation_bytes(&operation)?;
     let request_hash = control_operation_request_hash(&canonical);
     if request_hash != entry.request_hash {
@@ -295,6 +305,22 @@ fn validate_result_binding(
     prepared: &PreparedOperation,
     result: &ControlResult,
 ) -> anyhow::Result<()> {
+    if let Some(kid) = &result.renewed_controller_kid {
+        let public_key = prepared
+            .signed
+            .operation
+            .renewal_public_key
+            .as_ref()
+            .context("target renewed a key without a signed proposal")?;
+        let bytes: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(public_key)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid renewal public key"))?;
+        let key = nazo_crypto::ed25519::VerifyingKey::from_bytes(&bytes)?;
+        if nazo_operator_protocol::controller_key_id(&key) != *kid {
+            bail!("target renewed a different controller key");
+        }
+    }
     validate_control_result_binding(
         &prepared.signed.operation.operation_id,
         &prepared.signed.request_hash,
@@ -399,6 +425,7 @@ fn validate_result_contract(
 /// later identical invocation can replay the same server result instead of
 /// losing the only recovery anchor.
 pub fn settle_journal(
+    keys: &ControllerKeyStore,
     journal: &OperationJournal,
     prepared: &PreparedOperation,
     verdict: &DispatchVerdict,
@@ -417,6 +444,7 @@ pub fn settle_journal(
         DispatchVerdict::Terminal(result) => {
             validate_result_binding(prepared, result)?;
             journal.mark_accepted_if_matches(&expected)?;
+            activate_renewed_key(keys, prepared, result)?;
             persist_terminal(result).with_context(|| {
                 format!(
                     "failed to persist terminal result for operation '{}'",
@@ -426,6 +454,34 @@ pub fn settle_journal(
             journal.clear_if_matches(&expected)
         }
     }
+}
+
+pub(crate) fn activate_renewed_key(
+    keys: &ControllerKeyStore,
+    prepared: &PreparedOperation,
+    result: &ControlResult,
+) -> anyhow::Result<()> {
+    validate_result_binding(prepared, result)?;
+    let Some(kid) = &result.renewed_controller_kid else {
+        return Ok(());
+    };
+    let deployment = &prepared.signed.operation.deployment_id;
+    if let Some(active) = keys.load_active(deployment)? {
+        // A replay of an older receipt must never undo a later rotation.
+        if active.kid() == prepared.signed.operation.kid {
+            keys.set_active_kid(deployment, kid)?;
+        } else if active.kid() != kid {
+            return Ok(());
+        }
+        if keys
+            .list_keys(deployment)?
+            .iter()
+            .any(|key| key.kid == prepared.signed.operation.kid)
+        {
+            keys.retire_kid(deployment, &prepared.signed.operation.kid)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -444,6 +500,95 @@ mod tests {
         protected_header, verify_control_operation_signature,
     };
     use std::cell::RefCell;
+
+    #[test]
+    fn renewal_survives_lost_response_and_failed_business_operation() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let old = f.keys.get_or_create_active(f.deployment)?;
+        let journal = f.journal()?;
+        let prepared = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        let resumed = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        assert_eq!(prepared.signed.compact_jws, resumed.signed.compact_jws);
+        let candidate = f
+            .keys
+            .list_keys(f.deployment)?
+            .into_iter()
+            .find(|key| !key.active)
+            .unwrap();
+        let mut result = valid_result(&prepared.signed.operation, ControlOutcome::Failed);
+        result.renewed_controller_kid = Some(candidate.kid.clone());
+        let verdict = DispatchVerdict::Terminal(result);
+        assert!(
+            settle_journal(&f.keys, &journal, &prepared, &verdict, |_| anyhow::bail!(
+                "receipt persistence failed"
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            f.keys.load_active(f.deployment)?.unwrap().kid(),
+            candidate.kid
+        );
+        assert!(journal.load()?.is_some());
+        assert!(
+            !f.keys
+                .list_keys(f.deployment)?
+                .iter()
+                .any(|key| key.kid == old.kid())
+        );
+        let replay = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        assert_eq!(prepared.signed.compact_jws, replay.signed.compact_jws);
+        settle_journal(&f.keys, &journal, &replay, &verdict, |_| Ok(()))?;
+        assert!(journal.load()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn renewal_receipt_cannot_activate_an_unproposed_key() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let old = f.keys.get_or_create_active(f.deployment)?;
+        let journal = f.journal()?;
+        let prepared = prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            input("rev-1"),
+        )?;
+        let other = f.keys.generate_candidate(f.deployment)?;
+        let mut result = valid_result(&prepared.signed.operation, ControlOutcome::Succeeded);
+        result.renewed_controller_kid = Some(other.kid);
+        assert!(
+            settle_journal(
+                &f.keys,
+                &journal,
+                &prepared,
+                &DispatchVerdict::Terminal(result),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(f.keys.load_active(f.deployment)?.unwrap().kid(), old.kid());
+        assert!(journal.load()?.is_some());
+        Ok(())
+    }
 
     struct Fixture {
         _temp: filesystem::PrivateTempDir,
@@ -577,6 +722,7 @@ mod tests {
 
     fn valid_result(operation: &ControlOperation, outcome: ControlOutcome) -> ControlResult {
         ControlResult {
+            renewed_controller_kid: None,
             schema: CONTROL_RESULT_SCHEMA,
             operation_id: operation.operation_id.clone(),
             request_hash: control_operation_request_hash(
@@ -594,6 +740,7 @@ mod tests {
     #[test]
     fn dynamic_tenant_results_match_their_operation_contracts() {
         let mut result = ControlResult {
+            renewed_controller_kid: None,
             schema: CONTROL_RESULT_SCHEMA,
             operation_id: "01a05c08-1fc8-72d2-a05e-480753f2b01b".to_owned(),
             request_hash: "ab".repeat(32),
@@ -680,7 +827,7 @@ mod tests {
         target.push_acceptance(true);
         let verdict = dispatch_via_target(&target, &prepared, None)?;
         assert_eq!(verdict, DispatchVerdict::InProgressAccepted);
-        settle_journal(&journal, &prepared, &verdict, |_| {
+        settle_journal(&f.keys, &journal, &prepared, &verdict, |_| {
             anyhow::bail!("in-progress verdict must not invoke terminal persistence")
         })?;
         assert_eq!(journal.load()?.expect("kept").state, JournalState::Accepted);
@@ -713,7 +860,7 @@ mod tests {
             &prepared,
             valid_receipt(&prepared, ControlOutcome::Succeeded),
         )?;
-        let persistence_error = settle_journal(&journal, &prepared, &verdict, |_| {
+        let persistence_error = settle_journal(&f.keys, &journal, &prepared, &verdict, |_| {
             anyhow::bail!("durable result store unavailable")
         })
         .expect_err("callback failure must abort settlement");
@@ -727,7 +874,7 @@ mod tests {
         );
 
         let persisted = RefCell::new(None);
-        settle_journal(&journal, &prepared, &verdict, |result| {
+        settle_journal(&f.keys, &journal, &prepared, &verdict, |result| {
             persisted.replace(Some(result.clone()));
             Ok(())
         })?;
@@ -991,7 +1138,7 @@ mod tests {
         // A crash before settle is harmless: the resume path still works.
         let v2 = dispatch_via_target(&target, &second, None)?;
         assert_eq!(v2, DispatchVerdict::InProgressAccepted);
-        settle_journal(&journal, &second, &v2, |_| {
+        settle_journal(&f.keys, &journal, &second, &v2, |_| {
             anyhow::bail!("in-progress verdict must not invoke terminal persistence")
         })?;
 
@@ -1023,7 +1170,7 @@ mod tests {
                 code: "REJECTED".to_owned()
             }
         );
-        settle_journal(&journal, &first, &verdict, |_| {
+        settle_journal(&f.keys, &journal, &first, &verdict, |_| {
             anyhow::bail!("rejected verdict must not invoke terminal persistence")
         })?;
         assert!(journal.load()?.is_none(), "rejected entry cleared");
@@ -1115,7 +1262,7 @@ mod tests {
                 code: crate::error_codes::CONTROLLER_KEY_UNAUTHORIZED.to_owned()
             }
         );
-        settle_journal(&journal, &prepared, &verdict, |_| {
+        settle_journal(&f.keys, &journal, &prepared, &verdict, |_| {
             anyhow::bail!("definitive server rejection has no terminal result")
         })?;
         assert!(journal.load()?.is_none());

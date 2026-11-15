@@ -75,12 +75,34 @@ pub(crate) fn build_signed_control_operation_for_record(
             )
         })?;
     let operation_id = Uuid::now_v7().to_string();
-    let operation = build_control_operation_with_id_and_kid(
+    let mut operation = build_control_operation_with_id_and_kid(
         &record.deployment_id,
         input,
         operation_id,
         loaded.kid().to_owned(),
     );
+    // Recovery may execute the server artifact retained in a protocol-3 backup.
+    // TODO: remove this legacy wire form once those backups are retired.
+    if !matches!(
+        operation.operation,
+        ControlOperationPayload::RecoveryInvalidate { .. }
+    ) {
+        let summaries = keys.list_keys(&record.deployment_id)?;
+        let active_created = summaries
+            .iter()
+            .find(|key| key.kid == loaded.kid())
+            .context("active controller key is missing")?
+            .created_at;
+        let candidate = match summaries
+            .into_iter()
+            .rev()
+            .find(|key| !key.active && key.created_at >= active_created)
+        {
+            Some(candidate) => candidate,
+            None => keys.generate_candidate(&record.deployment_id)?,
+        };
+        operation.renewal_public_key = Some(candidate.public_key);
+    }
     let (compact_jws, request_hash) = sign_control_operation(&operation, loaded.signing_key())?;
     Ok(SignedControlOperation {
         request_hash,
@@ -103,6 +125,7 @@ pub(crate) fn build_control_operation_with_id_and_kid(
     kid: String,
 ) -> ControlOperation {
     ControlOperation {
+        renewal_public_key: None,
         schema: CONTROL_OPERATION_SCHEMA,
         operation_id,
         kid,
@@ -205,10 +228,37 @@ mod tests {
     }
 
     #[test]
+    fn backup_recovery_keeps_the_protocol_three_request_shape() -> anyhow::Result<()> {
+        let f = fixture()?;
+        register_instance(&f, "production", "deploy-alpha")?;
+        f.keys.get_or_create_active("deploy-alpha")?;
+        let signed = build_signed_control_operation(
+            &f.registry,
+            &f.keys,
+            "production",
+            ControlOperationInput {
+                operation: ControlOperationPayload::RecoveryInvalidate {
+                    state_epoch: Uuid::now_v7().to_string(),
+                },
+                config_revision: "rev-1".into(),
+            },
+        )?;
+        assert!(signed.operation.renewal_public_key.is_none());
+        assert!(
+            serde_json::to_value(&signed.operation)?
+                .get("renewal_public_key")
+                .is_none()
+        );
+        assert_eq!(f.keys.list_keys("deploy-alpha")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn opaque_keys_preserve_published_control_operation_bytes() -> anyhow::Result<()> {
         // Published by operator-protocol 5810e56 before the opaque-key migration.
         let key = nazo_crypto::ed25519::SigningKey::from_bytes(&[23; 32]);
         let operation = ControlOperation {
+            renewal_public_key: None,
             schema: CONTROL_OPERATION_SCHEMA,
             operation_id: "019c8ca2-30a6-7000-8000-000000000005".to_owned(),
             kid: nazo_operator_protocol::controller_key_id(&key.verifying_key()),
@@ -338,6 +388,7 @@ mod tests {
         let store_key = f.keys.get_or_create_active("deploy-alpha")?;
 
         let build = |revision: &str| ControlOperation {
+            renewal_public_key: None,
             schema: CONTROL_OPERATION_SCHEMA,
             operation_id: "01900000-0000-7000-8000-000000000001".to_owned(),
             kid: store_key.kid().to_owned(),

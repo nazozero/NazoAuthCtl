@@ -2762,6 +2762,7 @@ mod tests {
                 .expect("transient state epoch lock") =
                 job.transient_state_epoch.map(str::to_owned);
             Ok(nazo_operator_protocol::ControlResult {
+                renewed_controller_kid: None,
                 schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id: job.operation_id.to_owned(),
                 request_hash: "0".repeat(64),
@@ -2873,6 +2874,7 @@ mod tests {
 
     fn valid_control_result() -> nazo_operator_protocol::ControlResult {
         nazo_operator_protocol::ControlResult {
+            renewed_controller_kid: None,
             schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
             operation_id: CONTROL_JWS_OP_ID.to_owned(),
             request_hash: "0".repeat(64),

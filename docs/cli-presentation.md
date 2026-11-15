@@ -15,7 +15,10 @@ nazoauthctl --json self verify-state
 
 Default output presents results, relevant fields, and next steps. Failed host or
 instance observations retain their diagnostics beneath the table. Controller
-expiry notices retain server warnings even when the local clock disagrees. Host, instance,
+expiry notices retain server warnings while the displayed key is unexpired;
+expired keys omit approaching-expiry warnings, including those from older servers.
+The table distinguishes valid, expired, and revoked keys. Occupied slots count
+non-revoked controllers, including expired keys, rather than historical rows. Host, instance,
 status and operation listings use tables that account for Chinese character width.
 Update and rollback show the release version, health and configuration revision;
 the update report derives rollback availability from the resulting target state.

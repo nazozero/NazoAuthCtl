@@ -1907,6 +1907,7 @@ mod tests {
             })
             .collect();
         ControlResult {
+            renewed_controller_kid: None,
             schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
             operation_id: "01890f8e-7c18-7b70-9d1e-9bb8c44a2f50".to_owned(),
             request_hash: "e".repeat(64),
