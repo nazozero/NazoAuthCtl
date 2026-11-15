@@ -15,8 +15,9 @@ nazoauthctl oidf run oidc-core-p001
 
 The configuration command stores the operator-owned wildcard DNS suffix and
 the selected Suite origin once for the selected instance. Neither has a
-NazoAuth-owned default. The first run command runs the complete Matrix bundled
-in the signed NazoAuthCtl release. The second uses a stable group
+NazoAuth-owned default. The first run command selects the complete Matrix bundled
+in the signed NazoAuthCtl release, with the explicit temporary exclusions below.
+The second uses a stable group
 alias; the third selects one exact bundled plan. The other aliases are
 `oidc`, `fapi`, `openid4vci`, `openid4vp`, and `openid4vc`. Unknown selectors
 fail and print the valid aliases, groups, and plans.
@@ -57,6 +58,43 @@ and image digest. The reference is release-v5.3.3, the version against which
 these inputs are checked.
 The actual configured Suite origin and its reported module outcomes are recorded
 separately. Official, self-hosted and third-party Suite origins use the same path.
+
+Suite compatibility follows the protocol implementation, not the reverse. The
+controller owns test registrations, user interaction and evidence collection;
+NazoAuth owns ordinary protocol and management endpoints. A Suite incompatibility
+must not enable a server exception or change an official outcome.
+
+The upstream [release-v5.3.4 source](https://github.com/openid-certification/conformance-suite/tree/23353b36957d6466010de767c812d2c91ed37638)
+adds VP credential-type and revocation tests, VCI client-attestation negative
+tests, and CIBA ping concurrency fixes. Its generic VCI/VP Final plans are marked
+alpha and non-certifiable; the corresponding HAIP plans are certifiable. Those
+labels describe the plans, not certification of NazoAuth.
+FAPI 2 Final and its VCI issuer subclass generate issuer-audience assertions.
+CIBA still generates endpoint-audience assertions in normal private-key flows,
+including in [upstream revision daca6ad](https://github.com/openid-certification/conformance-suite/blob/daca6ad2068468d42557ea1152f899cc3ac01a10/src/main/java/net/openid/conformance/sequence/client/AddPrivateKeyJWTClientAuthenticationToBackchannelRequest.java).
+This conflicts with [RFC 10070 section 4](https://www.rfc-editor.org/rfc/rfc10070.html#section-4).
+The existing upstream [issue #1499](https://gitlab.com/openid/conformance-suite/-/issues/1499)
+tracks tests that fail against issuer-only client authentication.
+
+Until upstream fixes these flows, ctl does not instantiate the exact known
+CIBA `private_key_jwt` modules listed in `suite_compatibility.rs`, for the bundled
+`plain_fapi` ping/poll variants. Discovery, mTLS variants, other plans and unknown
+new modules still run. All 44 plans remain in the Matrix. The controller neither
+changes assertions nor enables a server exception.
+
+Each plan's `temporary_exclusions` records the unexecuted module name, effective
+variant and reason with the upstream issue. `defined_modules` on the plan still
+counts the complete Suite definition; execution/progress/integrity counts cover
+the selected subset. These exclusions are not official Suite `SKIPPED` results
+and never count as passes. `suite_pass` stays false while exclusions exist;
+`acceptance_pass` and the CLI exit status evaluate the executed subset and normal
+cleanup, with the partial scope printed explicitly. Remaining failures still fail
+the run. JSON and private evidence retain the complete exclusion inventory.
+
+Remove the temporary list after upstream's positive/control flows use issuer-only
+assertion audiences at both the backchannel and token endpoints and those modules
+have been rerun against the unchanged server policy. Source review and controller
+regressions alone do not qualify a new reference image or prove a full Suite run.
 
 Recovery journals retain their persisted content identities and resource
 ownership records. Upgrading the controller does not recompute old run identities

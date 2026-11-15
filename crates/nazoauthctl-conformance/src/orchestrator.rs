@@ -24,7 +24,7 @@ use crate::progress::{
     redacted_variant,
 };
 use crate::report::{
-    CleanupFailure, CleanupReport, ConformanceReport, ModuleOutcome, ModuleReport,
+    CleanupFailure, CleanupReport, ConformanceReport, ModuleExclusion, ModuleOutcome, ModuleReport,
     ModuleReportContext, OrchestrationIntegrity, PlanReport, summarize_module_outcomes,
 };
 use crate::{OidfDriverLane, OidfPlanResourceBudget};
@@ -647,7 +647,7 @@ impl ConformanceRunner {
                         } else {
                             None
                         };
-                    let created =
+                    let mut created =
                         match self
                             .config
                             .client
@@ -686,6 +686,7 @@ impl ConformanceRunner {
                         plan_name: created.name.clone(),
                         defined_modules,
                         created_instances: 0,
+                        temporary_exclusions: Vec::new(),
                     });
                     let report_index = plans.len() - 1;
                     // Validate the full Suite definition before any budget
@@ -749,6 +750,30 @@ impl ConformanceRunner {
                     }
                     observed_modules = next_observed_modules
                         .expect("validated Suite module count must remain in range");
+                    // Validate and budget the complete upstream definition first.
+                    // Exclusions never conceal malformed definitions or allocate a runner.
+                    created.modules.retain(|module| {
+                        let mut effective_variant = variant.clone();
+                        effective_variant.extend(module.variant.clone());
+                        let Some(reason) = crate::suite_compatibility::temporary_exclusion(
+                            &plan.plan,
+                            &module.test_name,
+                            &effective_variant,
+                        ) else {
+                            return true;
+                        };
+                        plans[report_index]
+                            .temporary_exclusions
+                            .push(ModuleExclusion {
+                                test_name: module.test_name.clone(),
+                                variant: effective_variant,
+                                reason: reason.to_owned(),
+                            });
+                        false
+                    });
+                    let excluded = plans[report_index].temporary_exclusions.len();
+                    groups[group_index].total -= excluded;
+                    groups[group_index].remaining -= excluded;
                     planned.push(PlannedPlan {
                         group_index,
                         matrix_plan_id: plan.id.clone(),
@@ -1270,7 +1295,10 @@ impl ConformanceRunner {
         // cancellation after a terminal result can race the Suite's final
         // callback, while an unreported allocation still needs cancellation
         // before its plan is deleted.
-        let defined_modules = plans.iter().map(|plan| plan.defined_modules).sum::<usize>();
+        let defined_modules = plans
+            .iter()
+            .map(PlanReport::executable_modules)
+            .sum::<usize>();
         let created_instances = plans
             .iter()
             .map(|plan| plan.created_instances)
@@ -1388,7 +1416,12 @@ impl ConformanceRunner {
             && all_selected_plan_definitions_enumerated
             && outcomes.unexpected_skipped_modules.is_empty()
             && unknown_declared_skip_modules.is_empty();
-        let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
+        let suite_pass = defined_modules > 0
+            && all_modules_terminal
+            && outcomes.all_passed
+            && plans
+                .iter()
+                .all(|plan| plan.temporary_exclusions.is_empty());
         let orchestration_integrity = OrchestrationIntegrity {
             defined_modules,
             created_instances,
@@ -4365,93 +4398,100 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn serial_vp_expected_immediate_rejection_skips_receipt_and_deferred_review() {
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .expect("temporary root")
-            .join(format!(
-                "nazoauth-vp-expected-rejection-{}",
-                uuid::Uuid::now_v7()
-            ));
-        crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
-        let transport = Arc::new(DeferredReviewTransport {
-            requests: Mutex::new(Vec::new()),
-            suite_origin: "https://www.certification.openid.net",
-            test_name: "oid4vp-1final-verifier-invalid-kb-jwt-signature",
-            module_variant: BTreeMap::new(),
-            info_after_capture: serde_json::json!({"status":"FINISHED","result":"PASSED"}),
-            wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
-            info_calls: AtomicUsize::new(0),
-            upload_review: false,
-            uploaded: AtomicBool::new(false),
-        });
-        let client = SuiteClient::with_transport(
-            Origin::parse("https://www.certification.openid.net").expect("official Suite"),
-            Some(BearerToken::new("suite-token").expect("token")),
-            transport.clone(),
-            ClientConfig::default(),
-        )
-        .expect("client");
-        let mut matrix = one_plan_matrix(serde_json::json!({
-            "alias":"vp-alias",
-            "browser":[{
-                "match":"https://issuer.example/authorize*",
-                "tasks":[{"commands":[]}]
-            }]
-        }));
-        matrix.digest = "b".repeat(64);
-        matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
-        let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
-            expected_delivery_host: "www.certification.openid.net",
-            starts: 0,
-            completes: 0,
-            completion_outcome: OpenId4VpCompletionOutcome::ExpectedImmediateRejection,
-        }));
-        let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
-        let runner = ConformanceRunner::new(ConformanceRunConfig {
-            client,
-            matrix,
-            target_origin: Some(
-                BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
-            ),
-            binding: Some(test_binding()),
-            poll_timeout: Duration::from_secs(1),
-            control: RunControl::default(),
-            plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
-            plan_resource_budgets: one_plan_budgets(),
-            selected_resource_budget: budget(1, 1, 60),
-            jobs: 1,
+        for (suite_result, expected_outcome) in [
+            ("PASSED", ModuleOutcome::Passed),
+            ("FAILED", ModuleOutcome::Failed),
+        ] {
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("temporary root")
+                .join(format!(
+                    "nazoauth-vp-expected-rejection-{}",
+                    uuid::Uuid::now_v7()
+                ));
+            crate::secure_file::ensure_directory(&root, true).expect("private evidence root");
+            let transport = Arc::new(DeferredReviewTransport {
+                requests: Mutex::new(Vec::new()),
+                suite_origin: "https://www.certification.openid.net",
+                test_name: "oid4vp-1final-verifier-present-revoked-credential",
+                module_variant: BTreeMap::new(),
+                info_after_capture: serde_json::json!({"status":"FINISHED","result":suite_result}),
+                wait_state_after_capture: serde_json::json!({"state":"FINISHED"}),
+                info_calls: AtomicUsize::new(0),
+                upload_review: false,
+                uploaded: AtomicBool::new(false),
+            });
+            let client = SuiteClient::with_transport(
+                Origin::parse("https://www.certification.openid.net").expect("official Suite"),
+                Some(BearerToken::new("suite-token").expect("token")),
+                transport.clone(),
+                ClientConfig::default(),
+            )
+            .expect("client");
+            let mut matrix = one_plan_matrix(serde_json::json!({
+                "alias":"vp-alias",
+                "browser":[{
+                    "match":"https://issuer.example/authorize*",
+                    "tasks":[{"commands":[]}]
+                }]
+            }));
+            matrix.digest = "b".repeat(64);
+            matrix.document.groups[0].plans[0].plan = "oid4vp-1final-verifier-test-plan".to_owned();
+            let verifier_state = Arc::new(Mutex::new(DeferredReviewVerifier {
+                expected_delivery_host: "www.certification.openid.net",
+                starts: 0,
+                completes: 0,
+                completion_outcome: OpenId4VpCompletionOutcome::ExpectedImmediateRejection,
+            }));
+            let verifier: Arc<Mutex<dyn OpenId4VpVerifier>> = verifier_state.clone();
+            let runner = ConformanceRunner::new(ConformanceRunConfig {
+                client,
+                matrix,
+                target_origin: Some(
+                    BrowserTargetOrigin::parse("https://issuer.example").expect("target"),
+                ),
+                binding: Some(test_binding()),
+                poll_timeout: Duration::from_secs(1),
+                control: RunControl::default(),
+                plan_lanes: BTreeMap::from([("p".to_owned(), OidfDriverLane::Parallel)]),
+                plan_resource_budgets: one_plan_budgets(),
+                selected_resource_budget: budget(1, 1, 60),
+                jobs: 1,
 
-            automation: vec![ConformanceAutomation {
-                verifier: Some(verifier),
-                issuer: None,
-                ciba_approver: None,
-            }],
-            suite_resource_observer: Some(Arc::new(RetainingObserver)),
-        })
-        .expect("runner");
+                automation: vec![ConformanceAutomation {
+                    verifier: Some(verifier),
+                    issuer: None,
+                    ciba_approver: None,
+                }],
+                suite_resource_observer: Some(Arc::new(RetainingObserver)),
+            })
+            .expect("runner");
 
-        let report = runner.run(&mut ()).report;
+            let report = runner.run(&mut ()).report;
 
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.local_success);
-        assert!(report.suite_pass);
-        assert!(report.acceptance_pass);
-        assert!(!report.review_pending);
-        assert_eq!(report.modules.len(), 1);
-        assert_eq!(report.modules[0].outcome, ModuleOutcome::Passed);
-        assert!(report.modules[0].terminal);
-        assert!(report.modules[0].deferred_review_pending.is_none());
-        assert!(report.modules[0].review_screenshots.is_empty());
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(report.local_success);
+            assert_eq!(report.suite_pass, suite_result == "PASSED");
+            assert_eq!(report.acceptance_pass, suite_result == "PASSED");
+            assert!(!report.review_pending);
+            assert_eq!(report.modules.len(), 1);
+            assert_eq!(report.modules[0].outcome, expected_outcome);
+            assert!(report.modules[0].terminal);
+            assert!(report.modules[0].deferred_review_pending.is_none());
+            assert!(report.modules[0].review_screenshots.is_empty());
 
-        let verifier = verifier_state.lock().expect("verifier");
-        assert_eq!((verifier.starts, verifier.completes), (1, 1));
-        drop(verifier);
-        let requests = transport.requests.lock().expect("requests");
-        assert!(requests.iter().all(|(method, path)| {
-            *method != HttpMethod::Delete && !path.contains("image") && !path.contains("visited")
-        }));
-        drop(requests);
-        std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+            let verifier = verifier_state.lock().expect("verifier");
+            assert_eq!((verifier.starts, verifier.completes), (1, 1));
+            drop(verifier);
+            let requests = transport.requests.lock().expect("requests");
+            assert!(requests.iter().all(|(method, path)| {
+                *method != HttpMethod::Delete
+                    && !path.contains("image")
+                    && !path.contains("visited")
+            }));
+            drop(requests);
+            std::fs::remove_dir_all(root).expect("remove temporary evidence root");
+        }
     }
     #[test]
     fn suite_html_evidence_accepts_official_snapshot_but_not_pending_or_empty_evidence() {

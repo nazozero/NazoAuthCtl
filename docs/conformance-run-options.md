@@ -57,12 +57,29 @@ Backup validation probes the token schema before computing its sentinel. Legacy 
 The bundled HAIP issuer clients explicitly require PAR, as required by HAIP 1.0 section 4 when using the authorization endpoint. Wallet attestation authentication remains unchanged. This changes the recorded matrix digest without excluding any module.
 
 The FAPI-CIBA ID1 plans register clients with baseline assurance and explicit
-CIBA requirements: signed authentication requests, PS256 ID Tokens, mTLS-bound tokens and
-endpoint audiences for `private_key_jwt`. They do not select FAPI 2 assurance,
-which requires issuer-only assertion audiences. FAPI 2 plans retain their own
-assurance policy; no Suite result or expected outcome is changed.
+CIBA requirements: signed authentication requests, PS256 ID Tokens and mTLS-bound
+tokens. All bundled client registrations use the server's issuer-only assertion
+audience policy from [RFC 10070 Section 4](https://www.rfc-editor.org/rfc/rfc10070.html#section-4);
+they omit the retired endpoint and multiple-audience exceptions. FAPI 2 plans
+retain their own assurance policy. The pinned Suite still uses endpoint audiences
+in CIBA client-authentication sequences. The exact known conflicting modules are
+temporarily excluded only for `private_key_jwt` / `plain_fapi` ping and poll,
+while discovery and mTLS tests continue. See the [exclusion inventory and removal
+condition](oidf.md#test-inputs-and-evidence). Excluded modules are recorded as not
+executed, not as passes or official Suite skips. Successful setup or a successful
+executed subset is not evidence that the excluded tests passed. No assertion,
+official outcome or server security policy is rewritten.
 
-The official VP wallet may return a result page instead of an HTTP redirect. The controller then visits only the completion URL returned by the target start operation. Target rejection or an unrelated redirect still fails. Historical signed-receipt checks remain for older records, and official REVIEW outcomes remain unchanged.
+The official VP wallet may return a result page instead of an HTTP redirect.
+Positive VP flows still require the target transaction's completion endpoint to
+succeed. For the Suite's named negative tests, including wrong `vct`, revoked
+status-list credentials and revoked identifier-list credentials, an immediate
+target rejection can instead leave a Suite result page. The controller then
+collects the Suite's terminal result without requiring a successful target
+transaction. This interaction is not a pass: a Suite failure remains a failure,
+including failure to fetch a revocation list. An unrelated redirect or a Suite
+HTTP error still fails. Historical signed-receipt checks remain for older records,
+and official REVIEW outcomes remain unchanged.
 
 For issuer-initiated multiple-client authorization, the Suite log's two explicit `VCIWaitForCredentialOffer` transitions determine when the second offer is due. A local completed-browser cache is not authoritative because another registered browser worker can complete the first flow. No offer is sent while browser URLs are pending, and repeated polling remains bounded to two offers.
 
@@ -71,8 +88,8 @@ For issuer-initiated multiple-client authorization, the Suite log's two explicit
 
 New runs use the official Suite scripted browser and its per-module sessions.
 The controller does not install or start a local browser or WebDriver. HTTP VCI,
-VP and CIBA drivers remain; VP independently checks the target transaction's
-completion endpoint before accepting the interaction.
+VP and CIBA drivers remain; positive VP flows independently check the target
+transaction's completion endpoint before accepting the interaction.
 
 The Suite may fill review placeholders with HTML evidence. The controller keeps
 that HTML and its metadata, rejects unfilled placeholders, and preserves

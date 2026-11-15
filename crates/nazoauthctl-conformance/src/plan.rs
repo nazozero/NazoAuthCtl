@@ -347,7 +347,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_ciba_clients_use_ciba_audiences_without_fapi2_assurance() {
+    fn bundled_ciba_clients_use_baseline_assurance_with_ciba_requirements() {
         let matrix: serde_json::Value = serde_json::from_slice(BUNDLED_MATRIX).unwrap();
         let group = matrix["groups"]
             .as_array()
@@ -371,16 +371,38 @@ mod tests {
                     registration["backchannel_authentication_request_signing_alg"],
                     "PS256"
                 );
-                if registration["token_endpoint_auth_method"] == "private_key_jwt" {
-                    assert_eq!(
-                        registration["allow_client_assertion_endpoint_audience"],
-                        true
-                    );
-                }
                 checked += 1;
             }
         }
         assert_eq!(checked, 8);
+    }
+
+    #[test]
+    fn bundled_clients_do_not_request_retired_assertion_audience_exceptions() {
+        let matrix: BundledOidfMatrix = serde_json::from_slice(BUNDLED_MATRIX).unwrap();
+        let mut checked = 0;
+        for group in &matrix.groups {
+            for role in group
+                .required_roles
+                .iter()
+                .chain(group.plans.iter().flat_map(|plan| &plan.required_roles))
+            {
+                if let Some(registration) = &role.registration_template {
+                    for retired in [
+                        "allow_client_assertion_audience_array",
+                        "allow_client_assertion_endpoint_audience",
+                    ] {
+                        assert!(
+                            registration.get(retired).is_none(),
+                            "{}: {retired}",
+                            role.role
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
     }
 
     #[test]
