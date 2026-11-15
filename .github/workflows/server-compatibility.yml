@@ -148,7 +148,7 @@ jobs:
             --signer-workflow nazozero/NazoAuth/.github/workflows/release-security.yml \
             --source-ref "refs/tags/$SERVER_RELEASE" \
             --deny-self-hosted-runners
-      - name: Verify the protocol-3 host release identity
+      - name: Verify the host release identity
         shell: bash
         env:
           SERVER_RELEASE: ${{ steps.server_release.outputs.version }}
@@ -158,7 +158,7 @@ jobs:
           chmod 0755 "$server"
           "$server" release-identity >host-identity.json
           jq -e --arg release "$SERVER_RELEASE" \
-            '.release == $release and .protocol == 3' host-identity.json
+            '.release == $release' host-identity.json
       - name: Verify the signed OCI identity at its immutable digest
         shell: bash
         env:
@@ -202,6 +202,7 @@ jobs:
           set -euo pipefail
           export EXPECTED_OCI_INDEX_DIGEST="$SERVER_OCI_INDEX_DIGEST"
           export EXPECTED_OCI_PLATFORM_DIGEST="$SERVER_OCI_PLATFORM_DIGEST"
+          export EXPECTED_SERVER_PROTOCOL="$(jq -er '.protocol' host-identity.json)"
           # This selected test calls VerifiedRelease::verify directly; the
           # identity assertions below bind that verified manifest to the
           # independently attested host and Cosign-verified OCI artifacts.
