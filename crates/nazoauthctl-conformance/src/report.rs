@@ -30,6 +30,23 @@ pub struct PlanReport {
     pub plan_name: String,
     pub defined_modules: usize,
     pub created_instances: usize,
+    /// Controller exclusions, not Suite SKIPPED results. The upstream definition
+    /// count above includes them; execution and progress counts do not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub temporary_exclusions: Vec<ModuleExclusion>,
+}
+
+impl PlanReport {
+    pub(crate) fn executable_modules(&self) -> usize {
+        self.defined_modules - self.temporary_exclusions.len()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ModuleExclusion {
+    pub test_name: String,
+    pub variant: BTreeMap<String, String>,
+    pub reason: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -151,6 +168,7 @@ pub(crate) struct ModuleReportContext {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct OrchestrationIntegrity {
+    /// Modules selected for execution, excluding recorded temporary exclusions.
     pub defined_modules: usize,
     pub created_instances: usize,
     pub terminal_modules: usize,
@@ -260,6 +278,12 @@ pub struct ConformanceReport {
 }
 
 impl ConformanceReport {
+    pub fn has_temporary_exclusions(&self) -> bool {
+        self.plans
+            .iter()
+            .any(|plan| !plan.temporary_exclusions.is_empty())
+    }
+
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec_pretty(self)
     }

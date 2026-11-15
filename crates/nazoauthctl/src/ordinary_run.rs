@@ -1001,12 +1001,13 @@ fn execute_with_progress<S: ProgressSink>(
     deployment_report.cleanup_complete = cleanup_complete;
     let success = errors.is_empty()
         && report.as_ref().is_some_and(|report| {
-            conformance_run_succeeds(
-                report.local_success,
-                report.matrix_expectations_satisfied,
-                report.failed_modules.len(),
-                report.incomplete_modules.len(),
-            )
+            report.orchestration_integrity.defined_modules > 0
+                && conformance_run_succeeds(
+                    report.local_success,
+                    report.matrix_expectations_satisfied,
+                    report.failed_modules.len(),
+                    report.incomplete_modules.len(),
+                )
         });
     let output = FinalOutput {
         schema: 3,
@@ -1251,6 +1252,29 @@ mod acceptance_tests {
                 result: None,
             },
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_control_completion_preserves_durable_diagnostic_identity() {
+        let failed = failed_recovery_operation("550e8400-e29b-41d4-a716-446655440010");
+        let completion = nazoauthctl_core::ConformanceControlCompletion {
+            identity: nazoauthctl_core::ControlOperationIdentity {
+                operation_id: failed.operation_id.clone(),
+                request_hash: failed.request_hash.clone(),
+                kid: failed.controller_kid,
+            },
+            result: failed.result,
+        };
+        let error = super::successful_control_completion(
+            nazoauthctl_core::ConformanceControlOutcome::Failed(completion),
+            "Apply",
+        )
+        .expect_err("a durable failure cannot become a successful setup")
+        .to_string();
+        assert!(error.contains(&format!("operation_id={}", failed.operation_id)));
+        assert!(error.contains(&format!("request_hash={}", failed.request_hash)));
+        assert!(error.contains("EXECUTION_FAILED"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1537,9 +1561,10 @@ fn successful_control_completion(
     match outcome {
         nazoauthctl_core::ConformanceControlOutcome::Succeeded(completion) => Ok(completion),
         nazoauthctl_core::ConformanceControlOutcome::Failed(completion) => bail!(
-            "{label} ControlOperation failed durably: operation_id={} request_hash={}",
+            "{label} ControlOperation failed durably: operation_id={} request_hash={} error={}",
             completion.identity.operation_id,
             completion.identity.request_hash,
+            serde_json::to_string(&completion.result.error)?,
         ),
     }
 }
@@ -2031,6 +2056,22 @@ fn run_policy_lines(
         };
         lines.push(format!("{label}: {}", report.excluded_plans.join(", ")));
     }
+    for plan in &report.plans {
+        if let Some(exclusion) = plan.temporary_exclusions.first() {
+            let label = match language {
+                OutputLanguage::Chinese => "规范冲突暂时排除（未执行，不计通过；仅评价其余测试）",
+                OutputLanguage::English => {
+                    "Temporary specification exclusions (not run or passed; remaining tests only)"
+                }
+            };
+            lines.push(format!(
+                "{label}: {} / {} — {}",
+                plan.matrix_plan_id,
+                plan.temporary_exclusions.len(),
+                exclusion.reason,
+            ));
+        }
+    }
     lines
 }
 
@@ -2046,11 +2087,19 @@ fn write_final_output<W: io::Write>(
         return writeln!(writer).context("failed to finish the structured conformance report");
     }
 
-    let status = match (language, output.success) {
-        (OutputLanguage::Chinese, true) => "OIDF 结果：通过",
-        (OutputLanguage::Chinese, false) => "OIDF 结果：未通过",
-        (OutputLanguage::English, true) => "OIDF result: passed",
-        (OutputLanguage::English, false) => "OIDF result: not passed",
+    let partial = output
+        .report
+        .as_ref()
+        .is_some_and(|report| report.has_temporary_exclusions());
+    let status = match (language, output.success, partial) {
+        (OutputLanguage::Chinese, true, true) => "OIDF 结果：已执行部分通过（存在暂时排除）",
+        (OutputLanguage::English, true, true) => {
+            "OIDF result: executed subset passed (temporary exclusions)"
+        }
+        (OutputLanguage::Chinese, true, false) => "OIDF 结果：通过",
+        (OutputLanguage::Chinese, false, _) => "OIDF 结果：未通过",
+        (OutputLanguage::English, true, false) => "OIDF result: passed",
+        (OutputLanguage::English, false, _) => "OIDF result: not passed",
     };
     writeln!(writer, "{status}")?;
 
@@ -2133,11 +2182,17 @@ fn write_terminal_final_output(
             "Suite records",
         ),
     };
-    let outcome = match (language, output.success) {
-        (OutputLanguage::Chinese, true) => "通过",
-        (OutputLanguage::Chinese, false) => "未通过",
-        (OutputLanguage::English, true) => "Passed",
-        (OutputLanguage::English, false) => "Not passed",
+    let partial = output
+        .report
+        .as_ref()
+        .is_some_and(|report| report.has_temporary_exclusions());
+    let outcome = match (language, output.success, partial) {
+        (OutputLanguage::Chinese, true, true) => "已执行部分通过（存在暂时排除）",
+        (OutputLanguage::English, true, true) => "Executed subset passed (temporary exclusions)",
+        (OutputLanguage::Chinese, true, false) => "通过",
+        (OutputLanguage::Chinese, false, _) => "未通过",
+        (OutputLanguage::English, true, false) => "Passed",
+        (OutputLanguage::English, false, _) => "Not passed",
     };
     let mut details = vec![format!("{result_label}: {outcome}")];
 

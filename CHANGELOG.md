@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+## 0.3.11 - 2026-11-15
+
+- Remove retired client-assertion audience exceptions from bundled OIDF client
+  registrations so resource Apply follows NazoAuth's RFC 10070 policy.
+- Include the durable server error code when OIDF setup or recovery fails.
+- Temporarily exclude exact CIBA private-key modules whose Suite-generated
+  endpoint audiences conflict with RFC 10070. Keep discovery and mTLS coverage,
+  record each unexecuted module and upstream issue, and label subset acceptance
+  separately from a full Suite pass.
+- Drive the newer Suite VP wrong-type and revoked-credential negative tests
+  through immediate rejection without requiring a successful target transaction;
+  preserve the Suite's actual pass, failure and review outcomes.
+
 ## 0.3.10 - 2026-11-15
 
 - Validate signed server compatibility through the controller's protocol policy

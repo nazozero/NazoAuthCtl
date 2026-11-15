@@ -161,6 +161,22 @@ impl Transport for ParallelFixtureTransport {
                 .lock()
                 .expect("created plans")
                 .push(plan.clone());
+            if plan == "fapi-ciba-id1-test-plan" {
+                return Self::response(
+                    201,
+                    serde_json::json!({
+                        "id": plan,
+                        "name": plan,
+                        "modules": [
+                            {"testModule":"fapi-ciba-id1-discovery-end-point-verification"},
+                            {"testModule":"fapi-ciba-id1"},
+                            {"testModule":"fapi-ciba-id1-ensure-request-object-bad-aud-fails"},
+                            {"testModule":"fapi-ciba-id1-refresh-token", "variant":{"client_auth_type":"mtls"}},
+                            {"testModule":"fapi-ciba-id1-future-module"}
+                        ]
+                    }),
+                );
+            }
             return Self::response(
                 201,
                 serde_json::json!({
@@ -372,6 +388,97 @@ fn parallel_fixture_with_lanes(
 
 #[derive(Default)]
 struct RecordingSink(Vec<ProgressSnapshot>);
+
+#[test]
+fn temporary_ciba_exclusions_preserve_discovery_mtls_unknown_tests_and_real_failures() {
+    for jobs in [1, 2] {
+        for auth in ["private_key_jwt", "mtls"] {
+            for result in ["PASSED", "FAILED"] {
+                let (mut runner, transport) = parallel_fixture_with_result(
+                    serde_json::json!({}),
+                    &["fapi-ciba-id1-test-plan", "unaffected"],
+                    None,
+                    result,
+                );
+                runner.config.jobs = jobs;
+                runner.config.matrix.document.groups[0].plans[0].variant = BTreeMap::from([
+                    ("client_auth_type".into(), auth.into()),
+                    ("fapi_ciba_profile".into(), "plain_fapi".into()),
+                    ("ciba_mode".into(), "poll".into()),
+                ]);
+                runner
+                    .config
+                    .plan_resource_budgets
+                    .get_mut("fapi-ciba-id1-test-plan")
+                    .unwrap()
+                    .modules = 5;
+                runner.config.selected_resource_budget.modules = 6;
+                let report = runner.run(&mut ()).report;
+                assert!(report.local_success, "{:?}", report.errors);
+                let ciba = &report.plans[0];
+                let exclusions = if auth == "private_key_jwt" { 2 } else { 0 };
+                assert_eq!(ciba.defined_modules, 5);
+                assert_eq!(ciba.temporary_exclusions.len(), exclusions);
+                assert_eq!(ciba.created_instances, 5 - exclusions);
+                assert_eq!(report.modules.len(), 6 - exclusions);
+                assert_eq!(report.progress.total, 6 - exclusions);
+                assert_eq!(
+                    report.orchestration_integrity.defined_modules,
+                    6 - exclusions
+                );
+                assert!(report.orchestration_integrity.cleanup_complete);
+                assert_eq!(report.cleanup.deleted_plans.len(), 2);
+                assert_eq!(report.acceptance_pass, result == "PASSED");
+                assert_eq!(report.suite_pass, result == "PASSED" && exclusions == 0);
+                for excluded in &ciba.temporary_exclusions {
+                    assert!(excluded.reason.contains("RFC 10070"));
+                    assert!(excluded.reason.contains("/issues/1499"));
+                    assert_eq!(excluded.variant["client_auth_type"], "private_key_jwt");
+                    assert!(
+                        !report
+                            .modules
+                            .iter()
+                            .any(|module| module.test_name == excluded.test_name)
+                    );
+                    assert!(
+                        !transport
+                            .finished
+                            .lock()
+                            .unwrap()
+                            .contains(&format!("m-{}", excluded.test_name))
+                    );
+                }
+                for retained in [
+                    "fapi-ciba-id1-discovery-end-point-verification",
+                    "fapi-ciba-id1-refresh-token",
+                    "fapi-ciba-id1-future-module",
+                    "test-unaffected",
+                ] {
+                    assert!(
+                        report
+                            .modules
+                            .iter()
+                            .any(|module| module.test_name == retained)
+                    );
+                }
+                let json = serde_json::to_value(&report).unwrap();
+                if exclusions > 0 {
+                    assert_eq!(
+                        json["plans"][0]["temporary_exclusions"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                    assert!(
+                        report.skipped_modules.is_empty(),
+                        "local exclusions are not official SKIPPED results"
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn module_persistence_failure_stops_dispatch_but_preserves_created_instance_for_cleanup() {

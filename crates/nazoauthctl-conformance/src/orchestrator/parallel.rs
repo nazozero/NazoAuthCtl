@@ -411,7 +411,7 @@ fn merge_reports(
     if !all_plans_finished && !errors.iter().any(|error| error == "run interrupted") {
         errors.push(SCHEDULER_INCOMPLETE.to_owned());
     }
-    let defined_modules = plans.iter().map(|plan| plan.defined_modules).sum();
+    let defined_modules = plans.iter().map(PlanReport::executable_modules).sum();
     let created_instances = plans.iter().map(|plan| plan.created_instances).sum();
     let terminal_modules = modules.iter().filter(|module| module.terminal).count();
     let all_modules_instantiated = all_plans_finished && defined_modules == created_instances;
@@ -496,7 +496,12 @@ fn merge_reports(
         && prepared.all_selected_plan_definitions_enumerated
         && outcomes.unexpected_skipped_modules.is_empty()
         && prepared.unknown_declared_skip_modules.is_empty();
-    let suite_pass = defined_modules > 0 && all_modules_terminal && outcomes.all_passed;
+    let suite_pass = defined_modules > 0
+        && all_modules_terminal
+        && outcomes.all_passed
+        && plans
+            .iter()
+            .all(|plan| plan.temporary_exclusions.is_empty());
     let orchestration_integrity = OrchestrationIntegrity {
         defined_modules,
         created_instances,

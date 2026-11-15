@@ -24,6 +24,7 @@ mod progress;
 mod proxy_trust;
 mod recovery;
 mod report;
+mod suite_compatibility;
 use nazoauthctl_runtime::secure_file;
 mod transport;
 
@@ -88,8 +89,9 @@ pub use recovery::{
     TenantResourceRecoveryBinding, TenantResourceRecoveryPhase,
 };
 pub use report::{
-    CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleOutcome,
-    ModuleReport, PlanReport, ReviewScreenshotReport, WarningCondition, WarningModule,
+    CleanupFailure, CleanupReport, ConformanceReport, DeferredReviewPending, ModuleExclusion,
+    ModuleOutcome, ModuleReport, PlanReport, ReviewScreenshotReport, WarningCondition,
+    WarningModule,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,

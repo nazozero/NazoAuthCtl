@@ -30,7 +30,7 @@ const MAX_TEST_NAME_BYTES: usize = 512;
 const MAX_VARIANT_VALUE_BYTES: usize = 256;
 const MAX_CREATE_ATTEMPTS: usize = 4;
 const SPECIAL_POST_TEST: &str = "oid4vp-1final-verifier-request-uri-method-post";
-const IMMEDIATE_REJECTION_TESTS: [&str; 8] = [
+const IMMEDIATE_REJECTION_TESTS: [&str; 11] = [
     "oid4vp-1final-verifier-invalid-session-transcript",
     "oid4vp-1final-verifier-invalid-kb-jwt-signature",
     "oid4vp-1final-verifier-invalid-credential-signature",
@@ -39,6 +39,9 @@ const IMMEDIATE_REJECTION_TESTS: [&str; 8] = [
     "oid4vp-1final-verifier-invalid-kb-jwt-aud",
     "oid4vp-1final-verifier-kb-jwt-iat-in-past",
     "oid4vp-1final-verifier-kb-jwt-iat-in-future",
+    "oid4vp-1final-verifier-wrong-vct",
+    "oid4vp-1final-verifier-present-revoked-credential",
+    "oid4vp-1final-verifier-present-credential-on-identifier-list",
 ];
 
 /// The deployment-owned trust-policy binding that must accompany every
@@ -1241,54 +1244,56 @@ mod tests {
 
     #[test]
     fn negative_test_accepts_suite_2xx_after_target_immediate_rejection() {
-        let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
-        let suite = Origin::parse("https://suite.example").expect("suite");
-        let transport = Arc::new(CompletionTransport {
-            requests: std::sync::Mutex::new(Vec::new()),
-            responses: std::sync::Mutex::new(VecDeque::from([
-                HttpResponse {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: serde_json::to_vec(&serde_json::json!({
-                        "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
-                        "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
-                        "expires_in": 300
-                    }))
-                    .expect("start response")
-                    .into(),
-                },
-                HttpResponse {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: Vec::new().into(),
-                },
-            ])),
-        });
-        let mut client = OpenId4VpVerifierClient::with_transport(
-            target,
-            suite,
-            Zeroizing::new("management-secret".to_owned()),
-            transport.clone(),
-            binding(),
-        )
-        .expect("client");
-        let request = OpenId4VpStartRequest::new(
-            "vp",
+        for test_name in [
             "oid4vp-1final-verifier-invalid-session-transcript",
-            BTreeMap::new(),
-            false,
-            binding(),
-        )
-        .expect("request");
-        let presentation = client.start(&request).expect("presentation");
+            "oid4vp-1final-verifier-wrong-vct",
+            "oid4vp-1final-verifier-present-revoked-credential",
+            "oid4vp-1final-verifier-present-credential-on-identifier-list",
+        ] {
+            let target = BrowserTargetOrigin::parse("https://issuer.example").expect("target");
+            let suite = Origin::parse("https://suite.example").expect("suite");
+            let transport = Arc::new(CompletionTransport {
+                requests: std::sync::Mutex::new(Vec::new()),
+                responses: std::sync::Mutex::new(VecDeque::from([
+                    HttpResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: serde_json::to_vec(&serde_json::json!({
+                            "authorization_url": "https://suite.example/test/a/vp/authorize?x=1",
+                            "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "expires_in": 300
+                        }))
+                        .expect("start response")
+                        .into(),
+                    },
+                    HttpResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: Vec::new().into(),
+                    },
+                ])),
+            });
+            let mut client = OpenId4VpVerifierClient::with_transport(
+                target,
+                suite,
+                Zeroizing::new("management-secret".to_owned()),
+                transport.clone(),
+                binding(),
+            )
+            .expect("client");
+            let request =
+                OpenId4VpStartRequest::new("vp", test_name, BTreeMap::new(), false, binding())
+                    .expect("request");
+            let presentation = client.start(&request).expect("presentation");
 
-        assert_eq!(
-            client
-                .complete(&presentation, &presentation.authorization_url)
-                .expect("immediate rejection is an expected negative outcome"),
-            OpenId4VpCompletionOutcome::ExpectedImmediateRejection
-        );
-        assert_eq!(transport.requests.lock().expect("request lock").len(), 2);
+            assert_eq!(
+                client
+                    .complete(&presentation, &presentation.authorization_url)
+                    .expect("immediate rejection is an expected negative outcome"),
+                OpenId4VpCompletionOutcome::ExpectedImmediateRejection
+            );
+            assert_eq!(transport.requests.lock().expect("request lock").len(), 2);
+        }
     }
 
     #[test]
