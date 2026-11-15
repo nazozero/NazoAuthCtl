@@ -2423,6 +2423,7 @@ mod tests {
             request_hash: "b".repeat(64),
             controller_kid: "c".repeat(43),
             result: ControlResult {
+                renewed_controller_kid: None,
                 schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                 operation_id,
                 request_hash: "b".repeat(64),

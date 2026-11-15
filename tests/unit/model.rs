@@ -70,7 +70,10 @@ fn release_manifest_binds_every_binary_and_oci_identity() {
         .unwrap()
         .remove("operator_protocol");
     assert!(serde_json::from_value::<ReleaseManifest>(missing_protocol).is_err());
-    assert_eq!(nazo_operator_protocol::PROTOCOL_VERSION, 3);
+    assert_eq!(nazo_operator_protocol::PROTOCOL_VERSION, 4);
+    let mut legacy = manifest.clone();
+    legacy.operator_protocol = 3;
+    assert!(legacy.validate("v0.2.0", "release-identity").is_ok());
     let mut invalid = manifest.clone();
     invalid.operator_protocol = 2;
     assert!(invalid.validate("v0.2.0", "release-identity").is_err());

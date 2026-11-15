@@ -975,6 +975,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 if requires_controller_identity_recovery(code) =>
             {
                 crate::controller_identity::settle_journal(
+                    &keys,
                     &control_journal,
                     &prepared,
                     &verdict,
@@ -1046,6 +1047,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 plan.candidate_control_operation_id = None;
                 journal.store(&plan)?;
                 crate::controller_identity::settle_journal(
+                    &keys,
                     &control_journal,
                     &prepared,
                     &verdict,
@@ -1056,6 +1058,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
             crate::controller_identity::DispatchVerdict::OutcomeUnknown
             | crate::controller_identity::DispatchVerdict::InProgressAccepted => {
                 crate::controller_identity::settle_journal(
+                    &keys,
                     &control_journal,
                     &prepared,
                     &verdict,
@@ -1072,6 +1075,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                     plan.candidate_control_operation_id = None;
                     journal.store(&plan)?;
                     crate::controller_identity::settle_journal(
+                        &keys,
                         &control_journal,
                         &prepared,
                         &verdict,
@@ -1099,6 +1103,7 @@ fn run_recover(args: RecoverArgs, global: Option<&str>) -> anyhow::Result<()> {
                 plan.phase = RecoveryPhase::WaitingForDeadline;
                 journal.store(&plan)?;
                 crate::controller_identity::settle_journal(
+                    &keys,
                     &control_journal,
                     &prepared,
                     &verdict,

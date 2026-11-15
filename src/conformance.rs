@@ -1,17 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
-use nazo_operator_protocol::{
-    ControlOperationPayload, ControlOutcome, ControlResult, canonical_control_operation_bytes,
-    control_operation_request_hash,
-};
+use nazo_operator_protocol::{ControlOperationPayload, ControlOutcome, ControlResult};
 
 use crate::{
     controller_identity::{
-        OperationJournal, PreparedOperation,
-        operation::{ControlOperationInput, build_control_operation_with_id_and_kid},
-        prepare_control_operation, prepare_pending_control_operation,
-        store::ControllerKeyStore,
+        OperationJournal, PreparedOperation, operation::ControlOperationInput,
+        prepare_control_operation, prepare_pending_control_operation, store::ControllerKeyStore,
         validate_control_change_set, validate_control_result_binding,
     },
     filesystem::ensure_private_directory,
@@ -197,20 +192,15 @@ impl ConformanceSession {
         expected: &crate::controller_identity::OperationJournalEntry,
         operation: ControlOperationPayload,
     ) -> anyhow::Result<Option<ControlOperationPayload>> {
-        let operation = build_control_operation_with_id_and_kid(
+        let prepared = crate::controller_identity::dispatch::prepare_entry_resume(
+            expected,
             &self.evidence.deployment_id,
             ControlOperationInput {
                 operation,
                 config_revision: self.config_revision.clone(),
             },
-            expected.operation_id.clone(),
-            expected.kid.clone(),
-        );
-        let canonical = canonical_control_operation_bytes(&operation)?;
-        Ok(
-            (control_operation_request_hash(&canonical) == expected.request_hash)
-                .then_some(operation.operation),
-        )
+        )?;
+        Ok(prepared.map(|prepared| prepared.signed.operation.operation))
     }
 
     pub fn resume_pending_control_operation<F>(
@@ -317,6 +307,11 @@ impl ConformanceSession {
             &prepared.signed.operation.operation_id,
             &prepared.signed.request_hash,
             &prepared.signed.operation.operation,
+            &result,
+        )?;
+        crate::controller_identity::dispatch::activate_renewed_key(
+            &self.controller_keys,
+            &prepared,
             &result,
         )?;
         let completion = ConformanceControlCompletion {
@@ -509,6 +504,7 @@ mod tests {
                 accepted,
                 rejection_code: self.rejection_code.borrow().clone(),
                 result: accepted.then(|| ControlResult {
+                    renewed_controller_kid: None,
                     schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
                     operation_id: request.operation_id.clone(),
                     request_hash,

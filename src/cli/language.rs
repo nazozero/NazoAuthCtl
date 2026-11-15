@@ -108,7 +108,7 @@ status 默认显示汇总表；--json 输出完整结构化数据。"
             "instance register 接管目标主机上已发现的部署。instance forget 仅删除本地实例记录和密钥引用，不修改目标部署或撤销控制器。删除资源使用 uninstall；撤销控制器使用 controller revoke。"
         }
         HelpTopic::Controller => {
-            "身份变更需要管理员重新完成 MFA 并批准本次操作。未提供批准令牌时会交互登录；--credentials-file 可提供仅当前用户可读的凭据文件。密钥注册后 30 天到期。revoke 只撤销指定控制器；recover 使用离线恢复密钥重新建立绑定，--rotate-secret 在重新批准后更换恢复密钥。"
+            "显式身份变更需要管理员重新完成 MFA 并批准本次操作。未提供批准令牌时会交互登录；--credentials-file 可提供仅当前用户可读的凭据文件。管理操作会通过本机或 SSH 自动更换剩余不超过 7 天（含已过期）的当前未撤销密钥，无需定期 MFA。新密钥注册后 30 天到期。revoke 只撤销指定控制器；recover 使用离线恢复密钥重新建立绑定，--rotate-secret 在重新批准后更换恢复密钥。"
         }
         HelpTopic::Install => {
             "使用指定的外部 PostgreSQL 和 Valkey，以及已有的数据库运行与生命周期角色。密码从文件读取，不写入日志。安装完成后，依次运行 admin create、bind 和 verify；安装不自动生成备份或执行公网验证。"

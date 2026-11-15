@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.9 - 2026-11-15
+
+- Automatically propose and activate controller-key renewal during signed
+  management operations, including update with an expired key. No recurring MFA,
+  background daemon or additional HTTP renewal request is required.
+- Clarify that the key deadline triggers rotation; revocation terminates the
+  controller's authorization. Host/SSH access remains independently required.
+- Preserve pending keys and signed requests across lost responses, failed
+  business operations and local receipt-persistence failures.
+- Distinguish valid, expired and revoked keys; count occupied slots without
+  revoked history and suppress approaching-expiry warnings for expired keys.
+- Use NazoAuth operator protocol 4. Upgrade the command host and SSH helper,
+  then run update to NazoAuth 0.3.8 or later.
+
 ## 0.3.8 - 2026-10-24
 
 ### Fixed

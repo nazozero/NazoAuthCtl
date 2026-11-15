@@ -3,9 +3,28 @@
 The controller and server are independently released. Interoperability is defined
 by the operator protocol version and the signed release-manifest schema, not
 by an independently maintained controller SemVer range. This controller accepts
-operator protocol 3 and release-manifest schema 7. The protocol crate remains
+operator protocol 4 and release-manifest schema 7, and retains protocol 3
+artifact/identity readers for existing backups and rollback. Recovery invalidation
+uses the original request format for those backups; it retains the existing
+offline-secret recovery path if their controller identity no longer admits.
+Protocol 4 adds signed
+controller-key renewal proposals and confirmed successor receipts. Existing
+operation schema 3 journals remain readable and are replayed byte-for-byte.
+Upgrade the controller on the command host and SSH target before running
+`update` to NazoAuth 0.3.8 or later; that update uses the verified new server
+binary for migration and can renew an expired, non-revoked key. Other management
+operations require the upgraded server. The protocol crate remains
 an immutable Cargo dependency; updating a server release with the same protocol
 does not require changing that dependency or rebuilding the controller.
+
+The 30-day key deadline is a rotation deadline, not the end of the host
+administrator's authorization. Renewal still requires the existing local/SSH
+host access and systemd or container-engine management privileges. A stolen
+Controller key alone cannot use a public renewal endpoint; no such endpoint
+exists. Compromise of both the key and host execution authority requires
+revoking both the Controller slot and host/SSH access. Expiry is not a substitute
+for revocation, and a privileged helper must not be exposed to untrusted callers
+with only the Controller key as authorization.
 
 Platform builds and the server compatibility gate run in parallel; publishing
 requires both to succeed. The release gate builds the exact controller commit and resolves the latest

@@ -1352,6 +1352,7 @@ mod tests {
 
     fn terminal_result() -> ControlResult {
         ControlResult {
+            renewed_controller_kid: None,
             schema: nazo_operator_protocol::CONTROL_RESULT_SCHEMA,
             operation_id: OPERATION_ID.to_owned(),
             request_hash: "a".repeat(64),

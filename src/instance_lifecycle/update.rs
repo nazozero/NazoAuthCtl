@@ -293,6 +293,7 @@ pub(crate) fn run_update(
                 control_result: Some(control_result),
             } => {
                 settle_journal(
+                    keys,
                     &journal,
                     &prepared,
                     &DispatchVerdict::Terminal(control_result),
@@ -303,6 +304,7 @@ pub(crate) fn run_update(
             }
             HostCompletionBody::StateMutateMigrationFailed { result } => {
                 settle_journal(
+                    keys,
                     &journal,
                     &prepared,
                     &DispatchVerdict::Terminal(result),
@@ -315,6 +317,7 @@ pub(crate) fn run_update(
             }
             HostCompletionBody::StateMutateRecoveryRequired { result, detail } => {
                 settle_journal(
+                    keys,
                     &journal,
                     &prepared,
                     &DispatchVerdict::Terminal(result),
@@ -356,6 +359,7 @@ pub(crate) fn run_update(
             }
             if code == "CONTROL_OUTCOME_UNKNOWN" || detail.contains("CONTROL_OUTCOME_UNKNOWN") {
                 settle_journal(
+                    keys,
                     &journal,
                     &prepared,
                     &DispatchVerdict::OutcomeUnknown,
@@ -370,6 +374,7 @@ pub(crate) fn run_update(
                 bail!("update operation identity conflicts with the target journal: {detail}");
             }
             settle_journal(
+                keys,
                 &journal,
                 &prepared,
                 &DispatchVerdict::DefinitivelyRejected {

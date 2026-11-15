@@ -330,9 +330,15 @@ fn reconcile_from_snapshot(
             .map(|item| item.kid.as_str())
             .collect();
         let mut retired = Vec::new();
+        // An unacknowledged automatic renewal may still install a candidate.
+        // Keep both signing and successor material until that operation settles.
+        let pending_operation =
+            super::journal::OperationJournal::open(keys.instance_dir(deployment)?)?
+                .load()?
+                .is_some();
         for kid in local_kids
             .iter()
-            .filter(|kid| !listed_kids.contains(&kid.as_str()))
+            .filter(|kid| !pending_operation && !listed_kids.contains(&kid.as_str()))
         {
             if keys.retire_kid(deployment, kid).is_ok() {
                 retired.push(kid.clone());
@@ -829,13 +835,13 @@ pub fn add_flow<A: ControllerRegistryApi>(
     verify_committed_slot(&slot, deployment, &kid, "add")?;
 
     // This ctl adopts its NEW slot as the identity it signs with; the
-    // previous key stays enrolled until its own expiry or explicit revocation.
+    // previous controller remains enrolled until explicitly revoked.
     let report = finish_activation(registry, keys, &record.alias, deployment, &kid, slot)?;
     filesystem::remove_file_durable(&pending_add_path(keys, deployment)?)?;
     Ok(crate::ui::message!(
-        "{report}note: the previous controller key remains enrolled and valid until its own \
-         expiry or explicit revocation\n",
-        "{report}原控制器密钥仍有效，直至到期或被主动撤销。\n"
+        "{report}note: the previous controller remains enrolled and can renew its key; \
+         revoke that controller to terminate its authorization\n",
+        "{report}原控制器仍已注册并可自动换钥；如需终止其授权，请撤销该控制器。\n"
     ))
 }
 
@@ -959,12 +965,12 @@ pub fn slots_flow<A: ControllerRegistryApi>(
         report.push('\n');
     }
     report.push_str(&crate::ui::message!(
-        "controller slots for '{}' (deployment {}, issuer {}): {} item(s), max {}\n",
-        "实例“{}”的控制器\n\n部署：{}\n服务地址：{}\n数量：{} / {}\n",
+        "controller slots for '{}' (deployment {}, issuer {}): occupied slots (not revoked): {} / {}\n",
+        "实例“{}”的控制器\n\n部署：{}\n服务地址：{}\n占用名额（未撤销）：{} / {}\n",
         record.alias,
         deployment,
         record.issuer,
-        snapshot.total,
+        snapshot.active_slots().count(),
         snapshot.max_active_slots
     ));
     let rows = snapshot
@@ -975,7 +981,10 @@ pub fn slots_flow<A: ControllerRegistryApi>(
                 slot.label.clone(),
                 slot.controller_id.clone(),
                 match slot.status {
-                    SlotStatus::Active => crate::ui::text("Active", "有效"),
+                    SlotStatus::Active if slot.expires_at <= now => {
+                        crate::ui::text("Expired", "已过期")
+                    }
+                    SlotStatus::Active => crate::ui::text("Valid", "有效"),
                     SlotStatus::Revoked => crate::ui::text("Revoked", "已撤销"),
                 }
                 .to_owned(),
@@ -1003,7 +1012,7 @@ pub fn slots_flow<A: ControllerRegistryApi>(
         if !matches!(expiry, expiry::ExpiryStatus::Ok { .. }) {
             report.push_str(&format!("\n{}: {}", slot.label, expiry.render()));
         }
-        if slot.warning.is_some() {
+        if slot.warning.is_some() && !matches!(expiry, expiry::ExpiryStatus::Expired { .. }) {
             report.push_str(&format!(
                 "\n{}:{}",
                 slot.label,
@@ -1503,6 +1512,37 @@ mod tests {
             )?;
             Ok(())
         }
+    }
+
+    #[test]
+    fn listing_keeps_candidate_material_for_an_unsettled_renewal() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let active = f.keys.get_or_create_active("deploy-alpha")?;
+        f.mark_bound(CONTROLLER_A)?;
+        let journal =
+            super::super::journal::OperationJournal::open(f.keys.instance_dir("deploy-alpha")?)?;
+        crate::controller_identity::prepare_control_operation(
+            &f.registry,
+            &f.keys,
+            &journal,
+            "production",
+            crate::controller_identity::ControlOperationInput {
+                operation: nazo_operator_protocol::ControlOperationPayload::MigrateApply,
+                config_revision: "revision-1".into(),
+            },
+        )?;
+        let candidates = f.keys.list_keys("deploy-alpha")?;
+        assert_eq!(candidates.len(), 2);
+        let api = FakeApi::default();
+        api.push_snapshot(vec![slot_view(
+            CONTROLLER_A,
+            active.kid(),
+            SlotStatus::Active,
+            -5,
+        )]);
+        slots_flow(&api, &f.registry, &f.keys, f.record())?;
+        assert_eq!(f.keys.list_keys("deploy-alpha")?, candidates);
+        Ok(())
     }
 
     fn slot_view(
@@ -2314,7 +2354,7 @@ mod tests {
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 20)]);
         let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
         assert!(
-            report.contains("Active") && report.contains("Expires (UTC)"),
+            report.contains("Valid") && report.contains("Expires (UTC)"),
             "{report}"
         );
         assert!(report.contains(CONTROLLER_A), "{report}");
@@ -2326,6 +2366,10 @@ mod tests {
         api.push_snapshot(vec![slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 0)]);
         let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
         assert!(report.contains("EXPIRED"), "{report}");
+        assert!(
+            report.contains("Expired") && !report.contains("Valid"),
+            "{report}"
+        );
 
         let mut server_warned = slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, 20);
         server_warned.warning =
@@ -2341,6 +2385,61 @@ mod tests {
         assert!(
             record.last_observation.is_none(),
             "explicit live list output must not become a second expiry authority"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slots_flow_counts_unrevoked_slots_and_suppresses_expired_warnings() -> anyhow::Result<()> {
+        let f = fixture()?;
+        let api = FakeApi::default();
+        let mut expired = slot_view(CONTROLLER_A, KID_A, SlotStatus::Active, -5);
+        // Older servers also send this pre-expiry warning for expired keys.
+        expired.warning = Some(crate::controller_identity::admin_api::ExpiryWarningKind::Urgent24h);
+        api.push_snapshot(vec![
+            expired,
+            slot_view(CONTROLLER_B, KID_A, SlotStatus::Revoked, -10),
+        ]);
+        let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
+        assert!(
+            report.contains(crate::ui::text(
+                "occupied slots (not revoked): 1 / 3",
+                "占用名额（未撤销）：1 / 3"
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains(crate::ui::text("Expired", "已过期"))
+                && report.contains(crate::ui::text("Revoked", "已撤销")),
+            "{report}"
+        );
+        assert!(
+            !report.contains(crate::ui::text("Valid", "有效"))
+                && !report.contains(crate::ui::text("server-warning=", "服务端提醒")),
+            "{report}"
+        );
+        assert!(
+            report.contains(crate::ui::text("EXPIRED", "执行新操作前需更换密钥")),
+            "{report}"
+        );
+
+        api.push_snapshot(vec![slot_view(
+            CONTROLLER_B,
+            KID_A,
+            SlotStatus::Revoked,
+            -10,
+        )]);
+        let report = slots_flow(&api, &f.registry, &f.keys, f.record())?;
+        assert!(
+            report.contains(crate::ui::text(
+                "occupied slots (not revoked): 0 / 3",
+                "占用名额（未撤销）：0 / 3"
+            )),
+            "{report}"
+        );
+        assert!(
+            !report.contains(crate::ui::text("Expired", "已过期")),
+            "{report}"
         );
         Ok(())
     }

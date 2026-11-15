@@ -35,7 +35,7 @@ pub enum ExpiryStatus {
 impl ExpiryStatus {
     pub fn classify(now: DateTime<Utc>, expires_at: DateTime<Utc>) -> Self {
         let seconds_remaining = (expires_at - now).num_seconds();
-        if seconds_remaining <= 0 {
+        if expires_at <= now {
             Self::Expired {
                 seconds_overdue: -seconds_remaining,
             }
@@ -150,6 +150,11 @@ mod tests {
         // 1s before expiry → urgent
         assert!(matches!(
             ExpiryStatus::classify(now, now + Duration::seconds(1)),
+            ExpiryStatus::Urgent { .. }
+        ));
+        // A positive sub-second remainder is still unexpired.
+        assert!(matches!(
+            ExpiryStatus::classify(now, now + Duration::milliseconds(500)),
             ExpiryStatus::Urgent { .. }
         ));
         // exactly at expiry → expired

@@ -42,7 +42,7 @@ impl ReleaseManifest {
         {
             bail!("signed release manifest failed policy validation");
         }
-        if self.operator_protocol != nazo_operator_protocol::PROTOCOL_VERSION {
+        if !nazo_operator_protocol::supports_operator_protocol(self.operator_protocol) {
             bail!("signed release manifest has an invalid operator protocol contract");
         }
         let Some(artifact) = self
