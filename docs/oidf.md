@@ -77,7 +77,7 @@ directly; group selection, exclusions and bounded execution remain supported.
 
 Evidence schema 5 records the controller version, Matrix and driver digests,
 the combined input identity, and the reference Suite release, source revision
-and image digest. The OP/AS Matrix reference remains release-v5.3.3, the version against which
+and image digest. The existing Matrix reference remains release-v5.3.3, the version against which
 these particular bundled inputs were checked. NazoAuth's independent RP workflow
 uses its own pinned Suite release-v5.3.4. Changing the controller's reference
 requires verification of its 44 OP/AS plans against that Suite, not merely
@@ -105,7 +105,7 @@ tracks tests that fail against issuer-only client authentication.
 Until upstream fixes these flows, ctl does not instantiate the exact known
 CIBA `private_key_jwt` modules listed in `suite_compatibility.rs`, for the bundled
 `plain_fapi` ping/poll variants. Discovery, other mTLS modules, other plans and unknown
-new modules still run. All 44 OP/AS plans remain in the Matrix. The controller neither
+new modules still run. All 44 existing plans remain in the Matrix. The controller neither
 changes assertions nor enables a server exception.
 
 The exact mTLS module
