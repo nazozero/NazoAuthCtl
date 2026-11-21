@@ -19,8 +19,31 @@ NazoAuth-owned default. The first run command selects the complete Matrix bundle
 in the signed NazoAuthCtl release, with the explicit temporary exclusions below.
 The second uses a stable group
 alias; the third selects one exact bundled plan. The other aliases are
-`oidc`, `fapi`, `openid4vci`, `openid4vp`, and `openid4vc`. Unknown selectors
-fail and print the valid aliases, groups, and plans.
+`oidc`, `fapi`, `openid4vci`, `openid4vp`, and `openid4vc`. `oidc` selects
+the nine existing **OpenID Provider** plans across Core, Logout and Session
+Management (the `oidc-core`, `oidc-logout`, and `oidc-session` groups).
+The selector previously covered only Core. Unknown selectors fail and print the
+valid aliases, groups, and plans.
+
+### RP is a separate test role
+
+NazoAuth also acts as an OIDC Relying Party for upstream federation. The OIDF
+**RP** Basic, Configuration and Back-Channel Logout plans exercise the opposite
+direction: the Suite is the upstream OP and NazoAuth is the client. They run
+against NazoAuth's production Native RP handlers in
+[`OIDC RP research`](https://github.com/nazozero/NazoAuth/actions/workflows/oidc-rp-research.yml),
+not through `nazoauthctl oidf run`. The [RP changes and evidence](https://github.com/nazozero/NazoAuth/pull/299)
+record which official modules ran and the two unsigned-ID-Token modules that
+the Suite skipped. These are conformance test results, not a claim of RP
+certification.
+
+The controller's existing OIDF tenant-resource flow cannot configure a new
+upstream RP provider or bind a Suite test identity into the deployed server.
+Adding the three RP plan names to this OP Matrix would start the wrong
+direction of the protocol and misreport incomplete work as RP coverage.
+Keep RP evidence in the server's existing CI until a real production-facing
+RP fixture and controller driver are available; do not add test-only provider
+management to the server.
 
 NazoAuthCtl automatically creates a temporary tenant below the configured domain,
 fresh test material, managed browser workers, and a private evidence directory.
@@ -54,8 +77,11 @@ directly; group selection, exclusions and bounded execution remain supported.
 
 Evidence schema 5 records the controller version, Matrix and driver digests,
 the combined input identity, and the reference Suite release, source revision
-and image digest. The reference is release-v5.3.3, the version against which
-these inputs are checked.
+and image digest. The existing Matrix reference remains release-v5.3.3, the version against which
+these particular bundled inputs were checked. NazoAuth's independent RP workflow
+uses its own pinned Suite release-v5.3.4. Changing the controller's reference
+requires verification of its 44 OP/AS plans against that Suite, not merely
+copying the newer reference from the RP workflow.
 The actual configured Suite origin and its reported module outcomes are recorded
 separately. Official, self-hosted and third-party Suite origins use the same path.
 
@@ -79,7 +105,7 @@ tracks tests that fail against issuer-only client authentication.
 Until upstream fixes these flows, ctl does not instantiate the exact known
 CIBA `private_key_jwt` modules listed in `suite_compatibility.rs`, for the bundled
 `plain_fapi` ping/poll variants. Discovery, other mTLS modules, other plans and unknown
-new modules still run. All 44 plans remain in the Matrix. The controller neither
+new modules still run. All 44 existing plans remain in the Matrix. The controller neither
 changes assertions nor enables a server exception.
 
 The exact mTLS module
