@@ -82,9 +82,7 @@ pub fn resolve_bundled_oidf_selection(
             .collect::<Vec<_>>()
     };
     let groups = match selector {
-        "oidc" => matching_groups(&|id| {
-            matches!(id, "oidc-core" | "oidc-logout" | "oidc-session")
-        }),
+        "oidc" => matching_groups(&|id| matches!(id, "oidc-core" | "oidc-logout" | "oidc-session")),
         "ciba" => matching_groups(&|id| id == "fapi-ciba"),
         "fapi" => matching_groups(&|id| id.starts_with("fapi-")),
         "openid4vci" => matching_groups(&|id| id.starts_with("openid4vc-vci")),
