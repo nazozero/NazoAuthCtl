@@ -27,24 +27,22 @@ valid aliases, groups, and plans.
 
 ### RP is a separate test role
 
-NazoAuth also acts as an OIDC Relying Party for upstream federation. The OIDF
-**RP** Basic, Configuration and Back-Channel Logout plans exercise the opposite
-direction: the Suite is the upstream OP and NazoAuth is the client. They run
-against NazoAuth's production Native RP handlers in
-[`OIDC RP research`](https://github.com/nazozero/NazoAuth/actions/workflows/oidc-rp-research.yml),
-not through `nazoauthctl oidf run`. The [RP changes and evidence](https://github.com/nazozero/NazoAuth/pull/299)
-record which official modules ran and the two unsigned-ID-Token modules that
-the Suite skipped. These are conformance test results, not a claim of RP
-certification.
+OIDC RP tests reverse the Suite's role: the Suite acts as an upstream OP and
+the unchanged, separately deployed NazoAuth instance is the RP under test.
+Use `nazoauthctl oidf run oidc-rp --rp-config FILE` for the three official
+Basic, Configuration and Back-Channel RP plans. Add `--rp-config FILE` to
+`oidf run oidc` for combined OP + RP or to an unqualified `oidf run` for the
+44-plan OP/AS Matrix plus RP. `oidc-op` selects the nine OP plans explicitly.
 
-The controller's existing OIDF tenant-resource flow cannot configure a new
-upstream RP provider or bind a Suite test identity into the deployed server.
-Adding the three RP plan names to this OP Matrix would start the wrong
-direction of the protocol and misreport incomplete work as RP coverage.
-Keep RP evidence in the server's existing CI until a real production-facing
-RP fixture and controller driver are available; do not add test-only provider
-management to the server.
+The RP fixture must already exist in ordinary production configuration.
+NazoAuthCtl neither adds Suite-specific server endpoints nor writes directly
+to the NazoAuth identity database. Its RP driver sends real HTTPS requests
+to `/auth/federation/...` and checks normal `/auth/me` session status.
+See [RP black-box setup and remaining preconditions](oidf-rp.md).
 
+The existing [NazoAuth in-process RP suite harness](https://github.com/nazozero/NazoAuth/actions/workflows/oidc-rp-research.yml)
+is implementation-level evidence and cannot replace external black-box
+acceptance or an actual independently configured production NazoAuth release.
 NazoAuthCtl automatically creates a temporary tenant below the configured domain,
 fresh test material, managed browser workers, and a private evidence directory.
 For CIBA, ctl reads the authenticated Suite log and completes the requested

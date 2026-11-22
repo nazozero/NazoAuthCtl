@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an external OIDC RP Suite execution lane owned by NazoAuthCtl.
+  Existing 44 OP/AS plans stay unchanged; RP runs against production HTTPS
+  endpoints and never seed private identity-link tables.
+
 ## 0.4.0 - Pending publication
 
 - Correct `oidf run oidc` to select all nine bundled OP Core, Logout and

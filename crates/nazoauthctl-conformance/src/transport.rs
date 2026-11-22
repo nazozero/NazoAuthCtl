@@ -42,6 +42,20 @@ impl HttpRequest {
         }
     }
 
+    pub fn post_form(url: Url, body: String) -> Self {
+        Self {
+            method: HttpMethod::Post,
+            url,
+            headers: vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
+            body: Some(bytes::Bytes::from(body)),
+        }
+    }
+
+    pub fn with_header(mut self, name: &str, value: String) -> Self {
+        self.headers.push((name.to_owned(), value));
+        self
+    }
+
     pub fn method(&self) -> HttpMethod {
         self.method
     }

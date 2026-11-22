@@ -23,6 +23,7 @@ mod plan;
 mod progress;
 mod proxy_trust;
 mod recovery;
+mod rp;
 mod report;
 mod suite_compatibility;
 use nazoauthctl_runtime::secure_file;
@@ -71,6 +72,7 @@ pub use orchestrator::{
     RunSummary, SuiteResourceObserver, recover_suite_resources,
 };
 pub use origin::{Origin, OriginError};
+pub use rp::{RpReport, RpSettings, run as run_rp_blackbox};
 pub use plan::{
     OidfDriverPlanEntry, OidfExecutionPlan, OidfPlanError, OidfPlanSelection, bundled_oidf_matrix,
     bundled_oidf_selection_choices, open_bundled_oidf_driver_plan, resolve_bundled_oidf_plan_id,
