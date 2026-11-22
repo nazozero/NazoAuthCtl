@@ -320,7 +320,7 @@ pub fn run(
             )?;
             output.modules.push(RpModuleReport {
                 name: module.test_name.clone(),
-                suite_module_id: instance.id,
+                suite_module_id: std::mem::take(&mut instance.id),
                 suite_status,
                 suite_result,
                 observed_http_status,
@@ -482,7 +482,7 @@ impl Browser<'_> {
         if let Some(jar) = self.cookies.get(&origin) {
             let value = jar
                 .iter()
-                .map(|(name, value)| format!("{name}={value}"))
+                .map(|(name, value)| format!("{name}={}", value.as_str()))
                 .collect::<Vec<_>>()
                 .join("; ");
             if !value.is_empty() {
