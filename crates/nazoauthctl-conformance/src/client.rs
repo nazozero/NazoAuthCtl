@@ -122,6 +122,17 @@ impl SuiteClient {
         })
     }
 
+    /// Record the actual external Suite build alongside conformance outcomes.
+    pub fn server_info(&self) -> Result<Value, SuiteClientError> {
+        let response = self.request_json(
+            HttpMethod::Get, "/api/server", &[], None, false, self.config.max_response_bytes,
+        )?;
+        if response.status != 200 || !response.body.is_object() {
+            return Err(SuiteClientError::MalformedResponse);
+        }
+        Ok(response.body)
+    }
+
     pub fn create_plan(
         &self,
         plan_name: &str,

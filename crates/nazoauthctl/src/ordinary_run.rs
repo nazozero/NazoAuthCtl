@@ -490,7 +490,8 @@ fn execute_with_progress<S: ProgressSink>(
     interrupt_notice: &'static str,
 ) -> anyhow::Result<i32> {
     if invocation.rp_only {
-        return execute_rp_only(&invocation, progress, language);
+        install_interrupt_handler(&control, user_interrupted, interrupt_notice)?;
+        return execute_rp_only(&invocation, progress, language, &control);
     }
     progress.activity(&ProgressActivity::OpeningDeployment);
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
@@ -539,6 +540,11 @@ fn execute_with_progress<S: ProgressSink>(
     let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language, progress)?;
     progress.activity(&ProgressActivity::RecoveringPreviousRun);
     let recovered_retention = recover_pending_runs(&session, &recovery_store, Some(&suite_client))?;
+    let rp_target = production_rp_origin(session.target_issuer())?;
+    nazoauthctl_conformance::recover_rp_runs(
+        &suite_client, &rp_target, rp_setup.as_ref().map(|(_, settings)| settings),
+        &session.recovery_directory().join("evidence"),
+    )?;
     if !recovered_retention.is_empty() {
         progress.activity(&ProgressActivity::Finished);
         if invocation.json {
@@ -794,7 +800,7 @@ fn execute_with_progress<S: ProgressSink>(
         requires_ciba,
         requires_vci,
         requires_vp,
-        control,
+        control.clone(),
         Arc::clone(&user_interrupted),
         interrupt_notice,
         progress,
@@ -1023,6 +1029,7 @@ fn execute_with_progress<S: ProgressSink>(
             &evidence_directory,
             invocation.poll_timeout,
             invocation.delete_suite_plans,
+            &control,
         );
         match attempt {
             Ok(result) => rp_report = Some(result),
@@ -1076,6 +1083,7 @@ fn execute_rp_only<S: ProgressSink>(
     invocation: &RunInvocation,
     progress: &mut S,
     language: OutputLanguage,
+    control: &RunControl,
 ) -> anyhow::Result<i32> {
     progress.activity(&ProgressActivity::OpeningDeployment);
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
@@ -1098,8 +1106,21 @@ fn execute_rp_only<S: ProgressSink>(
     if !recover_pending_runs(&session, &recovery_store, Some(&suite))?.is_empty() {
         bail!("unsettled earlier Suite retention requires recovery before RP execution");
     }
+    nazoauthctl_conformance::recover_rp_runs(
+        &suite, &target, Some(&settings), &session.recovery_directory().join("evidence"),
+    )?;
     let run_id = format!("rp-{}", uuid::Uuid::now_v7());
     let evidence_directory = create_evidence_directory(session.recovery_directory(), &run_id)?;
+    let deployment = session.deployment_evidence();
+    nazoauthctl_runtime::secure_file::write_atomic(
+        &evidence_directory.join("rp-target.json"),
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "deployment_id": deployment.deployment_id,
+            "release": deployment.release,
+            "target_issuer": deployment.target_issuer,
+            "runtime": evidence_runtime(&deployment.runtime),
+        }))?, true,
+    ).map_err(|error| anyhow::anyhow!("failed to persist RP target identity: {error:?}"))?;
     let rp = nazoauthctl_conformance::run_rp_blackbox(
         &suite,
         target,
@@ -1107,6 +1128,7 @@ fn execute_rp_only<S: ProgressSink>(
         &evidence_directory,
         invocation.poll_timeout,
         invocation.delete_suite_plans,
+        control,
     )?;
     let success = rp.success;
     let output = serde_json::json!({
@@ -1116,6 +1138,7 @@ fn execute_rp_only<S: ProgressSink>(
         "deployment": {
             "id": session.deployment_evidence().deployment_id,
             "release": session.deployment_evidence().release,
+            "runtime": evidence_runtime(&session.deployment_evidence().runtime),
         },
         "evidence_directory": evidence_directory,
         "rp": rp,
@@ -2408,6 +2431,16 @@ struct RunSecrets {
     applicant_password: Zeroizing<String>,
 }
 
+fn install_interrupt_handler(
+    control: &RunControl, user_interrupted: Arc<AtomicBool>, interrupt_notice: &'static str,
+) -> anyhow::Result<()> {
+    let interrupt = control.clone();
+    ctrlc::set_handler(move || {
+        if !user_interrupted.swap(true, Ordering::SeqCst) { eprintln!("{interrupt_notice}"); }
+        interrupt.interrupt();
+    }).context("failed to install the conformance interrupt handler")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_signed_suite<S: ProgressSink>(
     mut materialized: nazoauthctl_conformance::TenantResourceMaterializedMatrix,
@@ -2456,14 +2489,7 @@ fn run_signed_suite<S: ProgressSink>(
         .transpose()
         .context("failed to derive the run tenant OpenID4VP management token")?;
     let selected = materialized.take_matrix();
-    let interrupt = control.clone();
-    ctrlc::set_handler(move || {
-        if !user_interrupted.swap(true, Ordering::SeqCst) {
-            eprintln!("{interrupt_notice}");
-        }
-        interrupt.interrupt();
-    })
-    .context("failed to install the conformance interrupt handler")?;
+    install_interrupt_handler(&control, user_interrupted, interrupt_notice)?;
     let jobs = invocation.jobs.min(selected.document.plan_count());
     if control.is_interrupted() {
         bail!("run interrupted");

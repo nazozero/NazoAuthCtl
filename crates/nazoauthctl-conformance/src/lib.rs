@@ -94,7 +94,7 @@ pub use report::{
     ModuleOutcome, ModuleReport, PlanReport, ReviewScreenshotReport, WarningCondition,
     WarningModule,
 };
-pub use rp::{RpReport, RpSettings, run as run_rp_blackbox};
+pub use rp::{RpReport, RpSettings, recover_runs as recover_rp_runs, run as run_rp_blackbox};
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,
     TransportFailureStage,

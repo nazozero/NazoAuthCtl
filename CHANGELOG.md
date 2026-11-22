@@ -4,7 +4,9 @@
 
 - Add an external OIDC RP Suite execution lane owned by NazoAuthCtl.
   Existing 44 OP/AS plans stay unchanged; RP runs against production HTTPS
-  endpoints and never seed private identity-link tables.
+  endpoints and never seed private identity-link tables. Production account
+  binding, same-account session assertions, key rotation, public unlink and
+  crash recovery run through the same driver used by the CLI and black-box CI.
 
 ## 0.4.0 - Pending publication
 

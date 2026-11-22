@@ -37,6 +37,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sha")
     parser.add_argument("--require-main", action="store_true")
+    parser.add_argument("--require-rp", action="store_true")
     args = parser.parse_args()
     repository = os.environ["GITHUB_REPOSITORY"]
     response = json.loads(subprocess.check_output([
@@ -45,6 +46,16 @@ def main():
         "-f", f"head_sha={args.sha}", "-F", "per_page=100",
     ], text=True))
     run_id = select_run(response["workflow_runs"], args.sha, repository, args.require_main)
+    if args.require_rp:
+        rp_response = json.loads(subprocess.check_output([
+            "gh", "api", "--method", "GET",
+            f"/repos/{repository}/actions/workflows/oidc-rp-blackbox.yml/runs",
+            "-f", f"head_sha={args.sha}", "-F", "per_page=100",
+        ], text=True))
+        try:
+            select_run(rp_response["workflow_runs"], args.sha, repository, args.require_main)
+        except ValueError as error:
+            raise ValueError(f"OIDC RP black-box CI must finish successfully for {args.sha}") from error
     artifacts = json.loads(subprocess.check_output([
         "gh", "api", f"/repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100",
     ], text=True))

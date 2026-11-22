@@ -35,11 +35,20 @@ The configured client secret must match the real Suite static client.
   "configuration": {"alias": "rp-config-owned-alias", "provider_id": "rp-config"},
   "configuration_keys_provider_id": "rp-config-keys",
   "backchannel": {"alias": "rp-logout-owned-alias", "provider_id": "rp-logout"},
-  "post_logout_redirect_uri": "https://rp.example/ui/login",
+  "post_logout_redirect_uri": "https://rp.example/live",
   "session_cookie_name": "nazo_session",
-  "csrf_cookie_name": "nazo_csrf"
+  "csrf_cookie_name": "nazo_csrf",
+  "account": {"email": "rp-acceptance@example.com", "password": "private-account-password"}
 }
 ```
+
+Use a dedicated disposable local account with a password and no MFA, created
+through normal registration or administrator provisioning. During a run, that
+account and these four providers are exclusive to this controller. The driver
+records its existing links before making changes and removes only links it
+created in the four configured provider scopes. Keep this file owner-private;
+account passwords and Suite client secrets are never written to the recovery
+journal or public report.
 
 The target origin and immutable binary identity are taken from the
 controller's verified `--instance` deployment. The Suite URL and API
@@ -62,15 +71,26 @@ the existing private run-evidence directory, alongside the RP report.
 The controller also asserts the local callback's session and CSRF behavior
 and uses the normal `/auth/me` route to verify session revocation.
 
-**Known black-box precondition:** a first federated login can provision an
-account only when the upstream returns a verified email. The current public
-federation-link endpoints support listing/unlinking but not user-initiated
-linking. Some Suite RP cases have no verified email. For such cases an
-ordinary prior account/link establishment must be demonstrated; the
-old in-process RP fixture's direct identity-link insertion is forbidden.
-If no legitimate production path exists, that case is reported incomplete
-rather than accepted as successful, and issue #101 remains open.
+Before the 28 conformance modules run, the controller signs in to the local
+fixture account and starts each binding through
+`POST /auth/me/federation/links/{provider_id}/start`. The ordinary callback
+verifies the original Suite OP response and binds its subject to that same
+account. Setup modules and their original Suite states are recorded separately.
+The conformance modules then start with a fresh browser cookie jar and must
+establish a real local session for that account. Negative modules must return
+401 without a local session. Key rotation performs both required logins.
 
-The new lane's presence does not itself establish official OIDF certification
-or prove a successful external end-to-end run. These require actual
-deployment, Suite execution and inspectable evidence.
+Every Suite plan and module has a durable create intent before the API request.
+Its returned opaque ID replaces that intent. A later run recovers an interrupted
+run through the existing Suite cleanup API and the ordinary account unlink
+endpoint. An unknown create response stays pending for operator reconciliation;
+resources are never guessed from aliases. Completed runs retain an ownership
+receipt alongside their incrementally saved report, including failed assertions.
+
+CI runs the same controller driver against an independent production NazoAuth
+binary, provisioned with the normal `migrate` and `admin-provision` commands.
+It uses the unmodified, digest-pinned original OIDF Suite. Evidence records both
+source commits, the binary SHA-256, the live Suite version and the original
+module outcomes. Private raw logs are exported with fixture secrets redacted;
+PASSED, FAILED, REVIEW and SKIPPED results remain unchanged. The two unsigned
+ID Token cases retain their Suite SKIPPED result.

@@ -1,0 +1,110 @@
+name: OIDC RP black-box
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oidc-rp-blackbox-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  production-rp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    services:
+      postgres:
+        image: docker.io/library/postgres:18.7-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+        env:
+          POSTGRES_DB: oauth
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d oauth"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      valkey:
+        image: docker.io/valkey/valkey:9.1.3-alpine@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/oauth
+      VALKEY_URL: redis://127.0.0.1:6379/0
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUSTFLAGS: '-C link-arg=-Wl,--threads=1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Check out the independent production server
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nazozero/NazoAuth
+          ref: 13857743a78dda24d634ebf677170c8cc5a42ad1
+          path: sut
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: oidc-rp-blackbox
+          workspaces: |
+            . -> target
+            sut -> target
+      - name: Prepare the isolated runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libpq-dev
+          python3 sut/scripts/ci_build_jobs.py >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/oidf-rp"
+      - name: Build the unchanged production binary
+        working-directory: sut
+        run: cargo +1.100.0 build --locked -p nazo-server --bin nazoauth
+      - name: Build the controller RP driver
+        run: cargo test --locked -p nazoauthctl-conformance --test rp_blackbox --no-run
+      - name: Start the original OIDF Suite
+        run: bash tests/fixtures/oidf-rp/bootstrap-suite.sh "$RUNNER_TEMP/oidf-rp"
+      - name: Provision and start the normal production server
+        run: python3 tests/fixtures/oidf-rp/bootstrap-sut.py sut/target/debug/nazoauth "$RUNNER_TEMP/oidf-rp/sut"
+      - name: Record immutable binaries and source identities
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'oidf-rp'
+          binary = pathlib.Path('sut/target/debug/nazoauth')
+          evidence = {
+              'controller_commit': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(),
+              'nazoauth_commit': subprocess.check_output(['git','-C','sut','rev-parse','HEAD'], text=True).strip(),
+              'nazoauth_binary_sha256': hashlib.file_digest(binary.open('rb'), 'sha256').hexdigest(),
+              'target_origin': 'https://localhost:8445',
+          }
+          (root / 'evidence' / 'source-identities.json').write_text(json.dumps(evidence, indent=2) + '\n')
+          PY
+      - name: Run all 28 RP modules through public production HTTP
+        env:
+          OIDF_RP_EVIDENCE: ${{ runner.temp }}/oidf-rp/private-rp-evidence
+        run: cargo test --locked -p nazoauthctl-conformance --test rp_blackbox -- --ignored --nocapture
+      - name: Export outcomes with temporary secrets redacted
+        if: always()
+        run: python3 tests/fixtures/oidf-rp/export-evidence.py "$RUNNER_TEMP/oidf-rp"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: oidc-rp-blackbox-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/oidf-rp/evidence
+          if-no-files-found: error
+      - name: Stop owned test processes
+        if: always()
+        run: |
+          if [ -n "${OIDF_RP_SERVER_PID:-}" ]; then kill "$OIDF_RP_SERVER_PID" || true; fi
+          docker rm -f nazo-rp-blackbox-nginx nazo-rp-blackbox-server nazo-rp-blackbox-mongo || true
