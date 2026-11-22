@@ -281,18 +281,18 @@ fn validate_journal(journal: &Journal) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nazoauthctl_runtime::filesystem::PrivateTempDir;
 
-    struct Fixture(PathBuf);
+    struct Fixture(PrivateTempDir);
 
     impl Fixture {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("rp-recovery-{}", uuid::Uuid::now_v7()));
-            Self(secure_file::ensure_directory(&path, true).unwrap())
+            Self(PrivateTempDir::new("rp-recovery").unwrap())
         }
 
         fn create(&self) -> Recovery {
             Recovery::create(
-                &self.0.join("run-1"),
+                &self.0.path().join("run-1"),
                 &Origin::parse_suite("https://suite.example").unwrap(),
                 &Origin::parse("https://login.example").unwrap(),
                 "account-1".to_owned(),
@@ -303,12 +303,6 @@ mod tests {
                 vec!["rp-provider".to_owned()],
             )
             .unwrap()
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -324,7 +318,7 @@ mod tests {
             .unwrap();
         drop(recovery);
 
-        let pending = Recovery::pending(&fixture.0).unwrap();
+        let pending = Recovery::pending(fixture.0.path()).unwrap();
         assert_eq!(pending.len(), 1);
         let reopened = &pending[0];
         assert_eq!(reopened.state().origin, "https://suite.example");
@@ -344,7 +338,7 @@ mod tests {
         recovery.before_create("unknown-allocation").unwrap();
         drop(recovery);
 
-        let mut pending = Recovery::pending(&fixture.0).unwrap();
+        let mut pending = Recovery::pending(fixture.0.path()).unwrap();
         let recovery = &mut pending[0];
         assert_eq!(
             recovery.state().pending_create_intents,
@@ -357,7 +351,7 @@ mod tests {
             .unwrap();
         recovery.settle(false).unwrap();
         drop(pending);
-        assert!(Recovery::pending(&fixture.0).unwrap().is_empty());
+        assert!(Recovery::pending(fixture.0.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -372,8 +366,8 @@ mod tests {
             assert_eq!(recovery.state().cleanup_complete, !retained);
             assert!(recovery.before_create("another-intent").is_err());
             drop(recovery);
-            assert!(Recovery::pending(&fixture.0).unwrap().is_empty());
-            assert!(fixture.0.join("run-1").join(JOURNAL_FILE).is_file());
+            assert!(Recovery::pending(fixture.0.path()).unwrap().is_empty());
+            assert!(fixture.0.path().join("run-1").join(JOURNAL_FILE).is_file());
         }
     }
 
@@ -381,9 +375,9 @@ mod tests {
     fn a_running_controller_keeps_the_recovery_lease() {
         let fixture = Fixture::new();
         let recovery = fixture.create();
-        assert!(Recovery::pending(&fixture.0).is_err());
+        assert!(Recovery::pending(fixture.0.path()).is_err());
         drop(recovery);
-        assert_eq!(Recovery::pending(&fixture.0).unwrap().len(), 1);
+        assert_eq!(Recovery::pending(fixture.0.path()).unwrap().len(), 1);
     }
 
     #[test]
@@ -397,6 +391,6 @@ mod tests {
             .push("../unowned-plan".to_owned());
         recovery.persist().unwrap();
         drop(recovery);
-        assert!(Recovery::pending(&fixture.0).is_err());
+        assert!(Recovery::pending(fixture.0.path()).is_err());
     }
 }
