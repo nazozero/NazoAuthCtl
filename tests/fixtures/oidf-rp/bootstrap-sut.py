@@ -15,7 +15,7 @@ import uuid
 
 
 def private_json(path, value):
-    with path.open("x", opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
+    with open(path, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as output:
         json.dump(value, output, indent=2)
         output.write("\n")
 
@@ -91,7 +91,7 @@ def main():
     })
     env = dict(os.environ, NAZOAUTH_SERVER_CONFIG_FILE=str(config_path))
     log_path = directory / "server-private.log"
-    with log_path.open("x", opener=lambda name, flags: os.open(name, flags, 0o600)) as log:
+    with open(log_path, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as log:
         subprocess.run([str(binary), "migrate"], cwd=directory, env=env, check=True, stdout=log, stderr=log)
         provision_env = dict(env, NAZOAUTH_ADMIN_PROVISION_FILE=str(credential_path),
                              NAZOAUTH_ADMIN_PROVISION_OPERATION_ID="initial-rp-account",

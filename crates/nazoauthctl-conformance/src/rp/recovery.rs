@@ -159,7 +159,13 @@ impl Recovery {
 
     pub(super) fn module_created(&mut self, intent: &str, module_id: &str) -> anyhow::Result<()> {
         self.resolve_intent(intent, module_id)?;
-        if !self.journal.suite.module_ids.iter().any(|id| id == module_id) {
+        if !self
+            .journal
+            .suite
+            .module_ids
+            .iter()
+            .any(|id| id == module_id)
+        {
             self.journal.suite.module_ids.push(module_id.to_owned());
         }
         self.persist()
@@ -340,7 +346,10 @@ mod tests {
 
         let mut pending = Recovery::pending(&fixture.0).unwrap();
         let recovery = &mut pending[0];
-        assert_eq!(recovery.state().pending_create_intents, ["unknown-allocation"]);
+        assert_eq!(
+            recovery.state().pending_create_intents,
+            ["unknown-allocation"]
+        );
         assert!(recovery.settle(false).is_err());
         assert!(recovery.settle(true).is_err());
         recovery
@@ -381,7 +390,11 @@ mod tests {
     fn disk_boundary_rejects_a_resource_id_that_could_change_the_cleanup_path() {
         let fixture = Fixture::new();
         let mut recovery = fixture.create();
-        recovery.journal.suite.plan_ids.push("../unowned-plan".to_owned());
+        recovery
+            .journal
+            .suite
+            .plan_ids
+            .push("../unowned-plan".to_owned());
         recovery.persist().unwrap();
         drop(recovery);
         assert!(Recovery::pending(&fixture.0).is_err());

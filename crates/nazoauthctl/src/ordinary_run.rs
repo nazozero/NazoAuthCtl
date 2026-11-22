@@ -542,7 +542,9 @@ fn execute_with_progress<S: ProgressSink>(
     let recovered_retention = recover_pending_runs(&session, &recovery_store, Some(&suite_client))?;
     let rp_target = production_rp_origin(session.target_issuer())?;
     nazoauthctl_conformance::recover_rp_runs(
-        &suite_client, &rp_target, rp_setup.as_ref().map(|(_, settings)| settings),
+        &suite_client,
+        &rp_target,
+        rp_setup.as_ref().map(|(_, settings)| settings),
         &session.recovery_directory().join("evidence"),
     )?;
     if !recovered_retention.is_empty() {
@@ -1107,7 +1109,10 @@ fn execute_rp_only<S: ProgressSink>(
         bail!("unsettled earlier Suite retention requires recovery before RP execution");
     }
     nazoauthctl_conformance::recover_rp_runs(
-        &suite, &target, Some(&settings), &session.recovery_directory().join("evidence"),
+        &suite,
+        &target,
+        Some(&settings),
+        &session.recovery_directory().join("evidence"),
     )?;
     let run_id = format!("rp-{}", uuid::Uuid::now_v7());
     let evidence_directory = create_evidence_directory(session.recovery_directory(), &run_id)?;
@@ -1119,8 +1124,10 @@ fn execute_rp_only<S: ProgressSink>(
             "release": deployment.release,
             "target_issuer": deployment.target_issuer,
             "runtime": evidence_runtime(&deployment.runtime),
-        }))?, true,
-    ).map_err(|error| anyhow::anyhow!("failed to persist RP target identity: {error:?}"))?;
+        }))?,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("failed to persist RP target identity: {error:?}"))?;
     let rp = nazoauthctl_conformance::run_rp_blackbox(
         &suite,
         target,
@@ -1131,6 +1138,22 @@ fn execute_rp_only<S: ProgressSink>(
         control,
     )?;
     let success = rp.success;
+    let modules = rp
+        .plans
+        .iter()
+        .flat_map(|plan| &plan.modules)
+        .collect::<Vec<_>>();
+    let suite_passed = modules
+        .iter()
+        .filter(|module| module.suite_result.as_deref() == Some("PASSED"))
+        .count();
+    let suite_skipped = modules
+        .iter()
+        .filter(|module| module.suite_result.as_deref() == Some("SKIPPED"))
+        .count();
+    let module_count = modules.len();
+    let suite_other = module_count - suite_passed - suite_skipped;
+    let application_passed = module_count - rp.failed_application_assertions;
     let output = serde_json::json!({
         "schema": 1,
         "success": success,
@@ -1150,11 +1173,19 @@ fn execute_rp_only<S: ProgressSink>(
     } else {
         let status = if success { "PASSED" } else { "FAILED" };
         println!(
-            "OIDC RP black-box: {status}. Evidence: {}",
+            "OIDC RP black-box acceptance: {status}. Suite: {suite_passed} PASSED, \
+             {suite_skipped} SKIPPED, {suite_other} other ({module_count}/28 modules). \
+             Application assertions: {application_passed}/28 passed. Evidence: {}",
             evidence_directory.display()
         );
     }
-    Ok(if success { 0 } else { 1 })
+    Ok(if control.is_interrupted() {
+        130
+    } else if success {
+        0
+    } else {
+        1
+    })
 }
 
 fn conformance_run_succeeds(
@@ -2432,13 +2463,18 @@ struct RunSecrets {
 }
 
 fn install_interrupt_handler(
-    control: &RunControl, user_interrupted: Arc<AtomicBool>, interrupt_notice: &'static str,
+    control: &RunControl,
+    user_interrupted: Arc<AtomicBool>,
+    interrupt_notice: &'static str,
 ) -> anyhow::Result<()> {
     let interrupt = control.clone();
     ctrlc::set_handler(move || {
-        if !user_interrupted.swap(true, Ordering::SeqCst) { eprintln!("{interrupt_notice}"); }
+        if !user_interrupted.swap(true, Ordering::SeqCst) {
+            eprintln!("{interrupt_notice}");
+        }
         interrupt.interrupt();
-    }).context("failed to install the conformance interrupt handler")
+    })
+    .context("failed to install the conformance interrupt handler")
 }
 
 #[allow(clippy::too_many_arguments)]

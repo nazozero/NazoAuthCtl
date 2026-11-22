@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: nazozero/NazoAuth
-          ref: 13857743a78dda24d634ebf677170c8cc5a42ad1
+          ref: 6bc37162f889710bd28e8f98979c9ef0a1e0ef96
           path: sut
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0

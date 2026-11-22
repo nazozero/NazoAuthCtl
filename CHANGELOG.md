@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - Pending publication
 
 - Add an external OIDC RP Suite execution lane owned by NazoAuthCtl.
   Existing 44 OP/AS plans stay unchanged; RP runs against production HTTPS
@@ -8,14 +8,12 @@
   binding, same-account session assertions, key rotation, public unlink and
   crash recovery run through the same driver used by the CLI and black-box CI.
 
-## 0.4.0 - Pending publication
-
 - Correct `oidf run oidc` to select all nine bundled OP Core, Logout and
   Session Management plans rather than only the five Core plans. Exact plan
   selectors and the default full 44-plan Matrix are unchanged.
-- Record the separate RP Basic, Configuration and Back-Channel Logout
-  conformance workflow in NazoAuth. Do not import RP plan names into the
-  controller's OP Matrix without a working RP provision-and-run path.
+- Run all 28 RP Basic, Configuration and Back-Channel Logout modules against an
+  independent production NazoAuth binary. Preserve the Suite's original outcomes
+  and require successful black-box CI on the exact main commit before release.
 - Preserve operator protocol 4, immutable dependency revisions, and existing
   persisted state/backup formats. The release remains gated on successful CI
   and signed server compatibility.
