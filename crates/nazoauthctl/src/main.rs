@@ -611,22 +611,45 @@ mod tests {
     fn rp_selection_requires_private_configuration_and_keeps_op_plans() {
         assert!(routed_run(&args(&["nazoauthctl", "oidf", "run", "oidc-rp"])).is_err());
         let rp = routed_run(&args(&[
-            "nazoauthctl", "oidf", "run", "oidc-rp", "--rp-config", "rp.json",
-        ])).unwrap().unwrap();
+            "nazoauthctl",
+            "oidf",
+            "run",
+            "oidc-rp",
+            "--rp-config",
+            "rp.json",
+        ]))
+        .unwrap()
+        .unwrap();
         assert!(rp.rp_only);
         assert_eq!(rp.rp_config.as_deref(), Some("rp.json"));
         let op = routed_run(&args(&["nazoauthctl", "oidf", "run", "oidc-op"]))
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert!(!op.rp_only);
         assert_eq!(op.groups, ["oidc-core", "oidc-logout", "oidc-session"]);
         let both = routed_run(&args(&[
-            "nazoauthctl", "oidf", "run", "oidc", "--rp-config", "rp.json",
-        ])).unwrap().unwrap();
+            "nazoauthctl",
+            "oidf",
+            "run",
+            "oidc",
+            "--rp-config",
+            "rp.json",
+        ]))
+        .unwrap()
+        .unwrap();
         assert_eq!(both.groups, op.groups);
         assert!(!both.rp_only);
-        assert!(routed_run(&args(&[
-            "nazoauthctl", "oidf", "run", "ciba", "--rp-config", "rp.json",
-        ])).is_err());
+        assert!(
+            routed_run(&args(&[
+                "nazoauthctl",
+                "oidf",
+                "run",
+                "ciba",
+                "--rp-config",
+                "rp.json",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

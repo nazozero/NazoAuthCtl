@@ -15,9 +15,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
     ClientConfig, DeleteOutcome, HttpRequest, HttpResponse, HttpTransport, Origin, SuiteClient,
-    Transport,
-    client::ModuleDefinition,
-    matrix::zeroize_json_value,
+    Transport, client::ModuleDefinition, matrix::zeroize_json_value,
 };
 use nazoauthctl_runtime::secure_file;
 
@@ -57,8 +55,10 @@ struct RpProvider {
 
 impl RpSettings {
     pub fn load(path: &Path, target: &Origin) -> anyhow::Result<Self> {
-        let mut bytes = secure_file::read_bounded(path, MAX_RP_CONFIG_BYTES, true)
-            .map_err(|error| anyhow::anyhow!("RP configuration must be a private regular file: {error:?}"))?;
+        let mut bytes =
+            secure_file::read_bounded(path, MAX_RP_CONFIG_BYTES, true).map_err(|error| {
+                anyhow::anyhow!("RP configuration must be a private regular file: {error:?}")
+            })?;
         let parsed = serde_json::from_slice::<Self>(&bytes);
         bytes.zeroize();
         let settings = parsed.context("RP configuration is malformed")?;
@@ -83,8 +83,15 @@ impl RpSettings {
             || self.csrf_cookie_name.is_empty()
             || configured.iter().any(|id| !valid_path_segment(id))
             || configured.into_iter().collect::<BTreeSet<_>>().len() != 4
-            || providers.iter().any(|provider| !valid_path_segment(&provider.alias))
-            || providers.iter().map(|provider| provider.alias.as_str()).collect::<BTreeSet<_>>().len() != 3
+            || providers
+                .iter()
+                .any(|provider| !valid_path_segment(&provider.alias))
+            || providers
+                .iter()
+                .map(|provider| provider.alias.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 3
         {
             bail!("RP configuration contains invalid or conflicting provider bindings");
         }
@@ -102,7 +109,8 @@ impl RpSettings {
 fn valid_path_segment(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,11 +180,15 @@ pub fn run(
     let transport = HttpTransport::new(ClientConfig::default().timeout)?;
     // Use an existing public production endpoint to establish which RP
     // providers are enabled; no introspection of server internals.
-    let providers = transport.send(
-        HttpRequest::get(target.url("/auth/federation/providers")?),
-        MAX_RP_HTTP_BYTES,
-    )?.body.json::<Value>()?;
-    let visible = providers["providers"].as_array()
+    let providers = transport
+        .send(
+            HttpRequest::get(target.url("/auth/federation/providers")?),
+            MAX_RP_HTTP_BYTES,
+        )?
+        .body
+        .json::<Value>()?;
+    let visible = providers["providers"]
+        .as_array()
         .context("production RP provider list is unavailable")?;
     for id in [
         &settings.basic.provider_id,
@@ -184,7 +196,10 @@ pub fn run(
         &settings.configuration_keys_provider_id,
         &settings.backchannel.provider_id,
     ] {
-        if !visible.iter().any(|provider| provider["provider_id"] == *id) {
+        if !visible
+            .iter()
+            .any(|provider| provider["provider_id"] == *id)
+        {
             bail!("required production RP provider is not enabled");
         }
     }
@@ -197,7 +212,11 @@ pub fn run(
         suite_pass: true,
         blocked_preconditions: 0,
     };
-    for profile in [RpProfile::Basic, RpProfile::Configuration, RpProfile::Backchannel] {
+    for profile in [
+        RpProfile::Basic,
+        RpProfile::Configuration,
+        RpProfile::Backchannel,
+    ] {
         let provider = match profile {
             RpProfile::Basic => &settings.basic,
             RpProfile::Configuration => &settings.configuration,
@@ -215,13 +234,18 @@ pub fn run(
             cleanup: "retained",
         };
         let plan_is_known = profile_modules(profile).len() == plan.modules.len()
-            && plan.modules.iter().all(|module| profile_modules(profile).contains(&module.test_name.as_str()));
+            && plan
+                .modules
+                .iter()
+                .all(|module| profile_modules(profile).contains(&module.test_name.as_str()));
         if !plan_is_known {
             report.success = false;
             report.suite_pass = false;
             output.cleanup = "retained-unknown-plan";
             report.plans.push(output);
-            bail!("OIDF Suite RP module set differs from the reviewed plan; plan retained for inspection");
+            bail!(
+                "OIDF Suite RP module set differs from the reviewed plan; plan retained for inspection"
+            );
         }
         for (index, module) in plan.modules.iter().enumerate() {
             let instance = suite.create_module(&plan.id, module)?;
@@ -229,17 +253,27 @@ pub fn run(
             let mut application_error = None;
             let mut application_pass = false;
             let mut ready = suite.wait_for_state(
-                &instance.id, &["CONFIGURED", "WAITING", "FINISHED", "INTERRUPTED"], poll_timeout,
+                &instance.id,
+                &["CONFIGURED", "WAITING", "FINISHED", "INTERRUPTED"],
+                poll_timeout,
             )?;
             if ready["state"] == "CONFIGURED" {
                 suite.start_module(&instance.id)?;
                 ready = suite.wait_for_state(
-                    &instance.id, &["WAITING", "FINISHED", "INTERRUPTED"], poll_timeout,
+                    &instance.id,
+                    &["WAITING", "FINISHED", "INTERRUPTED"],
+                    poll_timeout,
                 )?;
             }
             if ready["state"] == "WAITING" {
                 match drive_module(
-                    &transport, &target, suite.origin(), settings, profile, provider, module,
+                    &transport,
+                    &target,
+                    suite.origin(),
+                    settings,
+                    profile,
+                    provider,
+                    module,
                 ) {
                     Ok(status) => {
                         observed_http_status = Some(status);
@@ -251,30 +285,39 @@ pub fn run(
                     }
                 }
             } else {
-                application_error = Some("Suite module did not reach the browser-ready state".into());
+                application_error =
+                    Some("Suite module did not reach the browser-ready state".into());
             }
             if application_pass {
-                let _ = suite.wait_for_state(
-                    &instance.id, &["FINISHED", "INTERRUPTED"], poll_timeout,
-                );
+                let _ =
+                    suite.wait_for_state(&instance.id, &["FINISHED", "INTERRUPTED"], poll_timeout);
             }
             let final_state = suite.module_info(&instance.id)?;
-            let suite_status = final_state["status"].as_str().unwrap_or("INCOMPLETE").to_owned();
+            let suite_status = final_state["status"]
+                .as_str()
+                .unwrap_or("INCOMPLETE")
+                .to_owned();
             let suite_result = final_state["result"].as_str().map(str::to_owned);
-            let expected = if module.test_name == UNSIGNED { "SKIPPED" } else { "PASSED" };
+            let expected = if module.test_name == UNSIGNED {
+                "SKIPPED"
+            } else {
+                "PASSED"
+            };
             let accepted = suite_status == "FINISHED"
                 && suite_result.as_deref() == Some(expected)
                 && application_pass;
             report.success &= accepted;
-            report.suite_pass &= suite_status == "FINISHED" && suite_result.as_deref() == Some("PASSED");
+            report.suite_pass &=
+                suite_status == "FINISHED" && suite_result.as_deref() == Some("PASSED");
             if !application_pass && observed_http_status == Some(401) {
                 report.blocked_preconditions += 1;
             }
             let log = suite.module_log(&instance.id)?;
             let relative = format!("rp-{}-{:02}.json", profile.name(), index + 1);
             let bytes = serde_json::to_vec(&log)?;
-            secure_file::write_atomic(&evidence_dir.join(&relative), &bytes, true)
-                .map_err(|error| anyhow::anyhow!("failed to save private RP Suite log: {error:?}"))?;
+            secure_file::write_atomic(&evidence_dir.join(&relative), &bytes, true).map_err(
+                |error| anyhow::anyhow!("failed to save private RP Suite log: {error:?}"),
+            )?;
             output.modules.push(RpModuleReport {
                 name: module.test_name.clone(),
                 suite_module_id: instance.id,
@@ -297,8 +340,12 @@ pub fn run(
         }
         report.plans.push(output);
     }
-    secure_file::write_atomic(&evidence_dir.join("rp-report.json"), &serde_json::to_vec_pretty(&report)?, true)
-        .map_err(|error| anyhow::anyhow!("failed to save private RP report: {error:?}"))?;
+    secure_file::write_atomic(
+        &evidence_dir.join("rp-report.json"),
+        &serde_json::to_vec_pretty(&report)?,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("failed to save private RP report: {error:?}"))?;
     Ok(report)
 }
 
@@ -314,8 +361,16 @@ fn plan_variant(profile: RpProfile) -> BTreeMap<String, String> {
     variants
 }
 
-fn plan_config(profile: RpProfile, settings: &RpSettings, target: &Origin, provider: &RpProvider) -> Value {
-    let callback = format!("{}/auth/federation/{}/callback", target, provider.provider_id);
+fn plan_config(
+    profile: RpProfile,
+    settings: &RpSettings,
+    target: &Origin,
+    provider: &RpProvider,
+) -> Value {
+    let callback = format!(
+        "{}/auth/federation/{}/callback",
+        target, provider.provider_id
+    );
     let mut client = json!({
         "client_id": settings.client_id,
         "client_secret": settings.client_secret,
@@ -323,8 +378,10 @@ fn plan_config(profile: RpProfile, settings: &RpSettings, target: &Origin, provi
         "id_token_signed_response_alg": "RS256",
     });
     if profile == RpProfile::Backchannel {
-        client["backchannel_logout_uri"] =
-            json!(format!("{}/auth/federation/{}/backchannel-logout", target, provider.provider_id));
+        client["backchannel_logout_uri"] = json!(format!(
+            "{}/auth/federation/{}/backchannel-logout",
+            target, provider.provider_id
+        ));
         client["backchannel_logout_session_required"] = json!(true);
         client["post_logout_redirect_uri"] = json!(settings.post_logout_redirect_uri);
     }
@@ -352,20 +409,28 @@ fn plan_config(profile: RpProfile, settings: &RpSettings, target: &Origin, provi
 fn profile_modules(profile: RpProfile) -> &'static [&'static str] {
     match profile {
         RpProfile::Basic => &[
-            "oidcc-client-test", "oidcc-client-test-kid-absent-single-jwks",
-            "oidcc-client-test-idtoken-sig-rs256", "oidcc-client-test-scope-userinfo-claims",
-            "oidcc-client-test-client-secret-basic", "oidcc-client-test-invalid-iss",
-            "oidcc-client-test-missing-sub", "oidcc-client-test-invalid-aud",
-            "oidcc-client-test-missing-iat", "oidcc-client-test-invalid-sig-rs256",
-            "oidcc-client-test-userinfo-invalid-sub", "oidcc-client-test-nonce-invalid",
-            "oidcc-client-test-kid-absent-multiple-jwks", UNSIGNED,
+            "oidcc-client-test",
+            "oidcc-client-test-kid-absent-single-jwks",
+            "oidcc-client-test-idtoken-sig-rs256",
+            "oidcc-client-test-scope-userinfo-claims",
+            "oidcc-client-test-client-secret-basic",
+            "oidcc-client-test-invalid-iss",
+            "oidcc-client-test-missing-sub",
+            "oidcc-client-test-invalid-aud",
+            "oidcc-client-test-missing-iat",
+            "oidcc-client-test-invalid-sig-rs256",
+            "oidcc-client-test-userinfo-invalid-sub",
+            "oidcc-client-test-nonce-invalid",
+            "oidcc-client-test-kid-absent-multiple-jwks",
+            UNSIGNED,
         ],
         RpProfile::Configuration => &[
             "oidcc-client-test-discovery-openid-config",
             "oidcc-client-test-discovery-issuer-mismatch",
             "oidcc-client-test-signing-key-rotation",
             "oidcc-client-test-signing-key-rotation-just-before-signing",
-            "oidcc-client-test-discovery-jwks-uri-keys", UNSIGNED,
+            "oidcc-client-test-discovery-jwks-uri-keys",
+            UNSIGNED,
         ],
         RpProfile::Backchannel => &[
             LOGOUT_VALID,
@@ -381,12 +446,17 @@ fn profile_modules(profile: RpProfile) -> &'static [&'static str] {
 }
 
 fn negative_module(module: &str) -> bool {
-    matches!(module,
-        "oidcc-client-test-invalid-iss" | "oidcc-client-test-missing-sub"
-        | "oidcc-client-test-invalid-aud" | "oidcc-client-test-missing-iat"
-        | "oidcc-client-test-invalid-sig-rs256" | "oidcc-client-test-userinfo-invalid-sub"
-        | "oidcc-client-test-nonce-invalid" | "oidcc-client-test-kid-absent-multiple-jwks"
-        | UNSIGNED
+    matches!(
+        module,
+        "oidcc-client-test-invalid-iss"
+            | "oidcc-client-test-missing-sub"
+            | "oidcc-client-test-invalid-aud"
+            | "oidcc-client-test-missing-iat"
+            | "oidcc-client-test-invalid-sig-rs256"
+            | "oidcc-client-test-userinfo-invalid-sub"
+            | "oidcc-client-test-nonce-invalid"
+            | "oidcc-client-test-kid-absent-multiple-jwks"
+            | UNSIGNED
     )
 }
 
@@ -410,20 +480,30 @@ impl Browser<'_> {
             None => HttpRequest::get(url),
         };
         if let Some(jar) = self.cookies.get(&origin) {
-            let value = jar.iter().map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>().join("; ");
+            let value = jar
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ");
             if !value.is_empty() {
                 request = request.with_header("cookie", value);
             }
         }
         let response = self.http.send(request, MAX_RP_HTTP_BYTES)?;
         let jar = self.cookies.entry(origin).or_default();
-        for cookie in response.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie")) {
+        for cookie in response
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+        {
             let pair = cookie.1.split(';').next().unwrap_or_default();
             if let Some((name, value)) = pair.split_once('=') {
                 if valid_path_segment(name) {
-                    if value.is_empty() { jar.remove(name); }
-                    else { jar.insert(name.to_owned(), Zeroizing::new(value.to_owned())); }
+                    if value.is_empty() {
+                        jar.remove(name);
+                    } else {
+                        jar.insert(name.to_owned(), Zeroizing::new(value.to_owned()));
+                    }
                 }
             }
         }
@@ -439,7 +519,10 @@ impl Browser<'_> {
     }
 
     fn cookie(&self, name: &str) -> Option<&str> {
-        self.cookies.get(self.target.as_str())?.get(name).map(|value| value.as_str())
+        self.cookies
+            .get(self.target.as_str())?
+            .get(name)
+            .map(|value| value.as_str())
     }
 
     fn follow(&mut self, mut url: Url) -> anyhow::Result<(Url, HttpResponse)> {
@@ -448,7 +531,9 @@ impl Browser<'_> {
             if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
                 return Ok((url, response));
             }
-            let location = response.header("location").context("RP redirect missing Location")?;
+            let location = response
+                .header("location")
+                .context("RP redirect missing Location")?;
             url = url.join(location)?;
         }
         bail!("RP flow exceeded the redirect budget")
@@ -471,7 +556,12 @@ fn drive_module(
     };
     let start_url = target.url(&format!("/auth/federation/{provider_id}/start"))?;
     let callback = target.url(&format!("/auth/federation/{provider_id}/callback"))?;
-    let mut browser = Browser { http, target, suite, cookies: BTreeMap::new() };
+    let mut browser = Browser {
+        http,
+        target,
+        suite,
+        cookies: BTreeMap::new(),
+    };
     if module.test_name == "oidcc-client-test-discovery-openid-config"
         || module.test_name == "oidcc-client-test-discovery-issuer-mismatch"
     {
@@ -481,9 +571,12 @@ fn drive_module(
                 bail!("issuer mismatch did not reject discovery before authorization");
             }
         } else {
-            let redirect = response.header("location").context("discovery did not redirect")?;
+            let redirect = response
+                .header("location")
+                .context("discovery did not redirect")?;
             let url = Url::parse(redirect)?;
-            if response.status != 302 || url.origin().ascii_serialization() != suite.as_str()
+            if response.status != 302
+                || url.origin().ascii_serialization() != suite.as_str()
                 || !url.path().ends_with("/authorize")
             {
                 bail!("valid discovery did not reach the Suite authorization endpoint");
@@ -492,22 +585,29 @@ fn drive_module(
         return Ok(response.status);
     }
     let (final_url, response) = browser.follow(start_url)?;
-    let body = response.body.json::<Value>().context("RP callback was not JSON")?;
+    let body = response
+        .body
+        .json::<Value>()
+        .context("RP callback was not JSON")?;
     if final_url.origin().ascii_serialization() != target.as_str()
         || final_url.path() != callback.path()
     {
         bail!("RP flow did not finish at the configured callback");
     }
     if negative_module(&module.test_name) {
-        if response.status != 401 || body["error"] != "access_denied"
+        if response.status != 401
+            || body["error"] != "access_denied"
             || browser.cookie(&settings.session_cookie_name).is_some()
         {
             bail!("invalid upstream identity was accepted or returned an unexpected status");
         }
         return Ok(response.status);
     }
-    let csrf = body["csrf_token"].as_str().context("RP callback has no CSRF token")?;
-    if response.status != 200 || body["mfa_required"] != false
+    let csrf = body["csrf_token"]
+        .as_str()
+        .context("RP callback has no CSRF token")?;
+    if response.status != 200
+        || body["mfa_required"] != false
         || body["expires_in"].as_i64().is_none_or(|value| value <= 0)
         || browser.cookie(&settings.session_cookie_name).is_none()
         || browser.cookie(&settings.csrf_cookie_name) != Some(csrf)
@@ -515,7 +615,15 @@ fn drive_module(
         bail!("valid upstream identity did not establish an authenticated local session");
     }
     if profile == RpProfile::Backchannel {
-        drive_logout(&mut browser, target, suite, settings, provider, &module.test_name, csrf)?;
+        drive_logout(
+            &mut browser,
+            target,
+            suite,
+            settings,
+            provider,
+            &module.test_name,
+            csrf,
+        )?;
     }
     Ok(response.status)
 }
@@ -538,7 +646,8 @@ fn drive_logout(
         bail!("RP-initiated logout accepted a missing CSRF token");
     }
     let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("csrf_token", csrf).finish();
+        .append_pair("csrf_token", csrf)
+        .finish();
     let intent = browser.post(endpoint, body)?;
     if intent.status != 200 || intent.header("cache-control") != Some("no-store") {
         bail!("RP did not return a non-cacheable upstream logout form");
@@ -556,7 +665,9 @@ fn drive_logout(
         .append_pair("post_logout_redirect_uri", &return_uri)
         .finish();
     let op_response = browser.post(action.clone(), form)?;
-    let redirect = op_response.header("location").context("Suite logout did not redirect")?;
+    let redirect = op_response
+        .header("location")
+        .context("Suite logout did not redirect")?;
     let url = action.join(redirect)?;
     if url.as_str() != return_uri {
         bail!("Suite logout did not return to the registered RP URI");
@@ -571,14 +682,18 @@ fn drive_logout(
 
 fn parse_logout_form(html: &str) -> anyhow::Result<(Url, String, String)> {
     let action = Regex::new(r#"<form method="post" action="([^"]+)""#)?
-        .captures(html).and_then(|c| c.get(1)).context("upstream logout form is missing")?;
+        .captures(html)
+        .and_then(|c| c.get(1))
+        .context("upstream logout form is missing")?;
     let hidden = Regex::new(r#"<input type="hidden" name="([^"]+)" value="([^"]*)""#)?;
     let mut values = BTreeMap::new();
     for pair in hidden.captures_iter(html) {
         values.insert(pair[1].to_owned(), pair[2].to_owned());
     }
     let hint = values.remove("id_token_hint").context("no ID Token hint")?;
-    let return_uri = values.remove("post_logout_redirect_uri").context("no return URI")?;
+    let return_uri = values
+        .remove("post_logout_redirect_uri")
+        .context("no return URI")?;
     if hint.is_empty() {
         bail!("empty upstream logout ID Token hint");
     }
@@ -620,8 +735,17 @@ mod tests {
             "backchannel": {"alias":"rp-logout", "provider_id":"rp-logout"},
             "post_logout_redirect_uri": "https://rp.example/ui/login",
             "session_cookie_name":"nazo_session", "csrf_cookie_name":"nazo_csrf"
-        })).unwrap();
-        assert!(settings.validate(&Origin::parse("https://rp.example").unwrap()).is_ok());
-        assert!(settings.validate(&Origin::parse("https://other.example").unwrap()).is_err());
+        }))
+        .unwrap();
+        assert!(
+            settings
+                .validate(&Origin::parse("https://rp.example").unwrap())
+                .is_ok()
+        );
+        assert!(
+            settings
+                .validate(&Origin::parse("https://other.example").unwrap())
+                .is_err()
+        );
     }
 }

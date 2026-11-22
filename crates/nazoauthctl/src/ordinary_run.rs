@@ -504,11 +504,15 @@ fn execute_with_progress<S: ProgressSink>(
     let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
         .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
     // Validate externally configured RP facts before creating temporary OP resources.
-    let rp_setup = invocation.rp_config.as_deref().map(|path| {
-        let target = production_rp_origin(session.target_issuer())?;
-        let settings = nazoauthctl_conformance::RpSettings::load(Path::new(path), &target)?;
-        Ok::<_, anyhow::Error>((target, settings))
-    }).transpose()?;
+    let rp_setup = invocation
+        .rp_config
+        .as_deref()
+        .map(|path| {
+            let target = production_rp_origin(session.target_issuer())?;
+            let settings = nazoauthctl_conformance::RpSettings::load(Path::new(path), &target)?;
+            Ok::<_, anyhow::Error>((target, settings))
+        })
+        .transpose()?;
 
     progress.activity(&ProgressActivity::LoadingMatrix);
     let driver_plan = open_bundled_oidf_driver_plan(OidfPlanSelection {
@@ -1013,8 +1017,12 @@ fn execute_with_progress<S: ProgressSink>(
     let mut rp_report = None;
     if let Some((target, settings)) = rp_setup {
         let attempt = nazoauthctl_conformance::run_rp_blackbox(
-            &suite_client, target, &settings, &evidence_directory,
-            invocation.poll_timeout, invocation.delete_suite_plans,
+            &suite_client,
+            target,
+            &settings,
+            &evidence_directory,
+            invocation.poll_timeout,
+            invocation.delete_suite_plans,
         );
         match attempt {
             Ok(result) => rp_report = Some(result),
@@ -1073,13 +1081,16 @@ fn execute_rp_only<S: ProgressSink>(
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("RP black-box execution requires a verified running NazoAuth release")?;
     let recovery_store = ConformanceRecoveryStore::open(
-        session.recovery_directory(), &session.deployment_evidence().deployment_id,
+        session.recovery_directory(),
+        &session.deployment_evidence().deployment_id,
     )?;
     let _lock = recovery_store.acquire_orchestration_lock()?;
     recover_pending_runs(&session, &recovery_store, None)?;
     let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())?;
     let target = production_rp_origin(session.target_issuer())?;
-    let config_path = invocation.rp_config.as_deref()
+    let config_path = invocation
+        .rp_config
+        .as_deref()
         .context("RP execution requires --rp-config")?;
     let settings = nazoauthctl_conformance::RpSettings::load(Path::new(config_path), &target)?;
     progress.activity(&ProgressActivity::AuthenticatingSuite);
@@ -1090,8 +1101,12 @@ fn execute_rp_only<S: ProgressSink>(
     let run_id = format!("rp-{}", uuid::Uuid::now_v7());
     let evidence_directory = create_evidence_directory(session.recovery_directory(), &run_id)?;
     let rp = nazoauthctl_conformance::run_rp_blackbox(
-        &suite, target, &settings, &evidence_directory,
-        invocation.poll_timeout, invocation.delete_suite_plans,
+        &suite,
+        target,
+        &settings,
+        &evidence_directory,
+        invocation.poll_timeout,
+        invocation.delete_suite_plans,
     )?;
     let success = rp.success;
     let output = serde_json::json!({
@@ -1111,7 +1126,10 @@ fn execute_rp_only<S: ProgressSink>(
         println!();
     } else {
         let status = if success { "PASSED" } else { "FAILED" };
-        println!("OIDC RP black-box: {status}. Evidence: {}", evidence_directory.display());
+        println!(
+            "OIDC RP black-box: {status}. Evidence: {}",
+            evidence_directory.display()
+        );
     }
     Ok(if success { 0 } else { 1 })
 }

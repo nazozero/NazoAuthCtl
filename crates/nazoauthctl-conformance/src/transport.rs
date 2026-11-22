@@ -46,7 +46,10 @@ impl HttpRequest {
         Self {
             method: HttpMethod::Post,
             url,
-            headers: vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
+            headers: vec![(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )],
             body: Some(bytes::Bytes::from(body)),
         }
     }
