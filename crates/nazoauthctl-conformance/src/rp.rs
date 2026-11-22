@@ -166,7 +166,7 @@ pub struct RpReport {
     pub plans: Vec<RpPlanReport>,
     pub success: bool,
     pub suite_pass: bool,
-    pub blocked_preconditions: usize,
+    pub failed_application_assertions: usize,
 }
 
 pub fn run(
@@ -210,7 +210,7 @@ pub fn run(
         plans: Vec::new(),
         success: true,
         suite_pass: true,
-        blocked_preconditions: 0,
+        failed_application_assertions: 0,
     };
     for profile in [
         RpProfile::Basic,
@@ -248,7 +248,7 @@ pub fn run(
             );
         }
         for (index, module) in plan.modules.iter().enumerate() {
-            let instance = suite.create_module(&plan.id, module)?;
+            let mut instance = suite.create_module(&plan.id, module)?;
             let mut observed_http_status = None;
             let mut application_error = None;
             let mut application_pass = false;
@@ -309,10 +309,16 @@ pub fn run(
             report.success &= accepted;
             report.suite_pass &=
                 suite_status == "FINISHED" && suite_result.as_deref() == Some("PASSED");
-            if !application_pass && observed_http_status == Some(401) {
-                report.blocked_preconditions += 1;
+            if !application_pass {
+                report.failed_application_assertions += 1;
             }
             let log = suite.module_log(&instance.id)?;
+            // A failed browser assertion can leave the Suite runner in WAITING.
+            // End that exact module before reusing the plan alias. Retain the
+            // original observed state; cancellation never counts as PASSED.
+            if suite_status != "FINISHED" && suite_status != "INTERRUPTED" {
+                suite.cancel_module(&instance.id)?;
+            }
             let relative = format!("rp-{}-{:02}.json", profile.name(), index + 1);
             let bytes = serde_json::to_vec(&log)?;
             secure_file::write_atomic(&evidence_dir.join(&relative), &bytes, true).map_err(
