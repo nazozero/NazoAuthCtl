@@ -1026,7 +1026,10 @@ impl<'a> Browser<'a> {
                 .with_header("x-csrf-token", csrf),
         )?;
         if response.status != 200 || response.body.json::<Value>()?["success"] != true {
-            bail!("local test session could not be revoked");
+            bail!(
+                "local test session could not be revoked (HTTP {})",
+                response.status
+            );
         }
         if self.get(self.target.url("/auth/me")?)?.status != 401 {
             bail!("local test session remained authenticated after logout");

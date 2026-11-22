@@ -129,7 +129,7 @@ impl SuiteClient {
             "/api/server",
             &[],
             None,
-            false,
+            true,
             self.config.max_response_bytes,
         )?;
         if response.status != 200 || !response.body.is_object() {

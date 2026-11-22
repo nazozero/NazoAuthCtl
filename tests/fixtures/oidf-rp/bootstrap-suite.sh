@@ -57,6 +57,7 @@ http {
     ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
     ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
     ssl_protocols TLSv1.3;
+    proxy_http_version 1.1;
     proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-Proto https;
     proxy_set_header X-Forwarded-Host $http_host;
@@ -89,7 +90,7 @@ docker run -d --name nazo-rp-blackbox-server --network host \
   -e OIDC_GOOGLE_SECRET=unused-local-development-secret \
   -e OIDC_GITLAB_CLIENTID=unused-local-development-client \
   -e OIDC_GITLAB_SECRET=unused-local-development-secret \
-  -e JAVA_EXTRA_ARGS='-Dfintechlabs.devmode=true -Dserver.address=127.0.0.1 -Djavax.net.ssl.trustStore=/fixture/java.p12 -Djavax.net.ssl.trustStorePassword=changeit' \
+  -e JAVA_EXTRA_ARGS='-Dfintechlabs.devmode=true -Dfintechlabs.makeDummyUserAdminInDevMode=false -Dserver.address=127.0.0.1 -Djavax.net.ssl.trustStore=/fixture/java.p12 -Djavax.net.ssl.trustStorePassword=changeit' \
   -v "$task_dir/tls/java.p12:/fixture/java.p12:ro" \
   "$suite_image"
 docker run -d --name nazo-rp-blackbox-nginx --network host \
@@ -113,8 +114,17 @@ if [[ "$ready" != true ]]; then
   exit 1
 fi
 
+# The original token API only mints tokens for ordinary users. Keep the dev
+# user non-admin and use its real short-lived Bearer token in the controller.
+(
+  umask 077
+  curl --silent --show-error --fail --cacert "$task_dir/tls/ca.crt" \
+    --json '{}' https://localhost:8443/api/token > "$task_dir/suite-token.json"
+)
+
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   echo "OIDF_SUITE_CA=$task_dir/tls/ca.crt" >> "$GITHUB_ENV"
   echo "OIDF_WORK_DIR=$task_dir" >> "$GITHUB_ENV"
+  echo "OIDF_RP_SUITE_TOKEN=$task_dir/suite-token.json" >> "$GITHUB_ENV"
 fi
 printf 'OIDF Suite ready at https://localhost:8443; CA: %s\n' "$task_dir/tls/ca.crt"

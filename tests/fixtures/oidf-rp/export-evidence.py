@@ -25,6 +25,9 @@ def export(root):
     if settings.is_file():
         config = json.loads(settings.read_text())
         secrets = [config["client_secret"], config["account"]["password"]]
+    suite_token = root / "suite-token.json"
+    if suite_token.is_file():
+        secrets.append(json.loads(suite_token.read_text())["token"])
     server_config = root / "sut" / ".env.yaml"
     if server_config.is_file():
         config = json.loads(server_config.read_text())

@@ -84,6 +84,12 @@ impl Transport for Scripted {
             .expect("unexpected extra HTTP request");
         assert_eq!(request.method(), step.method);
         assert_eq!(request.url().as_str(), step.url);
+        if request.url().path() == "/api/server" {
+            assert_eq!(
+                request.header("authorization"),
+                Some("Bearer fixture-suite-token")
+            );
+        }
         if request.url().path() == "/auth/login" {
             assert_eq!(request.header("content-type"), Some("application/json"));
             let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
@@ -418,7 +424,7 @@ fn setup_http_failure_revokes_the_authenticated_session_before_returning() {
         ),
         step(
             HttpMethod::Get,
-            "https://suite.example/api/server",
+            "https://suite.example/api/server?",
             200,
             json!({"version":"5.3.4"}),
             &[],
@@ -435,9 +441,13 @@ fn setup_http_failure_revokes_the_authenticated_session_before_returning() {
     ];
     steps.extend(logout_steps());
     let http = std::sync::Arc::new(Scripted::new(steps));
-    let suite =
-        SuiteClient::with_transport(suite_origin, None, http.clone(), ClientConfig::default())
-            .unwrap();
+    let suite = SuiteClient::with_transport(
+        suite_origin,
+        Some(crate::BearerToken::new("fixture-suite-token").unwrap()),
+        http.clone(),
+        ClientConfig::default(),
+    )
+    .unwrap();
     assert!(
         run_with_transport(
             &suite,

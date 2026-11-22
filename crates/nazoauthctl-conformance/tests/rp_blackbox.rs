@@ -3,7 +3,8 @@
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use nazoauthctl_conformance::{
-    ClientConfig, HttpTransport, Origin, RpSettings, RunControl, SuiteClient, run_rp_blackbox,
+    BearerToken, ClientConfig, HttpTransport, Origin, RpSettings, RunControl, SuiteClient,
+    run_rp_blackbox,
 };
 use nazoauthctl_runtime::secure_file;
 
@@ -18,15 +19,23 @@ fn production_rp_blackbox() {
     let evidence =
         PathBuf::from(env::var_os("OIDF_RP_EVIDENCE").expect("private evidence directory"));
     secure_file::ensure_directory(&evidence, true).unwrap();
+    #[derive(serde::Deserialize)]
+    struct SuiteToken {
+        token: String,
+    }
+    let token_path =
+        PathBuf::from(env::var_os("OIDF_RP_SUITE_TOKEN").expect("private Suite API token"));
+    let token_json = secure_file::read_bounded(&token_path, 16 * 1024, true).unwrap();
+    let token: SuiteToken = serde_json::from_slice(&token_json).unwrap();
     let suite = SuiteClient::with_transport(
         suite_origin,
-        None,
+        Some(BearerToken::new(token.token).unwrap()),
         Arc::new(HttpTransport::new(Duration::from_secs(30)).unwrap()),
         ClientConfig::default(),
     )
     .unwrap();
-    // The isolated original Suite dev profile has no authentication. Production
-    // invocations still use the controller's authenticated Suite workflow.
+    // The original Suite dev user mints this short-lived token through its
+    // normal token API; the driver always sends the real Bearer credential.
     let report = run_rp_blackbox(
         &suite,
         target,
