@@ -238,7 +238,10 @@ pub fn run(
             .iter()
             .map(|module| module.test_name.as_str())
             .collect::<BTreeSet<_>>();
-        let expected = profile_modules(profile).iter().copied().collect::<BTreeSet<_>>();
+        let expected = profile_modules(profile)
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let plan_is_known = observed.len() == plan.modules.len() && observed == expected;
         if !plan_is_known {
             report.success = false;
