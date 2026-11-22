@@ -233,11 +233,13 @@ pub fn run(
             modules: Vec::new(),
             cleanup: "retained",
         };
-        let plan_is_known = profile_modules(profile).len() == plan.modules.len()
-            && plan
-                .modules
-                .iter()
-                .all(|module| profile_modules(profile).contains(&module.test_name.as_str()));
+        let observed = plan
+            .modules
+            .iter()
+            .map(|module| module.test_name.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected = profile_modules(profile).iter().copied().collect::<BTreeSet<_>>();
+        let plan_is_known = observed.len() == plan.modules.len() && observed == expected;
         if !plan_is_known {
             report.success = false;
             report.suite_pass = false;
@@ -503,13 +505,13 @@ impl Browser<'_> {
             .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
         {
             let pair = cookie.1.split(';').next().unwrap_or_default();
-            if let Some((name, value)) = pair.split_once('=') {
-                if valid_path_segment(name) {
-                    if value.is_empty() {
-                        jar.remove(name);
-                    } else {
-                        jar.insert(name.to_owned(), Zeroizing::new(value.to_owned()));
-                    }
+            if let Some((name, value)) = pair.split_once('=')
+                && valid_path_segment(name)
+            {
+                if value.is_empty() {
+                    jar.remove(name);
+                } else {
+                    jar.insert(name.to_owned(), Zeroizing::new(value.to_owned()));
                 }
             }
         }
