@@ -82,7 +82,7 @@ pub fn resolve_bundled_oidf_selection(
             .collect::<Vec<_>>()
     };
     let groups = match selector {
-        "oidc" => matching_groups(&|id| id == "oidc-core"),
+        "oidc" => matching_groups(&|id| matches!(id, "oidc-core" | "oidc-logout" | "oidc-session")),
         "ciba" => matching_groups(&|id| id == "fapi-ciba"),
         "fapi" => matching_groups(&|id| id.starts_with("fapi-")),
         "openid4vci" => matching_groups(&|id| id.starts_with("openid4vc-vci")),
@@ -436,6 +436,16 @@ mod tests {
         assert_eq!(
             resolve_bundled_oidf_selection(None).unwrap(),
             OidfPlanSelection::default()
+        );
+        assert_eq!(
+            resolve_bundled_oidf_selection(Some("oidc")).unwrap().groups,
+            ["oidc-core", "oidc-logout", "oidc-session"]
+        );
+        assert_eq!(
+            open_bundled_oidf_driver_plan(resolve_bundled_oidf_selection(Some("oidc")).unwrap())
+                .unwrap()
+                .selected_plan_count,
+            9,
         );
         assert_eq!(
             resolve_bundled_oidf_selection(Some("ciba")).unwrap().groups,

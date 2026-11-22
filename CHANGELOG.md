@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.4.0 - Pending publication
+
+- Correct `oidf run oidc` to select all nine bundled OP Core, Logout and
+  Session Management plans rather than only the five Core plans. Exact plan
+  selectors and the default full 44-plan Matrix are unchanged.
+- Record the separate RP Basic, Configuration and Back-Channel Logout
+  conformance workflow in NazoAuth. Do not import RP plan names into the
+  controller's OP Matrix without a working RP provision-and-run path.
+- Preserve operator protocol 4, immutable dependency revisions, and existing
+  persisted state/backup formats. The release remains gated on successful CI
+  and signed server compatibility.
+
 ## 0.3.11 - 2026-11-15
 
 - Remove retired client-assertion audience exceptions from bundled OIDF client
