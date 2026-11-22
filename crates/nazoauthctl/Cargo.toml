@@ -21,6 +21,7 @@ ctrlc = "3.5.2"
 cliclack = "0.5.6"
 nazoauthctl-core = { path = "../.." }
 nazoauthctl-conformance = { path = "../nazoauthctl-conformance" }
+nazoauthctl-runtime = { path = "../nazoauthctl-runtime" }
 nazo-operator-protocol.workspace = true
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -34,6 +35,3 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
-
-[dev-dependencies]
-nazoauthctl-runtime = { path = "../nazoauthctl-runtime" }

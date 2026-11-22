@@ -24,6 +24,7 @@ mod progress;
 mod proxy_trust;
 mod recovery;
 mod report;
+mod rp;
 mod suite_compatibility;
 use nazoauthctl_runtime::secure_file;
 mod transport;
@@ -93,6 +94,7 @@ pub use report::{
     ModuleOutcome, ModuleReport, PlanReport, ReviewScreenshotReport, WarningCondition,
     WarningModule,
 };
+pub use rp::{RpReport, RpSettings, recover_runs as recover_rp_runs, run as run_rp_blackbox};
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, Transport, TransportError,
     TransportFailureStage,

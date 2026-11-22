@@ -26,14 +26,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Require successful controller CI for exact tag commit
+      - name: Require successful controller and RP black-box CI for exact tag commit
         id: ci
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          python3 scripts/resolve_ci_run.py "$RELEASE_SHA" --require-main >> "$GITHUB_OUTPUT"
+          python3 scripts/resolve_ci_run.py "$RELEASE_SHA" --require-main --require-rp >> "$GITHUB_OUTPUT"
       - name: Validate immutable controller release input
         env:
           RELEASE_TAG: ${{ github.ref_name }}

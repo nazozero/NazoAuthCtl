@@ -489,6 +489,10 @@ fn execute_with_progress<S: ProgressSink>(
     user_interrupted: Arc<AtomicBool>,
     interrupt_notice: &'static str,
 ) -> anyhow::Result<i32> {
+    if invocation.rp_only {
+        install_interrupt_handler(&control, user_interrupted, interrupt_notice)?;
+        return execute_rp_only(&invocation, progress, language, &control);
+    }
     progress.activity(&ProgressActivity::OpeningDeployment);
     let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
         .context("deployment is not ready for ordinary conformance orchestration")?;
@@ -500,6 +504,16 @@ fn execute_with_progress<S: ProgressSink>(
     recover_pending_runs(&session, &recovery_store, None)?;
     let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())
         .map_err(|error| anyhow::anyhow!("configured OIDF Suite origin is invalid: {error}"))?;
+    // Validate externally configured RP facts before creating temporary OP resources.
+    let rp_setup = invocation
+        .rp_config
+        .as_deref()
+        .map(|path| {
+            let target = production_rp_origin(session.target_issuer())?;
+            let settings = nazoauthctl_conformance::RpSettings::load(Path::new(path), &target)?;
+            Ok::<_, anyhow::Error>((target, settings))
+        })
+        .transpose()?;
 
     progress.activity(&ProgressActivity::LoadingMatrix);
     let driver_plan = open_bundled_oidf_driver_plan(OidfPlanSelection {
@@ -526,6 +540,13 @@ fn execute_with_progress<S: ProgressSink>(
     let (suite_client, token) = authenticate_suite(&invocation, &suite_origin, language, progress)?;
     progress.activity(&ProgressActivity::RecoveringPreviousRun);
     let recovered_retention = recover_pending_runs(&session, &recovery_store, Some(&suite_client))?;
+    let rp_target = production_rp_origin(session.target_issuer())?;
+    nazoauthctl_conformance::recover_rp_runs(
+        &suite_client,
+        &rp_target,
+        rp_setup.as_ref().map(|(_, settings)| settings),
+        &session.recovery_directory().join("evidence"),
+    )?;
     if !recovered_retention.is_empty() {
         progress.activity(&ProgressActivity::Finished);
         if invocation.json {
@@ -781,7 +802,7 @@ fn execute_with_progress<S: ProgressSink>(
         requires_ciba,
         requires_vci,
         requires_vp,
-        control,
+        control.clone(),
         Arc::clone(&user_interrupted),
         interrupt_notice,
         progress,
@@ -999,7 +1020,26 @@ fn execute_with_progress<S: ProgressSink>(
         errors.push(format!("recovery-finish={error:#}"));
     }
     deployment_report.cleanup_complete = cleanup_complete;
+    // RP executes against the unchanged production instance, never against
+    // the temporary tenant or an in-process test bridge.
+    let mut rp_report = None;
+    if let Some((target, settings)) = rp_setup {
+        let attempt = nazoauthctl_conformance::run_rp_blackbox(
+            &suite_client,
+            target,
+            &settings,
+            &evidence_directory,
+            invocation.poll_timeout,
+            invocation.delete_suite_plans,
+            &control,
+        );
+        match attempt {
+            Ok(result) => rp_report = Some(result),
+            Err(error) => errors.push(format!("RP black-box execution={error:#}")),
+        }
+    }
     let success = errors.is_empty()
+        && rp_report.as_ref().is_none_or(|rp| rp.success)
         && report.as_ref().is_some_and(|report| {
             report.orchestration_integrity.defined_modules > 0
                 && conformance_run_succeeds(
@@ -1014,6 +1054,7 @@ fn execute_with_progress<S: ProgressSink>(
         success,
         errors,
         report,
+        rp: rp_report,
         retention,
         evidence,
         deployment: deployment_report,
@@ -1027,6 +1068,118 @@ fn execute_with_progress<S: ProgressSink>(
         write_final_output(io::stdout().lock(), &output, language, false)?;
     }
     Ok(if user_interrupted.load(Ordering::SeqCst) {
+        130
+    } else if success {
+        0
+    } else {
+        1
+    })
+}
+
+fn production_rp_origin(issuer: &str) -> anyhow::Result<Origin> {
+    let url = Url::parse(issuer)?;
+    Origin::parse(&url.origin().ascii_serialization()).map_err(Into::into)
+}
+
+fn execute_rp_only<S: ProgressSink>(
+    invocation: &RunInvocation,
+    progress: &mut S,
+    language: OutputLanguage,
+    control: &RunControl,
+) -> anyhow::Result<i32> {
+    progress.activity(&ProgressActivity::OpeningDeployment);
+    let session = nazoauthctl_core::ConformanceSession::open(invocation.instance.as_deref())
+        .context("RP black-box execution requires a verified running NazoAuth release")?;
+    let recovery_store = ConformanceRecoveryStore::open(
+        session.recovery_directory(),
+        &session.deployment_evidence().deployment_id,
+    )?;
+    let _lock = recovery_store.acquire_orchestration_lock()?;
+    recover_pending_runs(&session, &recovery_store, None)?;
+    let suite_origin = Origin::parse_public_suite(session.oidf_suite_origin())?;
+    let target = production_rp_origin(session.target_issuer())?;
+    let config_path = invocation
+        .rp_config
+        .as_deref()
+        .context("RP execution requires --rp-config")?;
+    let settings = nazoauthctl_conformance::RpSettings::load(Path::new(config_path), &target)?;
+    progress.activity(&ProgressActivity::AuthenticatingSuite);
+    let (suite, _token) = authenticate_suite(invocation, &suite_origin, language, progress)?;
+    if !recover_pending_runs(&session, &recovery_store, Some(&suite))?.is_empty() {
+        bail!("unsettled earlier Suite retention requires recovery before RP execution");
+    }
+    nazoauthctl_conformance::recover_rp_runs(
+        &suite,
+        &target,
+        Some(&settings),
+        &session.recovery_directory().join("evidence"),
+    )?;
+    let run_id = format!("rp-{}", uuid::Uuid::now_v7());
+    let evidence_directory = create_evidence_directory(session.recovery_directory(), &run_id)?;
+    let deployment = session.deployment_evidence();
+    nazoauthctl_runtime::secure_file::write_atomic(
+        &evidence_directory.join("rp-target.json"),
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "deployment_id": deployment.deployment_id,
+            "release": deployment.release,
+            "target_issuer": deployment.target_issuer,
+            "runtime": evidence_runtime(&deployment.runtime),
+        }))?,
+        true,
+    )
+    .map_err(|error| anyhow::anyhow!("failed to persist RP target identity: {error:?}"))?;
+    let rp = nazoauthctl_conformance::run_rp_blackbox(
+        &suite,
+        target,
+        &settings,
+        &evidence_directory,
+        invocation.poll_timeout,
+        invocation.delete_suite_plans,
+        control,
+    )?;
+    let success = rp.success;
+    let modules = rp
+        .plans
+        .iter()
+        .flat_map(|plan| &plan.modules)
+        .collect::<Vec<_>>();
+    let suite_passed = modules
+        .iter()
+        .filter(|module| module.suite_result.as_deref() == Some("PASSED"))
+        .count();
+    let suite_skipped = modules
+        .iter()
+        .filter(|module| module.suite_result.as_deref() == Some("SKIPPED"))
+        .count();
+    let module_count = modules.len();
+    let suite_other = module_count - suite_passed - suite_skipped;
+    let application_passed = module_count - rp.failed_application_assertions;
+    let output = serde_json::json!({
+        "schema": 1,
+        "success": success,
+        "role": "oidc-rp",
+        "deployment": {
+            "id": session.deployment_evidence().deployment_id,
+            "release": session.deployment_evidence().release,
+            "runtime": evidence_runtime(&session.deployment_evidence().runtime),
+        },
+        "evidence_directory": evidence_directory,
+        "rp": rp,
+    });
+    progress.activity(&ProgressActivity::Finished);
+    if invocation.json {
+        serde_json::to_writer_pretty(io::stdout().lock(), &output)?;
+        println!();
+    } else {
+        let status = if success { "PASSED" } else { "FAILED" };
+        println!(
+            "OIDC RP black-box acceptance: {status}. Suite: {suite_passed} PASSED, \
+             {suite_skipped} SKIPPED, {suite_other} other ({module_count}/28 modules). \
+             Application assertions: {application_passed}/28 passed. Evidence: {}",
+            evidence_directory.display()
+        );
+    }
+    Ok(if control.is_interrupted() {
         130
     } else if success {
         0
@@ -1171,6 +1324,7 @@ mod acceptance_tests {
             success: false,
             errors: vec!["test failure".to_owned()],
             report: None,
+            rp: None,
             retention: None,
             evidence: None,
             deployment: DeploymentReport {
@@ -1809,6 +1963,8 @@ struct FinalOutput {
     errors: Vec<String>,
     report: Option<nazoauthctl_conformance::ConformanceReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    rp: Option<nazoauthctl_conformance::RpReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     retention: Option<SuiteRetentionManifestReceipt>,
     evidence: Option<EvidenceBundleReceipt>,
     deployment: DeploymentReport,
@@ -2306,6 +2462,21 @@ struct RunSecrets {
     applicant_password: Zeroizing<String>,
 }
 
+fn install_interrupt_handler(
+    control: &RunControl,
+    user_interrupted: Arc<AtomicBool>,
+    interrupt_notice: &'static str,
+) -> anyhow::Result<()> {
+    let interrupt = control.clone();
+    ctrlc::set_handler(move || {
+        if !user_interrupted.swap(true, Ordering::SeqCst) {
+            eprintln!("{interrupt_notice}");
+        }
+        interrupt.interrupt();
+    })
+    .context("failed to install the conformance interrupt handler")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_signed_suite<S: ProgressSink>(
     mut materialized: nazoauthctl_conformance::TenantResourceMaterializedMatrix,
@@ -2354,14 +2525,7 @@ fn run_signed_suite<S: ProgressSink>(
         .transpose()
         .context("failed to derive the run tenant OpenID4VP management token")?;
     let selected = materialized.take_matrix();
-    let interrupt = control.clone();
-    ctrlc::set_handler(move || {
-        if !user_interrupted.swap(true, Ordering::SeqCst) {
-            eprintln!("{interrupt_notice}");
-        }
-        interrupt.interrupt();
-    })
-    .context("failed to install the conformance interrupt handler")?;
+    install_interrupt_handler(&control, user_interrupted, interrupt_notice)?;
     let jobs = invocation.jobs.min(selected.document.plan_count());
     if control.is_interrupted() {
         bail!("run interrupted");

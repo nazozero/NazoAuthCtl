@@ -28,13 +28,13 @@ fn release_workflow_requires_successful_ci_for_the_exact_tag_commit() {
     ))
     .unwrap();
     let gate = workflow
-        .find("Require successful controller CI for exact tag commit")
+        .find("Require successful controller and RP black-box CI for exact tag commit")
         .unwrap();
     let build = workflow.find("\n  build:").unwrap();
     assert!(gate < build, "tag CI gate must precede the build job");
     for required in [
         "actions: read",
-        "python3 scripts/resolve_ci_run.py \"$RELEASE_SHA\" --require-main",
+        "python3 scripts/resolve_ci_run.py \"$RELEASE_SHA\" --require-main --require-rp",
         "ci_run_id: ${{ steps.ci.outputs.run_id }}",
         "artifact_ids: ${{ steps.ci.outputs.artifact_ids }}",
         "artifact-ids: ${{ fromJSON(needs.policy.outputs.artifact_ids)[matrix.target] }}",
