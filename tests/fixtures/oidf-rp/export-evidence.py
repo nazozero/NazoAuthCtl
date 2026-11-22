@@ -25,6 +25,11 @@ def export(root):
     if settings.is_file():
         config = json.loads(settings.read_text())
         secrets = [config["client_secret"], config["account"]["password"]]
+    server_config = root / "sut" / ".env.yaml"
+    if server_config.is_file():
+        config = json.loads(server_config.read_text())
+        database = config["DATABASE_URL"]
+        secrets.extend([database, urlsplit(database).password, config["SIGNING_KEY_ENCRYPTION_KEY"]])
 
     def redact(value):
         if isinstance(value, dict):

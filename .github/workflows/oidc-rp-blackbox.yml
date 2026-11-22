@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: nazozero/NazoAuth
-          ref: 6bc37162f889710bd28e8f98979c9ef0a1e0ef96
+          ref: 6b6f1c6b6047e56832155fb0655fbeaafbae1032
           path: sut
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
@@ -64,7 +64,7 @@ jobs:
       - name: Prepare the isolated runner
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libpq-dev
+          sudo apt-get install -y --no-install-recommends pkg-config libpq-dev postgresql-client
           python3 sut/scripts/ci_build_jobs.py >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/oidf-rp"
       - name: Build the unchanged production binary

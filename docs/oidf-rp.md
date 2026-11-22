@@ -1,7 +1,7 @@
 # OIDC RP black-box setup
 
 NazoAuth is the **system under test**. NazoAuthCtl drives the official OIDF
-Suite as upstream OpenID Provider, using real HTTPS and the released NazoAuth
+Suite as upstream OpenID Provider, using real HTTPS and a production NazoAuth
 binary. It never constructs in-process Federation services or writes a test
 identity link directly into PostgreSQL.
 
@@ -77,8 +77,10 @@ fixture account and starts each binding through
 verifies the original Suite OP response and binds its subject to that same
 account. Setup modules and their original Suite states are recorded separately.
 The conformance modules then start with a fresh browser cookie jar and must
-establish a real local session for that account. Negative modules must return
-401 without a local session. Key rotation performs both required logins.
+establish a real local session for that account. Invalid identity callbacks must
+return 401 without a local session; an issuer mismatch in Discovery must reject
+the metadata before authorization starts. Key rotation performs both required
+logins.
 
 Every Suite plan and module has a durable create intent before the API request.
 Its returned opaque ID replaces that intent. A later run recovers an interrupted

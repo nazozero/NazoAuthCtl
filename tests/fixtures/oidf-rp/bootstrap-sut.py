@@ -11,6 +11,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
 
 
@@ -35,6 +36,15 @@ def main():
     client_id = "nazoauth-rp-acceptance"
     client_secret = secrets.token_urlsafe(32)
     deployment = "rp-" + uuid.uuid4().hex
+    epoch = uuid.UUID(int=(time.time_ns() // 1_000_000) << 80
+                      | 7 << 76 | secrets.randbits(12) << 64 | 2 << 62 | secrets.randbits(62))
+    lifecycle_database = os.environ["DATABASE_URL"]
+    database = urlsplit(lifecycle_database)
+    runtime_role = "nazoauth_rp_runtime"
+    runtime_password = secrets.token_urlsafe(32)
+    runtime_database = database._replace(
+        netloc=f"{runtime_role}:{runtime_password}@{database.netloc.rsplit('@', 1)[-1]}"
+    ).geturl()
     providers = []
     for provider_id, alias, discovery, logout, scope in [
         ("rp-basic", "rp-basic", False, False, "openid email profile"),
@@ -63,13 +73,14 @@ def main():
         "BIND": "127.0.0.1:18080", "PUBLIC_BASE_URL": origin,
         "MTLS_ENDPOINT_BASE_URL": origin, "TRANSPORT_MODE": "trusted-proxy",
         "TRUSTED_PROXY_CIDRS": "127.0.0.1/32", "MTLS_CERTIFICATE_SOURCE": "disabled",
-        "DATABASE_URL": os.environ["DATABASE_URL"], "VALKEY_URL": os.environ["VALKEY_URL"],
-        "VALKEY_STATE_EPOCH": str(uuid.uuid4()), "DEPLOYMENT_ID": deployment,
+        "DATABASE_URL": runtime_database, "VALKEY_URL": os.environ["VALKEY_URL"],
+        "VALKEY_STATE_EPOCH": str(epoch), "DEPLOYMENT_ID": deployment,
         "COOKIE_SECURE": True, "SESSION_COOKIE_NAME": "nazo_session", "CSRF_COOKIE_NAME": "nazo_csrf",
         "FRONTEND_BASE_URL": origin, "CORS_ALLOWED_ORIGINS": origin,
         "FEDERATION_PROVIDER_CONFIGS": json.dumps(providers), "EMAIL_DELIVERY": "disabled",
         "DATA_DIR": str(directory / "runtime"), "UI_ENABLED": False,
-        "SECURITY_AUDIT_REQUIRE_LEAST_PRIVILEGE": False,
+        "SIGNING_KEY_ENCRYPTION_KEY_ID": "rp-signing-root",
+        "SIGNING_KEY_ENCRYPTION_KEY": secrets.token_urlsafe(32),
         "RUST_LOG": "info",
     }
     # Configuration is JSON, which is also a YAML document. The production
@@ -89,10 +100,19 @@ def main():
         "post_logout_redirect_uri": origin + "/live",
         "session_cookie_name": "nazo_session", "csrf_cookie_name": "nazo_csrf",
     })
-    env = dict(os.environ, NAZOAUTH_SERVER_CONFIG_FILE=str(config_path))
+    env = dict(os.environ, NAZOAUTH_SERVER_CONFIG_FILE=str(config_path), DATABASE_URL=runtime_database)
     log_path = directory / "server-private.log"
     with open(log_path, "x", opener=lambda name, flags: os.open(name, flags, 0o600)) as log:
-        subprocess.run([str(binary), "migrate"], cwd=directory, env=env, check=True, stdout=log, stderr=log)
+        # Only infrastructure roles are provisioned with SQL. The production
+        # migration CLI owns schema grants; all account/link state uses its CLI/HTTP.
+        subprocess.run(["psql", lifecycle_database, "--no-psqlrc", "--quiet", "-v", "ON_ERROR_STOP=1"],
+                       input=f"CREATE ROLE {runtime_role} LOGIN PASSWORD '{runtime_password}' NOSUPERUSER NOBYPASSRLS NOINHERIT;\n"
+                             f"REVOKE ALL ON DATABASE oauth FROM PUBLIC;\n"
+                             f"GRANT CONNECT ON DATABASE oauth TO postgres, {runtime_role};\n"
+                             "REVOKE CREATE ON SCHEMA public FROM PUBLIC;\n",
+                       text=True, check=True, stdout=log, stderr=log)
+        migrate_env = dict(env, DATABASE_URL=lifecycle_database, NAZOAUTH_MIGRATION_RUNTIME_ROLE=runtime_role)
+        subprocess.run([str(binary), "migrate"], cwd=directory, env=migrate_env, check=True, stdout=log, stderr=log)
         provision_env = dict(env, NAZOAUTH_ADMIN_PROVISION_FILE=str(credential_path),
                              NAZOAUTH_ADMIN_PROVISION_OPERATION_ID="initial-rp-account",
                              NAZOAUTH_ADMIN_PROVISION_DEPLOYMENT_ID=deployment)
