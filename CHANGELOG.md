@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 - Pending publication
+## 0.4.0 - 2026-11-22
 
 - Add an external OIDC RP Suite execution lane owned by NazoAuthCtl.
   Existing 44 OP/AS plans stay unchanged; RP runs against production HTTPS

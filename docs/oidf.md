@@ -38,11 +38,15 @@ The RP fixture must already exist in ordinary production configuration.
 NazoAuthCtl neither adds Suite-specific server endpoints nor writes directly
 to the NazoAuth identity database. Its RP driver sends real HTTPS requests
 to `/auth/federation/...` and checks normal `/auth/me` session status.
-See [RP black-box setup and remaining preconditions](oidf-rp.md).
+See [RP black-box setup](oidf-rp.md).
 
-The existing [NazoAuth in-process RP suite harness](https://github.com/nazozero/NazoAuth/actions/workflows/oidc-rp-research.yml)
-is implementation-level evidence and cannot replace external black-box
-acceptance or an actual independently configured production NazoAuth release.
+The [RP black-box workflow](https://github.com/nazozero/NazoAuthCtl/actions/workflows/oidc-rp-blackbox.yml)
+runs the same driver against an independent production binary. Its evidence
+records the exact NazoAuth and controller commits, the binary digest, the live
+Suite version, original module outcomes and public session assertions.
+
+### OP/AS orchestration
+
 NazoAuthCtl automatically creates a temporary tenant below the configured domain,
 fresh test material, managed browser workers, and a private evidence directory.
 For CIBA, ctl reads the authenticated Suite log and completes the requested
@@ -76,7 +80,7 @@ directly; group selection, exclusions and bounded execution remain supported.
 Evidence schema 5 records the controller version, Matrix and driver digests,
 the combined input identity, and the reference Suite release, source revision
 and image digest. The existing Matrix reference remains release-v5.3.3, the version against which
-these particular bundled inputs were checked. NazoAuth's independent RP workflow
+these particular bundled inputs were checked. The controller's independent RP workflow
 uses its own pinned Suite release-v5.3.4. Changing the controller's reference
 requires verification of its 44 OP/AS plans against that Suite, not merely
 copying the newer reference from the RP workflow.

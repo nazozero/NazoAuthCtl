@@ -4,7 +4,7 @@ set -euo pipefail
 
 task_dir="$(realpath "${1:?usage: bootstrap-suite.sh WORK_DIR}")"
 mkdir -p "$task_dir/tls" "$task_dir/evidence/bootstrap"
-chmod 700 "$task_dir/tls"
+chmod 700 "$task_dir" "$task_dir/tls"
 suite_image='registry.gitlab.com/openid/conformance-suite@sha256:dcc4bd1fb7e9c00f048a67373fe2bec5ecf9feb45a6b5d55e237e5c30e5312c6'
 nginx_image='registry.gitlab.com/openid/conformance-suite/nginx@sha256:9a7850826fcc8690cd43373528f50e9551ba33bf8e4a40b67b13267b0aca3675'
 mongo_image='mongo@sha256:b415b12f638e2685d06c58ab7fb5943577c50fadec6d9340ef67d21aeac72070'
