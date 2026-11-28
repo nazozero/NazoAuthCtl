@@ -1160,10 +1160,12 @@ impl ConformanceRunner {
                             };
                             match verifier.complete(&presentation, &presentation_delivery_url) {
                                 Ok(_) => {}
-                                Err(crate::browser::OpenId4VpError::CompletionFailed) => {
-                                    // A rejected positive presentation is a test failure when
-                                    // the Suite has already recorded that exact terminal result.
-                                    // Preserve normal failure collection and fail-fast handling.
+                                Err(
+                                    error @ (crate::browser::OpenId4VpError::CompletionFailed
+                                    | crate::browser::OpenId4VpError::UnexpectedAuthorizationRedirect),
+                                ) => {
+                                    // The Suite may terminate while generating the presentation.
+                                    // Continue only if this exact module already reports failure.
                                     match self.config.client.module_info(&instance.id) {
                                         Ok(info)
                                             if is_terminal(&info)
@@ -1173,10 +1175,7 @@ impl ConformanceRunner {
                                             observed = Some(info);
                                         }
                                         _ => {
-                                            errors.push(
-                                                crate::browser::OpenId4VpError::CompletionFailed
-                                                    .to_string(),
-                                            );
+                                            errors.push(error.to_string());
                                             groups[group_index].status = GroupStatus::Failed;
                                             break 'execute;
                                         }
@@ -4557,7 +4556,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct FailedCompletionVerifier;
+    struct FailedCompletionVerifier(OpenId4VpError);
     #[cfg(unix)]
     impl OpenId4VpVerifier for FailedCompletionVerifier {
         fn start(
@@ -4571,7 +4570,7 @@ mod tests {
             _: &crate::browser::OpenId4VpPresentation,
             _: &Url,
         ) -> Result<OpenId4VpCompletionOutcome, OpenId4VpError> {
-            Err(OpenId4VpError::CompletionFailed)
+            Err(self.0.clone())
         }
     }
 
@@ -4579,11 +4578,49 @@ mod tests {
     #[test]
     fn vp_completion_error_continues_only_after_confirmed_suite_failure() {
         for jobs in [1, 2] {
-            for (status, result, fail_fast, expected_modules) in [
-                ("FINISHED", "FAILED", false, 2),
-                ("FINISHED", "FAILED", true, 1),
-                ("FINISHED", "PASSED", false, 1),
-                ("RUNNING", "FAILED", false, 1),
+            for (status, result, driver_error, fail_fast, expected_modules) in [
+                (
+                    "FINISHED",
+                    "FAILED",
+                    OpenId4VpError::CompletionFailed,
+                    false,
+                    2,
+                ),
+                (
+                    "FINISHED",
+                    "FAILED",
+                    OpenId4VpError::CompletionFailed,
+                    true,
+                    1,
+                ),
+                (
+                    "INTERRUPTED",
+                    "FAILED",
+                    OpenId4VpError::UnexpectedAuthorizationRedirect,
+                    false,
+                    2,
+                ),
+                (
+                    "INTERRUPTED",
+                    "FAILED",
+                    OpenId4VpError::UnexpectedAuthorizationRedirect,
+                    true,
+                    1,
+                ),
+                (
+                    "FINISHED",
+                    "PASSED",
+                    OpenId4VpError::UnexpectedAuthorizationRedirect,
+                    false,
+                    1,
+                ),
+                (
+                    "RUNNING",
+                    "FAILED",
+                    OpenId4VpError::UnexpectedAuthorizationRedirect,
+                    false,
+                    1,
+                ),
             ] {
                 let transport = Arc::new(FailedCompletionTransport {
                     inner: DeferredReviewTransport {
@@ -4623,7 +4660,9 @@ mod tests {
                     jobs,
                     automation: (0..jobs)
                         .map(|_| ConformanceAutomation {
-                            verifier: Some(Arc::new(Mutex::new(FailedCompletionVerifier))),
+                            verifier: Some(Arc::new(Mutex::new(FailedCompletionVerifier(
+                                driver_error.clone(),
+                            )))),
                             ..Default::default()
                         })
                         .collect(),
@@ -4639,7 +4678,7 @@ mod tests {
                 );
                 assert!(!report.suite_pass);
                 assert!(!report.acceptance_pass);
-                if status == "FINISHED" && result == "FAILED" {
+                if matches!(status, "FINISHED" | "INTERRUPTED") && result == "FAILED" {
                     assert_eq!(report.modules[0].outcome, ModuleOutcome::Failed);
                     assert!(report.modules[0].terminal);
                     if !fail_fast {
